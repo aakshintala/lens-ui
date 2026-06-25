@@ -119,6 +119,13 @@ local scratch workspace; remote/managed connections are layered on top
   workspace/terminal/filesystem routes (which proxy to the runner) fail, and the
   Concierge has no runner. So Lens supervises the daemon as the parent process,
   not the bare server.
+  - **Empirically confirmed (2026-06-25 transport-stability spike):** with the
+    daemon down, `omnigent server start` brings the *server* up but leaves
+    `/v1/runners` empty and `host daemon attached: no`; a subsequent `POST
+    /v1/sessions {host_type:"external"}` + message yields `response.error
+    {code:"runner_failed_to_start"}` then `session.status:"failed"`. Also:
+    `omnigent server stop` tears the daemon down with the server, so a
+    stop/start cycle (e.g. a cold-start probe) leaves the stack runner-less.
 - **The spawn command (pin the actual argv).** Lens execs the daemon via
   `<hermetic-python> -m omnigent.host._daemon_entry` (the local mode is what
   cold-boots the server) — **not** `omnigent server start`. Pass explicit
