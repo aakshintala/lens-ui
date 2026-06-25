@@ -1,0 +1,241 @@
+<!-- @dsCard group="Lens" -->
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Lens — Board / home</title>
+<style>
+  :root{
+    --bg:#07080b; --bg1:#101319; --bg2:#151922; --bg3:#1c2230;
+    --line:#222936; --line2:#2c3442;
+    --tx:#eef2f7; --tx2:#9aa4b3; --tx3:#5f6a7a;
+    --green:#36c98a; --blue:#4c8dff; --orange:#ff8a3d; --red:#ff5d5d; --purple:#b08cff; --gray:#7a8493;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0}
+  body{background:var(--bg);color:var(--tx);font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,sans-serif;-webkit-font-smoothing:antialiased}
+  .app{display:flex;min-height:840px;width:1280px}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+
+  .rail{width:50px;background:var(--bg);border-right:1px solid var(--line);display:flex;flex-direction:column;align-items:center;padding:10px 0;gap:6px}
+  .logo{width:26px;height:26px;border-radius:7px;background:linear-gradient(135deg,#4c8dff,#b08cff);margin-bottom:8px}
+  .ricon{width:34px;height:34px;border-radius:8px;display:flex;align-items:center;justify-content:center;color:var(--tx2);font-size:15px;position:relative}
+  .ricon.on{background:var(--bg3);color:var(--tx)}
+  .ricon .dot{position:absolute;top:4px;right:4px;min-width:14px;height:14px;padding:0 3px;border-radius:8px;background:var(--red);color:#fff;font-size:9px;font-weight:700;display:flex;align-items:center;justify-content:center}
+  .spacer{flex:1}
+  .avatar{width:30px;height:30px;border-radius:50%;background:radial-gradient(circle at 30% 30%,#ffd479,#e0a042);display:flex;align-items:center;justify-content:center;font-size:14px;border:2px solid #2a2f3a}
+  .health{width:9px;height:9px;border-radius:50%;background:var(--green);box-shadow:0 0 0 3px rgba(54,201,138,.15);margin-top:6px}
+
+  .main{flex:1;display:flex;flex-direction:column;min-width:0}
+  .topbar{height:48px;flex:none;display:flex;align-items:center;gap:14px;padding:0 22px;border-bottom:1px solid var(--line)}
+  .btab{font-size:12.5px;color:var(--tx2);padding:5px 11px;border-radius:8px}
+  .btab.on{background:var(--bg3);color:var(--tx);font-weight:600}
+  .spend{margin-left:auto;display:flex;gap:18px;align-items:center}
+  .spend .lab{font-size:9px;letter-spacing:.07em;text-transform:uppercase;color:var(--tx3);display:block;line-height:1.1}
+  .spend b{font-size:13px}
+
+  .canvas{flex:1;padding:20px 24px;display:flex;flex-direction:column;gap:20px}
+
+  /* group */
+  .gwrap{border:1.5px solid var(--gborder);border-radius:15px;padding:14px;background:color-mix(in srgb, var(--gborder) 9%, var(--bg));box-shadow:0 0 22px -11px var(--gborder), inset 0 0 40px -20px color-mix(in srgb,var(--gborder) 60%,transparent)}
+  .gh{display:flex;align-items:center;gap:10px;margin:2px 4px 13px}
+  .gt{font-weight:700;font-size:15px;color:var(--gborder)}
+  .gmeta{margin-left:auto;font-size:12px;color:var(--tx2)}
+  .donepill{font-size:11px;color:var(--tx2);border:1px solid var(--line2);border-radius:7px;padding:1px 9px;margin-left:10px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:13px}
+
+  /* card */
+  .card{position:relative;border:1.5px solid var(--c);border-radius:13px;overflow:hidden;background:
+      radial-gradient(120% 130% at 0% 0%, color-mix(in srgb, var(--c) 12%, transparent), transparent 58%), var(--bg1);
+    box-shadow:0 0 22px -12px var(--c)}
+  .ctop{display:flex;gap:13px;padding:13px 15px 8px}
+  .tile{width:44px;height:44px;flex:none;border-radius:11px;display:flex;align-items:center;justify-content:center;font-size:19px;color:var(--c);background:color-mix(in srgb, var(--c) 14%, var(--bg2));border:1px solid color-mix(in srgb, var(--c) 30%, transparent)}
+  .cmeta{min-width:0;flex:1}
+  .stat{font-size:10px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;color:var(--c)}
+  .ttl{font-size:16px;font-weight:700;color:var(--tx);margin:2px 0 1px;letter-spacing:-.01em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .model{font-size:12px;color:var(--tx2);display:flex;align-items:center;gap:6px}
+  .tuib{font-size:8px;font-weight:700;letter-spacing:.04em;border:1px solid var(--line2);border-radius:3px;padding:0 3px;color:var(--tx3)}
+  .cact{margin-left:auto;align-self:flex-start}
+  .wake{font-size:11px;color:var(--tx);border:1px solid var(--line2);border-radius:8px;padding:4px 11px}
+
+  .actline{padding:0 15px 6px;font-size:12.5px;color:var(--tx);display:flex;align-items:center;gap:6px;min-height:14px}
+  .actline.attn{color:#ffc59a}
+  .actline.err{color:#ff9d9d}
+  .actline.sub{color:var(--blue)}
+
+  .rows{padding:0 15px 4px;display:flex;flex-direction:column;gap:2px}
+  .row{display:flex;align-items:center;gap:7px;font-size:12.5px;white-space:nowrap;overflow:hidden}
+  .ic{color:var(--tx3);flex:none}
+  .repo{color:var(--tx);flex:none}
+  .br{color:var(--brc,var(--purple));overflow:hidden;text-overflow:ellipsis}
+  .foot{display:flex;align-items:center;gap:9px;padding:8px 15px 11px}
+  .hostpill{font-size:11px;color:var(--tx);background:var(--bg3);border:1px solid var(--line2);border-radius:7px;padding:2px 8px}
+  .cost{color:var(--tx2);font-size:12px}
+  .pct{margin-left:auto;font-size:12px;color:var(--tx);font-weight:600}
+  .pbar{height:4px;background:rgba(255,255,255,.06)}
+  .pbar i{display:block;height:100%;background:var(--c)}
+  .dim{opacity:.5}
+  .dim.card{box-shadow:none}
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="rail">
+    <div class="logo"></div>
+    <div class="ricon on" title="Boards">▦</div>
+    <div class="ricon" title="Bridge">📥<span class="dot">3</span></div>
+    <div class="ricon" title="Archive">🗄</div>
+    <div class="ricon" title="Settings">⚙</div>
+    <div class="spacer"></div>
+    <div class="avatar" title="Concierge">🎩</div>
+    <div class="health"></div>
+  </div>
+
+  <div class="main">
+    <div class="topbar">
+      <span class="btab on">Polly</span>
+      <span class="btab">infra</span>
+      <span class="btab">scratch</span>
+      <span class="btab" style="color:var(--tx3)">＋</span>
+      <div class="spend">
+        <span><span class="lab">today</span><b>$6.40</b></span>
+        <span><span class="lab">7 days</span><b>$48.10</b></span>
+        <span><span class="lab">30 days</span><b>$211</b></span>
+        <span class="health" style="margin:0 0 0 4px"></span>
+      </div>
+    </div>
+
+    <div class="canvas">
+
+      <!-- GROUP: Polly feature (blue) — 3-up grid -->
+      <div class="gwrap" style="--gborder:var(--blue)">
+        <div class="gh">
+          <span class="gt">Polly feature</span>
+          <span class="gmeta">$36.94 · 12d</span>
+          <span class="donepill">5 done</span>
+        </div>
+        <div class="grid">
+
+          <div class="card" style="--c:var(--green)">
+            <div class="ctop">
+              <div class="tile">↻</div>
+              <div class="cmeta">
+                <div class="stat">Working</div>
+                <div class="ttl">auth refactor</div>
+                <div class="model">claude-sdk · Opus 4.8</div>
+              </div>
+            </div>
+            <div class="actline">✎ Refactoring auth module</div>
+            <div class="rows"><div class="row"><span class="ic">📁</span><span class="repo">app</span><span class="ic">⑂</span><span class="br" style="--brc:var(--green)">feat/auth-refactor</span></div></div>
+            <div class="foot"><span class="hostpill mono">local</span><span class="cost">~$16.53</span><span class="pct">25%</span></div>
+            <div class="pbar"><i style="width:25%"></i></div>
+          </div>
+
+          <div class="card" style="--c:var(--orange)">
+            <div class="ctop">
+              <div class="tile">🔔</div>
+              <div class="cmeta">
+                <div class="stat">Needs input</div>
+                <div class="ttl">payments api</div>
+                <div class="model">codex-native <span class="tuib">TUI</span> · GPT-5</div>
+              </div>
+            </div>
+            <div class="actline attn">⏸ approve: prod migration</div>
+            <div class="rows">
+              <div class="row"><span class="ic">📁</span><span class="repo">payments</span><span class="ic">⑂</span><span class="br" style="--brc:var(--orange)">feat/pay</span></div>
+              <div class="row"><span class="ic">📁</span><span class="repo">payments@infra</span><span class="ic">⑂</span><span class="br" style="--brc:var(--orange)">feat/pay</span></div>
+            </div>
+            <div class="foot"><span class="hostpill mono">sandbox</span><span class="cost">~$11.10</span><span class="pct">61%</span></div>
+            <div class="pbar"><i style="width:61%"></i></div>
+          </div>
+
+          <div class="card" style="--c:var(--blue)">
+            <div class="ctop">
+              <div class="tile">✓</div>
+              <div class="cmeta">
+                <div class="stat">Ready</div>
+                <div class="ttl">db migration</div>
+                <div class="model">claude-sdk · Sonnet 4.6</div>
+              </div>
+            </div>
+            <div class="actline sub">▸ 3 children · 1 busy</div>
+            <div class="rows"><div class="row"><span class="ic">📁</span><span class="repo">runtime</span><span class="ic">⑂</span><span class="br" style="--brc:var(--blue)">feat/migrate</span></div></div>
+            <div class="foot"><span class="hostpill mono">arca</span><span class="cost">~$9.31</span><span class="pct">37%</span></div>
+            <div class="pbar"><i style="width:37%"></i></div>
+          </div>
+
+        </div>
+      </div>
+
+      <!-- GROUP: infra (orange) — 2 cards -->
+      <div class="gwrap" style="--gborder:var(--orange)">
+        <div class="gh">
+          <span class="gt">infra</span>
+          <span class="gmeta">$2.70 · 6d</span>
+        </div>
+        <div class="grid">
+
+          <div class="card" style="--c:var(--green)">
+            <div class="ctop">
+              <div class="tile">↻</div>
+              <div class="cmeta">
+                <div class="stat">Working</div>
+                <div class="ttl">log pipeline</div>
+                <div class="model">goose-native <span class="tuib">TUI</span> · Llama-4</div>
+              </div>
+            </div>
+            <div class="actline">✎ wiring otel exporter</div>
+            <div class="rows"><div class="row"><span class="ic">📁</span><span class="repo">logs</span><span class="ic">⑂</span><span class="br" style="--brc:var(--green)">feat/logs</span></div></div>
+            <div class="foot"><span class="hostpill mono">internal-dev</span><span class="cost">~$1.90</span><span class="pct">14%</span></div>
+            <div class="pbar"><i style="width:14%"></i></div>
+          </div>
+
+          <div class="card" style="--c:var(--red)">
+            <div class="ctop">
+              <div class="tile">!</div>
+              <div class="cmeta">
+                <div class="stat">Failed</div>
+                <div class="ttl">flaky e2e fix</div>
+                <div class="model">cursor · Sonnet 4.6</div>
+              </div>
+              <div class="cact"><span class="wake">Retry</span></div>
+            </div>
+            <div class="actline err">✕ tool error: timeout</div>
+            <div class="rows"><div class="row"><span class="ic">📁</span><span class="repo">app</span><span class="ic">⑂</span><span class="br" style="--brc:var(--red)">fix/e2e</span></div></div>
+            <div class="foot"><span class="hostpill mono">local</span><span class="cost">~$0.80</span><span class="pct">—</span></div>
+            <div class="pbar"><i style="width:0%"></i></div>
+          </div>
+
+        </div>
+      </div>
+
+      <!-- GROUP: scratch (gray) — 1 card, slept -->
+      <div class="gwrap" style="--gborder:var(--gray)">
+        <div class="gh">
+          <span class="gt">scratch</span>
+          <span class="gmeta">$5.50 · 3d</span>
+        </div>
+        <div class="grid">
+          <div class="card dim" style="--c:var(--gray)">
+            <div class="ctop">
+              <div class="tile">☾</div>
+              <div class="cmeta">
+                <div class="stat">Slept</div>
+                <div class="ttl">docs cleanup</div>
+                <div class="model">claude-sdk · Haiku 4.5</div>
+              </div>
+              <div class="cact"><span class="wake">Resume</span></div>
+            </div>
+            <div class="actline" style="color:var(--tx3)">reclaimed · idle 22m</div>
+            <div class="rows"><div class="row"><span class="ic">📁</span><span class="repo">app</span><span class="ic">⑂</span><span class="br" style="--brc:var(--gray)">docs</span></div></div>
+            <div class="foot"><span class="hostpill mono">local</span><span class="cost">~$5.50</span><span class="pct">28%</span></div>
+            <div class="pbar"><i style="width:28%"></i></div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+</body>
+</html>

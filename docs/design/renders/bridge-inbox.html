@@ -1,0 +1,222 @@
+<!-- @dsCard group="Lens" -->
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Lens — Bridge / Inbox</title>
+<style>
+  :root{
+    --bg:#0c0e12; --bg1:#12151b; --bg2:#171b22; --bg3:#1e232c;
+    --line:#262c37; --line2:#2f3743;
+    --tx:#c9d2de; --tx2:#8b95a5; --tx3:#5c6675;
+    --accent:#4c8dff; --red:#ff5d5d; --blue:#4c8dff; --green:#36c98a; --purple:#a979ff; --amber:#e0a042;
+    --orange:#ff8a3d; --gray:#7a8493;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{background:var(--bg);color:var(--tx);font:12.5px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,sans-serif;-webkit-font-smoothing:antialiased}
+  .app{display:flex;height:760px;width:1280px;overflow:hidden}
+  .rail{width:50px;background:var(--bg);border-right:1px solid var(--line);display:flex;flex-direction:column;align-items:center;padding:10px 0;gap:6px}
+  .logo{width:26px;height:26px;border-radius:7px;background:linear-gradient(135deg,#4c8dff,#a979ff);margin-bottom:8px}
+  .ricon{width:34px;height:34px;border-radius:8px;display:flex;align-items:center;justify-content:center;color:var(--tx2);font-size:15px;position:relative}
+  .ricon.on{background:var(--bg3);color:var(--tx)}
+  .ricon .dot{position:absolute;top:5px;right:5px;min-width:14px;height:14px;padding:0 3px;border-radius:8px;background:var(--red);color:#fff;font-size:9px;font-weight:700;display:flex;align-items:center;justify-content:center}
+  .spacer{flex:1}
+  .avatar{width:30px;height:30px;border-radius:50%;background:radial-gradient(circle at 30% 30%,#ffd479,#e0a042);display:flex;align-items:center;justify-content:center;font-size:14px;border:2px solid #2a2f3a}
+  .health{width:9px;height:9px;border-radius:50%;background:var(--green);box-shadow:0 0 0 3px rgba(63,179,127,.15);margin-top:6px}
+
+  /* board shrunk (Bridge shrinks the board, doesn't take it over) */
+  .boards{width:244px;flex:none;background:var(--bg);border-right:1px solid var(--line);padding:10px;display:flex;flex-direction:column;gap:10px}
+  .grp{border:1.5px solid var(--blue);border-radius:13px;padding:9px;background:color-mix(in srgb,var(--blue) 9%,var(--bg));box-shadow:0 0 18px -12px var(--blue), inset 0 0 34px -20px color-mix(in srgb,var(--blue) 60%,transparent);display:flex;flex-direction:column;gap:9px}
+  .bcol-h{font-size:12px;font-weight:700;color:var(--blue);padding:0 2px;display:flex;align-items:center;gap:8px}
+  .bcol-h .m{margin-left:auto;font-size:10px;color:var(--tx2);font-weight:400}
+  .fc{position:relative;border:1.5px solid var(--c);border-radius:11px;overflow:hidden;background:radial-gradient(120% 130% at 0% 0%,color-mix(in srgb,var(--c) 12%,transparent),transparent 58%),var(--bg1);box-shadow:0 0 16px -12px var(--c)}
+  .fct{display:flex;gap:9px;padding:9px 10px 5px}
+  .ftile{width:30px;height:30px;flex:none;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:13px;color:var(--c);background:color-mix(in srgb,var(--c) 14%,var(--bg2));border:1px solid color-mix(in srgb,var(--c) 30%,transparent)}
+  .fstat{font-size:9px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--c)}
+  .ftt{font-size:12.5px;font-weight:700;margin:1px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .fmodel{font-size:10px;color:var(--tx2)}
+  .fact{padding:0 10px 5px;font-size:10.5px;color:var(--tx)}
+  .fact.attn{color:#ffc59a}
+  .ffoot{display:flex;align-items:center;gap:7px;padding:4px 10px 8px;font-size:10.5px}
+  .fhost{background:var(--bg3);border:1px solid var(--line2);border-radius:6px;padding:1px 6px;font-family:ui-monospace,Menlo,monospace;font-size:9.5px}
+  .fcost{color:var(--tx2)}
+  .fpct{margin-left:auto;color:var(--tx);font-weight:600}
+  .fbar{height:3px;background:rgba(255,255,255,.06)}
+  .fbar i{display:block;height:100%;background:var(--c)}
+  .pip{width:7px;height:7px;border-radius:50%;flex:none}
+
+  /* bridge surface */
+  .bridge{flex:1;display:flex;flex-direction:column;min-width:0;background:var(--bg1)}
+  .subtabs{height:42px;flex:none;display:flex;align-items:center;gap:4px;padding:0 16px;border-bottom:1px solid var(--line);background:var(--bg)}
+  .stab{font-size:12.5px;color:var(--tx2);padding:6px 12px;border-radius:8px 8px 0 0;display:flex;gap:7px;align-items:center}
+  .stab.on{color:var(--tx);font-weight:600;border:1px solid var(--line);border-bottom:1px solid var(--bg1);background:var(--bg1);position:relative;top:1px}
+  .stab .b{background:var(--accent2,#2b62c4);color:#fff;border-radius:8px;font-size:9px;padding:0 5px;font-weight:700}
+  .ttl-r{margin-left:auto;font-size:11px;color:var(--tx3)}
+
+  .filters{height:40px;flex:none;display:flex;align-items:center;gap:7px;padding:0 16px;border-bottom:1px solid var(--line)}
+  .fl{font-size:11px;color:var(--tx2);padding:4px 11px;border-radius:13px;border:1px solid var(--line)}
+  .fl.on{background:var(--bg3);color:var(--tx);border-color:var(--line2);font-weight:600}
+  .fl .c{color:var(--tx3);margin-left:5px;font-size:10px}
+  .fl.on .c{color:var(--accent)}
+
+  .list{flex:1;overflow:hidden;padding:14px 16px;display:flex;flex-direction:column;gap:11px}
+  .bandh{display:flex;align-items:center;gap:8px;font-size:10px;letter-spacing:.09em;text-transform:uppercase;color:var(--tx3);margin:2px 2px -2px}
+  .bandh.urgent{color:#ff9d9d}
+  .bandh .ln{flex:1;height:1px;background:var(--line)}
+  .pinned{display:flex;flex-direction:column;gap:11px;padding:11px;border:1px solid rgba(255,93,93,.28);border-radius:12px;background:rgba(255,93,93,.04)}
+  .item{border:1px solid var(--line);border-radius:11px;background:var(--bg2);overflow:hidden}
+  .item.attn{border-color:rgba(255,93,93,.45);box-shadow:0 0 16px -7px rgba(255,93,93,.5)}
+  .ihead{display:flex;align-items:center;gap:9px;padding:9px 13px;font-size:11.5px;border-bottom:1px solid var(--line)}
+  .frm{font-weight:600}
+  .arw{color:var(--tx3)}
+  .kind{font-size:9.5px;letter-spacing:.05em;text-transform:uppercase;padding:1px 7px;border-radius:5px;background:var(--bg3);color:var(--tx2);border:1px solid var(--line2)}
+  .kind.elic{color:#ffb4b4;border-color:rgba(255,93,93,.4)}
+  .kind.relay{color:#bda3ff;border-color:rgba(169,121,255,.4)}
+  .kind.todo{color:#9fe3c0;border-color:rgba(63,179,127,.4)}
+  .ts{margin-left:auto;color:var(--tx3);font-size:10.5px}
+  .status{font-size:10px;padding:1px 8px;border-radius:10px;display:flex;align-items:center;gap:5px}
+  .status.pending{background:rgba(255,93,93,.12);color:#ff9d9d}
+  .status.deliv{background:rgba(63,179,127,.12);color:#9fe3c0}
+  .status.def{background:var(--bg3);color:var(--tx3)}
+
+  .ibody{padding:11px 13px;font-size:12px;color:var(--tx)}
+  .ibody .prev{background:var(--bg);border:1px solid var(--line);border-radius:7px;padding:8px 10px;font-family:ui-monospace,Menlo,monospace;font-size:11px;color:var(--tx2);margin-top:7px}
+  .src{color:var(--amber);font-size:11px}
+
+  .iacts{display:flex;align-items:center;gap:7px;padding:9px 13px;border-top:1px solid var(--line);background:var(--bg1)}
+  .a{font-size:11px;color:var(--tx);border:1px solid var(--line2);border-radius:7px;padding:4px 12px}
+  .a.allow{background:rgba(63,179,127,.16);border-color:rgba(63,179,127,.5);color:#bff0d6}
+  .a.deny{background:rgba(255,93,93,.14);border-color:rgba(255,93,93,.5);color:#ffc2c2}
+  .a.ghost{color:var(--tx2)}
+  .a.prim{background:var(--accent);border-color:var(--accent);color:#fff}
+  .iacts .more{margin-left:auto;color:var(--tx3)}
+  .k{color:var(--tx3);font-size:10px;border:1px solid var(--line2);border-radius:4px;padding:0 4px}
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="rail">
+    <div class="logo"></div>
+    <div class="ricon" title="Boards">▦</div>
+    <div class="ricon on" title="Bridge">📥<span class="dot">3</span></div>
+    <div class="ricon" title="Archive">🗄</div>
+    <div class="ricon" title="Settings">⚙</div>
+    <div class="spacer"></div>
+    <div class="avatar" title="Concierge">🎩</div>
+    <div class="health"></div>
+  </div>
+
+  <div class="boards">
+   <div class="grp">
+    <div class="bcol-h">Polly feature <span class="m">$36.94 · 12d</span></div>
+    <div class="fc" style="--c:var(--orange)">
+      <div class="fct"><div class="ftile">🔔</div><div style="min-width:0"><div class="fstat">Needs input</div><div class="ftt">payments api</div><div class="fmodel">codex-native · GPT-5</div></div></div>
+      <div class="fact attn">⏸ approve: prod migration</div>
+      <div class="ffoot"><span class="fhost">sandbox</span><span class="fcost">~$11.10</span><span class="fpct">61%</span></div>
+      <div class="fbar"><i style="width:61%"></i></div>
+    </div>
+    <div class="fc" style="--c:var(--green)">
+      <div class="fct"><div class="ftile">↻</div><div style="min-width:0"><div class="fstat">Working</div><div class="ftt">auth refactor</div><div class="fmodel">claude-sdk · Opus 4.8</div></div></div>
+      <div class="fact">✎ Refactoring auth module</div>
+      <div class="ffoot"><span class="fhost">local</span><span class="fcost">~$16.53</span><span class="fpct">25%</span></div>
+      <div class="fbar"><i style="width:25%"></i></div>
+    </div>
+   </div>
+  </div>
+
+  <div class="bridge">
+    <div class="subtabs">
+      <span class="stab on">📥 Inbox <span class="b">3</span></span>
+      <span class="stab">🗒 Log</span>
+      <span class="stab">📚 Knowledge</span>
+      <span class="ttl-r">Bridge · scope: all · ⤢ detach</span>
+    </div>
+
+    <div class="filters">
+      <span class="fl on">All <span class="c">5</span></span>
+      <span class="fl">You <span class="c">2</span></span>
+      <span class="fl">Projects <span class="c">3</span></span>
+      <span class="fl">Agents <span class="c">1</span></span>
+      <span class="fl">Deferred <span class="c">1</span></span>
+    </div>
+
+    <div class="list">
+      <div class="bandh urgent">Needs you · 1 <span class="ln"></span> ⌘I cycles</div>
+      <div class="pinned">
+      <!-- 1. pending elicitation, mirrored from sub-agent -->
+      <div class="item attn">
+        <div class="ihead">
+          <span class="kind elic">Elicitation</span>
+          <span class="frm">System</span><span class="arw">→</span><span class="frm">You</span>
+          <span class="src">· from sub-agent payments api</span>
+          <span class="ts">just now</span>
+          <span class="status pending">● pending</span>
+        </div>
+        <div class="ibody">
+          <b>payments api</b> wants to run a production migration.
+          <div class="prev">$ alembic upgrade head — add_index_payments_created_at (concurrent, non-destructive)</div>
+        </div>
+        <div class="iacts">
+          <span class="a allow">Allow</span>
+          <span class="a deny">Deny</span>
+          <span class="a ghost">Cancel</span>
+          <span class="more">Discuss with Concierge · ⋯</span>
+        </div>
+      </div>
+      </div><!-- /pinned -->
+
+      <div class="bandh">Everything else <span class="ln"></span></div>
+
+      <!-- 2. agent-to-agent relay -->
+      <div class="item">
+        <div class="ihead">
+          <span class="kind relay">Relay</span>
+          <span class="frm">🤖 coder</span><span class="arw">→</span><span class="frm">🤖 reviewer</span>
+          <span class="ts">3m ago</span>
+          <span class="status deliv">● delivered</span>
+        </div>
+        <div class="ibody">"auth refactor is ready for review — `auth/refresh.rs` split out, expired-token guard added. Diff is 4 files."</div>
+        <div class="iacts">
+          <span class="a ghost">Reply</span>
+          <span class="a ghost">Open thread</span>
+          <span class="more">Send to… · ⋯</span>
+        </div>
+      </div>
+
+      <!-- 3. planning todo (floating) -->
+      <div class="item">
+        <div class="ihead">
+          <span class="kind todo">Planning todo</span>
+          <span class="frm">You</span>
+          <span class="ts">today</span>
+          <span class="status def">open</span>
+        </div>
+        <div class="ibody">Decide on the rollback story for the payments index migration before it ships.</div>
+        <div class="iacts">
+          <span class="a prim">Discuss with Concierge</span>
+          <span class="a ghost">Assign to agent…</span>
+          <span class="more">Done · ⋯</span>
+        </div>
+      </div>
+
+      <!-- 4. deferred note (quick-capture) -->
+      <div class="item">
+        <div class="ihead">
+          <span class="kind">Note</span>
+          <span class="frm">You</span>
+          <span class="ts">2h ago · ⌘⇧N</span>
+          <span class="status def">DEFERRED</span>
+        </div>
+        <div class="ibody">"the goose log-pipeline agent keeps re-fetching otel schema — cache it?" <span style="color:var(--tx3)">· captured from log pipeline</span></div>
+        <div class="iacts">
+          <span class="a ghost">Undefer</span>
+          <span class="a ghost">Discuss with Concierge</span>
+          <span class="more">⋯</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+</body>
+</html>
