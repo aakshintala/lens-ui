@@ -14,7 +14,7 @@ use crate::error::Result;
 use crate::http::decode_json;
 use std::collections::BTreeMap;
 
-use crate::ids::{ElicitationId, SessionId};
+use crate::ids::{ElicitationId, FileId, SessionId};
 
 /// Session status as reported by the REST surface (snapshot + list). Only three
 /// values reach REST; the server collapses `waiting`→`running` and never emits
@@ -824,6 +824,33 @@ impl ShellResult {
     }
 }
 
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct FileResource {
+    id: FileId,
+    #[serde(default)]
+    filename: Option<String>,
+    #[serde(default)]
+    bytes: Option<u64>,
+}
+impl FileResource {
+    pub fn id(&self) -> &FileId {
+        &self.id
+    }
+    pub fn filename(&self) -> Option<&str> {
+        self.filename.as_deref()
+    }
+    pub fn bytes(&self) -> Option<u64> {
+        self.bytes
+    }
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct FilesList {
+    pub data: Vec<FileResource>,
+    #[serde(default)]
+    pub has_more: bool,
+}
+
 /// A generic session resource (environment/terminal/file). Untyped server-side;
 /// expose id/object now, grow typed getters as the resource UI needs them.
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -1092,6 +1119,41 @@ impl<'a> Sessions<'a> {
             &format!("/v1/sessions/{id}/resources/environments/{env_id}"),
             &[],
         )
+    }
+
+    pub fn files(&self, id: &SessionId) -> Result<FilesList> {
+        self.client
+            .get_json(&format!("/v1/sessions/{id}/resources/files"), &[])
+    }
+
+    pub fn upload_file(
+        &self,
+        id: &SessionId,
+        bytes: Vec<u8>,
+        filename: &str,
+        mime: &str,
+    ) -> Result<FileResource> {
+        let part = reqwest::blocking::multipart::Part::bytes(bytes)
+            .file_name(filename.to_string())
+            .mime_str(mime)
+            .map_err(crate::error::ClientError::Network)?;
+        let form = reqwest::blocking::multipart::Form::new().part("file", part);
+        self.client.send_multipart(
+            reqwest::Method::POST,
+            &format!("/v1/sessions/{id}/resources/files"),
+            form,
+        )
+    }
+
+    pub fn file(&self, id: &SessionId, file_id: &FileId) -> Result<FileResource> {
+        self.client
+            .get_json(&format!("/v1/sessions/{id}/resources/files/{file_id}"), &[])
+    }
+
+    pub fn file_content(&self, id: &SessionId, file_id: &FileId) -> Result<Vec<u8>> {
+        self.client.get_bytes(&format!(
+            "/v1/sessions/{id}/resources/files/{file_id}/content"
+        ))
     }
 }
 

@@ -99,6 +99,16 @@ impl Client {
         crate::http::decode_json(path, status, &text)
     }
 
+    pub(crate) fn get_bytes(&self, path: &str) -> crate::error::Result<Vec<u8>> {
+        let url = self.conn().url(path)?;
+        let resp = self.conn().auth.apply(self.http().get(url)).send()?;
+        let status = resp.status().as_u16();
+        if !(200..=299).contains(&status) {
+            return Err(crate::http::check_status(path, status).unwrap_err());
+        }
+        Ok(resp.bytes()?.to_vec())
+    }
+
     /// Send a multipart/form-data request (bundle uploads).
     pub(crate) fn send_multipart<T: serde::de::DeserializeOwned>(
         &self,
