@@ -37,3 +37,15 @@ fn list_sessions_parses() {
     // Envelope parsed; data may be empty on a fresh server.
     let _ = list.has_more;
 }
+
+#[test]
+fn child_sessions_parses() {
+    let sid = lens_client::ids::SessionId::new(
+        std::env::var("LENS_OMNIGENT_SESSION_ID").expect("session id"),
+    );
+    let list = client()
+        .sessions()
+        .child_sessions(&sid, Some(10), None)
+        .expect("child_sessions");
+    let _ = list.has_more;
+}

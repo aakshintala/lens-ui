@@ -18,6 +18,7 @@ pub use client::Client;
 pub use connection::{Auth, Connection};
 pub use error::{ClientError, Result};
 pub use sessions::{
-    ElicitationAction, SendEventAck, SessionEventInput, SessionFilter, SessionKind, SessionList,
-    SessionSnapshot, SessionStatus, SessionSummary, Sessions,
+    ChildSessionList, ChildSessionSummary, ElicitationAction, SendEventAck, SessionEventInput,
+    SessionFilter, SessionKind, SessionList, SessionSnapshot, SessionStatus, SessionSummary,
+    Sessions,
 };

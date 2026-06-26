@@ -269,6 +269,109 @@ impl SessionFilter {
     }
 }
 
+/// Mirror of omnigent `ChildSessionSummary` (`schemas.py:558-664`). Not in
+/// `openapi.json` `components` — hand-written from source and contract-tested.
+/// The live `session.child_session.updated` event carries a PARTIAL of this
+/// shape, so fields the event may omit default rather than error (the state
+/// model merges present fields over the cached child row).
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct ChildSessionSummary {
+    id: SessionId,
+    #[serde(default)]
+    parent_session_id: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    tool: Option<String>,
+    #[serde(default)]
+    session_name: Option<String>,
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    agent_name: Option<String>,
+    #[serde(default)]
+    current_task_id: Option<String>,
+    #[serde(default)]
+    current_task_status: Option<String>,
+    #[serde(default)]
+    busy: bool,
+    #[serde(default)]
+    created_at: i64,
+    #[serde(default)]
+    updated_at: i64,
+    #[serde(default)]
+    labels: BTreeMap<String, String>,
+    #[serde(default)]
+    last_task_error: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    last_message_preview: Option<String>,
+    #[serde(default)]
+    pending_elicitations_count: i64,
+}
+
+impl ChildSessionSummary {
+    pub fn id(&self) -> &SessionId {
+        &self.id
+    }
+    pub fn parent_session_id(&self) -> &str {
+        &self.parent_session_id
+    }
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+    pub fn tool(&self) -> Option<&str> {
+        self.tool.as_deref()
+    }
+    pub fn session_name(&self) -> Option<&str> {
+        self.session_name.as_deref()
+    }
+    pub fn agent_id(&self) -> Option<&str> {
+        self.agent_id.as_deref()
+    }
+    pub fn agent_name(&self) -> Option<&str> {
+        self.agent_name.as_deref()
+    }
+    pub fn current_task_id(&self) -> Option<&str> {
+        self.current_task_id.as_deref()
+    }
+    pub fn current_task_status(&self) -> Option<&str> {
+        self.current_task_status.as_deref()
+    }
+    pub fn busy(&self) -> bool {
+        self.busy
+    }
+    pub fn created_at(&self) -> i64 {
+        self.created_at
+    }
+    pub fn updated_at(&self) -> i64 {
+        self.updated_at
+    }
+    pub fn labels(&self) -> &BTreeMap<String, String> {
+        &self.labels
+    }
+    pub fn last_task_error(&self) -> Option<&BTreeMap<String, String>> {
+        self.last_task_error.as_ref()
+    }
+    pub fn last_message_preview(&self) -> Option<&str> {
+        self.last_message_preview.as_deref()
+    }
+    pub fn pending_elicitations_count(&self) -> i64 {
+        self.pending_elicitations_count
+    }
+}
+
+/// `GET /v1/sessions/{id}/child_sessions` — paginated child summaries.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct ChildSessionList {
+    pub data: Vec<ChildSessionSummary>,
+    #[serde(default)]
+    pub first_id: Option<String>,
+    #[serde(default)]
+    pub last_id: Option<String>,
+    #[serde(default)]
+    pub has_more: bool,
+}
+
 /// Ack for `POST /v1/sessions/{id}/events` (HTTP 202). The openapi declares an
 /// empty body, but the route always returns a small JSON ack — model it with
 /// defaults so an empty or future-extended body still deserializes.
@@ -462,6 +565,24 @@ impl<'a> Sessions<'a> {
     /// `GET /v1/sessions` — fleet poll. Blocking.
     pub fn list(&self, filter: &SessionFilter) -> Result<SessionList> {
         self.client.get_json("/v1/sessions", &filter.to_query())
+    }
+
+    /// `GET /v1/sessions/{id}/child_sessions` — list sub-sessions. Blocking.
+    pub fn child_sessions(
+        &self,
+        id: &SessionId,
+        limit: Option<u32>,
+        after: Option<&str>,
+    ) -> Result<ChildSessionList> {
+        let mut q = Vec::new();
+        if let Some(n) = limit {
+            q.push(("limit", n.to_string()));
+        }
+        if let Some(a) = after {
+            q.push(("after", a.to_string()));
+        }
+        self.client
+            .get_json(&format!("/v1/sessions/{id}/child_sessions"), &q)
     }
 
     /// `POST /v1/sessions/{id}/events` — submit a typed event. Returns the
@@ -712,6 +833,29 @@ mod tests {
         assert_eq!(s.runner_online(), Some(true));
         assert_eq!(s.host_online(), None);
         assert!(!s.host_resumable());
+    }
+
+    #[test]
+    fn child_session_summary_parses_full_and_partial() {
+        // Full (GET) shape.
+        let full = r#"{"id":"c1","object":"child_session","parent_session_id":"p1",
+            "title":"T","tool":"task","session_name":"sn","kind":"sub_agent",
+            "created_at":1,"updated_at":2,"busy":true,"labels":{},"current_task_status":"running",
+            "pending_elicitations_count":3}"#;
+        let c: ChildSessionSummary = serde_json::from_str(full).unwrap();
+        assert_eq!(c.id().as_str(), "c1");
+        assert_eq!(c.parent_session_id(), "p1");
+        assert!(c.busy());
+        assert_eq!(c.pending_elicitations_count(), 3);
+        assert_eq!(c.current_task_status(), Some("running"));
+
+        // Partial (event delta) shape — most fields absent; required-on-full
+        // fields that events omit must default, not error.
+        let partial = r#"{"id":"c1","busy":false,"current_task_status":"launching"}"#;
+        let p: ChildSessionSummary = serde_json::from_str(partial).unwrap();
+        assert_eq!(p.id().as_str(), "c1");
+        assert_eq!(p.parent_session_id(), "");
+        assert_eq!(p.created_at(), 0);
     }
 
     #[test]
