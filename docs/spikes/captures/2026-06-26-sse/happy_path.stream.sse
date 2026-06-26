@@ -1,0 +1,75 @@
+event: session.heartbeat
+data: {"sequence_number": null, "type": "session.heartbeat", "server_time": null}
+
+event: session.resource.created
+data: {"sequence_number": null, "type": "session.resource.created", "resource": {"id": "terminal_tui_main", "object": "session.resource", "type": "terminal", "session_id": "conv_91d8bde71cae41e7b32e01a648e00f72", "name": "tui:main", "metadata": {"terminal_name": "tui", "session_key": "main", "running": true, "tmux_socket": "/var/folders/dq/_c83wftd34g281_1002c_gl00000gn/T/omnigent-terminal-ed2m_rtd/tmux.sock", "tmux_target": "main"}, "environment": "env_terminal_tui_main"}}
+
+event: session.changed_files.invalidated
+data: {"sequence_number": null, "type": "session.changed_files.invalidated", "session_id": "conv_91d8bde71cae41e7b32e01a648e00f72", "environment_id": "default"}
+
+event: session.presence
+data: {"sequence_number": null, "type": "session.presence", "conversation_id": "conv_91d8bde71cae41e7b32e01a648e00f72", "viewers": []}
+
+event: session.input.consumed
+data: {"sequence_number": null, "type": "session.input.consumed", "data": {"item_id": "msg_3abac588ef3a4278a4055a02a47ac5f2", "type": "message", "data": {"role": "user", "content": [{"type": "input_text", "text": "Reason step by step about which directory you are in, then run a single shell command to print the working directory and list its files, then give me a one-sentence summary of what you found."}], "agent": null}, "created_by": null, "cleared_pending_id": null}}
+
+event: session.status
+data: {"sequence_number": null, "type": "session.status", "conversation_id": "conv_91d8bde71cae41e7b32e01a648e00f72", "status": "running", "response_id": null, "error": null}
+
+event: response.in_progress
+data: {"sequence_number": 1, "type": "response.in_progress", "response": {"id": "resp_8e5a23243b1e4591afb9bb83", "object": "response", "status": "in_progress", "model": "claude-sdk", "created_at": 1782501218, "completed_at": null, "output": [], "background": false, "store": true, "usage": null, "previous_response_id": null, "conversation": null, "instructions": null, "reasoning": null, "error": null, "incomplete_details": null}}
+
+event: response.reasoning.started
+data: {"sequence_number": 3, "type": "response.reasoning.started"}
+
+event: response.output_text.delta
+data: {"sequence_number": 4, "type": "response.output_text.delta", "delta": "Reasoning: My", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 5, "type": "response.output_text.delta", "delta": " earlier shell call reported `\"cwd\": \"/Users/aakshintala/work/lens\"`, and the project instructions (CLAUD", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 6, "type": "response.output_text.delta", "delta": "E.md/MEMORY.md) are all rooted at `/Users/aakshintala/work/lens`, so that's my", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 7, "type": "response.output_text.delta", "delta": " working directory. Let me confirm with a single command.", "message_id": null, "index": null, "final": null}
+
+event: response.output_item.done
+data: {"sequence_number": 8, "type": "response.output_item.done", "item": {"id": "fc_52f83171c226", "type": "function_call", "status": "in_progress", "name": "sys_os_shell", "arguments": "{\"command\": \"pwd && ls\"}", "call_id": "toolu_01HijYUkd7fDUELjLrF5bsKy", "agent": "resp_8e5a23243b1e4591afb9bb83"}}
+
+event: session.changed_files.invalidated
+data: {"sequence_number": null, "type": "session.changed_files.invalidated", "session_id": "conv_91d8bde71cae41e7b32e01a648e00f72", "environment_id": "default"}
+
+event: response.output_item.done
+data: {"sequence_number": null, "type": "response.output_item.done", "item": {"id": "msg_957e7144ead248429d8963d8a770691b", "response_id": "resp_8e5a23243b1e4591afb9bb83", "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": "Reasoning: My earlier shell call reported `\"cwd\": \"/Users/aakshintala/work/lens\"`, and the project instructions (CLAUDE.md/MEMORY.md) are all rooted at `/Users/aakshintala/work/lens`, so that's my working directory. Let me confirm with a single command."}], "model": "claude-sdk"}}
+
+event: response.output_item.done
+data: {"sequence_number": 10, "type": "response.output_item.done", "item": {"id": "fc_5a32092a5f02", "type": "function_call", "status": "completed", "name": "sys_os_shell", "arguments": "{\"command\": \"pwd && ls\"}", "call_id": "toolu_01HijYUkd7fDUELjLrF5bsKy", "agent": "claude-sdk"}}
+
+event: response.output_item.done
+data: {"sequence_number": 11, "type": "response.output_item.done", "item": {"id": "fco_d56eb811c793", "type": "function_call_output", "call_id": "toolu_01HijYUkd7fDUELjLrF5bsKy", "output": "{\"stdout\": \"/Users/aakshintala/work/lens\\nAGENTS.md\\nCargo.lock\\nCargo.toml\\nCLAUDE.md\\ncrates\\ndocs\\nLICENSE\\nopencode.json\\nrust-toolchain.toml\\nspikes\\ntarget\\nvendor\\n\", \"stderr\": \"\", \"exit_code\": 0, \"timed_out\": false, \"shell\": \"/bin/bash\", \"cwd\": \"/Users/aakshintala/work/lens\"}", "arguments": "{\"command\": \"pwd && ls\"}", "status": "completed", "response_id": "resp_8e5a23243b1e4591afb9bb83"}}
+
+event: response.output_text.delta
+data: {"sequence_number": 12, "type": "response.output_text.delta", "delta": "I", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 13, "type": "response.output_text.delta", "delta": "'m in `/Users/aakshintala/work/lens`, the root of the **Lens** Rust workspace, containing its", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 14, "type": "response.output_text.delta", "delta": " Cargo manifests/toolchain, source `crates/`, `docs/`, `spikes/`, build `target/`, vendored deps, and agent", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 15, "type": "response.output_text.delta", "delta": " guide files (`AGENTS.md`, `CLAUDE.md`).", "message_id": null, "index": null, "final": null}
+
+event: response.output_item.done
+data: {"sequence_number": null, "type": "response.output_item.done", "item": {"id": "msg_8e669e5bda44429ab77f1d2213cd33b1", "response_id": "resp_8e5a23243b1e4591afb9bb83", "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": "I'm in `/Users/aakshintala/work/lens`, the root of the **Lens** Rust workspace, containing its Cargo manifests/toolchain, source `crates/`, `docs/`, `spikes/`, build `target/`, vendored deps, and agent guide files (`AGENTS.md`, `CLAUDE.md`)."}], "model": "claude-sdk"}}
+
+event: session.usage
+data: {"sequence_number": null, "type": "session.usage", "conversation_id": "conv_91d8bde71cae41e7b32e01a648e00f72", "context_tokens": null, "context_window": null, "total_cost_usd": 0.17027525000000002, "usage_by_model": {"claude-opus-4-8": {"input_tokens": 5416, "output_tokens": 847, "total_tokens": 6263, "cache_read_input_tokens": 40353, "cache_creation_input_tokens": 16295, "total_cost_usd": 0.17027525000000002}}}
+
+event: response.completed
+data: {"sequence_number": 17, "type": "response.completed", "response": {"id": "resp_8e5a23243b1e4591afb9bb83", "object": "response", "status": "completed", "model": "claude-sdk", "created_at": 1782501225, "completed_at": null, "output": [], "background": false, "store": true, "usage": {"input_tokens": 4, "output_tokens": 321, "output_tokens_details": {"reasoning_tokens": 0}, "total_tokens": 325, "context_tokens": 16297, "cache_read_input_tokens": 31354, "cache_creation_input_tokens": 857, "model": "claude-opus-4-8"}, "previous_response_id": null, "conversation": null, "instructions": null, "reasoning": null, "error": null, "incomplete_details": null}}
+
+event: session.status
+data: {"sequence_number": null, "type": "session.status", "conversation_id": "conv_91d8bde71cae41e7b32e01a648e00f72", "status": "idle", "response_id": null, "error": null}
+

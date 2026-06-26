@@ -35,11 +35,17 @@ and roll older "Recent" pointers off this page as they age.
   `0.3.0` timing or whether it'll materially change the API — not worth idling a project
   with a live server to extract ground truth from. Treat dev0 instability as a *planning
   input*, not a blocker. **Plan 3 approach (decided):**
-  1. **Golden-SSE capture spike FIRST** — capture real streams from the live pinned server
-     (status events, `child_session` updates, the conversation-item union, deltas) and model
-     the typed taxonomy from those bytes, NOT from the under-specified openapi. (The 4 review
-     bugs in 2c–2e were all guessed-envelope mistakes; capture-from-bytes is the fix, applied
-     up front to the riskiest layer.)
+  1. **Golden-SSE capture spike — DONE (2026-06-26).** Captured 13 stream event types from
+     real bytes vs pinned dev0 (happy-path item union, lifecycle, chrome, interrupt, error
+     family). Found **3 undocumented events** (`session.input.consumed`,
+     `session.changed_files.invalidated`, `session.interrupted`) to fold into §7, confirmed the
+     seq-null-vs-int split + no-seq persisted items + full snapshot chrome. **Only claude-sdk
+     works on this box** (codex binary quarantined; no `OPENAI_API_KEY`; claude-native is
+     TUI-only; cursor needs `pip install omnigent[cursor]`+key) and it folds reasoning into
+     `output_text` — so `reasoning_text.delta`/`reasoning_summary_text.delta` get schema-modeled
+     (trivial `{delta,seq,type}`, flagged), plus compact/elicitation/sub-agent/terminal deferred
+     to config-time. Findings: [`docs/spikes/2026-06-26-golden-sse-capture.md`](./spikes/2026-06-26-golden-sse-capture.md);
+     raw corpus under `docs/spikes/captures/2026-06-26-sse/`; memory `plan3-sse-capture-findings`.
   2. **Split by stability** — reader-thread + reconnect plumbing is already de-risked (transport
      spike: subscribe-first + mid-stream-drop recovery), build confidently; gate only the
      semantic event union on the captures.
@@ -74,6 +80,12 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Recent
 
+- **2026-06-26** — **Plan 3 golden-SSE capture spike DONE** (live claude-sdk drive,
+  subscribe-first, throwaway bash rig). 13 stream event types captured from bytes; 3
+  undocumented events found; bucket A/B/C + seq-split confirmed; error family captured.
+  Reasoning-delta + compact/elicitation/sub-agent/terminal blocked by the single-harness
+  box (claude-sdk only) → schema-model the trivial reasoning deltas, defer the rest. Next:
+  write the Plan 3 plan, model `ServerStreamEvent` from the captures.
 - **2026-06-25 (eve)** — lens-client **REST surface 2a–2e executed** end-to-end
   (subagent-driven: composer-2.5 build, Opus per-task review, gpt-5.5 cross-family
   at seams + one consolidated 2c–2e review). 31 commits, 47 tests, live-verified.
