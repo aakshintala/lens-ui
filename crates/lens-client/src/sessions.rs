@@ -767,6 +767,40 @@ impl SearchQuery {
     }
 }
 
+/// `GET …/diff/{relative_path}` — `{before, after}` (NOT a unified diff).
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct FileDiff {
+    before: String,
+    after: String,
+}
+impl FileDiff {
+    pub fn before(&self) -> &str {
+        &self.before
+    }
+    pub fn after(&self) -> &str {
+        &self.after
+    }
+}
+
+/// `GET …/filesystem/{relative_path}` — file read. ⚠ Mine the exact key names
+/// (content vs base64, encoding, size) from the runner source when wiring the
+/// editor; start with a `content()` getter over the field the runner returns.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct FileContent {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    encoding: Option<String>,
+}
+impl FileContent {
+    pub fn content(&self) -> Option<&str> {
+        self.content.as_deref()
+    }
+    pub fn encoding(&self) -> Option<&str> {
+        self.encoding.as_deref()
+    }
+}
+
 /// The session subservice — borrows the `Client` for the duration of a call.
 pub struct Sessions<'a> {
     client: &'a Client,
@@ -959,6 +993,34 @@ impl<'a> Sessions<'a> {
         self.client.get_json(
             &format!("/v1/sessions/{id}/resources/environments/{env_id}/search"),
             &query.to_query(),
+        )
+    }
+
+    pub fn list_filesystem(&self, id: &SessionId, env_id: &str) -> Result<FilesystemList> {
+        self.client.get_json(
+            &format!("/v1/sessions/{id}/resources/environments/{env_id}/filesystem"),
+            &[],
+        )
+    }
+
+    pub fn read_file(
+        &self,
+        id: &SessionId,
+        env_id: &str,
+        relative_path: &str,
+    ) -> Result<FileContent> {
+        self.client.get_json(
+            &format!(
+                "/v1/sessions/{id}/resources/environments/{env_id}/filesystem/{relative_path}"
+            ),
+            &[],
+        )
+    }
+
+    pub fn diff(&self, id: &SessionId, env_id: &str, relative_path: &str) -> Result<FileDiff> {
+        self.client.get_json(
+            &format!("/v1/sessions/{id}/resources/environments/{env_id}/diff/{relative_path}"),
+            &[],
         )
     }
 }
@@ -1295,5 +1357,12 @@ mod tests {
         assert!(pairs.contains(&("q", "fn main".to_string())));
         assert!(pairs.contains(&("include", "*.rs".to_string())));
         assert!(pairs.contains(&("limit", "100".to_string())));
+    }
+
+    #[test]
+    fn file_diff_parses_before_after() {
+        let d: FileDiff = serde_json::from_str(r#"{"before":"a\n","after":"b\n"}"#).unwrap();
+        assert_eq!(d.before(), "a\n");
+        assert_eq!(d.after(), "b\n");
     }
 }
