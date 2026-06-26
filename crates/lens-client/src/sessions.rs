@@ -868,6 +868,17 @@ impl ResourceObject {
     }
 }
 
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct CommentObject {
+    #[serde(default)]
+    id: Option<String>,
+}
+impl CommentObject {
+    pub fn id(&self) -> Option<&str> {
+        self.id.as_deref()
+    }
+}
+
 /// The session subservice — borrows the `Client` for the duration of a call.
 pub struct Sessions<'a> {
     client: &'a Client,
@@ -1196,6 +1207,57 @@ impl<'a> Sessions<'a> {
             &format!("/v1/sessions/{id}/resources/terminals/{terminal_id}/transfer"),
             &[],
             Some(&body),
+        )?;
+        Ok(())
+    }
+
+    pub fn add_comment(
+        &self,
+        id: &SessionId,
+        req: &crate::generated::AddCommentRequest,
+    ) -> Result<CommentObject> {
+        self.client.send_json(
+            reqwest::Method::POST,
+            &format!("/v1/sessions/{id}/comments"),
+            &[],
+            Some(req),
+        )
+    }
+
+    pub fn edit_comment(
+        &self,
+        id: &SessionId,
+        comment_id: &crate::ids::CommentId,
+        req: &crate::generated::UpdateCommentRequest,
+    ) -> Result<CommentObject> {
+        self.client.send_json(
+            reqwest::Method::PATCH,
+            &format!("/v1/sessions/{id}/comments/{comment_id}"),
+            &[],
+            Some(req),
+        )
+    }
+
+    pub fn delete_comment(&self, id: &SessionId, comment_id: &crate::ids::CommentId) -> Result<()> {
+        let _: serde_json::Value = self.client.send_json::<serde_json::Value, ()>(
+            reqwest::Method::DELETE,
+            &format!("/v1/sessions/{id}/comments/{comment_id}"),
+            &[],
+            None,
+        )?;
+        Ok(())
+    }
+
+    pub fn send_comments(
+        &self,
+        id: &SessionId,
+        req: &crate::generated::SendCommentsRequest,
+    ) -> Result<()> {
+        let _: serde_json::Value = self.client.send_json(
+            reqwest::Method::POST,
+            &format!("/v1/sessions/{id}/comments/send"),
+            &[],
+            Some(req),
         )?;
         Ok(())
     }

@@ -18,9 +18,9 @@ pub use client::Client;
 pub use connection::{Auth, Connection};
 pub use error::{ClientError, Result};
 pub use sessions::{
-    ChildSessionList, ChildSessionSummary, ConversationDeleted, CreateSessionRequest,
-    CreatedSessionResponse, ElicitationAction, ElicitationState, FileContent, FileDiff,
-    FileResource, FilesList, FilesystemEntry, FilesystemList, HostType, ResourceObject,
+    ChildSessionList, ChildSessionSummary, CommentObject, ConversationDeleted,
+    CreateSessionRequest, CreatedSessionResponse, ElicitationAction, ElicitationState, FileContent,
+    FileDiff, FileResource, FilesList, FilesystemEntry, FilesystemList, HostType, ResourceObject,
     SearchQuery, SendEventAck, SessionEventInput, SessionFilter, SessionKind, SessionList,
     SessionSnapshot, SessionStatus, SessionSummary, Sessions, ShellResult,
 };
