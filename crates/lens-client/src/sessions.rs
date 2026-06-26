@@ -801,6 +801,46 @@ impl FileContent {
     }
 }
 
+/// One-shot shell result (`POST …/shell`). ⚠ Confirm field names (stdout/stderr/
+/// exit_code) against the runner shell handler; these are the conventional keys.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct ShellResult {
+    #[serde(default)]
+    stdout: String,
+    #[serde(default)]
+    stderr: String,
+    #[serde(default)]
+    exit_code: Option<i64>,
+}
+impl ShellResult {
+    pub fn stdout(&self) -> &str {
+        &self.stdout
+    }
+    pub fn stderr(&self) -> &str {
+        &self.stderr
+    }
+    pub fn exit_code(&self) -> Option<i64> {
+        self.exit_code
+    }
+}
+
+/// A generic session resource (environment/terminal/file). Untyped server-side;
+/// expose id/object now, grow typed getters as the resource UI needs them.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct ResourceObject {
+    id: String,
+    #[serde(default, rename = "object")]
+    object: String,
+}
+impl ResourceObject {
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+    pub fn object(&self) -> &str {
+        &self.object
+    }
+}
+
 /// The session subservice — borrows the `Client` for the duration of a call.
 pub struct Sessions<'a> {
     client: &'a Client,
@@ -1020,6 +1060,36 @@ impl<'a> Sessions<'a> {
     pub fn diff(&self, id: &SessionId, env_id: &str, relative_path: &str) -> Result<FileDiff> {
         self.client.get_json(
             &format!("/v1/sessions/{id}/resources/environments/{env_id}/diff/{relative_path}"),
+            &[],
+        )
+    }
+
+    pub fn shell(&self, id: &SessionId, env_id: &str, command: &str) -> Result<ShellResult> {
+        let body = serde_json::json!({ "command": command });
+        self.client.send_json(
+            reqwest::Method::POST,
+            &format!("/v1/sessions/{id}/resources/environments/{env_id}/shell"),
+            &[],
+            Some(&body),
+        )
+    }
+
+    pub fn resources(
+        &self,
+        id: &SessionId,
+    ) -> Result<crate::generated::SessionResourcePaginatedList> {
+        self.client
+            .get_json(&format!("/v1/sessions/{id}/resources"), &[])
+    }
+
+    pub fn resource(&self, id: &SessionId, resource_id: &str) -> Result<ResourceObject> {
+        self.client
+            .get_json(&format!("/v1/sessions/{id}/resources/{resource_id}"), &[])
+    }
+
+    pub fn environment(&self, id: &SessionId, env_id: &str) -> Result<ResourceObject> {
+        self.client.get_json(
+            &format!("/v1/sessions/{id}/resources/environments/{env_id}"),
             &[],
         )
     }
