@@ -681,7 +681,7 @@ pub enum ResponseEvent {
 
     // ── tool calls & results ─────────────────────────────────────────────
     // Emitted via OutputItemDone with item.type = function_call | function_call_output.
-    // The crate dedups by call_id (see §7a).
+    // The crate suppresses literal (kind, call_id, status) re-fires (see §7a), preserving in_progress→completed progression.
     OutputItemDone {
         item: Item,                    // heterogeneous — see Item union below
     },
