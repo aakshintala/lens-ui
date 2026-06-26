@@ -87,14 +87,17 @@ mod tests {
 
     #[test]
     fn multibyte_utf8_split_across_chunks_is_not_corrupted() {
-        // "café" UTF-8: 63 61 66 c3 a9 — split inside the é sequence (after "caf").
+        // "café" UTF-8: 63 61 66 c3 a9 — split inside é: chunk1 ends with 0xC3, chunk2 starts with 0xA9.
         let payload = r#"{"delta":"café"}"#;
         let full = format!("event: response.output_text.delta\ndata: {payload}\n\n");
         let bytes = full.as_bytes();
         let split_at = bytes
             .windows(2)
             .position(|w| w == [0xc3, 0xa9])
-            .expect("é in payload");
+            .expect("é in payload")
+            + 1;
+        assert_eq!(bytes[split_at - 1], 0xc3);
+        assert_eq!(bytes[split_at], 0xa9);
         let mut p = SseParser::default();
         assert!(p.push(&bytes[..split_at]).is_empty());
         let frames = p.push(&bytes[split_at..]);
