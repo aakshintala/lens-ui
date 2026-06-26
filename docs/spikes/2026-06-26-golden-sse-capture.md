@@ -110,3 +110,33 @@ byte-verified), or capture later when the environment supports them:
 - Next: write the Plan 3 implementation plan; model the `ServerStreamEvent` enum from
   the captured bytes above (schema-derived only where blocked, clearly flagged), and
   reconcile the three undocumented events into typed-client.md §7.
+
+## Schema-derived variants pending byte-verification
+
+Flagged `// SCHEMA-DERIVED (not byte-verified — re-capture at config-time)` in
+`crates/lens-client/src/stream/event.rs` (Task 6, Plan 3a). Re-capture when the
+harness environment supports each family.
+
+**ResponseEvent (`response.*`):**
+- `Failed` — `response.failed`
+- `Incomplete` — `response.incomplete`
+- `Cancelled` — `response.cancelled`
+- `ReasoningTextDelta` — `response.reasoning_text.delta`
+- `ReasoningSummaryTextDelta` — `response.reasoning_summary_text.delta`
+- `CompactionInProgress` — `response.compaction.in_progress`
+- `CompactionCompleted` — `response.compaction.completed`
+- `CompactionFailed` — `response.compaction.failed`
+- `Error` — `response.error`
+- `ElicitationRequest` — `response.elicitation_request`
+- `ElicitationResolved` — `response.elicitation_resolved`
+
+**SessionEvent (`session.*`):**
+- `ChildSessionUpdated` — `session.child_session.updated`
+- `TerminalActivity` — `session.terminal.activity`
+- `TerminalPending` — `session.terminal_pending`
+- `Model` — `session.model`
+- `Todos` — `session.todos`
+- `ReasoningEffort` — `session.reasoning_effort`
+- `ModelOptions` — `session.model_options`
+- `SandboxStatus` — `session.sandbox_status`
+- `Skills` — `session.skills`

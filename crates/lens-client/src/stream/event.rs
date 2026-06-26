@@ -48,6 +48,34 @@ pub enum SessionEvent {
     Interrupted {
         requested_at: Option<i64>,
     },
+    // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
+    ChildSessionUpdated {
+        child_session_id: String,
+    },
+    // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
+    TerminalActivity {
+        terminal_id: String,
+    },
+    // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
+    TerminalPending {
+        pending: bool,
+    },
+    // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
+    Model {
+        model: String,
+    },
+    // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
+    Todos,
+    // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
+    ReasoningEffort {
+        reasoning_effort: Option<String>,
+    },
+    // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
+    ModelOptions,
+    // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
+    SandboxStatus,
+    // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
+    Skills,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -160,6 +188,94 @@ struct RawErrorData {
     #[serde(default)]
     message: Option<String>,
 }
+#[derive(Deserialize)]
+struct RawReasoningDelta {
+    delta: String,
+}
+#[derive(Deserialize)]
+struct RawCompactionCompleted {
+    #[serde(default)]
+    total_tokens: Option<i64>,
+}
+#[derive(Deserialize)]
+struct RawStreamErrorDetail {
+    code: String,
+    message: String,
+}
+#[derive(Deserialize)]
+struct RawStreamError {
+    source: String,
+    #[serde(default)]
+    tool_name: Option<String>,
+    error: RawStreamErrorDetail,
+}
+#[derive(Deserialize)]
+struct RawElicitationParams {
+    #[serde(rename = "message")]
+    _message: String,
+}
+#[derive(Deserialize)]
+struct RawElicitationRequest {
+    elicitation_id: String,
+    #[serde(rename = "params")]
+    _params: RawElicitationParams,
+}
+#[derive(Deserialize)]
+struct RawElicitationResolved {
+    elicitation_id: String,
+}
+#[derive(Deserialize)]
+struct RawChildSessionUpdated {
+    child_session_id: String,
+    #[serde(rename = "conversation_id")]
+    _conversation_id: String,
+    #[serde(rename = "child")]
+    _child: serde_json::Map<String, serde_json::Value>,
+}
+#[derive(Deserialize)]
+struct RawTerminalActivity {
+    terminal_id: String,
+    #[serde(rename = "session_id")]
+    _session_id: String,
+}
+#[derive(Deserialize)]
+struct RawTerminalPending {
+    pending: bool,
+    #[serde(rename = "conversation_id")]
+    _conversation_id: String,
+}
+#[derive(Deserialize)]
+struct RawSessionModel {
+    model: String,
+    #[serde(rename = "conversation_id")]
+    _conversation_id: String,
+}
+#[derive(Deserialize)]
+struct RawSessionReasoningEffort {
+    #[serde(default)]
+    reasoning_effort: Option<String>,
+    #[serde(rename = "conversation_id")]
+    _conversation_id: String,
+}
+#[derive(Deserialize)]
+struct RawSessionTodos {
+    #[serde(rename = "conversation_id")]
+    _conversation_id: String,
+    #[serde(rename = "todos")]
+    _todos: Vec<serde_json::Map<String, serde_json::Value>>,
+}
+#[derive(Deserialize)]
+struct RawSessionConversationOnly {
+    #[serde(rename = "conversation_id")]
+    _conversation_id: String,
+}
+#[derive(Deserialize)]
+struct RawSessionSandboxStatus {
+    #[serde(rename = "conversation_id")]
+    _conversation_id: String,
+    #[serde(rename = "stage")]
+    _stage: String,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResponseEvent {
@@ -174,6 +290,43 @@ pub enum ResponseEvent {
     ReasoningStarted,
     OutputItemDone {
         item: Item,
+    },
+    // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
+    Failed,
+    // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
+    Incomplete,
+    // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
+    Cancelled,
+    // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
+    ReasoningTextDelta {
+        delta: String,
+    },
+    // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
+    ReasoningSummaryTextDelta {
+        delta: String,
+    },
+    // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
+    CompactionInProgress,
+    // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
+    CompactionCompleted {
+        total_tokens: Option<i64>,
+    },
+    // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
+    CompactionFailed,
+    // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
+    Error {
+        source: String,
+        tool_name: Option<String>,
+        code: String,
+        message: String,
+    },
+    // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
+    ElicitationRequest {
+        elicitation_id: String,
+    },
+    // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
+    ElicitationResolved {
+        elicitation_id: String,
     },
 }
 
@@ -305,6 +458,57 @@ impl SessionEvent {
                     requested_at: r.data.and_then(|x| x.requested_at),
                 }
             }
+            // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
+            "session.child_session.updated" => {
+                let r: RawChildSessionUpdated = serde_json::from_str(d).ok()?;
+                SessionEvent::ChildSessionUpdated {
+                    child_session_id: r.child_session_id,
+                }
+            }
+            // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
+            "session.terminal.activity" => {
+                let r: RawTerminalActivity = serde_json::from_str(d).ok()?;
+                SessionEvent::TerminalActivity {
+                    terminal_id: r.terminal_id,
+                }
+            }
+            // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
+            "session.terminal_pending" => {
+                let r: RawTerminalPending = serde_json::from_str(d).ok()?;
+                SessionEvent::TerminalPending { pending: r.pending }
+            }
+            // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
+            "session.model" => {
+                let r: RawSessionModel = serde_json::from_str(d).ok()?;
+                SessionEvent::Model { model: r.model }
+            }
+            // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
+            "session.todos" => {
+                let _: RawSessionTodos = serde_json::from_str(d).ok()?;
+                SessionEvent::Todos
+            }
+            // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
+            "session.reasoning_effort" => {
+                let r: RawSessionReasoningEffort = serde_json::from_str(d).ok()?;
+                SessionEvent::ReasoningEffort {
+                    reasoning_effort: r.reasoning_effort,
+                }
+            }
+            // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
+            "session.model_options" => {
+                let _: RawSessionConversationOnly = serde_json::from_str(d).ok()?;
+                SessionEvent::ModelOptions
+            }
+            // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
+            "session.sandbox_status" => {
+                let _: RawSessionSandboxStatus = serde_json::from_str(d).ok()?;
+                SessionEvent::SandboxStatus
+            }
+            // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
+            "session.skills" => {
+                let _: RawSessionConversationOnly = serde_json::from_str(d).ok()?;
+                SessionEvent::Skills
+            }
             _ => return None,
         })
     }
@@ -329,6 +533,57 @@ impl ResponseEvent {
                 let env: RawItemEnvelope = serde_json::from_str(d).ok()?;
                 ResponseEvent::OutputItemDone {
                     item: Item::from_value(env.item),
+                }
+            }
+            // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
+            "response.failed" => ResponseEvent::Failed,
+            // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
+            "response.incomplete" => ResponseEvent::Incomplete,
+            // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
+            "response.cancelled" => ResponseEvent::Cancelled,
+            // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
+            "response.reasoning_text.delta" => {
+                let r: RawReasoningDelta = serde_json::from_str(d).ok()?;
+                ResponseEvent::ReasoningTextDelta { delta: r.delta }
+            }
+            // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
+            "response.reasoning_summary_text.delta" => {
+                let r: RawReasoningDelta = serde_json::from_str(d).ok()?;
+                ResponseEvent::ReasoningSummaryTextDelta { delta: r.delta }
+            }
+            // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
+            "response.compaction.in_progress" => ResponseEvent::CompactionInProgress,
+            // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
+            "response.compaction.completed" => {
+                let r: RawCompactionCompleted = serde_json::from_str(d).ok()?;
+                ResponseEvent::CompactionCompleted {
+                    total_tokens: r.total_tokens,
+                }
+            }
+            // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
+            "response.compaction.failed" => ResponseEvent::CompactionFailed,
+            // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
+            "response.error" => {
+                let r: RawStreamError = serde_json::from_str(d).ok()?;
+                ResponseEvent::Error {
+                    source: r.source,
+                    tool_name: r.tool_name,
+                    code: r.error.code,
+                    message: r.error.message,
+                }
+            }
+            // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
+            "response.elicitation_request" => {
+                let r: RawElicitationRequest = serde_json::from_str(d).ok()?;
+                ResponseEvent::ElicitationRequest {
+                    elicitation_id: r.elicitation_id,
+                }
+            }
+            // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
+            "response.elicitation_resolved" => {
+                let r: RawElicitationResolved = serde_json::from_str(d).ok()?;
+                ResponseEvent::ElicitationResolved {
+                    elicitation_id: r.elicitation_id,
                 }
             }
             _ => return None,
@@ -659,5 +914,261 @@ mod tests {
         assert!(has(|i| matches!(i, Item::FunctionCall { .. })));
         assert!(has(|i| matches!(i, Item::Message { .. })));
         assert!(has(|i| matches!(i, Item::FunctionCallOutput { .. })));
+    }
+
+    #[test]
+    fn schema_reasoning_text_delta() {
+        // SCHEMA-DERIVED: ReasoningTextDeltaEvent {delta, sequence_number, type}.
+        let ev = parse_event(&frame(
+            "response.reasoning_text.delta",
+            r#"{"delta":"because","sequence_number":5}"#,
+        ));
+        assert_eq!(
+            ev,
+            ServerStreamEvent::Response(ResponseEvent::ReasoningTextDelta {
+                delta: "because".into()
+            })
+        );
+    }
+
+    #[test]
+    fn schema_reasoning_summary_text_delta() {
+        // SCHEMA-DERIVED.
+        let ev = parse_event(&frame(
+            "response.reasoning_summary_text.delta",
+            r#"{"delta":"sum"}"#,
+        ));
+        assert_eq!(
+            ev,
+            ServerStreamEvent::Response(ResponseEvent::ReasoningSummaryTextDelta {
+                delta: "sum".into()
+            })
+        );
+    }
+
+    #[test]
+    fn schema_response_failed_carries_status() {
+        // SCHEMA-DERIVED: response.failed mirrors response.completed (response obj).
+        let ev = parse_event(&frame(
+            "response.failed",
+            r#"{"response":{"status":"failed"}}"#,
+        ));
+        assert_eq!(ev, ServerStreamEvent::Response(ResponseEvent::Failed));
+    }
+
+    #[test]
+    fn schema_response_incomplete() {
+        // SCHEMA-DERIVED.
+        let ev = parse_event(&frame(
+            "response.incomplete",
+            r#"{"response":{"status":"incomplete"}}"#,
+        ));
+        assert_eq!(ev, ServerStreamEvent::Response(ResponseEvent::Incomplete));
+    }
+
+    #[test]
+    fn schema_response_cancelled() {
+        // SCHEMA-DERIVED.
+        let ev = parse_event(&frame(
+            "response.cancelled",
+            r#"{"response":{"status":"cancelled"}}"#,
+        ));
+        assert_eq!(ev, ServerStreamEvent::Response(ResponseEvent::Cancelled));
+    }
+
+    #[test]
+    fn schema_compaction_in_progress() {
+        // SCHEMA-DERIVED.
+        let ev = parse_event(&frame("response.compaction.in_progress", "{}"));
+        assert_eq!(
+            ev,
+            ServerStreamEvent::Response(ResponseEvent::CompactionInProgress)
+        );
+    }
+
+    #[test]
+    fn schema_compaction_completed() {
+        // SCHEMA-DERIVED.
+        let ev = parse_event(&frame(
+            "response.compaction.completed",
+            r#"{"total_tokens":8421}"#,
+        ));
+        assert_eq!(
+            ev,
+            ServerStreamEvent::Response(ResponseEvent::CompactionCompleted {
+                total_tokens: Some(8421)
+            })
+        );
+    }
+
+    #[test]
+    fn schema_compaction_failed() {
+        // SCHEMA-DERIVED.
+        let ev = parse_event(&frame("response.compaction.failed", "{}"));
+        assert_eq!(
+            ev,
+            ServerStreamEvent::Response(ResponseEvent::CompactionFailed)
+        );
+    }
+
+    #[test]
+    fn schema_response_error() {
+        // SCHEMA-DERIVED: ErrorEvent {source, tool_name, error:{code, message}}.
+        let ev = parse_event(&frame(
+            "response.error",
+            r#"{"source":"llm","tool_name":null,"error":{"code":"timeout","message":"timed out"}}"#,
+        ));
+        assert_eq!(
+            ev,
+            ServerStreamEvent::Response(ResponseEvent::Error {
+                source: "llm".into(),
+                tool_name: None,
+                code: "timeout".into(),
+                message: "timed out".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn schema_elicitation_request() {
+        // SCHEMA-DERIVED.
+        let ev = parse_event(&frame(
+            "response.elicitation_request",
+            r#"{"elicitation_id":"elicit_abc","params":{"message":"approve?"}}"#,
+        ));
+        assert_eq!(
+            ev,
+            ServerStreamEvent::Response(ResponseEvent::ElicitationRequest {
+                elicitation_id: "elicit_abc".into()
+            })
+        );
+    }
+
+    #[test]
+    fn schema_elicitation_resolved() {
+        // SCHEMA-DERIVED.
+        let ev = parse_event(&frame(
+            "response.elicitation_resolved",
+            r#"{"elicitation_id":"elicit_abc"}"#,
+        ));
+        assert_eq!(
+            ev,
+            ServerStreamEvent::Response(ResponseEvent::ElicitationResolved {
+                elicitation_id: "elicit_abc".into()
+            })
+        );
+    }
+
+    #[test]
+    fn schema_child_session_updated() {
+        // SCHEMA-DERIVED: session.child_session.updated — flat child_session_id per openapi.
+        let ev = parse_event(&frame(
+            "session.child_session.updated",
+            r#"{"conversation_id":"conv_parent","child_session_id":"conv_child","child":{}}"#,
+        ));
+        assert_eq!(
+            ev,
+            ServerStreamEvent::Session(SessionEvent::ChildSessionUpdated {
+                child_session_id: "conv_child".into()
+            })
+        );
+    }
+
+    #[test]
+    fn schema_terminal_activity() {
+        // SCHEMA-DERIVED.
+        let ev = parse_event(&frame(
+            "session.terminal.activity",
+            r#"{"session_id":"conv_abc","terminal_id":"terminal_zsh_s1"}"#,
+        ));
+        assert_eq!(
+            ev,
+            ServerStreamEvent::Session(SessionEvent::TerminalActivity {
+                terminal_id: "terminal_zsh_s1".into()
+            })
+        );
+    }
+
+    #[test]
+    fn schema_terminal_pending() {
+        // SCHEMA-DERIVED: session.terminal_pending carries pending, not terminal_id.
+        let ev = parse_event(&frame(
+            "session.terminal_pending",
+            r#"{"conversation_id":"conv_abc","pending":true}"#,
+        ));
+        assert_eq!(
+            ev,
+            ServerStreamEvent::Session(SessionEvent::TerminalPending { pending: true })
+        );
+    }
+
+    #[test]
+    fn schema_session_model() {
+        // SCHEMA-DERIVED.
+        let ev = parse_event(&frame(
+            "session.model",
+            r#"{"conversation_id":"conv_abc","model":"opus"}"#,
+        ));
+        assert_eq!(
+            ev,
+            ServerStreamEvent::Session(SessionEvent::Model {
+                model: "opus".into()
+            })
+        );
+    }
+
+    #[test]
+    fn schema_session_todos() {
+        // SCHEMA-DERIVED.
+        let ev = parse_event(&frame(
+            "session.todos",
+            r#"{"conversation_id":"conv_abc","todos":[]}"#,
+        ));
+        assert_eq!(ev, ServerStreamEvent::Session(SessionEvent::Todos));
+    }
+
+    #[test]
+    fn schema_reasoning_effort() {
+        // SCHEMA-DERIVED.
+        let ev = parse_event(&frame(
+            "session.reasoning_effort",
+            r#"{"conversation_id":"conv_abc","reasoning_effort":"high"}"#,
+        ));
+        assert_eq!(
+            ev,
+            ServerStreamEvent::Session(SessionEvent::ReasoningEffort {
+                reasoning_effort: Some("high".into())
+            })
+        );
+    }
+
+    #[test]
+    fn schema_model_options() {
+        // SCHEMA-DERIVED.
+        let ev = parse_event(&frame(
+            "session.model_options",
+            r#"{"conversation_id":"conv_abc"}"#,
+        ));
+        assert_eq!(ev, ServerStreamEvent::Session(SessionEvent::ModelOptions));
+    }
+
+    #[test]
+    fn schema_sandbox_status() {
+        // SCHEMA-DERIVED.
+        let ev = parse_event(&frame(
+            "session.sandbox_status",
+            r#"{"conversation_id":"conv_abc","stage":"provisioning"}"#,
+        ));
+        assert_eq!(ev, ServerStreamEvent::Session(SessionEvent::SandboxStatus));
+    }
+
+    #[test]
+    fn schema_skills() {
+        // SCHEMA-DERIVED.
+        let ev = parse_event(&frame(
+            "session.skills",
+            r#"{"conversation_id":"conv_abc"}"#,
+        ));
+        assert_eq!(ev, ServerStreamEvent::Session(SessionEvent::Skills));
     }
 }
