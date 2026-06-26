@@ -122,6 +122,43 @@ impl SessionEventInput {
     }
 }
 
+/// The full set of `type` discriminators the server's `POST /events` route
+/// accepts (`_ALLOWED_EVENT_TYPES`, omnigent 0.3.0.dev0). Lens only *sends* the
+/// six modeled by `SessionEventInput`, but the contract test pins the whole set
+/// so a re-vendor that adds/removes a type is a conscious change. Kept sorted.
+pub const ALLOWED_EVENT_TYPES: [&str; 30] = [
+    "approval",
+    "compact",
+    "compaction",
+    "error",
+    "external_assistant_message",
+    "external_codex_collaboration_mode_change",
+    "external_codex_subagent_start",
+    "external_compaction_status",
+    "external_conversation_item",
+    "external_elicitation_resolved",
+    "external_model_change",
+    "external_output_reasoning_delta",
+    "external_output_text_delta",
+    "external_reasoning_effort_change",
+    "external_session_interrupted",
+    "external_session_status",
+    "external_session_todos",
+    "external_session_usage",
+    "external_subagent_start",
+    "function_call",
+    "function_call_output",
+    "interrupt",
+    "mcp_elicitation",
+    "message",
+    "native_tool",
+    "reasoning",
+    "resource_event",
+    "slash_command",
+    "stop_session",
+    "terminal_command",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,6 +249,48 @@ mod tests {
         ] {
             assert_eq!(evt.discriminator(), ty);
             assert_eq!(evt.to_json(), json!({"type": ty, "data": {}}));
+        }
+    }
+
+    #[test]
+    fn allowed_event_types_is_the_pinned_30() {
+        // Pinned to omnigent 0.3.0.dev0 (sessions.py _ALLOWED_EVENT_TYPES,
+        // = ITEM_TYPE_TO_DATA_CLS keys ∪ control/external extras). Sorted.
+        assert_eq!(ALLOWED_EVENT_TYPES.len(), 30);
+        let mut sorted = ALLOWED_EVENT_TYPES;
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted, ALLOWED_EVENT_TYPES,
+            "keep ALLOWED_EVENT_TYPES sorted"
+        );
+    }
+
+    #[test]
+    fn every_sent_discriminator_is_server_allowed() {
+        for evt in [
+            SessionEventInput::Message {
+                content: vec![],
+                model_override: None,
+                tools: None,
+            },
+            SessionEventInput::FunctionCallOutput {
+                call_id: "c".into(),
+                output: "o".into(),
+            },
+            SessionEventInput::Approval {
+                elicitation_id: crate::ids::ElicitationId::new("e"),
+                action: ElicitationAction::Accept,
+                content: None,
+            },
+            SessionEventInput::Interrupt,
+            SessionEventInput::Compact,
+            SessionEventInput::StopSession,
+        ] {
+            assert!(
+                ALLOWED_EVENT_TYPES.contains(&evt.discriminator()),
+                "{} not in ALLOWED_EVENT_TYPES",
+                evt.discriminator()
+            );
         }
     }
 }
