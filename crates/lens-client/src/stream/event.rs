@@ -328,6 +328,16 @@ pub enum ResponseEvent {
         last: Option<bool>,
     },
     ReasoningStarted,
+    /// SYNTHETIC (typed-client.md §7a) — emitted by `stream::normalize::Normalizer`,
+    /// never by `parse_event`. The SSE stream has no reasoning-end frame; the crate
+    /// closes the bracket on the first `OutputTextDelta`/`Completed` after
+    /// `ReasoningStarted`. `full_text`/`summary_text` accumulate the reasoning deltas
+    /// so the renderer need not re-accumulate.
+    /// NOT BYTE-VERIFIED (claude-sdk folds reasoning into output_text — re-capture at config-time)
+    ReasoningClosed {
+        full_text: String,
+        summary_text: String,
+    },
     OutputItemDone {
         item: Item,
     },
