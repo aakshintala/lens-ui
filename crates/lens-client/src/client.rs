@@ -1,7 +1,7 @@
 use crate::PINNED_OMNIGENT_VERSION;
 use crate::connection::Connection;
 use crate::error::{ClientError, Result};
-use crate::http::check_contract;
+use crate::http::{check_contract, check_status, decode_json};
 use crate::info::{ServerInfo, VersionResponse};
 
 pub struct Client {
@@ -19,27 +19,23 @@ impl Client {
 
         // 1. liveness
         let health = conn.auth.apply(http.get(conn.url("/health")?)).send()?;
-        if !health.status().is_success() {
-            return Err(ClientError::Server {
-                status: health.status().as_u16(),
-                body: serde_json::json!({ "stage": "health" }),
-            });
-        }
+        check_status("health", health.status().as_u16())?;
 
         // 2. contract gate
-        let ver: VersionResponse = conn
+        let version_resp = conn
             .auth
             .apply(http.get(conn.url("/api/version")?))
-            .send()?
-            .json()?;
+            .send()?;
+        let status = version_resp.status().as_u16();
+        let body = version_resp.text()?;
+        let ver: VersionResponse = decode_json("api/version", status, &body)?;
         check_contract(PINNED_OMNIGENT_VERSION, &ver.version)?;
 
         // 3. capabilities
-        let info: ServerInfo = conn
-            .auth
-            .apply(http.get(conn.url("/v1/info")?))
-            .send()?
-            .json()?;
+        let info_resp = conn.auth.apply(http.get(conn.url("/v1/info")?)).send()?;
+        let status = info_resp.status().as_u16();
+        let body = info_resp.text()?;
+        let info: ServerInfo = decode_json("v1/info", status, &body)?;
 
         Ok(Self { conn, http, info })
     }

@@ -34,6 +34,8 @@ impl Connection {
     }
 
     /// Join a `/`-rooted absolute path onto the connection's base URL.
+    /// Assumes the server is hosted at the URL root (absolute `/`-rooted paths
+    /// replace any base path); revisit if a base-path deployment is ever needed.
     pub fn url(&self, path: &str) -> Result<url::Url> {
         self.base_url.join(path).map_err(|e| ClientError::NotFound {
             what: format!("bad url {path}: {e}"),
