@@ -65,6 +65,29 @@ and roll older "Recent" pointers off this page as they age.
        wrong (JoinHandle drop detaches), caught by the reviewer.
      - **Deferred to Plan 3b** (3 Minors): redundant `serde(default)` on `Option`; `try_recv`
        idle-vs-closed liveness signal; reqwest read-timeout vs reader-thread leak on a hard hang.
+     - **Plan 3b split by stability** (decided 2026-06-26): **3b-1 = pure §7a normalization**
+       (no new endpoints, de-risked); **3b-2 = §7 no-replay reconnect** (pulls in typed
+       `Sessions::items()` + the session snapshot read, both deferred from 2a–2e — folded into 3b-2).
+     - **Plan 3b-1 EXECUTED & COMPLETE** (2026-06-26, subagent-driven: composer-2.5 build +
+       per-task cross-family review gpt-5.5; `2f9a46e..3b39412`, 4 tasks + 1 fix wave;
+       [`plan`](./superpowers/plans/2026-06-26-lens-client-plan3b1-normalization.md)). A pure
+       `stream::normalize::Normalizer` threaded into the reader thread: **`OutputItemDone` re-fire
+       suppression** (key `(kind, call_id, status)` — **literal-duplicate only**, so the captured
+       `function_call` `in_progress`→`completed` pair is preserved; §7a's "exactly once" wording
+       relaxed per the golden bytes) + **synthetic `ReasoningClosed`** (close-trigger byte-grounded
+       in `happy_path`; `full_text`/`summary_text` accumulation flagged NOT-byte-verified — claude-sdk
+       folds reasoning into `output_text`). 103 lib tests, clippy `--all-targets`/fmt clean,
+       `generated.rs` untouched. Final review (gpt-5.5) caught 1 real **Important**: the reader's
+       `Err(_)` transport-error path shared EOF's `normalizer.flush()`, falsely emitting a synthetic
+       `ReasoningClosed` on a mid-reasoning drop — fixed (`run` now generic over `io::Read`,
+       `Err(_) => return`, no flush; +2 regression tests), re-reviewed clean. §7a doc updated to the
+       pinned semantics. ⚠ `live_stream` NOT run this session (no server) — unit coverage only.
+     - **Next: Plan 3b-2 — no-replay reconnect (§7).** Attaches at the reader's `Err(_) => return`
+       seam (now reconnect-ready). Needs typed `Sessions::items()` (→ `Item` union) + typed snapshot
+       (`GET /v1/sessions/{id}` `include_items`/`include_liveness`) built as part of it; emits
+       `Reconnected { gap }` (the §7a bullet still pending); three-bucket dedup. The §7 reconnect
+       *ownership/trigger* ambiguity (§7 "crate owns protocol" vs §11 "state-model liveness watcher
+       triggers") is an **open Opus cross-doc question to resolve before writing 3b-2**.
   3. **Stand up contract-drift CI** (outstanding B6) — the passive alarm that makes tracking
      dev0 safe when `0.3.0` eventually tags.
   - composer-2.5 is weakest on temporal/stateful logic (`[[composer-delegation-profile]]`) — Plan 3
@@ -96,6 +119,15 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Recent
 
+- **2026-06-26** — **Plan 3b-1 (§7a SSE normalization) executed & complete**
+  (subagent-driven: composer-2.5 + per-task cross-family gpt-5.5; `2f9a46e..3b39412`,
+  4 tasks + fix wave). `Normalizer` in the reader thread: `OutputItemDone` literal-re-fire
+  suppression (preserves `in_progress`→`completed`) + synthetic `ReasoningClosed`
+  (flagged not-byte-verified). 103 lib tests, clippy/fmt clean. Final review caught the
+  `Err(_)`-path false-`ReasoningClosed` bug (fixed, reader now `io::Read`-generic +
+  reconnect-ready). Two design calls pinned from the captured bytes: dedup = literal-re-fire
+  only (relaxed §7a "exactly once"); build+flag `ReasoningClosed` rather than defer.
+  Next: Plan 3b-2 reconnect (§7) — resolve the §7-vs-§11 reconnect-ownership ambiguity first.
 - **2026-06-26** — **Plan 3 golden-SSE capture spike DONE** (live claude-sdk drive,
   subscribe-first, throwaway bash rig). 13 stream event types captured from bytes; 3
   undocumented events found; bucket A/B/C + seq-split confirmed; error family captured.
