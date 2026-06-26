@@ -41,6 +41,20 @@ impl Me {
     }
 }
 
+/// `GET /v1/agents` — agent registry (read-only; authoring is filesystem YAML +
+/// bundle upload). Elements are the generated `AgentObject`.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct AgentList {
+    #[serde(default)]
+    pub data: Vec<crate::generated::AgentObject>,
+    #[serde(default)]
+    pub first_id: Option<String>,
+    #[serde(default)]
+    pub last_id: Option<String>,
+    #[serde(default)]
+    pub has_more: bool,
+}
+
 impl Client {
     pub fn runner_status(&self, runner_id: &RunnerId) -> Result<RunnerStatus> {
         self.get_json(&format!("/v1/runners/{runner_id}/status"), &[])
@@ -48,6 +62,10 @@ impl Client {
 
     pub fn me(&self) -> Result<Me> {
         self.get_json("/v1/me", &[])
+    }
+
+    pub fn list_agents(&self) -> Result<AgentList> {
+        self.get_json("/v1/agents", &[])
     }
 }
 
@@ -74,5 +92,14 @@ mod tests {
         assert_eq!(m.user_id(), Some("u_42"));
         let anon: Me = serde_json::from_str(r#"{"user_id":null}"#).unwrap();
         assert_eq!(anon.user_id(), None);
+    }
+
+    #[test]
+    fn agent_list_parses() {
+        let body = r#"{"data":[{"id":"ag","name":"A","created_at":1}],"has_more":false}"#;
+        let list: AgentList = serde_json::from_str(body).unwrap();
+        assert_eq!(list.data[0].id, "ag");
+        assert_eq!(list.data[0].name, "A");
+        assert!(!list.has_more);
     }
 }
