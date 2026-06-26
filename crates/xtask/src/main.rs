@@ -36,22 +36,16 @@ fn codegen() -> Result<()> {
         parsed.push((name.clone(), schema));
     }
 
-    let mut failures: Vec<(String, String)> = Vec::new();
-    if let Err(e) = type_space.add_ref_types(parsed.iter().map(|(n, s)| (n.as_str(), s.clone()))) {
-        for (name, schema) in parsed {
+    if let Err(e) =
+        type_space.add_ref_types(parsed.iter().map(|(n, s)| (n.as_str(), s.clone())))
+    {
+        let mut failures: Vec<(String, String)> = Vec::new();
+        for (name, schema) in &parsed {
             let mut probe = typify::TypeSpace::new(&settings);
-            match probe.add_ref_types(std::iter::once((name.as_str(), schema.clone()))) {
-                Ok(()) => {
-                    type_space
-                        .add_ref_types(std::iter::once((name.as_str(), schema)))
-                        .with_context(|| format!("typify failed on schema {name}"))?;
-                }
-                Err(err) => failures.push((name, format!("{e}; isolated: {err}"))),
+            if let Err(err) = probe.add_ref_types(std::iter::once((name.as_str(), schema.clone()))) {
+                failures.push((name.clone(), err.to_string()));
             }
         }
-    }
-
-    if !failures.is_empty() {
         let skipped_path = root.join("vendor/omnigent-0.3.0.dev0/SKIPPED.md");
         let body: String = failures
             .iter()
@@ -61,6 +55,11 @@ fn codegen() -> Result<()> {
             + "\n";
         std::fs::write(&skipped_path, &body)
             .with_context(|| format!("write {}", skipped_path.display()))?;
+        let failed_names: Vec<&str> = failures.iter().map(|(n, _)| n.as_str()).collect();
+        bail!(
+            "typify batch add_ref_types failed: {e}; individually-failing schemas: {}",
+            failed_names.join(", ")
+        );
     }
 
     let tokens = type_space.to_stream();
