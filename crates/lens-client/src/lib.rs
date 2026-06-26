@@ -2,6 +2,7 @@
 //! See `docs/design/typed-client.md` (contract) and
 //! `docs/design/typed-client-implementation.md` (build decisions).
 
+pub mod connection;
 pub mod error;
 pub mod ids;
 
