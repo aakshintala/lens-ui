@@ -59,7 +59,6 @@ impl Client {
 
     /// Issue a GET expecting a JSON body, mapping status → typed errors. Internal
     /// building block for the typed REST methods. `query` pairs are appended as-is.
-    #[allow(dead_code)] // used by Sessions read methods (Task 3)
     pub(crate) fn get_json<T: serde::de::DeserializeOwned>(
         &self,
         path: &str,

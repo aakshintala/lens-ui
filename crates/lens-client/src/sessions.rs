@@ -87,6 +87,34 @@ impl SessionSnapshot {
     }
 }
 
+/// Options for `Sessions::get`. Defaults: liveness on, items off, no refresh.
+#[derive(Clone, Copy, Debug)]
+pub struct GetOpts {
+    pub include_items: bool,
+    pub include_liveness: bool,
+    pub refresh_state: bool,
+}
+
+impl Default for GetOpts {
+    fn default() -> Self {
+        Self {
+            include_items: false,
+            include_liveness: true,
+            refresh_state: false,
+        }
+    }
+}
+
+impl GetOpts {
+    fn to_query(self) -> Vec<(&'static str, String)> {
+        vec![
+            ("include_items", self.include_items.to_string()),
+            ("include_liveness", self.include_liveness.to_string()),
+            ("refresh_state", self.refresh_state.to_string()),
+        ]
+    }
+}
+
 /// Ack for `POST /v1/sessions/{id}/events` (HTTP 202). The openapi declares an
 /// empty body, but the route always returns a small JSON ack — model it with
 /// defaults so an empty or future-extended body still deserializes.
@@ -269,6 +297,12 @@ pub struct Sessions<'a> {
 impl<'a> Sessions<'a> {
     pub(crate) fn new(client: &'a Client) -> Self {
         Self { client }
+    }
+
+    /// `GET /v1/sessions/{id}` — the session snapshot. Blocking.
+    pub fn get(&self, id: &SessionId, opts: GetOpts) -> Result<SessionSnapshot> {
+        self.client
+            .get_json(&format!("/v1/sessions/{id}"), &opts.to_query())
     }
 
     /// `POST /v1/sessions/{id}/events` — submit a typed event. Returns the
@@ -463,6 +497,14 @@ mod tests {
         );
         // "waiting" is collapsed to "running" server-side and never reaches REST; reject it.
         assert!(serde_json::from_value::<SessionStatus>(json!("waiting")).is_err());
+    }
+
+    #[test]
+    fn get_opts_builds_expected_query() {
+        let q = GetOpts::default().to_query();
+        assert!(q.contains(&("include_liveness", "true".to_string())));
+        assert!(q.contains(&("include_items", "false".to_string())));
+        assert!(q.contains(&("refresh_state", "false".to_string())));
     }
 
     #[test]
