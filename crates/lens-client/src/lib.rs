@@ -9,6 +9,7 @@ pub mod generated;
 pub mod http;
 pub mod ids;
 pub mod info;
+pub mod sessions;
 
 /// The omnigent contract version this crate is pinned to (ADR-0001).
 pub const PINNED_OMNIGENT_VERSION: &str = "0.3.0.dev0";
@@ -16,3 +17,4 @@ pub const PINNED_OMNIGENT_VERSION: &str = "0.3.0.dev0";
 pub use client::Client;
 pub use connection::{Auth, Connection};
 pub use error::{ClientError, Result};
+pub use sessions::{ElicitationAction, SessionEventInput};
