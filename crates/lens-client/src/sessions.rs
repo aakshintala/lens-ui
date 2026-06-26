@@ -755,6 +755,58 @@ impl<'a> Sessions<'a> {
         )
     }
 
+    /// `POST /v1/sessions/{source_id}/fork` — clone the conversation onto a new
+    /// session. Returns the new (idle) snapshot.
+    pub fn fork(
+        &self,
+        source: &SessionId,
+        req: &crate::generated::SessionForkRequest,
+    ) -> Result<SessionSnapshot> {
+        self.client.send_json(
+            reqwest::Method::POST,
+            &format!("/v1/sessions/{source}/fork"),
+            &[],
+            Some(req),
+        )
+    }
+
+    /// `POST /v1/sessions/{id}/switch-agent` — switch the bound agent (fires
+    /// `session.agent_changed`). Returns the updated snapshot. `req.agent_id` required.
+    pub fn switch_agent(
+        &self,
+        id: &SessionId,
+        req: &crate::generated::SessionSwitchAgentRequest,
+    ) -> Result<SessionSnapshot> {
+        self.client.send_json(
+            reqwest::Method::POST,
+            &format!("/v1/sessions/{id}/switch-agent"),
+            &[],
+            Some(req),
+        )
+    }
+
+    /// `PUT /v1/sessions/{id}/agent` — store/replace the agent bundle (storage
+    /// only; does NOT fire `session.agent_changed`). Returns the stored `AgentObject`.
+    pub fn put_agent(
+        &self,
+        id: &SessionId,
+        bundle: Vec<u8>,
+        bundle_filename: &str,
+    ) -> Result<crate::generated::AgentObject> {
+        let form = reqwest::blocking::multipart::Form::new().part(
+            "bundle",
+            reqwest::blocking::multipart::Part::bytes(bundle)
+                .file_name(bundle_filename.to_string())
+                .mime_str("application/gzip")
+                .map_err(crate::error::ClientError::Network)?,
+        );
+        self.client.send_multipart(
+            reqwest::Method::PUT,
+            &format!("/v1/sessions/{id}/agent"),
+            form,
+        )
+    }
+
     /// `POST /v1/sessions/{id}/events` — submit a typed event. Returns the
     /// server's ack (queued/item_id/denial). Blocking.
     pub fn send_event(&self, id: &SessionId, evt: &SessionEventInput) -> Result<SendEventAck> {
