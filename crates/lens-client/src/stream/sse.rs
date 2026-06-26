@@ -18,6 +18,10 @@ pub(crate) struct SseParser {
 }
 
 impl SseParser {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
     /// Feed a byte chunk; return any frames completed (`\n\n`-terminated) by it.
     /// A trailing partial frame stays buffered for the next chunk.
     pub(crate) fn push(&mut self, bytes: &[u8]) -> Vec<SseFrame> {
@@ -67,7 +71,7 @@ mod tests {
 
     #[test]
     fn parses_a_single_frame() {
-        let mut p = SseParser::default();
+        let mut p = SseParser::new();
         let frames = p.push(b"event: session.status\ndata: {\"status\":\"idle\"}\n\n");
         assert_eq!(
             frames,
