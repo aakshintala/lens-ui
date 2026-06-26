@@ -1104,7 +1104,10 @@ impl<'a> Sessions<'a> {
             .send()?;
         let status = resp.status().as_u16();
         if !(200..=299).contains(&status) {
-            return Err(crate::http::check_status("v1/sessions/stream", status).unwrap_err());
+            return match crate::http::check_status("v1/sessions/stream", status) {
+                Ok(()) => unreachable!("non-2xx status must map to Err"),
+                Err(e) => Err(e),
+            };
         }
         Ok(crate::stream::EventStream::spawn(resp))
     }

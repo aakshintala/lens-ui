@@ -11,19 +11,21 @@ pub(crate) struct SseFrame {
 
 #[derive(Default)]
 pub(crate) struct SseParser {
-    buf: String,
+    buf: Vec<u8>,
 }
 
 impl SseParser {
     /// Feed a byte chunk; return any frames completed (`\n\n`-terminated) by it.
     /// A trailing partial frame stays buffered for the next chunk.
     pub(crate) fn push(&mut self, bytes: &[u8]) -> Vec<SseFrame> {
-        // Bytes are UTF-8 SSE text; lossy is safe — control framing is ASCII.
-        self.buf.push_str(&String::from_utf8_lossy(bytes));
+        self.buf.extend_from_slice(bytes);
         let mut out = Vec::new();
-        while let Some(idx) = self.buf.find("\n\n") {
-            let block: String = self.buf.drain(..idx + 2).collect();
-            if let Some(frame) = parse_block(block.trim_end_matches('\n')) {
+        while let Some(idx) = find_double_newline(&self.buf) {
+            let block_bytes: Vec<u8> = self.buf.drain(..idx + 2).collect();
+            let block = String::from_utf8_lossy(&block_bytes)
+                .trim_end_matches('\n')
+                .to_string();
+            if let Some(frame) = parse_block(&block) {
                 out.push(frame);
             }
         }
@@ -33,8 +35,16 @@ impl SseParser {
     /// Flush a trailing complete frame at EOF (server closed without a final `\n\n`).
     pub(crate) fn finish(&mut self) -> Vec<SseFrame> {
         let rest = std::mem::take(&mut self.buf);
-        parse_block(rest.trim()).into_iter().collect()
+        if rest.is_empty() {
+            return Vec::new();
+        }
+        let block = String::from_utf8_lossy(&rest).trim().to_string();
+        parse_block(&block).into_iter().collect()
     }
+}
+
+fn find_double_newline(buf: &[u8]) -> Option<usize> {
+    buf.windows(2).position(|w| w == b"\n\n")
 }
 
 /// Parse one `event:`/`data:` block. Multiple `data:` lines join with `\n`
@@ -73,6 +83,28 @@ mod tests {
                 data: "{\"status\":\"idle\"}".into()
             }]
         );
+    }
+
+    #[test]
+    fn multibyte_utf8_split_across_chunks_is_not_corrupted() {
+        // "café" UTF-8: 63 61 66 c3 a9 — split inside the é sequence (after "caf").
+        let payload = r#"{"delta":"café"}"#;
+        let full = format!("event: response.output_text.delta\ndata: {payload}\n\n");
+        let bytes = full.as_bytes();
+        let split_at = bytes
+            .windows(2)
+            .position(|w| w == [0xc3, 0xa9])
+            .expect("é in payload");
+        let mut p = SseParser::default();
+        assert!(p.push(&bytes[..split_at]).is_empty());
+        let frames = p.push(&bytes[split_at..]);
+        assert_eq!(frames.len(), 1);
+        assert!(
+            !frames[0].data.contains('\u{FFFD}'),
+            "split UTF-8 must not produce replacement chars: {:?}",
+            frames[0].data
+        );
+        assert_eq!(frames[0].data, payload);
     }
 
     #[test]

@@ -43,14 +43,14 @@ fn live_stream_yields_typed_events() {
     let mut saw_completed = false;
     let mut saw_unknown: Vec<String> = Vec::new();
     while std::time::Instant::now() < deadline {
-        match stream.recv() {
+        match stream.try_recv() {
             Some(ServerStreamEvent::Response(ResponseEvent::Completed)) => {
                 saw_completed = true;
                 break;
             }
             Some(ServerStreamEvent::Unknown { event_type }) => saw_unknown.push(event_type),
             Some(_) => {}
-            None => break,
+            None => std::thread::sleep(std::time::Duration::from_millis(50)),
         }
     }
     assert!(saw_completed, "never observed response.completed");

@@ -65,7 +65,9 @@ pub enum SessionEvent {
         model: String,
     },
     // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
-    Todos,
+    Todos {
+        todos: Vec<TodoItem>,
+    },
     // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
     ReasoningEffort {
         reasoning_effort: Option<String>,
@@ -73,7 +75,10 @@ pub enum SessionEvent {
     // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
     ModelOptions,
     // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
-    SandboxStatus,
+    SandboxStatus {
+        stage: String,
+        error: Option<String>,
+    },
     // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
     Skills,
 }
@@ -98,6 +103,34 @@ pub struct PresenceViewer {
 impl PresenceViewer {
     pub fn user_id(&self) -> Option<&str> {
         self.user_id.as_deref()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoItemStatus {
+    Pending,
+    InProgress,
+    Completed,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TodoItem {
+    content: String,
+    status: TodoItemStatus,
+    active_form: String,
+}
+impl TodoItem {
+    pub fn content(&self) -> &str {
+        &self.content
+    }
+    pub fn status(&self) -> TodoItemStatus {
+        self.status
+    }
+    pub fn active_form(&self) -> &str {
+        &self.active_form
     }
 }
 
@@ -258,11 +291,17 @@ struct RawSessionReasoningEffort {
     _conversation_id: String,
 }
 #[derive(Deserialize)]
+struct RawTodoItem {
+    content: String,
+    status: TodoItemStatus,
+    #[serde(rename = "activeForm")]
+    active_form: String,
+}
+#[derive(Deserialize)]
 struct RawSessionTodos {
     #[serde(rename = "conversation_id")]
     _conversation_id: String,
-    #[serde(rename = "todos")]
-    _todos: Vec<serde_json::Map<String, serde_json::Value>>,
+    todos: Vec<RawTodoItem>,
 }
 #[derive(Deserialize)]
 struct RawSessionConversationOnly {
@@ -273,8 +312,9 @@ struct RawSessionConversationOnly {
 struct RawSessionSandboxStatus {
     #[serde(rename = "conversation_id")]
     _conversation_id: String,
-    #[serde(rename = "stage")]
-    _stage: String,
+    stage: String,
+    #[serde(default)]
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -484,8 +524,18 @@ impl SessionEvent {
             }
             // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
             "session.todos" => {
-                let _: RawSessionTodos = serde_json::from_str(d).ok()?;
-                SessionEvent::Todos
+                let r: RawSessionTodos = serde_json::from_str(d).ok()?;
+                SessionEvent::Todos {
+                    todos: r
+                        .todos
+                        .into_iter()
+                        .map(|t| TodoItem {
+                            content: t.content,
+                            status: t.status,
+                            active_form: t.active_form,
+                        })
+                        .collect(),
+                }
             }
             // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
             "session.reasoning_effort" => {
@@ -501,8 +551,11 @@ impl SessionEvent {
             }
             // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
             "session.sandbox_status" => {
-                let _: RawSessionSandboxStatus = serde_json::from_str(d).ok()?;
-                SessionEvent::SandboxStatus
+                let r: RawSessionSandboxStatus = serde_json::from_str(d).ok()?;
+                SessionEvent::SandboxStatus {
+                    stage: r.stage,
+                    error: r.error,
+                }
             }
             // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
             "session.skills" => {
@@ -1122,9 +1175,18 @@ mod tests {
         // SCHEMA-DERIVED.
         let ev = parse_event(&frame(
             "session.todos",
-            r#"{"conversation_id":"conv_abc","todos":[]}"#,
+            r#"{"conversation_id":"conv_abc","todos":[{"content":"Fix the bug","status":"in_progress","activeForm":"Fixing the bug"}]}"#,
         ));
-        assert_eq!(ev, ServerStreamEvent::Session(SessionEvent::Todos));
+        assert_eq!(
+            ev,
+            ServerStreamEvent::Session(SessionEvent::Todos {
+                todos: vec![TodoItem {
+                    content: "Fix the bug".into(),
+                    status: TodoItemStatus::InProgress,
+                    active_form: "Fixing the bug".into(),
+                }],
+            })
+        );
     }
 
     #[test]
@@ -1159,7 +1221,13 @@ mod tests {
             "session.sandbox_status",
             r#"{"conversation_id":"conv_abc","stage":"provisioning"}"#,
         ));
-        assert_eq!(ev, ServerStreamEvent::Session(SessionEvent::SandboxStatus));
+        assert_eq!(
+            ev,
+            ServerStreamEvent::Session(SessionEvent::SandboxStatus {
+                stage: "provisioning".into(),
+                error: None,
+            })
+        );
     }
 
     #[test]
