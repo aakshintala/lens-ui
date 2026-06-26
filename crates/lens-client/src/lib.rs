@@ -4,6 +4,7 @@
 
 pub mod connection;
 pub mod error;
+pub mod generated;
 pub mod ids;
 
 /// The omnigent contract version this crate is pinned to (ADR-0001).
