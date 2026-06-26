@@ -879,6 +879,30 @@ impl CommentObject {
     }
 }
 
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct OwnerInfo {
+    #[serde(default)]
+    user_id: Option<String>,
+}
+impl OwnerInfo {
+    pub fn user_id(&self) -> Option<&str> {
+        self.user_id.as_deref()
+    }
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct PermissionsInfo {
+    // ⚠ Untyped server-side; model the grants once the sharing UI consumes them
+    // (e.g. a map of user_id -> level). Start minimal.
+    #[serde(default)]
+    public_level: Option<i64>,
+}
+impl PermissionsInfo {
+    pub fn public_level(&self) -> Option<i64> {
+        self.public_level
+    }
+}
+
 /// The session subservice — borrows the `Client` for the duration of a call.
 pub struct Sessions<'a> {
     client: &'a Client,
@@ -1258,6 +1282,46 @@ impl<'a> Sessions<'a> {
             &format!("/v1/sessions/{id}/comments/send"),
             &[],
             Some(req),
+        )?;
+        Ok(())
+    }
+
+    pub fn labels(&self, id: &SessionId) -> Result<crate::generated::SessionLabelsResponse> {
+        self.client
+            .get_json(&format!("/v1/sessions/{id}/labels"), &[])
+    }
+
+    pub fn owner(&self, id: &SessionId) -> Result<OwnerInfo> {
+        self.client
+            .get_json(&format!("/v1/sessions/{id}/owner"), &[])
+    }
+
+    pub fn permissions(&self, id: &SessionId) -> Result<PermissionsInfo> {
+        self.client
+            .get_json(&format!("/v1/sessions/{id}/permissions"), &[])
+    }
+
+    /// Grant levels 1–3 only (read/edit/manage); owner (4) is not grantable (server 403s).
+    pub fn grant_permission(
+        &self,
+        id: &SessionId,
+        req: &crate::generated::GrantPermissionRequest,
+    ) -> Result<()> {
+        let _: serde_json::Value = self.client.send_json(
+            reqwest::Method::PUT,
+            &format!("/v1/sessions/{id}/permissions"),
+            &[],
+            Some(req),
+        )?;
+        Ok(())
+    }
+
+    pub fn revoke_permission(&self, id: &SessionId, target_user_id: &str) -> Result<()> {
+        let _: serde_json::Value = self.client.send_json::<serde_json::Value, ()>(
+            reqwest::Method::DELETE,
+            &format!("/v1/sessions/{id}/permissions/{target_user_id}"),
+            &[],
+            None,
         )?;
         Ok(())
     }

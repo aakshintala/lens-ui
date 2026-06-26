@@ -20,7 +20,8 @@ pub use error::{ClientError, Result};
 pub use sessions::{
     ChildSessionList, ChildSessionSummary, CommentObject, ConversationDeleted,
     CreateSessionRequest, CreatedSessionResponse, ElicitationAction, ElicitationState, FileContent,
-    FileDiff, FileResource, FilesList, FilesystemEntry, FilesystemList, HostType, ResourceObject,
-    SearchQuery, SendEventAck, SessionEventInput, SessionFilter, SessionKind, SessionList,
-    SessionSnapshot, SessionStatus, SessionSummary, Sessions, ShellResult,
+    FileDiff, FileResource, FilesList, FilesystemEntry, FilesystemList, HostType, OwnerInfo,
+    PermissionsInfo, ResourceObject, SearchQuery, SendEventAck, SessionEventInput, SessionFilter,
+    SessionKind, SessionList, SessionSnapshot, SessionStatus, SessionSummary, Sessions,
+    ShellResult,
 };
