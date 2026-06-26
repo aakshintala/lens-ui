@@ -77,7 +77,6 @@ impl Client {
 
     /// Send a request with an optional JSON body, mapping status → typed errors.
     /// `body: None::<&()>` for verbs without a body.
-    #[allow(dead_code)] // used by Sessions create/lifecycle methods (Tasks 2-6)
     pub(crate) fn send_json<T, B>(
         &self,
         method: reqwest::Method,

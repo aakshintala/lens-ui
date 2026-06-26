@@ -556,6 +556,71 @@ pub const ALLOWED_EVENT_TYPES: [&str; 30] = [
     "terminal_command",
 ];
 
+/// Host placement for a new session.
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HostType {
+    External,
+    Managed,
+}
+
+/// JSON body for `POST /v1/sessions` (omnigent `SessionCreateRequest`,
+/// `schemas.py:1038-1155`). Not in `openapi.json` components — hand-written.
+/// Only `agent_id` is required; unset fields are omitted (server defaults apply).
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct CreateSessionRequest {
+    agent_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    host_type: Option<HostType>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    host_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    git: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    initial_items: Option<Vec<serde_json::Value>>,
+}
+
+impl CreateSessionRequest {
+    pub fn new(agent_id: impl Into<String>) -> Self {
+        Self {
+            agent_id: agent_id.into(),
+            host_type: None,
+            host_id: None,
+            workspace: None,
+            git: None,
+            initial_items: None,
+        }
+    }
+    pub fn host_type(mut self, h: HostType) -> Self {
+        self.host_type = Some(h);
+        self
+    }
+    pub fn host_id(mut self, v: impl Into<String>) -> Self {
+        self.host_id = Some(v.into());
+        self
+    }
+    pub fn workspace(mut self, v: impl Into<String>) -> Self {
+        self.workspace = Some(v.into());
+        self
+    }
+    pub fn git(mut self, branch_name: impl Into<String>, base_branch: Option<&str>) -> Self {
+        let mut g = serde_json::Map::new();
+        g.insert("branch_name".into(), serde_json::json!(branch_name.into()));
+        if let Some(b) = base_branch {
+            g.insert("base_branch".into(), serde_json::json!(b));
+        }
+        self.git = Some(serde_json::Value::Object(g));
+        self
+    }
+    /// `initial_items` are `SessionEventInput`-shaped; build via `SessionEventInput::to_json`.
+    pub fn initial_items(mut self, items: Vec<serde_json::Value>) -> Self {
+        self.initial_items = Some(items);
+        self
+    }
+}
+
 /// The session subservice — borrows the `Client` for the duration of a call.
 pub struct Sessions<'a> {
     client: &'a Client,
@@ -593,6 +658,12 @@ impl<'a> Sessions<'a> {
         }
         self.client
             .get_json(&format!("/v1/sessions/{id}/child_sessions"), &q)
+    }
+
+    /// `POST /v1/sessions` (JSON) — create a session against an existing agent.
+    pub fn create(&self, req: &CreateSessionRequest) -> Result<SessionSnapshot> {
+        self.client
+            .send_json(reqwest::Method::POST, "/v1/sessions", &[], Some(req))
     }
 
     /// `POST /v1/sessions/{id}/events` — submit a typed event. Returns the
@@ -870,6 +941,29 @@ mod tests {
         assert_eq!(p.kind(), None);
         assert_eq!(p.parent_session_id(), "");
         assert_eq!(p.created_at(), 0);
+    }
+
+    #[test]
+    fn create_request_serializes_minimal_and_full() {
+        use serde_json::json;
+        let min = CreateSessionRequest::new("ag_1");
+        assert_eq!(
+            serde_json::to_value(&min).unwrap(),
+            json!({"agent_id": "ag_1"})
+        );
+
+        let full = CreateSessionRequest::new("ag_1")
+            .host_type(HostType::Managed)
+            .host_id("host_9")
+            .git("feature/x", Some("main"));
+        let v = serde_json::to_value(&full).unwrap();
+        assert_eq!(v["agent_id"], json!("ag_1"));
+        assert_eq!(v["host_type"], json!("managed"));
+        assert_eq!(v["host_id"], json!("host_9"));
+        assert_eq!(
+            v["git"],
+            json!({"branch_name": "feature/x", "base_branch": "main"})
+        );
     }
 
     #[test]
