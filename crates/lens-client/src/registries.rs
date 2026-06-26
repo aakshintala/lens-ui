@@ -71,12 +71,27 @@ impl HostObject {
     }
 }
 
+/// Response of `POST /v1/hosts/{id}/directories` — `{object, path}` (no id).
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct DirectoryObject {
+    #[serde(default)]
+    object: String,
+    #[serde(default)]
+    path: String,
+}
+impl DirectoryObject {
+    pub fn object(&self) -> &str {
+        &self.object
+    }
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+}
+
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct HostList {
-    #[serde(default)]
+    #[serde(rename = "hosts", default)]
     pub data: Vec<HostObject>,
-    #[serde(default)]
-    pub has_more: bool,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -93,11 +108,12 @@ impl RunnerLaunchResult {
 
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct PolicyObject {
-    id: PolicyId,
+    #[serde(default)]
+    id: Option<PolicyId>,
 }
 impl PolicyObject {
-    pub fn id(&self) -> &PolicyId {
-        &self.id
+    pub fn id(&self) -> Option<&PolicyId> {
+        self.id.as_ref()
     }
 }
 
@@ -138,7 +154,7 @@ impl Client {
         &self,
         host_id: &HostId,
         req: &crate::generated::CreateDirectoryRequest,
-    ) -> Result<HostObject> {
+    ) -> Result<DirectoryObject> {
         self.send_json(
             reqwest::Method::POST,
             &format!("/v1/hosts/{host_id}/directories"),
@@ -236,6 +252,21 @@ mod tests {
     #[test]
     fn policy_object_parses_id() {
         let p: PolicyObject = serde_json::from_str(r#"{"id":"pol_1"}"#).unwrap();
-        assert_eq!(p.id().as_str(), "pol_1");
+        assert_eq!(p.id().map(|i| i.as_str()), Some("pol_1"));
+    }
+
+    #[test]
+    fn host_list_parses_hosts_key() {
+        let list: HostList =
+            serde_json::from_str(r#"{"hosts":[{"id":"host_1","object":"host"}]}"#).unwrap();
+        assert_eq!(list.data[0].id().as_str(), "host_1");
+    }
+
+    #[test]
+    fn directory_object_parses() {
+        let d: DirectoryObject =
+            serde_json::from_str(r#"{"object":"directory","path":"/tmp/x"}"#).unwrap();
+        assert_eq!(d.object(), "directory");
+        assert_eq!(d.path(), "/tmp/x");
     }
 }

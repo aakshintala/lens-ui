@@ -19,14 +19,14 @@ pub use client::Client;
 pub use connection::{Auth, Connection};
 pub use error::{ClientError, Result};
 pub use registries::{
-    AgentList, HostList, HostObject, Me, PolicyEvaluation, PolicyList, PolicyObject,
-    PolicyRegistry, RunnerLaunchResult, RunnerStatus,
+    AgentList, DirectoryObject, HostList, HostObject, Me, PolicyEvaluation, PolicyList,
+    PolicyObject, PolicyRegistry, RunnerLaunchResult, RunnerStatus,
 };
 pub use sessions::{
     ChildSessionList, ChildSessionSummary, CommentObject, ConversationDeleted,
     CreateSessionRequest, CreatedSessionResponse, ElicitationAction, ElicitationState, FileContent,
     FileDiff, FileResource, FilesList, FilesystemEntry, FilesystemList, HostType, OwnerInfo,
-    PermissionsInfo, ResourceObject, SearchQuery, SendEventAck, SessionEventInput, SessionFilter,
-    SessionKind, SessionList, SessionSnapshot, SessionStatus, SessionSummary, Sessions,
-    ShellResult,
+    PermissionsInfo, ResourceList, ResourceObject, SearchQuery, SendEventAck, SessionEventInput,
+    SessionFilter, SessionKind, SessionList, SessionSnapshot, SessionStatus, SessionSummary,
+    Sessions, ShellResult,
 };

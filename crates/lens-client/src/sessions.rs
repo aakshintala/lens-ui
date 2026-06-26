@@ -868,6 +868,19 @@ impl ResourceObject {
     }
 }
 
+/// `GET /v1/sessions/{id}/resources` — paginated session resources. Hand-modeled
+/// (not the generated type) so no `serde_json::Value` reaches consumers.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct ResourceList {
+    pub data: Vec<ResourceObject>,
+    #[serde(default)]
+    pub first_id: Option<String>,
+    #[serde(default)]
+    pub last_id: Option<String>,
+    #[serde(default)]
+    pub has_more: bool,
+}
+
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct CommentObject {
     #[serde(default)]
@@ -1136,10 +1149,7 @@ impl<'a> Sessions<'a> {
         )
     }
 
-    pub fn resources(
-        &self,
-        id: &SessionId,
-    ) -> Result<crate::generated::SessionResourcePaginatedList> {
+    pub fn resources(&self, id: &SessionId) -> Result<ResourceList> {
         self.client
             .get_json(&format!("/v1/sessions/{id}/resources"), &[])
     }
@@ -1712,5 +1722,15 @@ mod tests {
         let d: FileDiff = serde_json::from_str(r#"{"before":"a\n","after":"b\n"}"#).unwrap();
         assert_eq!(d.before(), "a\n");
         assert_eq!(d.after(), "b\n");
+    }
+
+    #[test]
+    fn resource_list_parses() {
+        let list: ResourceList = serde_json::from_str(
+            r#"{"data":[{"id":"r1","object":"environment"}],"has_more":false}"#,
+        )
+        .unwrap();
+        assert_eq!(list.data[0].id(), "r1");
+        assert!(!list.has_more);
     }
 }
