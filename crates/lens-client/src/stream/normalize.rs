@@ -16,7 +16,7 @@ use super::event::{ResponseEvent, ServerStreamEvent};
 use std::collections::HashSet;
 
 #[derive(Default)]
-#[allow(dead_code)]
+#[allow(dead_code)] // Task 4 wires into reader::run
 pub(crate) struct Normalizer {
     /// Keys of `OutputItemDone` items already emitted: `(kind, call_id, status)`.
     /// A repeat with an identical key is a literal re-fire and is dropped.
@@ -27,44 +27,80 @@ pub(crate) struct Normalizer {
 }
 
 #[derive(Default)]
-#[allow(dead_code)]
 struct ReasoningAccum {
     full_text: String,
     summary_text: String,
 }
 
-#[allow(dead_code)]
+#[allow(dead_code)] // Task 4 wires into reader::run
 impl Normalizer {
     /// Transform one parsed event into zero, one, or two normalized events.
     /// Total — never panics on event content. Task 2 adds suppression; Task 3
     /// adds the reasoning close.
     pub(crate) fn push(&mut self, ev: ServerStreamEvent) -> Vec<ServerStreamEvent> {
-        if let ServerStreamEvent::Response(ResponseEvent::OutputItemDone { item }) = &ev {
-            use super::event::Item;
-            let key = match item {
-                Item::FunctionCall {
-                    call_id, status, ..
-                } => Some(("function_call", call_id.clone(), status.clone())),
-                // `Item::FunctionCallOutput` carries no status field (Plan 3a) —
-                // key on call_id alone via a constant status slot.
-                Item::FunctionCallOutput { call_id, .. } => {
-                    Some(("function_call_output", call_id.clone(), String::new()))
-                }
-                _ => None, // messages/errors/other have no dedup key
-            };
-            if let Some(key) = key
-                && !self.seen_items.insert(key)
-            {
-                return Vec::new(); // literal re-fire — drop
+        use super::event::Item;
+        match &ev {
+            // ── reasoning bracket ────────────────────────────────────────────
+            ServerStreamEvent::Response(ResponseEvent::ReasoningStarted) => {
+                self.reasoning = Some(ReasoningAccum::default());
+                vec![ev]
             }
+            ServerStreamEvent::Response(ResponseEvent::ReasoningTextDelta { delta }) => {
+                if let Some(acc) = self.reasoning.as_mut() {
+                    acc.full_text.push_str(delta);
+                }
+                vec![ev]
+            }
+            ServerStreamEvent::Response(ResponseEvent::ReasoningSummaryTextDelta { delta }) => {
+                if let Some(acc) = self.reasoning.as_mut() {
+                    acc.summary_text.push_str(delta);
+                }
+                vec![ev]
+            }
+            ServerStreamEvent::Response(ResponseEvent::OutputTextDelta { .. })
+            | ServerStreamEvent::Response(ResponseEvent::Completed) => {
+                if let Some(close) = self.close_reasoning() {
+                    return vec![close, ev];
+                }
+                vec![ev]
+            }
+            // ── OutputItemDone re-fire suppression (Task 2) ──────────────────
+            ServerStreamEvent::Response(ResponseEvent::OutputItemDone { item }) => {
+                let key = match item {
+                    Item::FunctionCall {
+                        call_id, status, ..
+                    } => Some(("function_call", call_id.clone(), status.clone())),
+                    Item::FunctionCallOutput { call_id, .. } => {
+                        Some(("function_call_output", call_id.clone(), String::new()))
+                    }
+                    _ => None,
+                };
+                if let Some(key) = key
+                    && !self.seen_items.insert(key)
+                {
+                    return Vec::new();
+                }
+                vec![ev]
+            }
+            _ => vec![ev],
         }
-        vec![ev]
+    }
+
+    /// Take the open reasoning bracket (if any) and build its synthetic close.
+    fn close_reasoning(&mut self) -> Option<ServerStreamEvent> {
+        let acc = self.reasoning.take()?;
+        Some(ServerStreamEvent::Response(
+            ResponseEvent::ReasoningClosed {
+                full_text: acc.full_text,
+                summary_text: acc.summary_text,
+            },
+        ))
     }
 
     /// Flush any open synthetic state at stream EOF. Task 3 emits a trailing
     /// `ReasoningClosed` for a reasoning bracket the stream ended without closing.
     pub(crate) fn flush(&mut self) -> Vec<ServerStreamEvent> {
-        Vec::new()
+        self.close_reasoning().into_iter().collect()
     }
 }
 
@@ -226,5 +262,144 @@ mod tests {
             "in_progress + completed function_call both preserved"
         );
         assert_eq!(fco, 1, "single function_call_output preserved");
+    }
+
+    fn rdelta(d: &str) -> ServerStreamEvent {
+        ServerStreamEvent::Response(ResponseEvent::ReasoningTextDelta { delta: d.into() })
+    }
+    fn sdelta(d: &str) -> ServerStreamEvent {
+        ServerStreamEvent::Response(ResponseEvent::ReasoningSummaryTextDelta { delta: d.into() })
+    }
+    fn text_delta() -> ServerStreamEvent {
+        ServerStreamEvent::Response(ResponseEvent::OutputTextDelta {
+            delta: "Hi".into(),
+            message_id: None,
+            index: None,
+            last: None,
+        })
+    }
+
+    #[test]
+    fn reasoning_closes_on_first_output_text_delta_with_accumulated_text() {
+        let mut n = Normalizer::default();
+        assert_eq!(
+            n.push(ServerStreamEvent::Response(ResponseEvent::ReasoningStarted)),
+            vec![ServerStreamEvent::Response(ResponseEvent::ReasoningStarted)]
+        );
+        assert_eq!(n.push(rdelta("be")), vec![rdelta("be")]); // passes through + accumulates
+        assert_eq!(n.push(rdelta("cause")), vec![rdelta("cause")]);
+        assert_eq!(n.push(sdelta("sum")), vec![sdelta("sum")]);
+        // First output_text.delta closes the bracket: [ReasoningClosed, the delta].
+        let out = n.push(text_delta());
+        assert_eq!(
+            out,
+            vec![
+                ServerStreamEvent::Response(ResponseEvent::ReasoningClosed {
+                    full_text: "because".into(),
+                    summary_text: "sum".into(),
+                }),
+                text_delta(),
+            ]
+        );
+    }
+
+    #[test]
+    fn reasoning_closes_on_completed() {
+        let mut n = Normalizer::default();
+        n.push(ServerStreamEvent::Response(ResponseEvent::ReasoningStarted));
+        let completed = ServerStreamEvent::Response(ResponseEvent::Completed);
+        let out = n.push(completed.clone());
+        assert_eq!(
+            out,
+            vec![
+                ServerStreamEvent::Response(ResponseEvent::ReasoningClosed {
+                    full_text: String::new(),
+                    summary_text: String::new(),
+                }),
+                completed,
+            ]
+        );
+    }
+
+    #[test]
+    fn only_one_close_per_reasoning_bracket() {
+        let mut n = Normalizer::default();
+        n.push(ServerStreamEvent::Response(ResponseEvent::ReasoningStarted));
+        assert_eq!(n.push(text_delta()).len(), 2); // close + delta
+        assert_eq!(n.push(text_delta()), vec![text_delta()]); // no second close
+        assert_eq!(
+            n.push(ServerStreamEvent::Response(ResponseEvent::Completed)),
+            vec![ServerStreamEvent::Response(ResponseEvent::Completed)]
+        );
+    }
+
+    #[test]
+    fn output_text_delta_without_open_reasoning_is_untouched() {
+        let mut n = Normalizer::default();
+        assert_eq!(n.push(text_delta()), vec![text_delta()]);
+    }
+
+    #[test]
+    fn flush_closes_a_dangling_reasoning_bracket() {
+        let mut n = Normalizer::default();
+        n.push(ServerStreamEvent::Response(ResponseEvent::ReasoningStarted));
+        n.push(rdelta("x"));
+        assert_eq!(
+            n.flush(),
+            vec![ServerStreamEvent::Response(
+                ResponseEvent::ReasoningClosed {
+                    full_text: "x".into(),
+                    summary_text: String::new(),
+                }
+            )]
+        );
+        assert!(n.flush().is_empty()); // idempotent — already closed
+    }
+
+    #[test]
+    fn happy_path_fixture_synthesizes_one_reasoning_closed() {
+        // reasoning.started (line 22) is immediately followed by output_text.delta
+        // (line 25): the trigger is byte-grounded. full_text is empty (no delta
+        // frames on claude-sdk). Exactly one ReasoningClosed for the turn.
+        let bytes = include_bytes!("../../tests/fixtures/sse/happy_path.stream.sse");
+        let mut p = super::super::sse::SseParser::default();
+        let mut frames = p.push(bytes);
+        frames.extend(p.finish());
+        let mut n = Normalizer::default();
+        let mut out = Vec::new();
+        for f in &frames {
+            out.extend(n.push(super::super::event::parse_event(f)));
+        }
+        out.extend(n.flush());
+        let closes = out
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    ServerStreamEvent::Response(ResponseEvent::ReasoningClosed { .. })
+                )
+            })
+            .count();
+        assert_eq!(closes, 1);
+        // The close lands before the first output_text.delta.
+        let close_idx = out
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    ServerStreamEvent::Response(ResponseEvent::ReasoningClosed { .. })
+                )
+            })
+            .unwrap();
+        let first_text_idx = out
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    ServerStreamEvent::Response(ResponseEvent::OutputTextDelta { .. })
+                )
+            })
+            .unwrap();
+        assert!(close_idx < first_text_idx);
     }
 }
