@@ -7,18 +7,12 @@ pub mod error {
     pub struct ConversionError(::std::borrow::Cow<'static, str>);
     impl ::std::error::Error for ConversionError {}
     impl ::std::fmt::Display for ConversionError {
-        fn fmt(
-            &self,
-            f: &mut ::std::fmt::Formatter<'_>,
-        ) -> Result<(), ::std::fmt::Error> {
+        fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> Result<(), ::std::fmt::Error> {
             ::std::fmt::Display::fmt(&self.0, f)
         }
     }
     impl ::std::fmt::Debug for ConversionError {
-        fn fmt(
-            &self,
-            f: &mut ::std::fmt::Formatter<'_>,
-        ) -> Result<(), ::std::fmt::Error> {
+        fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> Result<(), ::std::fmt::Error> {
             ::std::fmt::Debug::fmt(&self.0, f)
         }
     }
@@ -59,7 +53,7 @@ pub mod error {
     Hash,
     Ord,
     PartialEq,
-    PartialOrd
+    PartialOrd,
 )]
 pub enum Action {
     #[serde(rename = "accept")]
@@ -85,9 +79,7 @@ impl ::std::fmt::Display for Action {
 }
 impl ::std::str::FromStr for Action {
     type Err = self::error::ConversionError;
-    fn from_str(
-        value: &str,
-    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+    fn from_str(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
         match value {
             "accept" => Ok(Self::Accept),
             "decline" => Ok(Self::Decline),
@@ -98,9 +90,7 @@ impl ::std::str::FromStr for Action {
 }
 impl ::std::convert::TryFrom<&str> for Action {
     type Error = self::error::ConversionError;
-    fn try_from(
-        value: &str,
-    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+    fn try_from(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
         value.parse()
     }
 }
@@ -391,7 +381,8 @@ pub struct BodyUpdateSessionAgentV1SessionsSessionIdAgentPut {
     pub bundle: ::std::string::String,
 }
 impl ::std::convert::From<&BodyUpdateSessionAgentV1SessionsSessionIdAgentPut>
-for BodyUpdateSessionAgentV1SessionsSessionIdAgentPut {
+    for BodyUpdateSessionAgentV1SessionsSessionIdAgentPut
+{
     fn from(value: &BodyUpdateSessionAgentV1SessionsSessionIdAgentPut) -> Self {
         value.clone()
     }
@@ -422,7 +413,8 @@ pub struct BodyUploadSessionFileV1SessionsSessionIdResourcesFilesPost {
     pub file: ::std::string::String,
 }
 impl ::std::convert::From<&BodyUploadSessionFileV1SessionsSessionIdResourcesFilesPost>
-for BodyUploadSessionFileV1SessionsSessionIdResourcesFilesPost {
+    for BodyUploadSessionFileV1SessionsSessionIdResourcesFilesPost
+{
     fn from(value: &BodyUploadSessionFileV1SessionsSessionIdResourcesFilesPost) -> Self {
         value.clone()
     }
@@ -944,9 +936,8 @@ impl ::std::convert::From<&ConversationRef> for ConversationRef {
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug, PartialEq)]
 pub struct CreateDefaultPolicyRequest {
     #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
-    pub factory_params: ::std::option::Option<
-        ::serde_json::Map<::std::string::String, ::serde_json::Value>,
-    >,
+    pub factory_params:
+        ::std::option::Option<::serde_json::Map<::std::string::String, ::serde_json::Value>>,
     pub handler: ::std::string::String,
     pub name: ::std::string::String,
     #[serde(rename = "type")]
@@ -1051,9 +1042,8 @@ impl ::std::convert::From<&CreateDirectoryRequest> for CreateDirectoryRequest {
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug, PartialEq)]
 pub struct CreateSessionPolicyRequest {
     #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
-    pub factory_params: ::std::option::Option<
-        ::serde_json::Map<::std::string::String, ::serde_json::Value>,
-    >,
+    pub factory_params:
+        ::std::option::Option<::serde_json::Map<::std::string::String, ::serde_json::Value>>,
     pub handler: ::std::string::String,
     pub name: ::std::string::String,
     #[serde(rename = "type")]
@@ -1367,9 +1357,8 @@ pub struct ElicitationRequestParams {
         default,
         skip_serializing_if = "::std::option::Option::is_none"
     )]
-    pub requested_schema: ::std::option::Option<
-        ::serde_json::Map<::std::string::String, ::serde_json::Value>,
-    >,
+    pub requested_schema:
+        ::std::option::Option<::serde_json::Map<::std::string::String, ::serde_json::Value>>,
     #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
     pub target_session_id: ::std::option::Option<::std::string::String>,
     #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
@@ -1606,7 +1595,8 @@ impl ::std::convert::From<bool> for ElicitationResultContentValue {
     }
 }
 impl ::std::convert::From<::std::vec::Vec<::std::string::String>>
-for ElicitationResultContentValue {
+    for ElicitationResultContentValue
+{
     fn from(value: ::std::vec::Vec<::std::string::String>) -> Self {
         Self::Variant4(value)
     }
@@ -1982,7 +1972,9 @@ impl ::std::convert::From<&HttpValidationError> for HttpValidationError {
 }
 impl ::std::default::Default for HttpValidationError {
     fn default() -> Self {
-        Self { detail: Default::default() }
+        Self {
+            detail: Default::default(),
+        }
     }
 }
 /**Event emitted once the task transitions to in-progress.
@@ -2365,7 +2357,7 @@ impl ::std::convert::From<&McpServerSummary> for McpServerSummary {
     Hash,
     Ord,
     PartialEq,
-    PartialOrd
+    PartialOrd,
 )]
 pub enum Mode {
     #[serde(rename = "form")]
@@ -2388,9 +2380,7 @@ impl ::std::fmt::Display for Mode {
 }
 impl ::std::str::FromStr for Mode {
     type Err = self::error::ConversionError;
-    fn from_str(
-        value: &str,
-    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+    fn from_str(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
         match value {
             "form" => Ok(Self::Form),
             "url" => Ok(Self::Url),
@@ -2400,9 +2390,7 @@ impl ::std::str::FromStr for Mode {
 }
 impl ::std::convert::TryFrom<&str> for Mode {
     type Error = self::error::ConversionError;
-    fn try_from(
-        value: &str,
-    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+    fn try_from(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
         value.parse()
     }
 }
@@ -3234,8 +3222,7 @@ pub struct ReasoningSummaryTextDeltaEvent {
     #[serde(rename = "type")]
     pub type_: ::std::string::String,
 }
-impl ::std::convert::From<&ReasoningSummaryTextDeltaEvent>
-for ReasoningSummaryTextDeltaEvent {
+impl ::std::convert::From<&ReasoningSummaryTextDeltaEvent> for ReasoningSummaryTextDeltaEvent {
     fn from(value: &ReasoningSummaryTextDeltaEvent) -> Self {
         value.clone()
     }
@@ -3505,9 +3492,7 @@ pub struct ResponseObject {
     #[serde(default = "defaults::response_object_object")]
     pub object: ::std::string::String,
     #[serde(default, skip_serializing_if = "::std::vec::Vec::is_empty")]
-    pub output: ::std::vec::Vec<
-        ::serde_json::Map<::std::string::String, ::serde_json::Value>,
-    >,
+    pub output: ::std::vec::Vec<::serde_json::Map<::std::string::String, ::serde_json::Value>>,
     #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
     pub previous_response_id: ::std::option::Option<::std::string::String>,
     #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
@@ -3580,9 +3565,8 @@ emit today — flat ``code`` / ``message`` plus an optional
 pub struct RetryErrorDetail {
     pub code: ::std::string::String,
     #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
-    pub detail: ::std::option::Option<
-        ::serde_json::Map<::std::string::String, ::serde_json::Value>,
-    >,
+    pub detail:
+        ::std::option::Option<::serde_json::Map<::std::string::String, ::serde_json::Value>>,
     pub message: ::std::string::String,
 }
 impl ::std::convert::From<&RetryErrorDetail> for RetryErrorDetail {
@@ -4390,9 +4374,7 @@ panel; transient (not persisted — the REST list is source of truth).
 /// </details>
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug, PartialEq)]
 pub struct SessionChangedFilesInvalidatedEvent {
-    #[serde(
-        default = "defaults::session_changed_files_invalidated_event_environment_id"
-    )]
+    #[serde(default = "defaults::session_changed_files_invalidated_event_environment_id")]
     pub environment_id: ::std::string::String,
     #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
     pub sequence_number: ::std::option::Option<i64>,
@@ -4401,7 +4383,8 @@ pub struct SessionChangedFilesInvalidatedEvent {
     pub type_: ::std::string::String,
 }
 impl ::std::convert::From<&SessionChangedFilesInvalidatedEvent>
-for SessionChangedFilesInvalidatedEvent {
+    for SessionChangedFilesInvalidatedEvent
+{
     fn from(value: &SessionChangedFilesInvalidatedEvent) -> Self {
         value.clone()
     }
@@ -4481,8 +4464,7 @@ pub struct SessionChildSessionUpdatedEvent {
     #[serde(rename = "type")]
     pub type_: ::std::string::String,
 }
-impl ::std::convert::From<&SessionChildSessionUpdatedEvent>
-for SessionChildSessionUpdatedEvent {
+impl ::std::convert::From<&SessionChildSessionUpdatedEvent> for SessionChildSessionUpdatedEvent {
     fn from(value: &SessionChildSessionUpdatedEvent) -> Self {
         value.clone()
     }
@@ -4554,8 +4536,7 @@ pub struct SessionCollaborationModeEvent {
     #[serde(rename = "type")]
     pub type_: ::std::string::String,
 }
-impl ::std::convert::From<&SessionCollaborationModeEvent>
-for SessionCollaborationModeEvent {
+impl ::std::convert::From<&SessionCollaborationModeEvent> for SessionCollaborationModeEvent {
     fn from(value: &SessionCollaborationModeEvent) -> Self {
         value.clone()
     }
@@ -5335,11 +5316,11 @@ impl ::std::convert::From<&SessionInterruptedPayload> for SessionInterruptedPayl
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug, PartialEq)]
 pub struct SessionLabelsResponse {
     pub id: ::std::string::String,
-    #[serde(default, skip_serializing_if = ":: std :: collections :: HashMap::is_empty")]
-    pub labels: ::std::collections::HashMap<
-        ::std::string::String,
-        ::std::string::String,
-    >,
+    #[serde(
+        default,
+        skip_serializing_if = ":: std :: collections :: HashMap::is_empty"
+    )]
+    pub labels: ::std::collections::HashMap<::std::string::String, ::std::string::String>,
 }
 impl ::std::convert::From<&SessionLabelsResponse> for SessionLabelsResponse {
     fn from(value: &SessionLabelsResponse) -> Self {
@@ -5949,8 +5930,7 @@ pub struct SessionResourcePaginatedList {
     #[serde(default = "defaults::session_resource_paginated_list_object")]
     pub object: ::std::string::String,
 }
-impl ::std::convert::From<&SessionResourcePaginatedList>
-for SessionResourcePaginatedList {
+impl ::std::convert::From<&SessionResourcePaginatedList> for SessionResourcePaginatedList {
     fn from(value: &SessionResourcePaginatedList) -> Self {
         value.clone()
     }
@@ -6384,8 +6364,7 @@ pub struct SessionTerminalActivityEvent {
     #[serde(rename = "type")]
     pub type_: ::std::string::String,
 }
-impl ::std::convert::From<&SessionTerminalActivityEvent>
-for SessionTerminalActivityEvent {
+impl ::std::convert::From<&SessionTerminalActivityEvent> for SessionTerminalActivityEvent {
     fn from(value: &SessionTerminalActivityEvent) -> Self {
         value.clone()
     }
@@ -6548,9 +6527,7 @@ pub struct SessionTodosEvent {
     pub conversation_id: ::std::string::String,
     #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
     pub sequence_number: ::std::option::Option<i64>,
-    pub todos: ::std::vec::Vec<
-        ::serde_json::Map<::std::string::String, ::serde_json::Value>,
-    >,
+    pub todos: ::std::vec::Vec<::serde_json::Map<::std::string::String, ::serde_json::Value>>,
     #[serde(rename = "type")]
     pub type_: ::std::string::String,
 }
@@ -6695,9 +6672,8 @@ pub struct SessionUsageEvent {
     #[serde(rename = "type")]
     pub type_: ::std::string::String,
     #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
-    pub usage_by_model: ::std::option::Option<
-        ::std::collections::HashMap<::std::string::String, ModelUsage>,
-    >,
+    pub usage_by_model:
+        ::std::option::Option<::std::collections::HashMap<::std::string::String, ModelUsage>>,
 }
 impl ::std::convert::From<&SessionUsageEvent> for SessionUsageEvent {
     fn from(value: &SessionUsageEvent) -> Self {
@@ -6779,7 +6755,7 @@ impl ::std::convert::From<&SkillSummary> for SkillSummary {
     Hash,
     Ord,
     PartialEq,
-    PartialOrd
+    PartialOrd,
 )]
 pub enum Source {
     #[serde(rename = "llm")]
@@ -6805,9 +6781,7 @@ impl ::std::fmt::Display for Source {
 }
 impl ::std::str::FromStr for Source {
     type Err = self::error::ConversionError;
-    fn from_str(
-        value: &str,
-    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+    fn from_str(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
         match value {
             "llm" => Ok(Self::Llm),
             "execution" => Ok(Self::Execution),
@@ -6818,9 +6792,7 @@ impl ::std::str::FromStr for Source {
 }
 impl ::std::convert::TryFrom<&str> for Source {
     type Error = self::error::ConversionError;
-    fn try_from(
-        value: &str,
-    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+    fn try_from(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
         value.parse()
     }
 }
@@ -6869,7 +6841,7 @@ impl ::std::convert::TryFrom<::std::string::String> for Source {
     Hash,
     Ord,
     PartialEq,
-    PartialOrd
+    PartialOrd,
 )]
 pub enum Stage {
     #[serde(rename = "provisioning")]
@@ -6904,9 +6876,7 @@ impl ::std::fmt::Display for Stage {
 }
 impl ::std::str::FromStr for Stage {
     type Err = self::error::ConversionError;
-    fn from_str(
-        value: &str,
-    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+    fn from_str(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
         match value {
             "provisioning" => Ok(Self::Provisioning),
             "cloning" => Ok(Self::Cloning),
@@ -6920,9 +6890,7 @@ impl ::std::str::FromStr for Stage {
 }
 impl ::std::convert::TryFrom<&str> for Stage {
     type Error = self::error::ConversionError;
-    fn try_from(
-        value: &str,
-    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+    fn try_from(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
         value.parse()
     }
 }
@@ -6970,7 +6938,7 @@ impl ::std::convert::TryFrom<::std::string::String> for Stage {
     Hash,
     Ord,
     PartialEq,
-    PartialOrd
+    PartialOrd,
 )]
 pub enum Status {
     #[serde(rename = "idle")]
@@ -7002,9 +6970,7 @@ impl ::std::fmt::Display for Status {
 }
 impl ::std::str::FromStr for Status {
     type Err = self::error::ConversionError;
-    fn from_str(
-        value: &str,
-    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+    fn from_str(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
         match value {
             "idle" => Ok(Self::Idle),
             "launching" => Ok(Self::Launching),
@@ -7017,9 +6983,7 @@ impl ::std::str::FromStr for Status {
 }
 impl ::std::convert::TryFrom<&str> for Status {
     type Error = self::error::ConversionError;
-    fn try_from(
-        value: &str,
-    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+    fn try_from(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
         value.parse()
     }
 }
@@ -7298,7 +7262,7 @@ impl ::std::convert::From<&TurnStartedEvent> for TurnStartedEvent {
     Hash,
     Ord,
     PartialEq,
-    PartialOrd
+    PartialOrd,
 )]
 pub enum Type {
     #[serde(rename = "environment")]
@@ -7324,9 +7288,7 @@ impl ::std::fmt::Display for Type {
 }
 impl ::std::str::FromStr for Type {
     type Err = self::error::ConversionError;
-    fn from_str(
-        value: &str,
-    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+    fn from_str(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
         match value {
             "environment" => Ok(Self::Environment),
             "terminal" => Ok(Self::Terminal),
@@ -7337,9 +7299,7 @@ impl ::std::str::FromStr for Type {
 }
 impl ::std::convert::TryFrom<&str> for Type {
     type Error = self::error::ConversionError;
-    fn try_from(
-        value: &str,
-    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+    fn try_from(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
         value.parse()
     }
 }
@@ -7807,9 +7767,7 @@ pub struct UpdateSessionRequest {
     #[serde(default)]
     pub silent: bool,
     #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
-    pub terminal_launch_args: ::std::option::Option<
-        ::std::vec::Vec<::std::string::String>,
-    >,
+    pub terminal_launch_args: ::std::option::Option<::std::vec::Vec<::std::string::String>>,
     #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
     pub title: ::std::option::Option<::std::string::String>,
 }
@@ -8099,7 +8057,8 @@ pub mod defaults {
     pub(super) fn response_object_object() -> ::std::string::String {
         "response".to_string()
     }
-    pub(super) fn session_changed_files_invalidated_event_environment_id() -> ::std::string::String {
+    pub(super) fn session_changed_files_invalidated_event_environment_id() -> ::std::string::String
+    {
         "default".to_string()
     }
     pub(super) fn session_resource_paginated_list_object() -> ::std::string::String {
