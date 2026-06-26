@@ -31,11 +31,24 @@ and roll older "Recent" pointers off this page as they age.
     ⚠ minimal wrappers (FileContent/ShellResult/FileResource/Host/Policy*) — grow
     getters + verify field names with golden captures when the state-model consumes
     them. Full rollup in `.superpowers/sdd/progress.md`.
-- **⚠ CHECKPOINT before Plan 3 (SSE taxonomy/state-model):** reassess tracking
-  `0.3.0.dev0` vs waiting for a `0.3.0` release tag. The REST surface (2a–2e) is cheap +
-  re-vendor-safe; the streaming taxonomy encodes the semantically-unstable parts (3 status
-  vocabularies, partial-merge child summaries, the events body) where dev0 churn is
-  expensive. Build REST now; gate the taxonomy investment on a conscious dev0-vs-0.3.0 call.
+- **Checkpoint RESOLVED (2026-06-25): build Plan 3 on `0.3.0.dev0` now.** No signal on
+  `0.3.0` timing or whether it'll materially change the API — not worth idling a project
+  with a live server to extract ground truth from. Treat dev0 instability as a *planning
+  input*, not a blocker. **Plan 3 approach (decided):**
+  1. **Golden-SSE capture spike FIRST** — capture real streams from the live pinned server
+     (status events, `child_session` updates, the conversation-item union, deltas) and model
+     the typed taxonomy from those bytes, NOT from the under-specified openapi. (The 4 review
+     bugs in 2c–2e were all guessed-envelope mistakes; capture-from-bytes is the fix, applied
+     up front to the riskiest layer.)
+  2. **Split by stability** — reader-thread + reconnect plumbing is already de-risked (transport
+     spike: subscribe-first + mid-stream-drop recovery), build confidently; gate only the
+     semantic event union on the captures.
+  3. **Stand up contract-drift CI** (outstanding B6) — the passive alarm that makes tracking
+     dev0 safe when `0.3.0` eventually tags.
+  - composer-2.5 is weakest on temporal/stateful logic (`[[composer-delegation-profile]]`) — Plan 3
+    is exactly that, so **per-task cross-family review returns here** (was relaxed for the static
+    REST surface). Mind the Cursor-credit cost (`[[review-spend-policy]]`).
+  - Now on branch `feat/lens-client-streaming` (off `main` @ `78fdaa3`).
 - **Doc walkthrough complete** (all 11 design docs in `docs/design/` reviewed);
   every surfaced decision is resolved or consciously deferred.
 - **Deferred, with a clean seam:**
