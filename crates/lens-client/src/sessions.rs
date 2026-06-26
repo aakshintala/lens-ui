@@ -278,6 +278,8 @@ impl SessionFilter {
 pub struct ChildSessionSummary {
     id: SessionId,
     #[serde(default)]
+    object: Option<String>,
+    #[serde(default)]
     parent_session_id: String,
     #[serde(default)]
     title: Option<String>,
@@ -285,6 +287,8 @@ pub struct ChildSessionSummary {
     tool: Option<String>,
     #[serde(default)]
     session_name: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
     #[serde(default)]
     agent_id: Option<String>,
     #[serde(default)]
@@ -313,6 +317,9 @@ impl ChildSessionSummary {
     pub fn id(&self) -> &SessionId {
         &self.id
     }
+    pub fn object(&self) -> Option<&str> {
+        self.object.as_deref()
+    }
     pub fn parent_session_id(&self) -> &str {
         &self.parent_session_id
     }
@@ -324,6 +331,9 @@ impl ChildSessionSummary {
     }
     pub fn session_name(&self) -> Option<&str> {
         self.session_name.as_deref()
+    }
+    pub fn kind(&self) -> Option<&str> {
+        self.kind.as_deref()
     }
     pub fn agent_id(&self) -> Option<&str> {
         self.agent_id.as_deref()
@@ -844,6 +854,8 @@ mod tests {
             "pending_elicitations_count":3}"#;
         let c: ChildSessionSummary = serde_json::from_str(full).unwrap();
         assert_eq!(c.id().as_str(), "c1");
+        assert_eq!(c.object(), Some("child_session"));
+        assert_eq!(c.kind(), Some("sub_agent"));
         assert_eq!(c.parent_session_id(), "p1");
         assert!(c.busy());
         assert_eq!(c.pending_elicitations_count(), 3);
@@ -854,6 +866,8 @@ mod tests {
         let partial = r#"{"id":"c1","busy":false,"current_task_status":"launching"}"#;
         let p: ChildSessionSummary = serde_json::from_str(partial).unwrap();
         assert_eq!(p.id().as_str(), "c1");
+        assert_eq!(p.object(), None);
+        assert_eq!(p.kind(), None);
         assert_eq!(p.parent_session_id(), "");
         assert_eq!(p.created_at(), 0);
     }
