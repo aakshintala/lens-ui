@@ -16,5 +16,8 @@ serde_json = "1"
 thiserror = "2"
 url = { version = "2", features = ["serde"] }
 
+[dev-dependencies]
+url = "2"
+
 [features]
 live-tests = []
