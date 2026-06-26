@@ -19,7 +19,7 @@ pub use connection::{Auth, Connection};
 pub use error::{ClientError, Result};
 pub use sessions::{
     ChildSessionList, ChildSessionSummary, ConversationDeleted, CreateSessionRequest,
-    CreatedSessionResponse, ElicitationAction, HostType, SendEventAck, SessionEventInput,
-    SessionFilter, SessionKind, SessionList, SessionSnapshot, SessionStatus, SessionSummary,
-    Sessions,
+    CreatedSessionResponse, ElicitationAction, ElicitationState, HostType, SendEventAck,
+    SessionEventInput, SessionFilter, SessionKind, SessionList, SessionSnapshot, SessionStatus,
+    SessionSummary, Sessions,
 };

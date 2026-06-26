@@ -662,6 +662,25 @@ impl ConversationDeleted {
     }
 }
 
+/// Pending elicitation state (`GET …/elicitations/{id}`). The response is
+/// untyped server-side; expose typed getters for the fields the elicitation UI
+/// consumes. Start with the correlation id + raw-typed status; extend as needed.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct ElicitationState {
+    #[serde(default)]
+    elicitation_id: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+}
+impl ElicitationState {
+    pub fn elicitation_id(&self) -> Option<&str> {
+        self.elicitation_id.as_deref()
+    }
+    pub fn status(&self) -> Option<&str> {
+        self.status.as_deref()
+    }
+}
+
 /// The session subservice — borrows the `Client` for the duration of a call.
 pub struct Sessions<'a> {
     client: &'a Client,
@@ -804,6 +823,29 @@ impl<'a> Sessions<'a> {
             reqwest::Method::PUT,
             &format!("/v1/sessions/{id}/agent"),
             form,
+        )
+    }
+
+    /// `GET /v1/sessions/{sid}/elicitations/{eid}` — deep-linkable pending state.
+    pub fn elicitation(&self, sid: &SessionId, eid: &ElicitationId) -> Result<ElicitationState> {
+        self.client
+            .get_json(&format!("/v1/sessions/{sid}/elicitations/{eid}"), &[])
+    }
+
+    /// `POST …/elicitations/{eid}/resolve` — RESTful resolve (preferred over the
+    /// `approval` event when an elicitation_id is on hand). Body is the generated
+    /// `ElicitationResult {action, content?}`.
+    pub fn resolve_elicitation(
+        &self,
+        sid: &SessionId,
+        eid: &ElicitationId,
+        result: &crate::generated::ElicitationResult,
+    ) -> Result<crate::sessions::SendEventAck> {
+        self.client.send_json(
+            reqwest::Method::POST,
+            &format!("/v1/sessions/{sid}/elicitations/{eid}/resolve"),
+            &[],
+            Some(result),
         )
     }
 
