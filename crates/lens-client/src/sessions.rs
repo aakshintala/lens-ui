@@ -681,6 +681,92 @@ impl ElicitationState {
     }
 }
 
+/// A filesystem entry (`runner/app.py:14548-14556`).
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct FilesystemEntry {
+    id: String,
+    name: String,
+    path: String,
+    #[serde(rename = "type")]
+    entry_type: String,
+    #[serde(default)]
+    bytes: Option<u64>,
+    #[serde(default)]
+    modified_at: Option<i64>,
+}
+impl FilesystemEntry {
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+    pub fn entry_type(&self) -> &str {
+        &self.entry_type
+    }
+    pub fn bytes(&self) -> Option<u64> {
+        self.bytes
+    }
+    pub fn modified_at(&self) -> Option<i64> {
+        self.modified_at
+    }
+}
+
+/// `{object:"list", data:[FilesystemEntry], has_more}` envelope.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct FilesystemList {
+    pub data: Vec<FilesystemEntry>,
+    #[serde(default)]
+    pub has_more: bool,
+}
+
+/// Query for environment search (`q` required; `include`/`exclude` globs; `limit` ≤ 500).
+#[derive(Clone, Debug)]
+pub struct SearchQuery {
+    q: String,
+    include: Option<String>,
+    exclude: Option<String>,
+    limit: Option<u32>,
+}
+impl SearchQuery {
+    pub fn new(q: impl Into<String>) -> Self {
+        Self {
+            q: q.into(),
+            include: None,
+            exclude: None,
+            limit: None,
+        }
+    }
+    pub fn include(mut self, g: impl Into<String>) -> Self {
+        self.include = Some(g.into());
+        self
+    }
+    pub fn exclude(mut self, g: impl Into<String>) -> Self {
+        self.exclude = Some(g.into());
+        self
+    }
+    pub fn limit(mut self, n: u32) -> Self {
+        self.limit = Some(n.min(500));
+        self
+    }
+    fn to_query(&self) -> Vec<(&'static str, String)> {
+        let mut v = vec![("q", self.q.clone())];
+        if let Some(g) = &self.include {
+            v.push(("include", g.clone()));
+        }
+        if let Some(g) = &self.exclude {
+            v.push(("exclude", g.clone()));
+        }
+        if let Some(n) = self.limit {
+            v.push(("limit", n.to_string()));
+        }
+        v
+    }
+}
+
 /// The session subservice — borrows the `Client` for the duration of a call.
 pub struct Sessions<'a> {
     client: &'a Client,
@@ -861,6 +947,19 @@ impl<'a> Sessions<'a> {
         let status = resp.status().as_u16();
         let body = resp.text()?;
         decode_json("sessions/events", status, &body)
+    }
+
+    /// `GET …/resources/environments/{env_id}/search` — server-side fs search.
+    pub fn search(
+        &self,
+        id: &SessionId,
+        env_id: &str,
+        query: &SearchQuery,
+    ) -> Result<FilesystemList> {
+        self.client.get_json(
+            &format!("/v1/sessions/{id}/resources/environments/{env_id}/search"),
+            &query.to_query(),
+        )
     }
 }
 
@@ -1176,5 +1275,25 @@ mod tests {
         let ack2: SendEventAck =
             serde_json::from_str(r#"{"queued": true, "future_field": 1}"#).unwrap();
         assert!(ack2.queued);
+    }
+
+    #[test]
+    fn filesystem_list_parses() {
+        let body = r#"{"object":"list","has_more":false,"data":[
+            {"id":"e1","object":"session.environment.filesystem.entry","name":"main.rs",
+             "path":"src/main.rs","type":"file","bytes":1024,"modified_at":1719331200}]}"#;
+        let l: FilesystemList = serde_json::from_str(body).unwrap();
+        assert_eq!(l.data[0].path(), "src/main.rs");
+        assert_eq!(l.data[0].entry_type(), "file");
+        assert_eq!(l.data[0].bytes(), Some(1024));
+    }
+
+    #[test]
+    fn search_query_builds() {
+        let q = SearchQuery::new("fn main").include("*.rs").limit(100);
+        let pairs = q.to_query();
+        assert!(pairs.contains(&("q", "fn main".to_string())));
+        assert!(pairs.contains(&("include", "*.rs".to_string())));
+        assert!(pairs.contains(&("limit", "100".to_string())));
     }
 }
