@@ -100,7 +100,6 @@ impl Client {
     }
 
     /// Send a multipart/form-data request (bundle uploads).
-    #[allow(dead_code)] // used by Sessions create/lifecycle methods (Tasks 2-6)
     pub(crate) fn send_multipart<T: serde::de::DeserializeOwned>(
         &self,
         method: reqwest::Method,

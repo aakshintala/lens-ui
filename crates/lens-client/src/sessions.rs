@@ -621,6 +621,26 @@ impl CreateSessionRequest {
     }
 }
 
+/// Response of multipart `POST /v1/sessions` (omnigent `CreatedSessionResponse`,
+/// `schemas.py:1289-1291`). Lighter than a snapshot.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct CreatedSessionResponse {
+    session_id: SessionId,
+    agent_id: String,
+    agent_name: String,
+}
+impl CreatedSessionResponse {
+    pub fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+    pub fn agent_id(&self) -> &str {
+        &self.agent_id
+    }
+    pub fn agent_name(&self) -> &str {
+        &self.agent_name
+    }
+}
+
 /// The session subservice — borrows the `Client` for the duration of a call.
 pub struct Sessions<'a> {
     client: &'a Client,
@@ -664,6 +684,27 @@ impl<'a> Sessions<'a> {
     pub fn create(&self, req: &CreateSessionRequest) -> Result<SessionSnapshot> {
         self.client
             .send_json(reqwest::Method::POST, "/v1/sessions", &[], Some(req))
+    }
+
+    /// `POST /v1/sessions` (multipart) — create from an agent `bundle` (.tar.gz)
+    /// with a JSON `metadata` part (omnigent `SessionCreateMetadata`).
+    pub fn create_with_bundle(
+        &self,
+        metadata: &serde_json::Value,
+        bundle: Vec<u8>,
+        bundle_filename: &str,
+    ) -> Result<CreatedSessionResponse> {
+        let form = reqwest::blocking::multipart::Form::new()
+            .text("metadata", serde_json::to_string(metadata)?)
+            .part(
+                "bundle",
+                reqwest::blocking::multipart::Part::bytes(bundle)
+                    .file_name(bundle_filename.to_string())
+                    .mime_str("application/gzip")
+                    .map_err(crate::error::ClientError::Network)?,
+            );
+        self.client
+            .send_multipart(reqwest::Method::POST, "/v1/sessions", form)
     }
 
     /// `POST /v1/sessions/{id}/events` — submit a typed event. Returns the
@@ -941,6 +982,15 @@ mod tests {
         assert_eq!(p.kind(), None);
         assert_eq!(p.parent_session_id(), "");
         assert_eq!(p.created_at(), 0);
+    }
+
+    #[test]
+    fn created_session_response_parses() {
+        let r: CreatedSessionResponse =
+            serde_json::from_str(r#"{"session_id":"s1","agent_id":"ag","agent_name":"A"}"#)
+                .unwrap();
+        assert_eq!(r.session_id().as_str(), "s1");
+        assert_eq!(r.agent_name(), "A");
     }
 
     #[test]
