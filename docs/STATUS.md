@@ -9,11 +9,23 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Open threads & next up
 
-- **NEXT: execute lens-client Foundation** (separate session) —
-  plan `docs/superpowers/plans/2026-06-25-lens-client-foundation.md`;
-  execution handoff `docs/handoffs/2026-06-25-lens-client-foundation-execution.md`
-  (subagent-driven, composer-2.5 build, Opus reviews each task, cross-family
-  review at end/seams). Build decisions: `docs/design/typed-client-implementation.md`.
+- **lens-client Foundation: DONE** (Plan 1 executed, 9 commits `043214e..f12050f`) —
+  crate skeleton/error/ids/connection, typify codegen (`generated.rs`, 88 schemas,
+  rustfmt-canonical via xtask), HTTP core + contract gate + ready-ladder handshake.
+  16 serverless tests, clippy/fmt clean, live handshake green vs pinned `0.3.0.dev0`.
+  Both seam reviews applied (gpt-5.5 codegen; gemini-3.1-pro final → 3 error-soundness
+  fixes). Gotchas in memory `lens-client-foundation-gotchas`.
+- **NEXT: execute lens-client REST surface (Plans 2a–2e)** (fresh session, subagent-driven) —
+  `docs/superpowers/plans/2026-06-25-lens-client-plan2{a,b,c,d,e}-*.md`. 2a=events write
+  path (fully specified); 2b=sessions read; 2c=lifecycle; 2d=resources/terminals/comments;
+  2e=registries. Decision baked in: reads return **typed wrappers (private fields +
+  typed getters), never `serde_json::Value` to consumers**; grow accessors lazily from
+  omnigent source (2d/2e carry ⚠ field-verify notes). Writes reuse generated request types.
+- **⚠ CHECKPOINT before Plan 3 (SSE taxonomy/state-model):** reassess tracking
+  `0.3.0.dev0` vs waiting for a `0.3.0` release tag. The REST surface (2a–2e) is cheap +
+  re-vendor-safe; the streaming taxonomy encodes the semantically-unstable parts (3 status
+  vocabularies, partial-merge child summaries, the events body) where dev0 churn is
+  expensive. Build REST now; gate the taxonomy investment on a conscious dev0-vs-0.3.0 call.
 - **Doc walkthrough complete** (all 11 design docs in `docs/design/` reviewed);
   every surfaced decision is resolved or consciously deferred.
 - **Deferred, with a clean seam:**
