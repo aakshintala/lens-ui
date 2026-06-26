@@ -641,6 +641,27 @@ impl CreatedSessionResponse {
     }
 }
 
+/// Response of `DELETE /v1/sessions/{id}` (omnigent `ConversationDeleted`).
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct ConversationDeleted {
+    id: SessionId,
+    #[serde(default)]
+    object: String,
+    #[serde(default)]
+    deleted: bool,
+}
+impl ConversationDeleted {
+    pub fn id(&self) -> &SessionId {
+        &self.id
+    }
+    pub fn object(&self) -> &str {
+        &self.object
+    }
+    pub fn deleted(&self) -> bool {
+        self.deleted
+    }
+}
+
 /// The session subservice — borrows the `Client` for the duration of a call.
 pub struct Sessions<'a> {
     client: &'a Client,
@@ -705,6 +726,33 @@ impl<'a> Sessions<'a> {
             );
         self.client
             .send_multipart(reqwest::Method::POST, "/v1/sessions", form)
+    }
+
+    /// `PATCH /v1/sessions/{id}` — update mutable session fields. Returns the
+    /// updated snapshot. Build `req` from `lens_client::generated::UpdateSessionRequest`
+    /// (fields: `runner_id`, `archived`, `silent`, `labels`, `model_override`,
+    /// `reasoning_effort`, `collaboration_mode`, `terminal_launch_args`, …).
+    pub fn patch(
+        &self,
+        id: &SessionId,
+        req: &crate::generated::UpdateSessionRequest,
+    ) -> Result<SessionSnapshot> {
+        self.client.send_json(
+            reqwest::Method::PATCH,
+            &format!("/v1/sessions/{id}"),
+            &[],
+            Some(req),
+        )
+    }
+
+    /// `DELETE /v1/sessions/{id}` — delete; `delete_branch` cleans the worktree.
+    pub fn delete(&self, id: &SessionId, delete_branch: bool) -> Result<ConversationDeleted> {
+        self.client.send_json::<ConversationDeleted, ()>(
+            reqwest::Method::DELETE,
+            &format!("/v1/sessions/{id}"),
+            &[("delete_branch", delete_branch.to_string())],
+            None,
+        )
     }
 
     /// `POST /v1/sessions/{id}/events` — submit a typed event. Returns the
@@ -991,6 +1039,15 @@ mod tests {
                 .unwrap();
         assert_eq!(r.session_id().as_str(), "s1");
         assert_eq!(r.agent_name(), "A");
+    }
+
+    #[test]
+    fn conversation_deleted_parses() {
+        let d: ConversationDeleted =
+            serde_json::from_str(r#"{"id":"s1","object":"conversation.deleted","deleted":true}"#)
+                .unwrap();
+        assert_eq!(d.id().as_str(), "s1");
+        assert!(d.deleted());
     }
 
     #[test]
