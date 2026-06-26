@@ -74,4 +74,45 @@ impl Client {
         let body = resp.text()?;
         crate::http::decode_json(path, status, &body)
     }
+
+    /// Send a request with an optional JSON body, mapping status → typed errors.
+    /// `body: None::<&()>` for verbs without a body.
+    #[allow(dead_code)] // used by Sessions create/lifecycle methods (Tasks 2-6)
+    pub(crate) fn send_json<T, B>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        query: &[(&str, String)],
+        body: Option<&B>,
+    ) -> crate::error::Result<T>
+    where
+        T: serde::de::DeserializeOwned,
+        B: serde::Serialize,
+    {
+        let url = self.conn().url(path)?;
+        let mut rb = self.http().request(method, url).query(query);
+        if let Some(b) = body {
+            rb = rb.json(b);
+        }
+        let resp = self.conn().auth.apply(rb).send()?;
+        let status = resp.status().as_u16();
+        let text = resp.text()?;
+        crate::http::decode_json(path, status, &text)
+    }
+
+    /// Send a multipart/form-data request (bundle uploads).
+    #[allow(dead_code)] // used by Sessions create/lifecycle methods (Tasks 2-6)
+    pub(crate) fn send_multipart<T: serde::de::DeserializeOwned>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        form: reqwest::blocking::multipart::Form,
+    ) -> crate::error::Result<T> {
+        let url = self.conn().url(path)?;
+        let rb = self.http().request(method, url).multipart(form);
+        let resp = self.conn().auth.apply(rb).send()?;
+        let status = resp.status().as_u16();
+        let text = resp.text()?;
+        crate::http::decode_json(path, status, &text)
+    }
 }
