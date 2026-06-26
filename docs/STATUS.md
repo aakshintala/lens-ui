@@ -48,7 +48,11 @@ and roll older "Recent" pointers off this page as they age.
      raw corpus under `docs/spikes/captures/2026-06-26-sse/`; memory `plan3-sse-capture-findings`.
   2. **Split by stability** — reader-thread + reconnect plumbing is already de-risked (transport
      spike: subscribe-first + mid-stream-drop recovery), build confidently; gate only the
-     semantic event union on the captures.
+     semantic event union on the captures. **Plan 3a written** (2026-06-26,
+     [`docs/superpowers/plans/2026-06-26-lens-client-plan3a-sse-transport.md`](./superpowers/plans/2026-06-26-lens-client-plan3a-sse-transport.md)):
+     6 tasks — pure SSE frame parser, `ServerStreamEvent` taxonomy from bytes (incl. the 3
+     capture corrections), reader-thread/`EventStream` bridge, schema-derived variants flagged.
+     Normalization (§7a) + no-replay reconnect (§7) = Plan 3b; contract-drift CI = Plan 3c.
   3. **Stand up contract-drift CI** (outstanding B6) — the passive alarm that makes tracking
      dev0 safe when `0.3.0` eventually tags.
   - composer-2.5 is weakest on temporal/stateful logic (`[[composer-delegation-profile]]`) — Plan 3
