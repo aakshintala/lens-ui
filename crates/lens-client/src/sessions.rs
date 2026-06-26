@@ -1325,6 +1325,52 @@ impl<'a> Sessions<'a> {
         )?;
         Ok(())
     }
+
+    pub fn policies(&self, id: &SessionId) -> Result<crate::registries::PolicyList> {
+        self.client
+            .get_json(&format!("/v1/sessions/{id}/policies"), &[])
+    }
+    pub fn create_policy(
+        &self,
+        id: &SessionId,
+        req: &crate::generated::CreateSessionPolicyRequest,
+    ) -> Result<crate::registries::PolicyObject> {
+        self.client.send_json(
+            reqwest::Method::POST,
+            &format!("/v1/sessions/{id}/policies"),
+            &[],
+            Some(req),
+        )
+    }
+    pub fn session_policy(
+        &self,
+        id: &SessionId,
+        policy_id: &crate::ids::PolicyId,
+    ) -> Result<crate::registries::PolicyObject> {
+        self.client
+            .get_json(&format!("/v1/sessions/{id}/policies/{policy_id}"), &[])
+    }
+    pub fn delete_policy(&self, id: &SessionId, policy_id: &crate::ids::PolicyId) -> Result<()> {
+        let _: serde_json::Value = self.client.send_json::<serde_json::Value, ()>(
+            reqwest::Method::DELETE,
+            &format!("/v1/sessions/{id}/policies/{policy_id}"),
+            &[],
+            None,
+        )?;
+        Ok(())
+    }
+    pub fn evaluate_policy(
+        &self,
+        id: &SessionId,
+        input: &serde_json::Value,
+    ) -> Result<crate::registries::PolicyEvaluation> {
+        self.client.send_json(
+            reqwest::Method::POST,
+            &format!("/v1/sessions/{id}/policies/evaluate"),
+            &[],
+            Some(input),
+        )
+    }
 }
 
 #[cfg(test)]

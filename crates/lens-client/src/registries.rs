@@ -4,7 +4,7 @@
 
 use crate::client::Client;
 use crate::error::Result;
-use crate::ids::{HostId, RunnerId};
+use crate::ids::{HostId, PolicyId, RunnerId};
 
 /// `GET /v1/runners/{id}/status` (`runner_tunnel.py:234-265`).
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -91,6 +91,30 @@ impl RunnerLaunchResult {
     }
 }
 
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct PolicyObject {
+    id: PolicyId,
+}
+impl PolicyObject {
+    pub fn id(&self) -> &PolicyId {
+        &self.id
+    }
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct PolicyList {
+    #[serde(default)]
+    pub data: Vec<PolicyObject>,
+    #[serde(default)]
+    pub has_more: bool,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct PolicyRegistry {}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct PolicyEvaluation {}
+
 impl Client {
     pub fn runner_status(&self, runner_id: &RunnerId) -> Result<RunnerStatus> {
         self.get_json(&format!("/v1/runners/{runner_id}/status"), &[])
@@ -148,6 +172,31 @@ impl Client {
             Some(req),
         )
     }
+
+    pub fn list_policies(&self) -> Result<PolicyList> {
+        self.get_json("/v1/policies", &[])
+    }
+    pub fn create_policy(
+        &self,
+        req: &crate::generated::CreateDefaultPolicyRequest,
+    ) -> Result<PolicyObject> {
+        self.send_json(reqwest::Method::POST, "/v1/policies", &[], Some(req))
+    }
+    pub fn policy(&self, id: &PolicyId) -> Result<PolicyObject> {
+        self.get_json(&format!("/v1/policies/{id}"), &[])
+    }
+    pub fn delete_policy(&self, id: &PolicyId) -> Result<()> {
+        let _: serde_json::Value = self.send_json::<serde_json::Value, ()>(
+            reqwest::Method::DELETE,
+            &format!("/v1/policies/{id}"),
+            &[],
+            None,
+        )?;
+        Ok(())
+    }
+    pub fn policy_registry(&self) -> Result<PolicyRegistry> {
+        self.get_json("/v1/policy-registry", &[])
+    }
 }
 
 #[cfg(test)]
@@ -182,5 +231,11 @@ mod tests {
         assert_eq!(list.data[0].id, "ag");
         assert_eq!(list.data[0].name, "A");
         assert!(!list.has_more);
+    }
+
+    #[test]
+    fn policy_object_parses_id() {
+        let p: PolicyObject = serde_json::from_str(r#"{"id":"pol_1"}"#).unwrap();
+        assert_eq!(p.id().as_str(), "pol_1");
     }
 }
