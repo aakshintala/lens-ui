@@ -133,9 +133,102 @@ struct RawInterruptedData {
     #[serde(default)]
     requested_at: Option<i64>,
 }
+#[derive(Deserialize)]
+struct RawTextDelta {
+    delta: String,
+    #[serde(default)]
+    message_id: Option<String>,
+    #[serde(default)]
+    index: Option<usize>,
+    #[serde(default, rename = "final")]
+    last: Option<bool>,
+}
+#[derive(Deserialize)]
+struct RawItemEnvelope {
+    item: serde_json::Value,
+}
+#[derive(Deserialize)]
+struct RawContentBlock {
+    #[serde(rename = "type")]
+    block_type: String,
+    #[serde(default)]
+    text: Option<String>,
+}
+#[derive(Deserialize)]
+struct RawErrorData {
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+}
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum ResponseEvent {} // filled in Task 4
+pub enum ResponseEvent {
+    InProgress,
+    Completed,
+    OutputTextDelta {
+        delta: String,
+        message_id: Option<String>,
+        index: Option<usize>,
+        last: Option<bool>,
+    },
+    ReasoningStarted,
+    OutputItemDone {
+        item: Item,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Item {
+    Message {
+        id: String,
+        role: String,
+        content: Vec<MessageContentBlock>,
+    },
+    /// `arguments` is the raw JSON string as it arrives on the wire (unparsed —
+    /// the state model owns parsing). `agent` is a wire wart: it is the
+    /// `resp_…` response id while `status == "in_progress"`, and the agent name
+    /// once `completed`. Exposed verbatim; consumers must not assume a name.
+    FunctionCall {
+        id: String,
+        call_id: String,
+        name: String,
+        arguments: String,
+        status: String,
+        agent: Option<String>,
+    },
+    FunctionCallOutput {
+        id: String,
+        call_id: String,
+        output: String,
+    },
+    Error {
+        id: String,
+        source: Option<String>,
+        code: Option<String>,
+        message: Option<String>,
+    },
+    /// Forward-compat for item types not yet modeled (native_tool, reasoning,
+    /// compaction, slash_command, terminal_command, resource_event) — added in
+    /// Task 6 / at config-time capture.
+    Other { item_type: String },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MessageContentBlock {
+    block_type: String,
+    text: Option<String>,
+}
+impl MessageContentBlock {
+    pub fn block_type(&self) -> &str {
+        &self.block_type
+    }
+    pub fn text(&self) -> Option<&str> {
+        self.text.as_deref()
+    }
+}
 
 /// Total: maps a raw frame to a typed event, degrading to `Unknown` on any
 /// unmodeled type or deserialization failure. Modeled-family dispatch is added
@@ -220,9 +313,104 @@ impl SessionEvent {
     }
 }
 impl ResponseEvent {
-    fn from_frame(_frame: &SseFrame) -> Option<Self> {
-        None
-    } // Task 4 fills this
+    fn from_frame(frame: &SseFrame) -> Option<Self> {
+        let d = &frame.data;
+        Some(match frame.event.as_str() {
+            "response.in_progress" => ResponseEvent::InProgress,
+            "response.completed" => ResponseEvent::Completed,
+            "response.reasoning.started" => ResponseEvent::ReasoningStarted,
+            "response.output_text.delta" => {
+                let r: RawTextDelta = serde_json::from_str(d).ok()?;
+                ResponseEvent::OutputTextDelta {
+                    delta: r.delta,
+                    message_id: r.message_id,
+                    index: r.index,
+                    last: r.last,
+                }
+            }
+            "response.output_item.done" => {
+                let env: RawItemEnvelope = serde_json::from_str(d).ok()?;
+                ResponseEvent::OutputItemDone {
+                    item: Item::from_value(env.item),
+                }
+            }
+            _ => return None,
+        })
+    }
+}
+
+impl Item {
+    /// Total over a wire item object; unmodeled `type`s map to `Other`.
+    fn from_value(v: serde_json::Value) -> Self {
+        let id = v
+            .get("id")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let item_type = v
+            .get("type")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let s = |k: &str| {
+            v.get(k)
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        let so = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
+        match item_type.as_str() {
+            "message" => {
+                let content = v
+                    .get("content")
+                    .and_then(|c| serde_json::from_value::<Vec<RawContentBlock>>(c.clone()).ok())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|b| MessageContentBlock {
+                        block_type: b.block_type,
+                        text: b.text,
+                    })
+                    .collect();
+                Item::Message {
+                    id,
+                    role: s("role"),
+                    content,
+                }
+            }
+            "function_call" => Item::FunctionCall {
+                id,
+                call_id: s("call_id"),
+                name: s("name"),
+                arguments: s("arguments"),
+                status: s("status"),
+                agent: so("agent"),
+            },
+            "function_call_output" => Item::FunctionCallOutput {
+                id,
+                call_id: s("call_id"),
+                output: s("output"),
+            },
+            "error" => {
+                let data = v
+                    .get("data")
+                    .and_then(|x| serde_json::from_value::<RawErrorData>(x.clone()).ok())
+                    .unwrap_or(RawErrorData {
+                        source: None,
+                        code: None,
+                        message: None,
+                    });
+                Item::Error {
+                    id,
+                    source: data.source,
+                    code: data.code,
+                    message: data.message,
+                }
+            }
+            other => Item::Other {
+                item_type: other.to_string(),
+            },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -335,5 +523,144 @@ mod tests {
             e,
             ServerStreamEvent::Session(SessionEvent::Interrupted { .. })
         )));
+    }
+
+    #[test]
+    fn output_text_delta_from_bytes() {
+        let ev = parse_event(&frame(
+            "response.output_text.delta",
+            r#"{"sequence_number":4,"delta":"Hello","message_id":null,"index":null,"final":null}"#,
+        ));
+        assert_eq!(
+            ev,
+            ServerStreamEvent::Response(ResponseEvent::OutputTextDelta {
+                delta: "Hello".into(),
+                message_id: None,
+                index: None,
+                last: None,
+            })
+        );
+    }
+
+    #[test]
+    fn output_item_done_function_call_keeps_arguments_as_string() {
+        let ev = parse_event(&frame(
+            "response.output_item.done",
+            r#"{"item":{"id":"fc_1","type":"function_call","status":"completed","name":"sys_os_shell","arguments":"{\"command\":\"pwd\"}","call_id":"toolu_1","agent":"claude-sdk"}}"#,
+        ));
+        match ev {
+            ServerStreamEvent::Response(ResponseEvent::OutputItemDone {
+                item:
+                    Item::FunctionCall {
+                        name,
+                        arguments,
+                        call_id,
+                        agent,
+                        ..
+                    },
+            }) => {
+                assert_eq!(name, "sys_os_shell");
+                assert_eq!(arguments, r#"{"command":"pwd"}"#); // raw JSON string, unparsed
+                assert_eq!(call_id, "toolu_1");
+                assert_eq!(agent.as_deref(), Some("claude-sdk"));
+            }
+            other => panic!("wrong event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn output_item_done_message_and_output() {
+        let m = parse_event(&frame(
+            "response.output_item.done",
+            r#"{"item":{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"hi"}]}}"#,
+        ));
+        assert!(matches!(
+            m,
+            ServerStreamEvent::Response(ResponseEvent::OutputItemDone {
+                item: Item::Message { .. }
+            })
+        ));
+        let o = parse_event(&frame(
+            "response.output_item.done",
+            r#"{"item":{"id":"fco_1","type":"function_call_output","call_id":"toolu_1","output":"/work"}}"#,
+        ));
+        assert!(matches!(
+            o,
+            ServerStreamEvent::Response(ResponseEvent::OutputItemDone {
+                item: Item::FunctionCallOutput { .. }
+            })
+        ));
+    }
+
+    #[test]
+    fn error_item_from_bytes() {
+        let ev = parse_event(&frame(
+            "response.output_item.done",
+            r#"{"item":{"id":"err_1","type":"error","status":"completed","data":{"source":"execution","code":"RuntimeError","message":"boom"}}}"#,
+        ));
+        match ev {
+            ServerStreamEvent::Response(ResponseEvent::OutputItemDone {
+                item:
+                    Item::Error {
+                        code,
+                        message,
+                        source,
+                        ..
+                    },
+            }) => {
+                assert_eq!(code.as_deref(), Some("RuntimeError"));
+                assert_eq!(message.as_deref(), Some("boom"));
+                assert_eq!(source.as_deref(), Some("execution"));
+            }
+            other => panic!("wrong event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unmodeled_item_type_becomes_other_not_panic() {
+        let ev = parse_event(&frame(
+            "response.output_item.done",
+            r#"{"item":{"id":"x","type":"native_tool","kind":"web_search_call"}}"#,
+        ));
+        assert!(matches!(
+            ev,
+            ServerStreamEvent::Response(ResponseEvent::OutputItemDone {
+                item: Item::Other { .. }
+            })
+        ));
+    }
+
+    #[test]
+    fn happy_path_fixture_full_event_coverage() {
+        let bytes = include_bytes!("../../tests/fixtures/sse/happy_path.stream.sse");
+        let mut p = super::super::sse::SseParser::default();
+        let mut frames = p.push(bytes);
+        frames.extend(p.finish());
+        let events: Vec<_> = frames.iter().map(parse_event).collect();
+        // No event in the captured happy-path turn falls through to Unknown.
+        let unknowns: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                ServerStreamEvent::Unknown { event_type } => Some(event_type.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            unknowns.is_empty(),
+            "unmodeled captured events: {unknowns:?}"
+        );
+        // The item union is exercised: function_call, message, function_call_output all present.
+        let has = |pred: fn(&Item) -> bool| {
+            events.iter().any(|e| {
+                matches!(
+                    e,
+                    ServerStreamEvent::Response(ResponseEvent::OutputItemDone { item })
+                        if pred(item)
+                )
+            })
+        };
+        assert!(has(|i| matches!(i, Item::FunctionCall { .. })));
+        assert!(has(|i| matches!(i, Item::Message { .. })));
+        assert!(has(|i| matches!(i, Item::FunctionCallOutput { .. })));
     }
 }
