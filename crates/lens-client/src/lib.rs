@@ -5,7 +5,9 @@
 pub mod connection;
 pub mod error;
 pub mod generated;
+pub mod http;
 pub mod ids;
+pub mod info;
 
 /// The omnigent contract version this crate is pinned to (ADR-0001).
 pub const PINNED_OMNIGENT_VERSION: &str = "0.3.0.dev0";
