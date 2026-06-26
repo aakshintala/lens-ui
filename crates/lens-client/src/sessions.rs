@@ -12,6 +12,8 @@ use serde_json::{Map, Value, json};
 use crate::client::Client;
 use crate::error::Result;
 use crate::http::decode_json;
+use std::collections::BTreeMap;
+
 use crate::ids::{ElicitationId, SessionId};
 
 /// Session status as reported by the REST surface (snapshot + list). Only three
@@ -24,6 +26,65 @@ pub enum SessionStatus {
     Idle,
     Running,
     Failed,
+}
+
+/// A session snapshot (`GET /v1/sessions/{id}`). Mirrors the CORE fields of
+/// omnigent's `SessionResponse` (`schemas.py:1601-1642`); unmodeled fields are
+/// ignored. Fields are private — access is via the typed getters, so the wire
+/// shape stays an lens-client implementation detail (single edit site for drift).
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct SessionSnapshot {
+    id: SessionId,
+    status: SessionStatus,
+    agent_id: String,
+    #[serde(default)]
+    agent_name: Option<String>,
+    #[serde(default)]
+    archived: bool,
+    created_at: i64,
+    #[serde(default)]
+    labels: BTreeMap<String, String>,
+    #[serde(default)]
+    runner_online: Option<bool>,
+    #[serde(default)]
+    host_online: Option<bool>,
+    #[serde(default)]
+    host_resumable: bool,
+}
+
+impl SessionSnapshot {
+    pub fn id(&self) -> &SessionId {
+        &self.id
+    }
+    pub fn status(&self) -> SessionStatus {
+        self.status
+    }
+    pub fn agent_id(&self) -> &str {
+        &self.agent_id
+    }
+    pub fn agent_name(&self) -> Option<&str> {
+        self.agent_name.as_deref()
+    }
+    pub fn archived(&self) -> bool {
+        self.archived
+    }
+    /// Creation time, epoch **seconds**.
+    pub fn created_at(&self) -> i64 {
+        self.created_at
+    }
+    pub fn labels(&self) -> &BTreeMap<String, String> {
+        &self.labels
+    }
+    /// `Some` only when the snapshot was fetched with `include_liveness` (default true).
+    pub fn runner_online(&self) -> Option<bool> {
+        self.runner_online
+    }
+    pub fn host_online(&self) -> Option<bool> {
+        self.host_online
+    }
+    pub fn host_resumable(&self) -> bool {
+        self.host_resumable
+    }
 }
 
 /// Ack for `POST /v1/sessions/{id}/events` (HTTP 202). The openapi declares an
@@ -402,6 +463,27 @@ mod tests {
         );
         // "waiting" is collapsed to "running" server-side and never reaches REST; reject it.
         assert!(serde_json::from_value::<SessionStatus>(json!("waiting")).is_err());
+    }
+
+    #[test]
+    fn session_snapshot_parses_core_fields_and_liveness() {
+        let body = r#"{
+            "id": "sess_1", "status": "running", "agent_id": "ag_1",
+            "agent_name": "Builder", "archived": false, "created_at": 1719331200,
+            "labels": {"env": "prod"}, "runner_online": true, "host_online": null,
+            "host_resumable": false, "extra_unmodeled_field": 99
+        }"#;
+        let s: SessionSnapshot = serde_json::from_str(body).unwrap();
+        assert_eq!(s.id().as_str(), "sess_1");
+        assert_eq!(s.status(), SessionStatus::Running);
+        assert_eq!(s.agent_id(), "ag_1");
+        assert_eq!(s.agent_name(), Some("Builder"));
+        assert!(!s.archived());
+        assert_eq!(s.created_at(), 1719331200);
+        assert_eq!(s.labels().get("env").map(String::as_str), Some("prod"));
+        assert_eq!(s.runner_online(), Some(true));
+        assert_eq!(s.host_online(), None);
+        assert!(!s.host_resumable());
     }
 
     #[test]
