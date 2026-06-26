@@ -9,6 +9,11 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Open threads & next up
 
+- **NEXT: execute lens-client Foundation** (separate session) —
+  plan `docs/superpowers/plans/2026-06-25-lens-client-foundation.md`;
+  execution handoff `docs/handoffs/2026-06-25-lens-client-foundation-execution.md`
+  (subagent-driven, composer-2.5 build, Opus reviews each task, cross-family
+  review at end/seams). Build decisions: `docs/design/typed-client-implementation.md`.
 - **Doc walkthrough complete** (all 11 design docs in `docs/design/` reviewed);
   every surfaced decision is resolved or consciously deferred.
 - **Deferred, with a clean seam:**
@@ -34,6 +39,14 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Recent
 
+- **2026-06-25 (pm)** — omnigent contract-pinning decided (ADR-0001: freeze a
+  commit, not the moving `0.3.0.dev0`; lock to release tags from `0.3.0`).
+  Confirmed the "removed" elicitation/permission routes were only hidden from
+  the openapi reference (`include_in_schema=False`), still ap-web-used → still
+  contract. lens-client foundation brainstormed → spec
+  (`typed-client-implementation.md`, decisions D1–D4: typify one-shot codegen;
+  sync/blocking, no tokio; local xtask verification; coarse dev0 gate) → Plan 1
+  written. Fixed two `typed-client.md` drifts (stale ~8 stream cap; async→sync).
 - **2026-06-25** — Cargo workspace stood up (edition 2024, spikes/ vs crates/
   lint wall); omnigent pinned-source install + `installing-omnigent-from-source`
   skill; **transport-stability spike** (throwaway harness, Opus-spec →

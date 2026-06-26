@@ -58,8 +58,14 @@ themselves are outstanding.
 ### 5. Contract-drift CI (B6 / Phase 0)
 `openapi.json` + an `OMNIGENT_PIN` file are vendored. **Still needed:** a CI job
 that diffs the vendored copy (path enumeration + SSE schema) against the sibling
-omnigent pin so the contract can't silently drift. Needs your CI. Also decide:
-does the pin **track a moving `0.3.0.dev0`** or **freeze a specific commit**?
+omnigent pin so the contract can't silently drift. Needs your CI.
+
+**Pin policy RESOLVED (2026-06-25):** freeze a specific commit, not the moving
+`0.3.0.dev0` label — see `docs/adr/0001-omnigent-contract-pinning.md`. Canonical
+pin is the Source HEAD commit; `openapi.json` is a generated artifact; advance
+per feature-slice; switch to release-pinning when upstream tags `0.3.0`. The
+drift-CI above is still outstanding (it becomes the "passive alarm" the ADR
+relies on).
 
 ---
 

@@ -191,9 +191,11 @@ replacing it.
 
 `GET /v1/sessions/{id}/stream` (openapi:7819). **Live-tail, no replay** — the
 server does not buffer past events. The crate opens one stream per *active*
-session; the state model's liveness layer (Active/Sleeping cap, default ~8
-concurrent streams per connection) decides which sessions are active. Sleeping
-sessions are repoll-ed for status via `GET /v1/sessions`.
+session; the state model's liveness layer decides which sessions are active —
+**no hard stream cap**: the active set self-bounds via 10-min terminal-aware
+auto-sleep (state-model §3.3). (An earlier draft cited a "~8 concurrent streams"
+cap; that cap was removed — do not reintroduce it.) Sleeping sessions are
+repoll-ed for status via `GET /v1/sessions`.
 
 Every event carries `sequence_number: Option<i64>` for dedup. Heartbeats carry
 additional gap-detection fields:
@@ -510,6 +512,14 @@ version bump, not a production release.
 ---
 
 ## 10. The typed Rust API surface (sketch)
+
+> **Runtime note (decided 2026-06-25, see `typed-client-implementation.md`):** the
+> public methods are **blocking/synchronous** `fn`, not `async fn`. The `async fn`
+> in the sketch below is illustrative of the *shape*, not the signature — callers
+> offload to background threads at the gpui seam (one thread per active session).
+> `lens-client` pulls in no async runtime; SSE/WS use dedicated blocking OS
+> threads → `std::sync::mpsc` → UI poller. Async/tokio/flume is a deferred,
+> seam-local change to revisit only if stream fan-out reaches the thousands.
 
 The crate's public surface to the rest of Lens:
 
