@@ -79,6 +79,18 @@ pub struct HostList {
     pub has_more: bool,
 }
 
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct RunnerLaunchResult {
+    #[serde(default)]
+    runner_id: Option<RunnerId>,
+    // ⚠ confirm the launch response shape (runner_id? status?) from sessions/host source.
+}
+impl RunnerLaunchResult {
+    pub fn runner_id(&self) -> Option<&RunnerId> {
+        self.runner_id.as_ref()
+    }
+}
+
 impl Client {
     pub fn runner_status(&self, runner_id: &RunnerId) -> Result<RunnerStatus> {
         self.get_json(&format!("/v1/runners/{runner_id}/status"), &[])
@@ -120,6 +132,21 @@ impl Client {
             None => format!("/v1/hosts/{host_id}/filesystem"),
         };
         self.get_json(&p, &[])
+    }
+
+    /// `POST /v1/hosts/{id}/runners` — launch a runner. `req` = generated
+    /// `LaunchRunnerRequest {session_id, workspace, git?}`.
+    pub fn launch_runner(
+        &self,
+        host_id: &HostId,
+        req: &crate::generated::LaunchRunnerRequest,
+    ) -> Result<RunnerLaunchResult> {
+        self.send_json(
+            reqwest::Method::POST,
+            &format!("/v1/hosts/{host_id}/runners"),
+            &[],
+            Some(req),
+        )
     }
 }
 
