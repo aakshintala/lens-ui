@@ -44,14 +44,15 @@ impl Client {
         &self.info
     }
 
+    /// The session subservice (`POST /events`, and read methods in later plans).
+    pub fn sessions(&self) -> crate::sessions::Sessions<'_> {
+        crate::sessions::Sessions::new(self)
+    }
+
     /// Internal accessors for later REST modules.
-    // Consumed by Plan 2 (REST surface); allow until then.
-    #[allow(dead_code)]
     pub(crate) fn conn(&self) -> &Connection {
         &self.conn
     }
-    // Consumed by Plan 2 (REST surface); allow until then.
-    #[allow(dead_code)]
     pub(crate) fn http(&self) -> &reqwest::blocking::Client {
         &self.http
     }

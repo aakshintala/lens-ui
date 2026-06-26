@@ -17,4 +17,4 @@ pub const PINNED_OMNIGENT_VERSION: &str = "0.3.0.dev0";
 pub use client::Client;
 pub use connection::{Auth, Connection};
 pub use error::{ClientError, Result};
-pub use sessions::{ElicitationAction, SendEventAck, SessionEventInput};
+pub use sessions::{ElicitationAction, SendEventAck, SessionEventInput, Sessions};

@@ -9,7 +9,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use crate::ids::ElicitationId;
+use crate::client::Client;
+use crate::error::Result;
+use crate::http::decode_json;
+use crate::ids::{ElicitationId, SessionId};
 
 /// Ack for `POST /v1/sessions/{id}/events` (HTTP 202). The openapi declares an
 /// empty body, but the route always returns a small JSON ack — model it with
@@ -184,6 +187,31 @@ pub const ALLOWED_EVENT_TYPES: [&str; 30] = [
     "stop_session",
     "terminal_command",
 ];
+
+/// The session subservice — borrows the `Client` for the duration of a call.
+pub struct Sessions<'a> {
+    client: &'a Client,
+}
+
+impl<'a> Sessions<'a> {
+    pub(crate) fn new(client: &'a Client) -> Self {
+        Self { client }
+    }
+
+    /// `POST /v1/sessions/{id}/events` — submit a typed event. Returns the
+    /// server's ack (queued/item_id/denial). Blocking.
+    pub fn send_event(&self, id: &SessionId, evt: &SessionEventInput) -> Result<SendEventAck> {
+        let conn = self.client.conn();
+        let url = conn.url(&format!("/v1/sessions/{id}/events"))?;
+        let resp = conn
+            .auth
+            .apply(self.client.http().post(url).json(&evt.to_json()))
+            .send()?;
+        let status = resp.status().as_u16();
+        let body = resp.text()?;
+        decode_json("sessions/events", status, &body)
+    }
+}
 
 #[cfg(test)]
 mod tests {
