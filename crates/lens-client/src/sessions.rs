@@ -11,6 +11,32 @@ use serde_json::{Map, Value, json};
 
 use crate::ids::ElicitationId;
 
+/// Ack for `POST /v1/sessions/{id}/events` (HTTP 202). The openapi declares an
+/// empty body, but the route always returns a small JSON ack — model it with
+/// defaults so an empty or future-extended body still deserializes.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct SendEventAck {
+    /// Whether the event was queued to the runner. Control events report `false`.
+    #[serde(default)]
+    pub queued: bool,
+    /// Store item id for persisted item events (`message`, …). For
+    /// `function_call_output` this echoes the `call_id`.
+    #[serde(default)]
+    pub item_id: Option<String>,
+    /// Pending id for the native-terminal `message` bypass path.
+    #[serde(default)]
+    pub pending_id: Option<String>,
+    /// Set when a policy denied a user `message`.
+    #[serde(default)]
+    pub denied: bool,
+    /// Human-readable denial reason (paired with `denied`).
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// Elicitation id for the `mcp_elicitation` path.
+    #[serde(default)]
+    pub elicitation_id: Option<String>,
+}
+
 /// Consumer reply action for an `approval` event (MCP `ElicitResult` semantics).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -292,5 +318,41 @@ mod tests {
                 evt.discriminator()
             );
         }
+    }
+
+    #[test]
+    fn ack_parses_queued_with_item_id() {
+        let ack: SendEventAck =
+            serde_json::from_str(r#"{"queued": true, "item_id": "item_42"}"#).unwrap();
+        assert!(ack.queued);
+        assert_eq!(ack.item_id.as_deref(), Some("item_42"));
+        assert!(!ack.denied);
+    }
+
+    #[test]
+    fn ack_parses_control_event_not_queued() {
+        let ack: SendEventAck = serde_json::from_str(r#"{"queued": false}"#).unwrap();
+        assert!(!ack.queued);
+        assert_eq!(ack.item_id, None);
+    }
+
+    #[test]
+    fn ack_parses_policy_denial() {
+        let ack: SendEventAck =
+            serde_json::from_str(r#"{"queued": false, "denied": true, "reason": "blocked"}"#)
+                .unwrap();
+        assert!(ack.denied);
+        assert_eq!(ack.reason.as_deref(), Some("blocked"));
+    }
+
+    #[test]
+    fn ack_tolerates_unknown_and_missing_fields() {
+        // Empty body (openapi's under-specified `{}`) must still deserialize.
+        let ack: SendEventAck = serde_json::from_str("{}").unwrap();
+        assert!(!ack.queued);
+        // Unknown extra fields are ignored, not an error.
+        let ack2: SendEventAck =
+            serde_json::from_str(r#"{"queued": true, "future_field": 1}"#).unwrap();
+        assert!(ack2.queued);
     }
 }
