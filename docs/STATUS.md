@@ -53,6 +53,18 @@ and roll older "Recent" pointers off this page as they age.
      6 tasks — pure SSE frame parser, `ServerStreamEvent` taxonomy from bytes (incl. the 3
      capture corrections), reader-thread/`EventStream` bridge, schema-derived variants flagged.
      Normalization (§7a) + no-replay reconnect (§7) = Plan 3b; contract-drift CI = Plan 3c.
+     - **Plan 3a EXECUTED & COMPLETE** (2026-06-26, subagent-driven: composer-2.5 build +
+       per-task cross-family review gpt-5.5/gemini-3.1-pro; `67541a5..f0c5431`, 9 commits).
+       85 lib tests + live `live_stream` pass vs warm claude-sdk session; fmt + clippy
+       `--all-targets` clean. Final review (gpt-5.5) caught 3 real Important bugs — **split-UTF-8
+       corruption** (per-chunk lossy decode → parser reworked to a `Vec<u8>` byte-buffer with a
+       mid-codepoint TDD test), an `unwrap_err`/`unreachable!` **panic path** in `Sessions::stream`
+       (now a panic-free `match check_status`), and **`Todos`/`SandboxStatus` dropping their
+       payload** (now typed subsets, no `Value`) — all fixed + re-reviewed. The cross-family
+       review earned its keep: composer's own "drop joins the reader" self-concern was factually
+       wrong (JoinHandle drop detaches), caught by the reviewer.
+     - **Deferred to Plan 3b** (3 Minors): redundant `serde(default)` on `Option`; `try_recv`
+       idle-vs-closed liveness signal; reqwest read-timeout vs reader-thread leak on a hard hang.
   3. **Stand up contract-drift CI** (outstanding B6) — the passive alarm that makes tracking
      dev0 safe when `0.3.0` eventually tags.
   - composer-2.5 is weakest on temporal/stateful logic (`[[composer-delegation-profile]]`) — Plan 3
