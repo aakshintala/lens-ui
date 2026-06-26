@@ -3,9 +3,6 @@
 //! Live-tail, no-replay (transport spike §4): framing must wait for a full
 //! `\n\n`-terminated frame, never match on a raw substring.
 
-// Consumed by stream reader (Task 5); allow until then.
-#![allow(dead_code)]
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SseFrame {
     pub event: String,
@@ -18,10 +15,6 @@ pub(crate) struct SseParser {
 }
 
 impl SseParser {
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
     /// Feed a byte chunk; return any frames completed (`\n\n`-terminated) by it.
     /// A trailing partial frame stays buffered for the next chunk.
     pub(crate) fn push(&mut self, bytes: &[u8]) -> Vec<SseFrame> {
@@ -71,7 +64,7 @@ mod tests {
 
     #[test]
     fn parses_a_single_frame() {
-        let mut p = SseParser::new();
+        let mut p = SseParser::default();
         let frames = p.push(b"event: session.status\ndata: {\"status\":\"idle\"}\n\n");
         assert_eq!(
             frames,

@@ -1084,6 +1084,31 @@ impl<'a> Sessions<'a> {
         )
     }
 
+    /// Open the live SSE event stream for a session. Live-tail, no-replay:
+    /// the caller must subscribe BEFORE posting the message that should be
+    /// observed (transport spike §4). Returns an `EventStream` whose reader
+    /// thread is already running.
+    pub fn stream(
+        &self,
+        id: &crate::ids::SessionId,
+    ) -> crate::error::Result<crate::stream::EventStream> {
+        let url = self
+            .client
+            .conn()
+            .url(&format!("/v1/sessions/{id}/stream"))?;
+        let resp = self
+            .client
+            .conn()
+            .auth
+            .apply(self.client.http().get(url))
+            .send()?;
+        let status = resp.status().as_u16();
+        if !(200..=299).contains(&status) {
+            return Err(crate::http::check_status("v1/sessions/stream", status).unwrap_err());
+        }
+        Ok(crate::stream::EventStream::spawn(resp))
+    }
+
     /// `POST /v1/sessions/{id}/events` — submit a typed event. Returns the
     /// server's ack (queued/item_id/denial). Blocking.
     pub fn send_event(&self, id: &SessionId, evt: &SessionEventInput) -> Result<SendEventAck> {

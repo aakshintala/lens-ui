@@ -3,9 +3,6 @@
 //! or unparseable event degrades to `Unknown` so the reader thread never panics
 //! on dev0 contract churn (AGENTS.md: the UI never panics).
 
-// Consumed by stream reader (Task 5); allow until then.
-#![allow(dead_code)]
-
 use super::sse::SseFrame;
 use serde::Deserialize;
 
