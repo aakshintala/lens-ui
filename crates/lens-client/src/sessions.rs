@@ -115,6 +115,160 @@ impl GetOpts {
     }
 }
 
+/// One element of `GET /v1/sessions` (omnigent `SessionListItem`, `schemas.py:1866-1885`).
+/// Like a snapshot minus liveness, plus `updated_at`.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct SessionSummary {
+    id: SessionId,
+    status: SessionStatus,
+    agent_id: String,
+    #[serde(default)]
+    agent_name: Option<String>,
+    #[serde(default)]
+    archived: bool,
+    created_at: i64,
+    updated_at: i64,
+    #[serde(default)]
+    labels: BTreeMap<String, String>,
+}
+
+impl SessionSummary {
+    pub fn id(&self) -> &SessionId {
+        &self.id
+    }
+    pub fn status(&self) -> SessionStatus {
+        self.status
+    }
+    pub fn agent_id(&self) -> &str {
+        &self.agent_id
+    }
+    pub fn agent_name(&self) -> Option<&str> {
+        self.agent_name.as_deref()
+    }
+    pub fn archived(&self) -> bool {
+        self.archived
+    }
+    pub fn created_at(&self) -> i64 {
+        self.created_at
+    }
+    pub fn updated_at(&self) -> i64 {
+        self.updated_at
+    }
+    pub fn labels(&self) -> &BTreeMap<String, String> {
+        &self.labels
+    }
+}
+
+/// `GET /v1/sessions` — a `PaginatedList` of summaries.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct SessionList {
+    pub data: Vec<SessionSummary>,
+    #[serde(default)]
+    pub first_id: Option<String>,
+    #[serde(default)]
+    pub last_id: Option<String>,
+    #[serde(default)]
+    pub has_more: bool,
+}
+
+/// `kind` filter for the fleet poll.
+#[derive(Clone, Copy, Debug)]
+pub enum SessionKind {
+    Default,
+    SubAgent,
+    Any,
+}
+
+impl SessionKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            SessionKind::Default => "default",
+            SessionKind::SubAgent => "sub_agent",
+            SessionKind::Any => "any",
+        }
+    }
+}
+
+/// Query filter for `Sessions::list`. All fields optional; unset → omitted.
+#[derive(Clone, Debug, Default)]
+pub struct SessionFilter {
+    limit: Option<u32>,
+    after: Option<String>,
+    before: Option<String>,
+    agent_id: Option<String>,
+    agent_name: Option<String>,
+    search_query: Option<String>,
+    include_archived: Option<bool>,
+    kind: Option<SessionKind>,
+}
+
+impl SessionFilter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn limit(mut self, n: u32) -> Self {
+        self.limit = Some(n);
+        self
+    }
+    pub fn after(mut self, c: impl Into<String>) -> Self {
+        self.after = Some(c.into());
+        self
+    }
+    pub fn before(mut self, c: impl Into<String>) -> Self {
+        self.before = Some(c.into());
+        self
+    }
+    pub fn agent_id(mut self, v: impl Into<String>) -> Self {
+        self.agent_id = Some(v.into());
+        self
+    }
+    pub fn agent_name(mut self, v: impl Into<String>) -> Self {
+        self.agent_name = Some(v.into());
+        self
+    }
+    pub fn search(mut self, v: impl Into<String>) -> Self {
+        self.search_query = Some(v.into());
+        self
+    }
+    pub fn include_archived(mut self, v: bool) -> Self {
+        self.include_archived = Some(v);
+        self
+    }
+    pub fn kind(mut self, k: SessionKind) -> Self {
+        self.kind = Some(k);
+        self
+    }
+
+    fn to_query(&self) -> Vec<(&'static str, String)> {
+        let mut q = Vec::new();
+        if let Some(n) = self.limit {
+            q.push(("limit", n.to_string()));
+        }
+        if let Some(v) = &self.after {
+            q.push(("after", v.clone()));
+        }
+        if let Some(v) = &self.before {
+            q.push(("before", v.clone()));
+        }
+        if let Some(v) = &self.agent_id {
+            q.push(("agent_id", v.clone()));
+        }
+        if let Some(v) = &self.agent_name {
+            q.push(("agent_name", v.clone()));
+        }
+        if let Some(v) = &self.search_query {
+            q.push(("search_query", v.clone()));
+        }
+        if let Some(v) = self.include_archived {
+            q.push(("include_archived", v.to_string()));
+        }
+        if let Some(k) = self.kind {
+            q.push(("kind", k.as_str().to_string()));
+        }
+        q
+    }
+}
+
 /// Ack for `POST /v1/sessions/{id}/events` (HTTP 202). The openapi declares an
 /// empty body, but the route always returns a small JSON ack — model it with
 /// defaults so an empty or future-extended body still deserializes.
@@ -303,6 +457,11 @@ impl<'a> Sessions<'a> {
     pub fn get(&self, id: &SessionId, opts: GetOpts) -> Result<SessionSnapshot> {
         self.client
             .get_json(&format!("/v1/sessions/{id}"), &opts.to_query())
+    }
+
+    /// `GET /v1/sessions` — fleet poll. Blocking.
+    pub fn list(&self, filter: &SessionFilter) -> Result<SessionList> {
+        self.client.get_json("/v1/sessions", &filter.to_query())
     }
 
     /// `POST /v1/sessions/{id}/events` — submit a typed event. Returns the
@@ -505,6 +664,33 @@ mod tests {
         assert!(q.contains(&("include_liveness", "true".to_string())));
         assert!(q.contains(&("include_items", "false".to_string())));
         assert!(q.contains(&("refresh_state", "false".to_string())));
+    }
+
+    #[test]
+    fn session_list_parses_paginated_envelope() {
+        let body = r#"{"object":"list","data":[
+            {"id":"s1","status":"idle","agent_id":"ag","agent_name":null,"archived":false,
+             "created_at":1,"updated_at":2,"labels":{}}],
+            "first_id":"s1","last_id":"s1","has_more":false}"#;
+        let list: SessionList = serde_json::from_str(body).unwrap();
+        assert_eq!(list.data.len(), 1);
+        assert_eq!(list.data[0].id().as_str(), "s1");
+        assert_eq!(list.data[0].updated_at(), 2);
+        assert!(!list.has_more);
+    }
+
+    #[test]
+    fn session_filter_builds_query() {
+        let f = SessionFilter::new()
+            .kind(SessionKind::SubAgent)
+            .include_archived(true)
+            .search("foo")
+            .limit(50);
+        let q = f.to_query();
+        assert!(q.contains(&("kind", "sub_agent".to_string())));
+        assert!(q.contains(&("include_archived", "true".to_string())));
+        assert!(q.contains(&("search_query", "foo".to_string())));
+        assert!(q.contains(&("limit", "50".to_string())));
     }
 
     #[test]

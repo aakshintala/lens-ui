@@ -26,3 +26,14 @@ fn get_snapshot_parses() {
     assert_eq!(snap.id().as_str(), sid.as_str());
     let _ = snap.status();
 }
+
+#[test]
+fn list_sessions_parses() {
+    use lens_client::sessions::SessionFilter;
+    let list = client()
+        .sessions()
+        .list(&SessionFilter::new().limit(5))
+        .expect("list");
+    // Envelope parsed; data may be empty on a fresh server.
+    let _ = list.has_more;
+}
