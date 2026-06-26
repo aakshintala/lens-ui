@@ -3,6 +3,7 @@
 //! `docs/design/typed-client-implementation.md` (build decisions).
 
 pub mod error;
+pub mod ids;
 
 /// The omnigent contract version this crate is pinned to (ADR-0001).
 pub const PINNED_OMNIGENT_VERSION: &str = "0.3.0.dev0";
