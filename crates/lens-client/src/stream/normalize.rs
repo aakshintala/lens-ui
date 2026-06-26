@@ -8,15 +8,15 @@
 //!      the bracket closes on the first `OutputTextDelta`/`Completed` after a
 //!      `ReasoningStarted`.
 //!
-//! Everything else passes through unchanged, in order. No text accumulation,
-//! call/result pairing, or reordering beyond the above — that is the state
-//! model's job. Lives on the Plan 3a reader thread; never blocks the foreground.
+//! Everything else passes through unchanged, in order. The only accumulation is
+//! reasoning-delta text for the synthetic `ReasoningClosed` — no call/result
+//! pairing or reordering beyond the above (typed-client.md §7a). Lives on the
+//! Plan 3a reader thread; never blocks the foreground.
 
 use super::event::{ResponseEvent, ServerStreamEvent};
 use std::collections::HashSet;
 
 #[derive(Default)]
-#[allow(dead_code)] // Task 4 wires into reader::run
 pub(crate) struct Normalizer {
     /// Keys of `OutputItemDone` items already emitted: `(kind, call_id, status)`.
     /// A repeat with an identical key is a literal re-fire and is dropped.
@@ -32,7 +32,6 @@ struct ReasoningAccum {
     summary_text: String,
 }
 
-#[allow(dead_code)] // Task 4 wires into reader::run
 impl Normalizer {
     /// Transform one parsed event into zero, one, or two normalized events.
     /// Total — never panics on event content. Task 2 adds suppression; Task 3
@@ -317,6 +316,40 @@ mod tests {
                     summary_text: String::new(),
                 }),
                 completed,
+            ]
+        );
+    }
+
+    #[test]
+    fn reasoning_accumulators_reset_on_reopen() {
+        let mut n = Normalizer::default();
+        // First bracket: accumulate "first", close on Completed.
+        n.push(ServerStreamEvent::Response(ResponseEvent::ReasoningStarted));
+        n.push(rdelta("first"));
+        let completed = ServerStreamEvent::Response(ResponseEvent::Completed);
+        let out = n.push(completed.clone());
+        assert_eq!(
+            out,
+            vec![
+                ServerStreamEvent::Response(ResponseEvent::ReasoningClosed {
+                    full_text: "first".into(),
+                    summary_text: String::new(),
+                }),
+                completed,
+            ]
+        );
+        // Second bracket: accumulators must reset — "second", not "firstsecond".
+        n.push(ServerStreamEvent::Response(ResponseEvent::ReasoningStarted));
+        n.push(rdelta("second"));
+        let out = n.push(text_delta());
+        assert_eq!(
+            out,
+            vec![
+                ServerStreamEvent::Response(ResponseEvent::ReasoningClosed {
+                    full_text: "second".into(),
+                    summary_text: String::new(),
+                }),
+                text_delta(),
             ]
         );
     }

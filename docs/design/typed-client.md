@@ -410,16 +410,23 @@ on it being authoritative here.
 The crate normalizes the raw SSE stream before handing events to the state
 model. The following guarantees hold; nothing beyond them:
 
-- **`ToolCall` dedup** — each `call_id` appears exactly once in `ToolCall`
-  events, even if the wire fires it twice (the claude-sdk MCP path double-fires).
-- **`ToolResult` dedup** — each `call_id` appears exactly once in `ToolResult`
-  events (the `response.completed` flush fires twice on some paths).
+- **`OutputItemDone` re-fire suppression** — a second `output_item.done` whose
+  `(kind, call_id, status)` was already emitted is dropped (claude-sdk's MCP path
+  double-fires identical items). This is **literal-duplicate suppression, not a
+  collapse to one event per `call_id`**: the captured `function_call`
+  `in_progress`→`completed` progression (same `call_id`, differing `status`) is
+  preserved as two events so the state model keeps the "tool starting" signal.
+  (Earlier drafts said "each `call_id` appears exactly once"; relaxed 2026-06-26
+  per the golden-SSE bytes — see `docs/spikes/2026-06-26-golden-sse-capture.md`.)
 - **`ReasoningClosed` synthesis (synthetic event)** — the SSE stream has no
-  explicit reasoning-end event. The crate emits `ReasoningClosed` when the
-  first `OutputTextDelta` or `ResponseCompleted` arrives after a
-  `ReasoningStarted`. The state model can treat reasoning as a proper
-  open/close bracket without tracking implicit state. Carries `full_text` +
-  `summary_text` so the transcript renderer doesn't re-accumulate.
+  explicit reasoning-end event. The crate emits `ReasoningClosed` when the first
+  `OutputTextDelta` or `Completed` arrives after a `ReasoningStarted`, carrying
+  the accumulated `full_text` + `summary_text` so the renderer need not
+  re-accumulate. The state model treats reasoning as a proper open/close bracket
+  without tracking implicit state. **NOT byte-verified**: claude-sdk (the only
+  harness on the capture box) folds reasoning into `output_text` and emits no
+  `reasoning_text.delta` frames, so the close *trigger* is byte-grounded but the
+  text accumulation is schema-derived — re-capture at config-time.
 - **`Reconnected { gap }` precedes all replayed history items** — ordering
   guaranteed. The state model must clear transient accumulators *before*
   history lands (per §7).

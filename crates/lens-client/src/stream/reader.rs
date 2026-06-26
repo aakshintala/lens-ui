@@ -8,6 +8,7 @@ use std::sync::mpsc;
 use std::thread::JoinHandle;
 
 use super::event::{ServerStreamEvent, parse_event};
+use super::normalize::Normalizer;
 use super::sse::SseParser;
 
 pub struct EventStream {
@@ -43,14 +44,17 @@ impl EventStream {
 
 fn run(mut resp: reqwest::blocking::Response, tx: mpsc::Sender<ServerStreamEvent>) {
     let mut parser = SseParser::default();
+    let mut normalizer = Normalizer::default();
     let mut buf = [0u8; 8192];
     loop {
         match resp.read(&mut buf) {
             Ok(0) => break, // server closed the stream
             Ok(n) => {
                 for frame in parser.push(&buf[..n]) {
-                    if tx.send(parse_event(&frame)).is_err() {
-                        return; // consumer dropped EventStream — stop reading
+                    for ev in normalizer.push(parse_event(&frame)) {
+                        if tx.send(ev).is_err() {
+                            return; // consumer dropped EventStream — stop reading
+                        }
                     }
                 }
             }
@@ -58,6 +62,12 @@ fn run(mut resp: reqwest::blocking::Response, tx: mpsc::Sender<ServerStreamEvent
         }
     }
     for frame in parser.finish() {
-        let _ = tx.send(parse_event(&frame));
+        for ev in normalizer.push(parse_event(&frame)) {
+            let _ = tx.send(ev);
+        }
+    }
+    // Close any reasoning bracket the stream ended without closing (§7a).
+    for ev in normalizer.flush() {
+        let _ = tx.send(ev);
     }
 }

@@ -42,6 +42,10 @@ fn live_stream_yields_typed_events() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let mut saw_completed = false;
     let mut saw_unknown: Vec<String> = Vec::new();
+    // Plan 3b-1: the stream is now normalized (re-fire dedup + synthetic
+    // ReasoningClosed). Surface any ReasoningClosed for visibility; claude-sdk
+    // folds reasoning into output_text, so this is typically empty-text.
+    let mut saw_reasoning_closed = 0usize;
     while std::time::Instant::now() < deadline {
         match stream.try_recv() {
             Some(ServerStreamEvent::Response(ResponseEvent::Completed)) => {
@@ -49,11 +53,15 @@ fn live_stream_yields_typed_events() {
                 break;
             }
             Some(ServerStreamEvent::Unknown { event_type }) => saw_unknown.push(event_type),
+            Some(ServerStreamEvent::Response(ResponseEvent::ReasoningClosed { .. })) => {
+                saw_reasoning_closed += 1;
+            }
             Some(_) => {}
             None => std::thread::sleep(std::time::Duration::from_millis(50)),
         }
     }
     assert!(saw_completed, "never observed response.completed");
+    eprintln!("normalized stream: {saw_reasoning_closed} ReasoningClosed event(s)");
     // Surface (do not hard-fail) any unmodeled live events — feeds Plan 3c drift.
     if !saw_unknown.is_empty() {
         eprintln!("UNMODELED live events (model these / Plan 3c): {saw_unknown:?}");
