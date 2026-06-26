@@ -4,7 +4,7 @@
 
 use crate::client::Client;
 use crate::error::Result;
-use crate::ids::RunnerId;
+use crate::ids::{HostId, RunnerId};
 
 /// `GET /v1/runners/{id}/status` (`runner_tunnel.py:234-265`).
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -55,6 +55,30 @@ pub struct AgentList {
     pub has_more: bool,
 }
 
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct HostObject {
+    id: HostId,
+    #[serde(default, rename = "object")]
+    object: String,
+    // ⚠ grow getters (name, online, provider, …) as the host-picker UI needs them.
+}
+impl HostObject {
+    pub fn id(&self) -> &HostId {
+        &self.id
+    }
+    pub fn object(&self) -> &str {
+        &self.object
+    }
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct HostList {
+    #[serde(default)]
+    pub data: Vec<HostObject>,
+    #[serde(default)]
+    pub has_more: bool,
+}
+
 impl Client {
     pub fn runner_status(&self, runner_id: &RunnerId) -> Result<RunnerStatus> {
         self.get_json(&format!("/v1/runners/{runner_id}/status"), &[])
@@ -66,6 +90,36 @@ impl Client {
 
     pub fn list_agents(&self) -> Result<AgentList> {
         self.get_json("/v1/agents", &[])
+    }
+
+    pub fn list_hosts(&self) -> Result<HostList> {
+        self.get_json("/v1/hosts", &[])
+    }
+    pub fn host(&self, host_id: &HostId) -> Result<HostObject> {
+        self.get_json(&format!("/v1/hosts/{host_id}"), &[])
+    }
+    pub fn create_directory(
+        &self,
+        host_id: &HostId,
+        req: &crate::generated::CreateDirectoryRequest,
+    ) -> Result<HostObject> {
+        self.send_json(
+            reqwest::Method::POST,
+            &format!("/v1/hosts/{host_id}/directories"),
+            &[],
+            Some(req),
+        )
+    }
+    pub fn host_filesystem(
+        &self,
+        host_id: &HostId,
+        path: Option<&str>,
+    ) -> Result<crate::sessions::FilesystemList> {
+        let p = match path {
+            Some(p) => format!("/v1/hosts/{host_id}/filesystem/{p}"),
+            None => format!("/v1/hosts/{host_id}/filesystem"),
+        };
+        self.get_json(&p, &[])
     }
 }
 
