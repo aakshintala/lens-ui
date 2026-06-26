@@ -15,12 +15,22 @@ and roll older "Recent" pointers off this page as they age.
   16 serverless tests, clippy/fmt clean, live handshake green vs pinned `0.3.0.dev0`.
   Both seam reviews applied (gpt-5.5 codegen; gemini-3.1-pro final → 3 error-soundness
   fixes). Gotchas in memory `lens-client-foundation-gotchas`.
-- **NEXT: execute lens-client REST surface (Plans 2a–2e)** (fresh session, subagent-driven) —
-  `docs/superpowers/plans/2026-06-25-lens-client-plan2{a,b,c,d,e}-*.md`. 2a=events write
-  path (fully specified); 2b=sessions read; 2c=lifecycle; 2d=resources/terminals/comments;
-  2e=registries. Decision baked in: reads return **typed wrappers (private fields +
-  typed getters), never `serde_json::Value` to consumers**; grow accessors lazily from
-  omnigent source (2d/2e carry ⚠ field-verify notes). Writes reuse generated request types.
+- **lens-client REST surface (Plans 2a–2e): DONE** (executed subagent-driven,
+  composer-2.5 build + Opus per-task review + gpt-5.5 cross-family; 31 commits
+  `b69e3d8..299ff72`). 2a=events write path; 2b=sessions read; 2c=lifecycle;
+  2d=resources/terminals/comments; 2e=registries. 47 serverless tests, clippy
+  `--all-targets` + fmt clean, `generated.rs` untouched. Live-verified vs pinned
+  `0.3.0.dev0`: send_event, sessions read (get/list/child), create→patch→delete
+  lifecycle. Reads are typed wrappers (private fields + getters, **no `Value` to
+  consumers**); writes reuse generated request types. Cross-family review caught
+  4 real shape bugs (hosts `{hosts}` envelope, directories `{object,path}` no-id,
+  policy id nullable, resources `Value` leak) — all fixed.
+  - **Deferred from 2a–2e (no consumer / need runner-backed live capture):**
+    `Sessions::items()` (→ Plan 3 typed item union), list endpoints with unknown
+    envelopes (`environments`, `terminals`, `changed_files`, `list_runners`), and
+    ⚠ minimal wrappers (FileContent/ShellResult/FileResource/Host/Policy*) — grow
+    getters + verify field names with golden captures when the state-model consumes
+    them. Full rollup in `.superpowers/sdd/progress.md`.
 - **⚠ CHECKPOINT before Plan 3 (SSE taxonomy/state-model):** reassess tracking
   `0.3.0.dev0` vs waiting for a `0.3.0` release tag. The REST surface (2a–2e) is cheap +
   re-vendor-safe; the streaming taxonomy encodes the semantically-unstable parts (3 status
@@ -51,6 +61,11 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Recent
 
+- **2026-06-25 (eve)** — lens-client **REST surface 2a–2e executed** end-to-end
+  (subagent-driven: composer-2.5 build, Opus per-task review, gpt-5.5 cross-family
+  at seams + one consolidated 2c–2e review). 31 commits, 47 tests, live-verified.
+  Review caught/fixed 4 real response-shape bugs. Cross-family review cadence
+  relaxed to one consolidated pass mid-drive to conserve Cursor credits.
 - **2026-06-25 (pm)** — omnigent contract-pinning decided (ADR-0001: freeze a
   commit, not the moving `0.3.0.dev0`; lock to release tags from `0.3.0`).
   Confirmed the "removed" elicitation/permission routes were only hidden from
