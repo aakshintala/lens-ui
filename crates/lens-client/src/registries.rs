@@ -27,9 +27,27 @@ impl RunnerStatus {
     }
 }
 
+/// `GET /v1/me` — auth identity (`app.py:1566-1592`). 200 carries `user_id`
+/// (null when accounts are off); a 401 (OIDC unauthenticated) is surfaced as
+/// `ClientError::Auth` by `decode_json`, so this type models the 200 body only.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct Me {
+    #[serde(default)]
+    user_id: Option<String>,
+}
+impl Me {
+    pub fn user_id(&self) -> Option<&str> {
+        self.user_id.as_deref()
+    }
+}
+
 impl Client {
     pub fn runner_status(&self, runner_id: &RunnerId) -> Result<RunnerStatus> {
         self.get_json(&format!("/v1/runners/{runner_id}/status"), &[])
+    }
+
+    pub fn me(&self) -> Result<Me> {
+        self.get_json("/v1/me", &[])
     }
 }
 
@@ -48,5 +66,13 @@ mod tests {
                 .unwrap();
         assert!(!off.online());
         assert_eq!(off.error(), Some("exited 1"));
+    }
+
+    #[test]
+    fn me_parses_user_id() {
+        let m: Me = serde_json::from_str(r#"{"user_id":"u_42"}"#).unwrap();
+        assert_eq!(m.user_id(), Some("u_42"));
+        let anon: Me = serde_json::from_str(r#"{"user_id":null}"#).unwrap();
+        assert_eq!(anon.user_id(), None);
     }
 }
