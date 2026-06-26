@@ -1155,6 +1155,50 @@ impl<'a> Sessions<'a> {
             "/v1/sessions/{id}/resources/files/{file_id}/content"
         ))
     }
+
+    pub fn create_terminal(
+        &self,
+        id: &SessionId,
+        opts: &serde_json::Value,
+    ) -> Result<ResourceObject> {
+        // opts e.g. {"launch_args": [...]}; ⚠ confirm create body shape.
+        self.client.send_json(
+            reqwest::Method::POST,
+            &format!("/v1/sessions/{id}/resources/terminals"),
+            &[],
+            Some(opts),
+        )
+    }
+
+    pub fn delete_terminal(
+        &self,
+        id: &SessionId,
+        terminal_id: &crate::ids::TerminalId,
+    ) -> Result<()> {
+        let _: serde_json::Value = self.client.send_json::<serde_json::Value, ()>(
+            reqwest::Method::DELETE,
+            &format!("/v1/sessions/{id}/resources/terminals/{terminal_id}"),
+            &[],
+            None,
+        )?;
+        Ok(())
+    }
+
+    pub fn transfer_terminal(
+        &self,
+        id: &SessionId,
+        terminal_id: &crate::ids::TerminalId,
+        target: &SessionId,
+    ) -> Result<()> {
+        let body = serde_json::json!({ "target_session_id": target.as_str() }); // ⚠ confirm body key
+        let _: serde_json::Value = self.client.send_json(
+            reqwest::Method::POST,
+            &format!("/v1/sessions/{id}/resources/terminals/{terminal_id}/transfer"),
+            &[],
+            Some(&body),
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
