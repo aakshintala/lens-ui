@@ -56,4 +56,23 @@ impl Client {
     pub(crate) fn http(&self) -> &reqwest::blocking::Client {
         &self.http
     }
+
+    /// Issue a GET expecting a JSON body, mapping status → typed errors. Internal
+    /// building block for the typed REST methods. `query` pairs are appended as-is.
+    #[allow(dead_code)] // used by Sessions read methods (Task 3)
+    pub(crate) fn get_json<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        query: &[(&str, String)],
+    ) -> crate::error::Result<T> {
+        let url = self.conn().url(path)?;
+        let resp = self
+            .conn()
+            .auth
+            .apply(self.http().get(url).query(query))
+            .send()?;
+        let status = resp.status().as_u16();
+        let body = resp.text()?;
+        crate::http::decode_json(path, status, &body)
+    }
 }

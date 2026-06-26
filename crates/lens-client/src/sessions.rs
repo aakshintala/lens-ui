@@ -14,6 +14,18 @@ use crate::error::Result;
 use crate::http::decode_json;
 use crate::ids::{ElicitationId, SessionId};
 
+/// Session status as reported by the REST surface (snapshot + list). Only three
+/// values reach REST; the server collapses `waiting`→`running` and never emits
+/// `launching` on parents (`sessions.py:1792-1811`). The richer 5-value SSE
+/// status (`SessionStatusEvent`) is modeled separately in the streaming plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionStatus {
+    Idle,
+    Running,
+    Failed,
+}
+
 /// Ack for `POST /v1/sessions/{id}/events` (HTTP 202). The openapi declares an
 /// empty body, but the route always returns a small JSON ack — model it with
 /// defaults so an empty or future-extended body still deserializes.
@@ -371,6 +383,25 @@ mod tests {
                 .unwrap();
         assert!(ack.denied);
         assert_eq!(ack.reason.as_deref(), Some("blocked"));
+    }
+
+    #[test]
+    fn session_status_deserializes_rest_values() {
+        use serde_json::json;
+        assert_eq!(
+            serde_json::from_value::<SessionStatus>(json!("idle")).unwrap(),
+            SessionStatus::Idle
+        );
+        assert_eq!(
+            serde_json::from_value::<SessionStatus>(json!("running")).unwrap(),
+            SessionStatus::Running
+        );
+        assert_eq!(
+            serde_json::from_value::<SessionStatus>(json!("failed")).unwrap(),
+            SessionStatus::Failed
+        );
+        // "waiting" is collapsed to "running" server-side and never reaches REST; reject it.
+        assert!(serde_json::from_value::<SessionStatus>(json!("waiting")).is_err());
     }
 
     #[test]
