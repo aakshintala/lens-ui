@@ -1,0 +1,54 @@
+event: session.heartbeat
+data: {"sequence_number": null, "type": "session.heartbeat", "server_time": null}
+
+event: session.resource.created
+data: {"sequence_number": null, "type": "session.resource.created", "resource": {"id": "terminal_tui_main", "object": "session.resource", "type": "terminal", "session_id": "conv_fef5d4def8b3416787b977b9d077dc78", "name": "tui:main", "metadata": {"terminal_name": "tui", "session_key": "main", "running": true, "tmux_socket": "/var/folders/dq/_c83wftd34g281_1002c_gl00000gn/T/omnigent-terminal-p91edfal/tmux.sock", "tmux_target": "main"}, "environment": "env_terminal_tui_main"}}
+
+event: session.changed_files.invalidated
+data: {"sequence_number": null, "type": "session.changed_files.invalidated", "session_id": "conv_fef5d4def8b3416787b977b9d077dc78", "environment_id": "default"}
+
+event: session.presence
+data: {"sequence_number": null, "type": "session.presence", "conversation_id": "conv_fef5d4def8b3416787b977b9d077dc78", "viewers": []}
+
+event: response.heartbeat
+data: {"sequence_number": 10, "type": "response.heartbeat", "server_time": "2026-06-27T04:46:56Z", "last_event_seq": 1}
+
+event: session.heartbeat
+data: {"sequence_number": null, "type": "session.heartbeat", "server_time": null}
+
+event: response.heartbeat
+data: {"sequence_number": 11, "type": "response.heartbeat", "server_time": "2026-06-27T04:47:11Z", "last_event_seq": 1}
+
+event: response.heartbeat
+data: {"sequence_number": 12, "type": "response.heartbeat", "server_time": "2026-06-27T04:47:26Z", "last_event_seq": 1}
+
+event: response.heartbeat
+data: {"sequence_number": 13, "type": "response.heartbeat", "server_time": "2026-06-27T04:47:41Z", "last_event_seq": 1}
+
+event: session.heartbeat
+data: {"sequence_number": null, "type": "session.heartbeat", "server_time": null}
+
+event: response.heartbeat
+data: {"sequence_number": 14, "type": "response.heartbeat", "server_time": "2026-06-27T04:47:56Z", "last_event_seq": 1}
+
+event: response.heartbeat
+data: {"sequence_number": 15, "type": "response.heartbeat", "server_time": "2026-06-27T04:48:11Z", "last_event_seq": 1}
+
+event: response.heartbeat
+data: {"sequence_number": 16, "type": "response.heartbeat", "server_time": "2026-06-27T04:48:26Z", "last_event_seq": 1}
+
+event: session.heartbeat
+data: {"sequence_number": null, "type": "session.heartbeat", "server_time": null}
+
+event: response.failed
+data: {"sequence_number": 17, "type": "response.failed", "response": {"id": "resp_bab8296ca44e424fb8d77106", "object": "response", "status": "failed", "model": "codex", "created_at": 1782535721, "completed_at": null, "output": [], "background": false, "store": true, "usage": null, "previous_response_id": null, "conversation": null, "instructions": null, "reasoning": null, "error": {"code": "RuntimeError", "message": "turn exceeded the 240s harness idle watchdog (run_turn emitted no events for 240s; likely a wedged LLM or tool call)"}, "incomplete_details": null}}
+
+event: session.status
+data: {"sequence_number": null, "type": "session.status", "conversation_id": "conv_fef5d4def8b3416787b977b9d077dc78", "status": "failed", "response_id": null, "error": {"code": "runner_error", "message": "turn exceeded the 240s harness idle watchdog (run_turn emitted no events for 240s; likely a wedged LLM or tool call)"}}
+
+event: session.skills
+data: {"sequence_number": null, "type": "session.skills", "conversation_id": "conv_fef5d4def8b3416787b977b9d077dc78"}
+
+event: session.terminal.activity
+data: {"sequence_number": null, "type": "session.terminal.activity", "session_id": "conv_fef5d4def8b3416787b977b9d077dc78", "terminal_id": "terminal_tui_main"}
+

@@ -1,0 +1,30 @@
+event: session.heartbeat
+data: {"sequence_number": null, "type": "session.heartbeat", "server_time": null}
+
+event: session.resource.created
+data: {"sequence_number": null, "type": "session.resource.created", "resource": {"id": "terminal_tui_main", "object": "session.resource", "type": "terminal", "session_id": "conv_abbc4bd2ec5a4b5aaa0559cd0a65f6a3", "name": "tui:main", "metadata": {"terminal_name": "tui", "session_key": "main", "running": true, "tmux_socket": "/var/folders/dq/_c83wftd34g281_1002c_gl00000gn/T/omnigent-terminal-28g9p8yl/tmux.sock", "tmux_target": "main"}, "environment": "env_terminal_tui_main"}}
+
+event: session.changed_files.invalidated
+data: {"sequence_number": null, "type": "session.changed_files.invalidated", "session_id": "conv_abbc4bd2ec5a4b5aaa0559cd0a65f6a3", "environment_id": "default"}
+
+event: session.presence
+data: {"sequence_number": null, "type": "session.presence", "conversation_id": "conv_abbc4bd2ec5a4b5aaa0559cd0a65f6a3", "viewers": []}
+
+event: session.input.consumed
+data: {"sequence_number": null, "type": "session.input.consumed", "data": {"item_id": "msg_460d2770a631478896a5e67f8839bd2b", "type": "message", "data": {"role": "user", "content": [{"type": "input_text", "text": "Think step by step: I doubled a number and added 4 to get 30. What was the number? Reason it out, then give the answer."}], "agent": null}, "created_by": null, "cleared_pending_id": null}}
+
+event: session.status
+data: {"sequence_number": null, "type": "session.status", "conversation_id": "conv_abbc4bd2ec5a4b5aaa0559cd0a65f6a3", "status": "running", "response_id": null, "error": null}
+
+event: response.in_progress
+data: {"sequence_number": 1, "type": "response.in_progress", "response": {"id": "resp_b947f8410d0c4906b46d626d", "object": "response", "status": "in_progress", "model": "pi", "created_at": 1782536013, "completed_at": null, "output": [], "background": false, "store": true, "usage": null, "previous_response_id": null, "conversation": null, "instructions": null, "reasoning": null, "error": null, "incomplete_details": null}}
+
+event: response.failed
+data: {"sequence_number": 2, "type": "response.failed", "response": {"id": "resp_b947f8410d0c4906b46d626d", "object": "response", "status": "failed", "model": "pi", "created_at": 1782536014, "completed_at": null, "output": [], "background": false, "store": true, "usage": null, "previous_response_id": null, "conversation": null, "instructions": null, "reasoning": null, "error": {"code": "RuntimeError", "message": "inner executor error: Pi process ended without response. Stderr: Error: Model \"qwen3.5:9b\" not found. Use --list-models to see available models."}, "incomplete_details": null}}
+
+event: session.status
+data: {"sequence_number": null, "type": "session.status", "conversation_id": "conv_abbc4bd2ec5a4b5aaa0559cd0a65f6a3", "status": "failed", "response_id": null, "error": {"code": "runner_error", "message": "inner executor error: Pi process ended without response. Stderr: Error: Model \"qwen3.5:9b\" not found. Use --list-models to see available models."}}
+
+event: session.skills
+data: {"sequence_number": null, "type": "session.skills", "conversation_id": "conv_abbc4bd2ec5a4b5aaa0559cd0a65f6a3"}
+

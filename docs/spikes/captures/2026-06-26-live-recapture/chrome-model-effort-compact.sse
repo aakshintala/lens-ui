@@ -1,0 +1,39 @@
+event: session.heartbeat
+data: {"sequence_number": null, "type": "session.heartbeat", "server_time": null}
+
+event: response.output_text.delta
+data: {"sequence_number": null, "type": "response.output_text.delta", "delta": "**Number: 9**", "message_id": "cb7ab21a-5ec1-49db-b096-a0ff7e35479e", "index": 1, "final": null}
+
+event: session.resource.created
+data: {"sequence_number": null, "type": "session.resource.created", "resource": {"id": "terminal_claude_main", "object": "session.resource", "type": "terminal", "session_id": "conv_18b57c5fb18d40329498f268787fa266", "name": "claude:main", "metadata": {"terminal_name": "claude", "session_key": "main", "running": true, "tmux_socket": "/var/folders/dq/_c83wftd34g281_1002c_gl00000gn/T/omnigent-terminal-y7ewt655/tmux.sock", "tmux_target": "main"}, "environment": "env_terminal_claude_main"}}
+
+event: session.changed_files.invalidated
+data: {"sequence_number": null, "type": "session.changed_files.invalidated", "session_id": "conv_18b57c5fb18d40329498f268787fa266", "environment_id": "default"}
+
+event: session.presence
+data: {"sequence_number": null, "type": "session.presence", "conversation_id": "conv_18b57c5fb18d40329498f268787fa266", "viewers": []}
+
+event: session.model
+data: {"sequence_number": null, "type": "session.model", "conversation_id": "conv_18b57c5fb18d40329498f268787fa266", "model": "claude-sonnet-4-6"}
+
+event: session.reasoning_effort
+data: {"sequence_number": null, "type": "session.reasoning_effort", "conversation_id": "conv_18b57c5fb18d40329498f268787fa266", "reasoning_effort": "high"}
+
+event: session.terminal.activity
+data: {"sequence_number": null, "type": "session.terminal.activity", "session_id": "conv_18b57c5fb18d40329498f268787fa266", "terminal_id": "terminal_claude_main"}
+
+event: session.status
+data: {"sequence_number": null, "type": "session.status", "conversation_id": "conv_18b57c5fb18d40329498f268787fa266", "status": "running", "response_id": null, "error": null}
+
+event: response.output_item.done
+data: {"sequence_number": null, "type": "response.output_item.done", "item": {"id": "sc_c329f26dec54433db53e0baad8aed7cf", "response_id": "resp_claude_a37caa959778dbbbd12188bbaf07cde8", "type": "slash_command", "status": "completed", "model": "claude-native-ui", "kind": "command", "name": "compact", "arguments": ""}}
+
+event: session.usage
+data: {"sequence_number": null, "type": "session.usage", "conversation_id": "conv_18b57c5fb18d40329498f268787fa266", "context_tokens": 29725, "context_window": 1000000, "total_cost_usd": null, "usage_by_model": null}
+
+event: response.compaction.in_progress
+data: {"sequence_number": null, "type": "response.compaction.in_progress"}
+
+event: session.status
+data: {"sequence_number": null, "type": "session.status", "conversation_id": "conv_18b57c5fb18d40329498f268787fa266", "status": "idle", "response_id": null, "error": null}
+

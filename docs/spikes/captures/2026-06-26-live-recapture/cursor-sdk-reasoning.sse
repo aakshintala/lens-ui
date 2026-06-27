@@ -1,0 +1,147 @@
+event: session.heartbeat
+data: {"sequence_number": null, "type": "session.heartbeat", "server_time": null}
+
+event: session.resource.created
+data: {"sequence_number": null, "type": "session.resource.created", "resource": {"id": "terminal_tui_main", "object": "session.resource", "type": "terminal", "session_id": "conv_2a954c9e6f234cb2b0494aa83a386948", "name": "tui:main", "metadata": {"terminal_name": "tui", "session_key": "main", "running": true, "tmux_socket": "/var/folders/dq/_c83wftd34g281_1002c_gl00000gn/T/omnigent-terminal-b24wjfby/tmux.sock", "tmux_target": "main"}, "environment": "env_terminal_tui_main"}}
+
+event: session.changed_files.invalidated
+data: {"sequence_number": null, "type": "session.changed_files.invalidated", "session_id": "conv_2a954c9e6f234cb2b0494aa83a386948", "environment_id": "default"}
+
+event: session.presence
+data: {"sequence_number": null, "type": "session.presence", "conversation_id": "conv_2a954c9e6f234cb2b0494aa83a386948", "viewers": []}
+
+event: session.input.consumed
+data: {"sequence_number": null, "type": "session.input.consumed", "data": {"item_id": "msg_cd7b776529a746d88a6a2d5de250ba1f", "type": "message", "data": {"role": "user", "content": [{"type": "input_text", "text": "Think step by step before answering: I doubled a number and added 4 to get 30. What was the number? Reason it out, then give the final answer."}], "agent": null}, "created_by": null, "cleared_pending_id": null}}
+
+event: session.status
+data: {"sequence_number": null, "type": "session.status", "conversation_id": "conv_2a954c9e6f234cb2b0494aa83a386948", "status": "running", "response_id": null, "error": null}
+
+event: response.in_progress
+data: {"sequence_number": 1, "type": "response.in_progress", "response": {"id": "resp_7ea58f3aa6964dbf9f00fe02", "object": "response", "status": "in_progress", "model": "cursor", "created_at": 1782537248, "completed_at": null, "output": [], "background": false, "store": true, "usage": null, "previous_response_id": null, "conversation": null, "instructions": null, "reasoning": null, "error": null, "incomplete_details": null}}
+
+event: response.reasoning_text.delta
+data: {"sequence_number": 3, "type": "response.reasoning_text.delta", "delta": "I need to solve a simple"}
+
+event: response.reasoning_text.delta
+data: {"sequence_number": 4, "type": "response.reasoning_text.delta", "delta": " algebra word problem."}
+
+event: response.output_text.delta
+data: {"sequence_number": 5, "type": "response.output_text.delta", "delta": "Let", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 6, "type": "response.output_text.delta", "delta": " the unknown", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 7, "type": "response.output_text.delta", "delta": " number be", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 8, "type": "response.output_text.delta", "delta": " **", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 9, "type": "response.output_text.delta", "delta": "x**.\n\n**", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 10, "type": "response.output_text.delta", "delta": "Set", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 11, "type": "response.output_text.delta", "delta": " up the equation**\n\n", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 12, "type": "response.output_text.delta", "delta": "\u201c", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 13, "type": "response.output_text.delta", "delta": "Doubled and", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 14, "type": "response.output_text.delta", "delta": " added 4\u201d", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 15, "type": "response.output_text.delta", "delta": " means:\n\n", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 16, "type": "response.output_text.delta", "delta": "\\[\n2x", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 17, "type": "response.output_text.delta", "delta": " + 4 =", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 18, "type": "response.output_text.delta", "delta": " 30\n\\", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 19, "type": "response.output_text.delta", "delta": "]\n\n**Solve**\n\n", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 20, "type": "response.output_text.delta", "delta": "Subtract", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 21, "type": "response.output_text.delta", "delta": " 4 from both", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 22, "type": "response.output_text.delta", "delta": " sides:\n\n\\[\n", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 23, "type": "response.output_text.delta", "delta": "2x = ", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 24, "type": "response.output_text.delta", "delta": "26\n\\", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 25, "type": "response.output_text.delta", "delta": "]\n\nDivide both", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 26, "type": "response.output_text.delta", "delta": " sides by 2", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 27, "type": "response.output_text.delta", "delta": ":\n\n\\[\nx", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 28, "type": "response.output_text.delta", "delta": " = 13", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 29, "type": "response.output_text.delta", "delta": "\n\\]\n\n**", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 30, "type": "response.output_text.delta", "delta": "Check**\n\n\\(", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 31, "type": "response.output_text.delta", "delta": "2 \\times", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 32, "type": "response.output_text.delta", "delta": " 13 + ", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 33, "type": "response.output_text.delta", "delta": "4 = 26", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 34, "type": "response.output_text.delta", "delta": " + 4 =", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 35, "type": "response.output_text.delta", "delta": " 30\\)", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 36, "type": "response.output_text.delta", "delta": " \u2713\n\n**", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 37, "type": "response.output_text.delta", "delta": "Final", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 38, "type": "response.output_text.delta", "delta": " answer: ", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 39, "type": "response.output_text.delta", "delta": "13**", "message_id": null, "index": null, "final": null}
+
+event: response.output_item.done
+data: {"sequence_number": null, "type": "response.output_item.done", "item": {"id": "msg_0d433dfe8cd443ca9f4b1ae90ec0f708", "response_id": "resp_7ea58f3aa6964dbf9f00fe02", "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": "Let the unknown number be **x**.\n\n**Set up the equation**\n\n\u201cDoubled and added 4\u201d means:\n\n\\[\n2x + 4 = 30\n\\]\n\n**Solve**\n\nSubtract 4 from both sides:\n\n\\[\n2x = 26\n\\]\n\nDivide both sides by 2:\n\n\\[\nx = 13\n\\]\n\n**Check**\n\n\\(2 \\times 13 + 4 = 26 + 4 = 30\\) \u2713\n\n**Final answer: 13**"}], "model": "cursor"}}
+
+event: session.usage
+data: {"sequence_number": null, "type": "session.usage", "conversation_id": "conv_2a954c9e6f234cb2b0494aa83a386948", "context_tokens": null, "context_window": null, "total_cost_usd": null, "usage_by_model": {"auto": {"input_tokens": 14013, "output_tokens": 231, "total_tokens": 14244, "cache_read_input_tokens": 7712, "cache_creation_input_tokens": 0, "total_cost_usd": null}}}
+
+event: response.completed
+data: {"sequence_number": 41, "type": "response.completed", "response": {"id": "resp_7ea58f3aa6964dbf9f00fe02", "object": "response", "status": "completed", "model": "cursor", "created_at": 1782537256, "completed_at": null, "output": [], "background": false, "store": true, "usage": {"input_tokens": 14013, "output_tokens": 231, "output_tokens_details": {"reasoning_tokens": 0}, "total_tokens": 14244, "context_tokens": null, "cache_read_input_tokens": 7712, "cache_creation_input_tokens": 0, "model": "auto"}, "previous_response_id": null, "conversation": null, "instructions": null, "reasoning": null, "error": null, "incomplete_details": null}}
+
+event: session.status
+data: {"sequence_number": null, "type": "session.status", "conversation_id": "conv_2a954c9e6f234cb2b0494aa83a386948", "status": "idle", "response_id": null, "error": null}
+
+event: session.skills
+data: {"sequence_number": null, "type": "session.skills", "conversation_id": "conv_2a954c9e6f234cb2b0494aa83a386948"}
+

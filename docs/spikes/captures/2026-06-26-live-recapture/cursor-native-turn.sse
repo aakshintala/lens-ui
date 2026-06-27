@@ -1,0 +1,48 @@
+event: session.heartbeat
+data: {"sequence_number": null, "type": "session.heartbeat", "server_time": null}
+
+event: session.resource.created
+data: {"sequence_number": null, "type": "session.resource.created", "resource": {"id": "terminal_cursor_main", "object": "session.resource", "type": "terminal", "session_id": "conv_f3414ba374c5408f98e7eb555a882d2c", "name": "cursor:main", "metadata": {"terminal_name": "cursor", "session_key": "main", "running": true, "tmux_socket": "/var/folders/dq/_c83wftd34g281_1002c_gl00000gn/T/omnigent-terminal-frvusvte/tmux.sock", "tmux_target": "main"}, "environment": "env_terminal_cursor_main"}}
+
+event: session.changed_files.invalidated
+data: {"sequence_number": null, "type": "session.changed_files.invalidated", "session_id": "conv_f3414ba374c5408f98e7eb555a882d2c", "environment_id": "default"}
+
+event: session.presence
+data: {"sequence_number": null, "type": "session.presence", "conversation_id": "conv_f3414ba374c5408f98e7eb555a882d2c", "viewers": []}
+
+event: response.in_progress
+data: {"sequence_number": 1, "type": "response.in_progress", "response": {"id": "resp_f040d087dc0b492c8ff1f199", "object": "response", "status": "in_progress", "model": "cursor-native-ui", "created_at": 1782535776, "completed_at": null, "output": [], "background": false, "store": true, "usage": null, "previous_response_id": null, "conversation": null, "instructions": null, "reasoning": null, "error": null, "incomplete_details": null}}
+
+event: session.terminal.activity
+data: {"sequence_number": null, "type": "session.terminal.activity", "session_id": "conv_f3414ba374c5408f98e7eb555a882d2c", "terminal_id": "terminal_cursor_main"}
+
+event: session.status
+data: {"sequence_number": null, "type": "session.status", "conversation_id": "conv_f3414ba374c5408f98e7eb555a882d2c", "status": "running", "response_id": null, "error": null}
+
+event: response.completed
+data: {"sequence_number": 2, "type": "response.completed", "response": {"id": "resp_f040d087dc0b492c8ff1f199", "object": "response", "status": "completed", "model": "cursor-native-ui", "created_at": 1782535777, "completed_at": null, "output": [], "background": false, "store": true, "usage": null, "previous_response_id": null, "conversation": null, "instructions": null, "reasoning": null, "error": null, "incomplete_details": null}}
+
+event: session.terminal.activity
+data: {"sequence_number": null, "type": "session.terminal.activity", "session_id": "conv_f3414ba374c5408f98e7eb555a882d2c", "terminal_id": "terminal_cursor_main"}
+
+event: session.terminal.activity
+data: {"sequence_number": null, "type": "session.terminal.activity", "session_id": "conv_f3414ba374c5408f98e7eb555a882d2c", "terminal_id": "terminal_cursor_main"}
+
+event: session.terminal.activity
+data: {"sequence_number": null, "type": "session.terminal.activity", "session_id": "conv_f3414ba374c5408f98e7eb555a882d2c", "terminal_id": "terminal_cursor_main"}
+
+event: session.terminal.activity
+data: {"sequence_number": null, "type": "session.terminal.activity", "session_id": "conv_f3414ba374c5408f98e7eb555a882d2c", "terminal_id": "terminal_cursor_main"}
+
+event: session.terminal.activity
+data: {"sequence_number": null, "type": "session.terminal.activity", "session_id": "conv_f3414ba374c5408f98e7eb555a882d2c", "terminal_id": "terminal_cursor_main"}
+
+event: session.input.consumed
+data: {"sequence_number": null, "type": "session.input.consumed", "data": {"item_id": "msg_0724fecff3f34ea59153a0633b3f297b", "type": "message", "data": {"role": "user", "content": [{"type": "input_text", "text": "Think step by step before answering: I doubled a number and added 4 to get 30. What was the number? Show your reasoning, then the answer."}], "agent": null}, "created_by": null, "cleared_pending_id": "pending_f2fb378fcbd64b7998b1afef7ab60f82"}}
+
+event: response.output_item.done
+data: {"sequence_number": null, "type": "response.output_item.done", "item": {"id": "msg_ddc626fc2bbd4e00aed0f3d17f0a0cfd", "response_id": "cursor:6d694e8117ec2a5dbcbc57672ad984dea3f9337659d3408b91b5d7c24749c039", "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": "**Step 1 \u2014 Define the unknown**\n\nLet the original number be \\(x\\).\n\n**Step 2 \u2014 Translate the words into an equation**\n\n\u201cDoubled a number and added 4\u201d means:\n\\[\n2x + 4\n\\]\n\n\u201cTo get 30\u201d means that equals 30:\n\\[\n2x + 4 = 30\n\\]\n\n**Step 3 \u2014 Solve for \\(x\\)**\n\nSubtract 4 from both sides:\n\\[\n2x = 30 - 4 = 26\n\\]\n\nDivide both sides by 2:\n\\[\nx = \\frac{26}{2} = 13\n\\]\n\n**Step 4 \u2014 Check**\n\nDouble 13: \\(13 \\times 2 = 26\\)  \nAdd 4: \\(26 + 4 = 30\\) \u2713\n\n**Answer: 13**"}], "model": "cursor-native-ui"}}
+
+event: session.status
+data: {"sequence_number": null, "type": "session.status", "conversation_id": "conv_f3414ba374c5408f98e7eb555a882d2c", "status": "idle", "response_id": null, "error": null}
+

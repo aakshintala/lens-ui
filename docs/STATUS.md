@@ -185,13 +185,23 @@ and roll older "Recent" pointers off this page as they age.
   every surfaced decision is resolved or consciously deferred.
 - **Deferred, with a clean seam:**
   - **lens-client review deferrals (Plan 4 triage, 2026-06-26):**
-    - **#5 event-surface recapture (capture spike)** — `session.agent_changed`,
-      `response.created`/`queued`, `turn.*` are `DEFERRED→Unknown` and ABSENT from the golden
-      corpus (claude-sdk emits none); a *live* agent switch currently surfaces as `Unknown`, which
-      the design (typed-client §3/§10) assumes the reducer consumes. Gated on a live server + a
-      harness that drives them; model from real bytes (decided), schema-model fallback if undrivable.
-      **Most consequential pre-consumer item** — folds in the `ChildSessionUpdated`/`Terminal*`/
-      poke-only chrome payload-loss family (all `SCHEMA-DERIVED, re-capture at config-time`).
+    - **#5 event-surface recapture (capture spike) — CAPTURE DONE (2026-06-26).** Drove the live
+      pinned server with the now-available native harnesses (`omnigent claude`/`cursor`/`polly`,
+      persistent runner + REST `message` injection) + a Cursor **SDK** key (`crsr_`, keychain) for
+      real reasoning. **Byte-verified 13 previously-`SCHEMA-DERIVED`/`Unknown` families:**
+      `reasoning_text.delta`, `agent_changed`, `child_session.updated` (+child spawn `session.created`),
+      `resource.deleted`, `session.model`/`reasoning_effort`/`todos`, `compaction.in_progress`,
+      `cancelled`/`interrupted`, `terminal.activity` (via **SSE — no WS**), elicitation
+      request+resolved (policy agent), `skills`/`heartbeat`/`failed`. **Findings + deltas:**
+      [`docs/spikes/2026-06-26-live-event-recapture.md`](./spikes/2026-06-26-live-event-recapture.md);
+      raw corpus `docs/spikes/captures/2026-06-26-live-recapture/`; memory `live-event-recapture-findings`.
+      **Key correction:** native TUI mirrors (claude/cursor-native) FOLD reasoning like claude-sdk —
+      real `reasoning_text.delta` needs a reasoning-emitting *inner executor* (cursor SDK here).
+      **Still blocked (no codex sub / no OpenAI key / subscription `llm_model:null`):** `turn.*`
+      (codex-native only), `response.created`/`queued` (openai-scaffold), `reasoning_summary_text.delta`
+      (codex), `compaction.completed` (needs configured model). **Deliverable was capture-only** —
+      a follow-on modeling plan flips byte-verified families `SCHEMA-DERIVED→MODELED` and grows the
+      two under-modeled payloads (`child{}` object; elicitation `params`).
     - **Small hardening:** `info.databricks_features: Value` (one read-side `Value` leak — type or
       make opaque); `ClientError::NotFound` false-friend rename + typed `Validation`/422 variant;
       `gap==Some(0)` proof, `/items` pagination, gated live reconnect smoke (no server-kill harness).
@@ -221,6 +231,18 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Recent
 
+- **2026-06-26** — **Live event-surface recapture spike (Plan 4 #5) — CAPTURE DONE.** Drove the
+  live pinned server headless via native harnesses (`omnigent claude`/`cursor`/`polly` — persistent
+  runner survives the launcher, drive via subscribe-first + REST `message` injection) + a Cursor
+  **SDK** API key for real reasoning deltas. Byte-verified 13 previously-unverified families
+  (reasoning_text.delta, agent_changed, child_session.updated + child session.created,
+  resource.deleted, model/effort/todos, compaction.in_progress, cancelled/interrupted,
+  terminal.activity **via SSE not WS**, elicitation request+resolved via a `ask_on_os_tools` policy
+  agent). Found 2 real under-modeled payloads (child_session drops `child{}`; elicitation drops
+  `params`) + 2 deferred types needing typed arms (child `session.created`, `resource.deleted`).
+  Still blocked by missing subscriptions: turn.*, response.created/queued, reasoning_summary,
+  compaction.completed. Capture-only deliverable; modeling is a follow-on plan.
+  [`spike`](./spikes/2026-06-26-live-event-recapture.md), memory `live-event-recapture-findings`.
 - **2026-06-26** — **Consolidated lens-client review + Plan 4 (pre-consumer hardening) executed &
   complete.** After lens-client reached feature-complete (Plans 1–3c), ran a whole-crate review
   (gpt-5.5 cross-family **+ Opus architecture synthesis**) before building a consumer on it. Findings

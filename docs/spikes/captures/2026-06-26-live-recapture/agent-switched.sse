@@ -1,0 +1,21 @@
+event: session.heartbeat
+data: {"sequence_number": null, "type": "session.heartbeat", "server_time": null}
+
+event: session.resource.created
+data: {"sequence_number": null, "type": "session.resource.created", "resource": {"id": "terminal_tui_main", "object": "session.resource", "type": "terminal", "session_id": "conv_2a954c9e6f234cb2b0494aa83a386948", "name": "tui:main", "metadata": {"terminal_name": "tui", "session_key": "main", "running": true, "tmux_socket": "/var/folders/dq/_c83wftd34g281_1002c_gl00000gn/T/omnigent-terminal-b24wjfby/tmux.sock", "tmux_target": "main"}, "environment": "env_terminal_tui_main"}}
+
+event: session.changed_files.invalidated
+data: {"sequence_number": null, "type": "session.changed_files.invalidated", "session_id": "conv_2a954c9e6f234cb2b0494aa83a386948", "environment_id": "default"}
+
+event: session.presence
+data: {"sequence_number": null, "type": "session.presence", "conversation_id": "conv_2a954c9e6f234cb2b0494aa83a386948", "viewers": []}
+
+event: session.agent_changed
+data: {"sequence_number": null, "type": "session.agent_changed", "conversation_id": "conv_2a954c9e6f234cb2b0494aa83a386948", "agent_id": "ag_2e97f9c41ff445619a455ebfd79de5ac", "agent_name": "debby"}
+
+event: session.changed_files.invalidated
+data: {"sequence_number": null, "type": "session.changed_files.invalidated", "session_id": "conv_2a954c9e6f234cb2b0494aa83a386948", "environment_id": "default"}
+
+event: session.resource.deleted
+data: {"sequence_number": null, "type": "session.resource.deleted", "resource_id": "terminal_tui_main", "resource_type": "terminal", "session_id": "conv_2a954c9e6f234cb2b0494aa83a386948"}
+

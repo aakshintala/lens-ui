@@ -1,0 +1,30 @@
+event: session.heartbeat
+data: {"sequence_number": null, "type": "session.heartbeat", "server_time": null}
+
+event: session.resource.created
+data: {"sequence_number": null, "type": "session.resource.created", "resource": {"id": "terminal_tui_main", "object": "session.resource", "type": "terminal", "session_id": "conv_78654524408644ec80904d3b0e1b0548", "name": "tui:main", "metadata": {"terminal_name": "tui", "session_key": "main", "running": true, "tmux_socket": "/var/folders/dq/_c83wftd34g281_1002c_gl00000gn/T/omnigent-terminal-lkwuc9nc/tmux.sock", "tmux_target": "main"}, "environment": "env_terminal_tui_main"}}
+
+event: session.changed_files.invalidated
+data: {"sequence_number": null, "type": "session.changed_files.invalidated", "session_id": "conv_78654524408644ec80904d3b0e1b0548", "environment_id": "default"}
+
+event: session.presence
+data: {"sequence_number": null, "type": "session.presence", "conversation_id": "conv_78654524408644ec80904d3b0e1b0548", "viewers": []}
+
+event: session.input.consumed
+data: {"sequence_number": null, "type": "session.input.consumed", "data": {"item_id": "msg_52f282ae3a6c4ec0bdf092ffa0ab630a", "type": "message", "data": {"role": "user", "content": [{"type": "input_text", "text": "Create a file at /tmp/spike_elicit.txt containing hello-elicit. Use your file/shell tool now."}], "agent": null}, "created_by": null, "cleared_pending_id": null}}
+
+event: session.status
+data: {"sequence_number": null, "type": "session.status", "conversation_id": "conv_78654524408644ec80904d3b0e1b0548", "status": "running", "response_id": null, "error": null}
+
+event: response.in_progress
+data: {"sequence_number": 1, "type": "response.in_progress", "response": {"id": "resp_0339e6ef7a0648ef96b4811e", "object": "response", "status": "in_progress", "model": "spike-elicit", "created_at": 1782539889, "completed_at": null, "output": [], "background": false, "store": true, "usage": null, "previous_response_id": null, "conversation": null, "instructions": null, "reasoning": null, "error": null, "incomplete_details": null}}
+
+event: response.reasoning.started
+data: {"sequence_number": 3, "type": "response.reasoning.started"}
+
+event: response.output_item.done
+data: {"sequence_number": 4, "type": "response.output_item.done", "item": {"id": "fc_69ab623d4b94", "type": "function_call", "status": "in_progress", "name": "sys_os_write", "arguments": "{\"path\": \"/tmp/spike_elicit.txt\", \"content\": \"hello-elicit\"}", "call_id": "toolu_011thEnWK7moJineDGsmTLPS", "agent": "resp_0339e6ef7a0648ef96b4811e"}}
+
+event: response.elicitation_request
+data: {"sequence_number": null, "type": "response.elicitation_request", "elicitation_id": "elicit_17f8355e96500efe97547b6104c31970", "method": "elicitation/create", "params": {"mode": "url", "message": "approve_file_ops: Agent wants to call sys_os_write('/tmp/spike_elicit.txt'). Approve?", "requestedSchema": {}, "url": "/approve/conv_78654524408644ec80904d3b0e1b0548/elicit_17f8355e96500efe97547b6104c31970", "phase": "tool_call", "policy_name": "approve_file_ops", "content_preview": "{\"path\": \"/tmp/spike_elicit.txt\", \"content\": \"hello-elicit\"}", "target_session_id": null}}
+

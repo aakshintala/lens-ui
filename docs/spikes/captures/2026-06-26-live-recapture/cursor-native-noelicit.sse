@@ -1,0 +1,54 @@
+event: session.heartbeat
+data: {"sequence_number": null, "type": "session.heartbeat", "server_time": null}
+
+event: session.resource.created
+data: {"sequence_number": null, "type": "session.resource.created", "resource": {"id": "terminal_cursor_main", "object": "session.resource", "type": "terminal", "session_id": "conv_f3414ba374c5408f98e7eb555a882d2c", "name": "cursor:main", "metadata": {"terminal_name": "cursor", "session_key": "main", "running": true, "tmux_socket": "/var/folders/dq/_c83wftd34g281_1002c_gl00000gn/T/omnigent-terminal-frvusvte/tmux.sock", "tmux_target": "main"}, "environment": "env_terminal_cursor_main"}}
+
+event: session.changed_files.invalidated
+data: {"sequence_number": null, "type": "session.changed_files.invalidated", "session_id": "conv_f3414ba374c5408f98e7eb555a882d2c", "environment_id": "default"}
+
+event: session.presence
+data: {"sequence_number": null, "type": "session.presence", "conversation_id": "conv_f3414ba374c5408f98e7eb555a882d2c", "viewers": []}
+
+event: response.in_progress
+data: {"sequence_number": 1, "type": "response.in_progress", "response": {"id": "resp_1c21f13d14f34454b5d158af", "object": "response", "status": "in_progress", "model": "cursor-native-ui", "created_at": 1782537746, "completed_at": null, "output": [], "background": false, "store": true, "usage": null, "previous_response_id": null, "conversation": null, "instructions": null, "reasoning": null, "error": null, "incomplete_details": null}}
+
+event: session.terminal.activity
+data: {"sequence_number": null, "type": "session.terminal.activity", "session_id": "conv_f3414ba374c5408f98e7eb555a882d2c", "terminal_id": "terminal_cursor_main"}
+
+event: session.status
+data: {"sequence_number": null, "type": "session.status", "conversation_id": "conv_f3414ba374c5408f98e7eb555a882d2c", "status": "running", "response_id": null, "error": null}
+
+event: response.completed
+data: {"sequence_number": 2, "type": "response.completed", "response": {"id": "resp_1c21f13d14f34454b5d158af", "object": "response", "status": "completed", "model": "cursor-native-ui", "created_at": 1782537747, "completed_at": null, "output": [], "background": false, "store": true, "usage": null, "previous_response_id": null, "conversation": null, "instructions": null, "reasoning": null, "error": null, "incomplete_details": null}}
+
+event: session.terminal.activity
+data: {"sequence_number": null, "type": "session.terminal.activity", "session_id": "conv_f3414ba374c5408f98e7eb555a882d2c", "terminal_id": "terminal_cursor_main"}
+
+event: session.terminal.activity
+data: {"sequence_number": null, "type": "session.terminal.activity", "session_id": "conv_f3414ba374c5408f98e7eb555a882d2c", "terminal_id": "terminal_cursor_main"}
+
+event: session.terminal.activity
+data: {"sequence_number": null, "type": "session.terminal.activity", "session_id": "conv_f3414ba374c5408f98e7eb555a882d2c", "terminal_id": "terminal_cursor_main"}
+
+event: session.terminal.activity
+data: {"sequence_number": null, "type": "session.terminal.activity", "session_id": "conv_f3414ba374c5408f98e7eb555a882d2c", "terminal_id": "terminal_cursor_main"}
+
+event: session.terminal.activity
+data: {"sequence_number": null, "type": "session.terminal.activity", "session_id": "conv_f3414ba374c5408f98e7eb555a882d2c", "terminal_id": "terminal_cursor_main"}
+
+event: session.terminal.activity
+data: {"sequence_number": null, "type": "session.terminal.activity", "session_id": "conv_f3414ba374c5408f98e7eb555a882d2c", "terminal_id": "terminal_cursor_main"}
+
+event: session.terminal.activity
+data: {"sequence_number": null, "type": "session.terminal.activity", "session_id": "conv_f3414ba374c5408f98e7eb555a882d2c", "terminal_id": "terminal_cursor_main"}
+
+event: session.input.consumed
+data: {"sequence_number": null, "type": "session.input.consumed", "data": {"item_id": "msg_8b7a2d8a83b942beb22496fd040ed53b", "type": "message", "data": {"role": "user", "content": [{"type": "input_text", "text": "Run this shell command in the terminal: rm -rf /tmp/spike_test_dir && echo done. Ask for my approval before running anything destructive."}], "agent": null}, "created_by": null, "cleared_pending_id": "pending_c67c33adc5c44d138350d8ae6fb4cd16"}}
+
+event: response.output_item.done
+data: {"sequence_number": null, "type": "response.output_item.done", "item": {"id": "msg_549979906eae4e6dac7f79cf0a958537", "response_id": "cursor:9be06c0aa963a9f0d38c4746d505460f1fc946cbfd0a05a0c0aa45903ed1b754", "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": "This command is destructive \u2014 I won't run it until you approve.\n\n**Command:**\n```bash\nrm -rf /tmp/spike_test_dir && echo done\n```\n\n**What it does:**\n1. `rm -rf /tmp/spike_test_dir` \u2014 recursively deletes the directory `/tmp/spike_test_dir` and everything inside it, with no confirmation prompt.\n2. `&& echo done` \u2014 prints `done` only if the removal succeeds.\n\n**Scope:** It only targets `/tmp/spike_test_dir`, not your whole system. Still, anything in that folder is permanently removed.\n\n**Approve?** Reply **yes** to run it, or **no** to skip. If you want a safer check first (e.g. list what's in that directory), say so and I can do that instead."}], "model": "cursor-native-ui"}}
+
+event: session.status
+data: {"sequence_number": null, "type": "session.status", "conversation_id": "conv_f3414ba374c5408f98e7eb555a882d2c", "status": "idle", "response_id": null, "error": null}
+
