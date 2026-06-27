@@ -50,6 +50,43 @@ pub struct SessionSnapshot {
     host_online: Option<bool>,
     #[serde(default)]
     host_resumable: bool,
+    #[serde(default)]
+    harness: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    runner_id: Option<String>,
+    #[serde(default)]
+    host_id: Option<String>,
+    #[serde(default)]
+    llm_model: Option<String>,
+    #[serde(default)]
+    model_override: Option<String>,
+    #[serde(default)]
+    reasoning_effort: Option<String>,
+    #[serde(default)]
+    context_window: Option<i64>,
+    #[serde(default)]
+    last_total_tokens: Option<i64>,
+    #[serde(default)]
+    total_cost_usd: Option<f64>,
+    #[serde(default)]
+    permission_level: Option<i64>,
+    #[serde(default)]
+    workspace: Option<String>,
+    #[serde(default)]
+    git_branch: Option<String>,
+    #[serde(default)]
+    root_conversation_id: Option<String>,
+    #[serde(default)]
+    parent_session_id: Option<String>,
+    #[serde(default)]
+    sub_agent_name: Option<String>,
+    // ⚠ DEFERRED: last_task_error — null in the capture, but the sibling
+    //   ChildSessionSummary models it as Option<BTreeMap<String,String>>
+    //   (sessions.rs:309). Its non-string live shape would fail the whole
+    //   snapshot deser, so it is left out (serde skips the unknown wire field).
+    //   Model when a non-null shape is captured.
 }
 
 impl SessionSnapshot {
@@ -84,6 +121,110 @@ impl SessionSnapshot {
     }
     pub fn host_resumable(&self) -> bool {
         self.host_resumable
+    }
+    pub fn harness(&self) -> &str {
+        &self.harness
+    }
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+    pub fn runner_id(&self) -> Option<&str> {
+        self.runner_id.as_deref()
+    }
+    pub fn host_id(&self) -> Option<&str> {
+        self.host_id.as_deref()
+    }
+    pub fn llm_model(&self) -> Option<&str> {
+        self.llm_model.as_deref()
+    }
+    pub fn model_override(&self) -> Option<&str> {
+        self.model_override.as_deref()
+    }
+    pub fn reasoning_effort(&self) -> Option<&str> {
+        self.reasoning_effort.as_deref()
+    }
+    pub fn context_window(&self) -> Option<i64> {
+        self.context_window
+    }
+    pub fn last_total_tokens(&self) -> Option<i64> {
+        self.last_total_tokens
+    }
+    pub fn total_cost_usd(&self) -> Option<f64> {
+        self.total_cost_usd
+    }
+    pub fn permission_level(&self) -> Option<i64> {
+        self.permission_level
+    }
+    pub fn workspace(&self) -> Option<&str> {
+        self.workspace.as_deref()
+    }
+    pub fn git_branch(&self) -> Option<&str> {
+        self.git_branch.as_deref()
+    }
+    pub fn root_conversation_id(&self) -> Option<&str> {
+        self.root_conversation_id.as_deref()
+    }
+    pub fn parent_session_id(&self) -> Option<&str> {
+        self.parent_session_id.as_deref()
+    }
+    pub fn sub_agent_name(&self) -> Option<&str> {
+        self.sub_agent_name.as_deref()
+    }
+}
+
+/// Per-model token+cost usage from `usage_by_model` on the session snapshot.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct ModelUsage {
+    #[serde(default)]
+    input_tokens: i64,
+    #[serde(default)]
+    output_tokens: i64,
+    #[serde(default)]
+    total_tokens: i64,
+    #[serde(default)]
+    cache_read_input_tokens: i64,
+    #[serde(default)]
+    cache_creation_input_tokens: i64,
+    #[serde(default)]
+    total_cost_usd: f64,
+}
+
+impl ModelUsage {
+    pub fn input_tokens(&self) -> i64 {
+        self.input_tokens
+    }
+    pub fn output_tokens(&self) -> i64 {
+        self.output_tokens
+    }
+    pub fn total_tokens(&self) -> i64 {
+        self.total_tokens
+    }
+    pub fn cache_read_input_tokens(&self) -> i64 {
+        self.cache_read_input_tokens
+    }
+    pub fn cache_creation_input_tokens(&self) -> i64 {
+        self.cache_creation_input_tokens
+    }
+    pub fn total_cost_usd(&self) -> f64 {
+        self.total_cost_usd
+    }
+}
+
+/// An attached skill summary from `skills` on the session snapshot.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct SkillRef {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    description: String,
+}
+
+impl SkillRef {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn description(&self) -> &str {
+        &self.description
     }
 }
 
@@ -1884,5 +2025,22 @@ mod tests {
         assert!(q.contains(&("limit", "50".to_string())));
         assert!(q.contains(&("order", "asc".to_string())));
         assert!(!q.iter().any(|(k, _)| *k == "after" || *k == "before"));
+    }
+
+    #[test]
+    fn snapshot_parses_bucket_b_scalars_from_golden() {
+        let raw = include_str!("../tests/fixtures/sse/happy_path.snapshot.json");
+        let s: super::SessionSnapshot = serde_json::from_str(raw).expect("parse snapshot");
+        assert_eq!(s.harness(), "claude-sdk");
+        assert_eq!(s.workspace(), Some("/Users/aakshintala/work/lens"));
+        assert_eq!(s.permission_level(), Some(4));
+        assert_eq!(
+            s.root_conversation_id(),
+            Some("conv_91d8bde71cae41e7b32e01a648e00f72")
+        );
+        // Byte fact: total_cost_usd present, llm_model/context_window null on this turn.
+        assert!(s.total_cost_usd().unwrap() > 0.0);
+        assert_eq!(s.llm_model(), None);
+        assert_eq!(s.context_window(), None);
     }
 }
