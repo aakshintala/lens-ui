@@ -452,7 +452,7 @@ Responsibilities:
   composer re-render from the updated scalar; the transcript keeps its
   history with the marker visible (decision J, capability map §0.7).
 
-- **`SnapshotRestored` fold (reconnect chrome)** — on
+- **`SnapshotRestored` fold (reconnect & bootstrap chrome)** — on
   `ServerStreamEvent::SnapshotRestored(SessionSnapshot)` (typed client §7, A2
   decision) the reducer bulk-folds the snapshot's bucket-B chrome
   scalars/collections into `SessionState` — status/usage/model/todos/
@@ -462,7 +462,12 @@ Responsibilities:
   arm does NOT push an `AgentChanged` item (no agent transition happened, just a
   wake) and emits no presence marker. Ordering is guaranteed by the crate:
   `Reconnected{gap}` (clears `StreamScratch` when `gap != Some(0)`) →
-  `SnapshotRestored` → replayed `GET /items` history.
+  `SnapshotRestored` → replayed `GET /items` history. **The same arm also folds
+  the bootstrap prelude** (first stream open, typed client §7 "Bootstrap", Plan 4):
+  the crate emits `SnapshotRestored` + replayed items on first connect too (no
+  `Reconnected` marker — no gap), so the reducer is the single writer of initial
+  state as well — the consumer no longer applies the opening snapshot/items through
+  a separate path.
 
 What the reducer finalizes is what gets appended to disk (§6). In-progress
 accumulators in `StreamScratch` are RAM-only and never persisted — exactly the
