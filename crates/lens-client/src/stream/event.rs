@@ -83,7 +83,6 @@ pub enum SessionEvent {
         child_session_id: String,
         child: ChildSession,
     },
-    // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
     TerminalActivity {
         terminal_id: String,
     },
@@ -91,15 +90,12 @@ pub enum SessionEvent {
     TerminalPending {
         pending: bool,
     },
-    // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
     Model {
         model: String,
     },
-    // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
     Todos {
         todos: Vec<TodoItem>,
     },
-    // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
     ReasoningEffort {
         reasoning_effort: Option<String>,
     },
@@ -110,7 +106,6 @@ pub enum SessionEvent {
         stage: String,
         error: Option<String>,
     },
-    // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
     Skills,
     AgentChanged {
         agent_id: String,
@@ -494,13 +489,10 @@ pub enum ResponseEvent {
     OutputItemDone {
         item: Item,
     },
-    // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
     Failed,
     // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
     Incomplete,
-    // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
     Cancelled,
-    // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
     ReasoningTextDelta {
         delta: String,
     },
@@ -508,7 +500,6 @@ pub enum ResponseEvent {
     ReasoningSummaryTextDelta {
         delta: String,
     },
-    // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
     CompactionInProgress,
     // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
     CompactionCompleted {
@@ -516,7 +507,6 @@ pub enum ResponseEvent {
     },
     // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
     CompactionFailed,
-    // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
     Error {
         source: String,
         tool_name: Option<String>,
@@ -527,7 +517,6 @@ pub enum ResponseEvent {
         elicitation_id: String,
         params: ElicitationParams,
     },
-    // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
     ElicitationResolved {
         elicitation_id: String,
     },
@@ -752,7 +741,6 @@ impl SessionEvent {
                     },
                 }
             }
-            // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
             "session.terminal.activity" => {
                 let r: RawTerminalActivity = serde_json::from_str(d).ok()?;
                 SessionEvent::TerminalActivity {
@@ -764,12 +752,10 @@ impl SessionEvent {
                 let r: RawTerminalPending = serde_json::from_str(d).ok()?;
                 SessionEvent::TerminalPending { pending: r.pending }
             }
-            // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
             "session.model" => {
                 let r: RawSessionModel = serde_json::from_str(d).ok()?;
                 SessionEvent::Model { model: r.model }
             }
-            // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
             "session.todos" => {
                 let r: RawSessionTodos = serde_json::from_str(d).ok()?;
                 SessionEvent::Todos {
@@ -784,7 +770,6 @@ impl SessionEvent {
                         .collect(),
                 }
             }
-            // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
             "session.reasoning_effort" => {
                 let r: RawSessionReasoningEffort = serde_json::from_str(d).ok()?;
                 SessionEvent::ReasoningEffort {
@@ -804,7 +789,6 @@ impl SessionEvent {
                     error: r.error,
                 }
             }
-            // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
             "session.skills" => {
                 let _: RawSessionConversationOnly = serde_json::from_str(d).ok()?;
                 SessionEvent::Skills
@@ -850,13 +834,10 @@ impl ResponseEvent {
                     item: Item::from_value(env.item),
                 }
             }
-            // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
             "response.failed" => ResponseEvent::Failed,
             // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
             "response.incomplete" => ResponseEvent::Incomplete,
-            // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
             "response.cancelled" => ResponseEvent::Cancelled,
-            // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
             "response.reasoning_text.delta" => {
                 let r: RawReasoningDelta = serde_json::from_str(d).ok()?;
                 ResponseEvent::ReasoningTextDelta { delta: r.delta }
@@ -866,7 +847,6 @@ impl ResponseEvent {
                 let r: RawReasoningDelta = serde_json::from_str(d).ok()?;
                 ResponseEvent::ReasoningSummaryTextDelta { delta: r.delta }
             }
-            // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
             "response.compaction.in_progress" => ResponseEvent::CompactionInProgress,
             // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
             "response.compaction.completed" => {
@@ -877,7 +857,6 @@ impl ResponseEvent {
             }
             // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
             "response.compaction.failed" => ResponseEvent::CompactionFailed,
-            // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
             "response.error" => {
                 let r: RawStreamError = serde_json::from_str(d).ok()?;
                 ResponseEvent::Error {
@@ -901,7 +880,6 @@ impl ResponseEvent {
                     },
                 }
             }
-            // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
             "response.elicitation_resolved" => {
                 let r: RawElicitationResolved = serde_json::from_str(d).ok()?;
                 ResponseEvent::ElicitationResolved {
@@ -1327,8 +1305,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_reasoning_text_delta() {
-        // SCHEMA-DERIVED: ReasoningTextDeltaEvent {delta, sequence_number, type}.
+    fn bytes_reasoning_text_delta() {
+        // Byte-verified: docs/spikes/captures/2026-06-26-live-recapture/cursor-sdk-reasoning.sse
         let ev = parse_event(&frame(
             "response.reasoning_text.delta",
             r#"{"delta":"because","sequence_number":5}"#,
@@ -1357,8 +1335,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_response_failed_carries_status() {
-        // SCHEMA-DERIVED: response.failed mirrors response.completed (response obj).
+    fn bytes_response_failed_carries_status() {
+        // Byte-verified: docs/spikes/captures/2026-06-26-live-recapture/pi-failed-model.sse
         let ev = parse_event(&frame(
             "response.failed",
             r#"{"response":{"status":"failed"}}"#,
@@ -1377,8 +1355,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_response_cancelled() {
-        // SCHEMA-DERIVED.
+    fn bytes_response_cancelled() {
+        // Byte-verified: docs/spikes/captures/2026-06-26-live-recapture/interrupt-cancelled.sse
         let ev = parse_event(&frame(
             "response.cancelled",
             r#"{"response":{"status":"cancelled"}}"#,
@@ -1387,8 +1365,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_compaction_in_progress() {
-        // SCHEMA-DERIVED.
+    fn bytes_compaction_in_progress() {
+        // Byte-verified: docs/spikes/captures/2026-06-26-live-recapture/chrome-model-effort-compact.sse
         let ev = parse_event(&frame("response.compaction.in_progress", "{}"));
         assert_eq!(
             ev,
@@ -1422,8 +1400,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_response_error() {
-        // SCHEMA-DERIVED: ErrorEvent {source, tool_name, error:{code, message}}.
+    fn bytes_response_error() {
+        // Byte-verified: docs/spikes/captures/2026-06-26-live-recapture/<various>.sse
         let ev = parse_event(&frame(
             "response.error",
             r#"{"source":"llm","tool_name":null,"error":{"code":"timeout","message":"timed out"}}"#,
@@ -1463,8 +1441,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_elicitation_resolved() {
-        // SCHEMA-DERIVED.
+    fn bytes_elicitation_resolved() {
+        // Byte-verified: docs/spikes/captures/2026-06-26-live-recapture/elicitation-resolved.sse
         let ev = parse_event(&frame(
             "response.elicitation_resolved",
             r#"{"elicitation_id":"elicit_abc"}"#,
@@ -1514,8 +1492,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_terminal_activity() {
-        // SCHEMA-DERIVED.
+    fn bytes_terminal_activity() {
+        // Byte-verified: docs/spikes/captures/2026-06-26-live-recapture/claude-native-turn.sse
         let ev = parse_event(&frame(
             "session.terminal.activity",
             r#"{"session_id":"conv_abc","terminal_id":"terminal_zsh_s1"}"#,
@@ -1542,8 +1520,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_session_model() {
-        // SCHEMA-DERIVED.
+    fn bytes_session_model() {
+        // Byte-verified: docs/spikes/captures/2026-06-26-live-recapture/chrome-model-effort-compact.sse
         let ev = parse_event(&frame(
             "session.model",
             r#"{"conversation_id":"conv_abc","model":"opus"}"#,
@@ -1557,8 +1535,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_session_todos() {
-        // SCHEMA-DERIVED.
+    fn bytes_session_todos() {
+        // Byte-verified: docs/spikes/captures/2026-06-26-live-recapture/claude-native-todos.sse
         let ev = parse_event(&frame(
             "session.todos",
             r#"{"conversation_id":"conv_abc","todos":[{"content":"Fix the bug","status":"in_progress","activeForm":"Fixing the bug"}]}"#,
@@ -1576,8 +1554,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_reasoning_effort() {
-        // SCHEMA-DERIVED.
+    fn bytes_reasoning_effort() {
+        // Byte-verified: docs/spikes/captures/2026-06-26-live-recapture/chrome-model-effort-compact.sse
         let ev = parse_event(&frame(
             "session.reasoning_effort",
             r#"{"conversation_id":"conv_abc","reasoning_effort":"high"}"#,
@@ -1617,8 +1595,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_skills() {
-        // SCHEMA-DERIVED.
+    fn bytes_skills() {
+        // Byte-verified: docs/spikes/captures/2026-06-26-live-recapture/interrupt-cancelled.sse
         let ev = parse_event(&frame(
             "session.skills",
             r#"{"conversation_id":"conv_abc"}"#,
