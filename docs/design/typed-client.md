@@ -321,20 +321,28 @@ SSE is no-replay. Correct reconnect:
    `Sessions::stream()`, restarting from step 2.
 4. **On success — snapshot (bucket B: chrome)** — `GET /v1/sessions/{id}` (with
    `include_items=true, include_liveness=true`) confirms the session exists and
-   **restores all session chrome** by applying the snapshot's scalars/collections
-   directly (status, usage, model, todos, model_options, reasoning_effort,
-   collaboration_mode, skills, archived, presence-count, …). This chrome is
-   **SSE-only/transient on the wire** — it is NOT replayed from `GET /items`; it
-   is reconstructed from the snapshot. Do not expect a `session.agent_changed`
-   marker on wake — apply the snapshot's current `agent_id`/`agent_name` instead.
+   **restores all session chrome** (status, usage, model, todos, model_options,
+   reasoning_effort, collaboration_mode, skills, archived, presence-count, …).
+   This chrome is **SSE-only/transient on the wire** — it is NOT replayed from
+   `GET /items`; it is reconstructed from the snapshot. The crate emits the
+   restore as a **single synthetic `ServerStreamEvent::SnapshotRestored(SessionSnapshot)`**
+   carrying the typed snapshot payload (the consumer never applies the snapshot
+   itself — see the ownership decision below). Do not expect a
+   `session.agent_changed` marker on wake — the snapshot's current
+   `agent_id`/`agent_name` ride inside `SnapshotRestored`, and the reducer's
+   arm for it folds the scalar **without** the live-transition transcript
+   side-effect (no spurious `AgentChanged` item).
 5. **History (bucket A: transcript)** — `GET /v1/sessions/{id}/items` fills the
    durable conversation items. **Persisted `ConversationItem` has no
    `sequence_number`** (`entities/conversation.py:644` — only `id`), so items are
    merged into the transcript by **item `id`** (idempotent upsert), NOT by
    sequence. The rest are replayed into the stream as `ServerStreamEvent` values.
-6. **Emit `Reconnected { gap }`** — before any replayed history items. The
-   ordering guarantee is load-bearing: the state model must clear transient
-   state *before* history lands.
+6. **Emit `Reconnected { gap }` → `SnapshotRestored`** — before any replayed
+   history items, in this order: `Reconnected { gap }` first (so the state model
+   clears transient accumulators when `gap != Some(0)`), then
+   `SnapshotRestored(SessionSnapshot)` (bucket-B chrome), then the replayed
+   `GET /items` history (bucket A). The ordering is load-bearing: transient state
+   is cleared, chrome is restored, *then* history lands.
 7. **Re-open stream + dedup (bucket C: live overlap)** — `GET /v1/sessions/{id}/stream`.
    `sequence_number` dedup applies **only to the live SSE overlap window**: events
    that fire between the snapshot/history read and the stream re-opening may arrive
@@ -378,16 +386,41 @@ The crate owns the protocol; the state model just keeps draining the
 `ServerStreamEvent` stream (app-arch state-model §8: "the pump just keeps
 reading") and never sees raw reconnect mechanics. The crate emits
 `ServerStreamEvent` — `StreamUpdate` is the state model's *reduced* output
-(§13), not the crate's emission. The three reconnect-lifecycle markers ride the
+(§13), not the crate's emission. The reconnect-lifecycle markers ride the
 same stream as synthetic values: `Reconnecting { attempt }` → `Reconnected { gap }`
-→ terminal `Disconnected`.
+→ `SnapshotRestored(SessionSnapshot)` (on success) … → terminal `Disconnected`
+(on give-up).
+
+**Decision — bucket-B chrome restore ownership (2026-06-26, Opus design; A2).**
+On reconnect the crate emits chrome restore as **one synthetic
+`ServerStreamEvent::SnapshotRestored(SessionSnapshot)`**, NOT as direct
+consumer apply and NOT as per-field synthetic `session.*` events.
+- **Why not consumer-applies-snapshot (Option B):** state-model §1 is LOCKED —
+  "this layer does NOT own reconnect" and "the boundary upstream is the
+  `ServerStreamEvent` stream." A direct apply would make the consumer aware of
+  reconnect and ingest a non-`ServerStreamEvent` payload, breaking that boundary
+  and the §4.1 single-writer/replayable invariant (the reducer is the only
+  writer of `SessionState`).
+- **Why not per-field synthetic `session.*` events (Option A1):** replaying the
+  snapshot through the existing per-event folds re-runs their side-effects — a
+  `session.agent_changed` fold pushes an `AgentChanged` *item* into the
+  transcript (state-model §4.1), so every wake would inject a spurious
+  agent-change marker. It also needs a snapshot-field→event map maintained in
+  lockstep with the wire forever.
+- **Why A2 (chosen):** one event carrying the typed `SessionSnapshot` keeps the
+  reducer the single writer and the consumer purely event-driven; the reducer
+  gets one dedicated arm that bulk-folds chrome scalars/collections with **no
+  transcript side-effects**; it reuses the typed snapshot reads (Plan 3b-2a)
+  wholesale — no per-field mapping. The state-model reducer (§4.1) must add a
+  `SnapshotRestored` arm: chrome-scalar/collection fold only, no `AgentChanged`
+  item insertion, no presence-marker emission.
 
 **Two seams this opens for the reconnect implementation (Plan 3b-2):** (a) the
 crate's §7a normalizer holds per-stream dedup state (`seen_items`) — it MUST be
 reset on `Reconnected { gap != Some(0) }`, or the `GET /items` history replay is
-wrongly suppressed as an already-seen re-fire; (b) the synthetic lifecycle
-markers are not wire events — they bypass dedup/reasoning normalization (pass
-through untouched).
+wrongly suppressed as an already-seen re-fire; (b) the synthetic markers
+(`Reconnecting`, `Reconnected`, `SnapshotRestored`, `Disconnected`) are not wire
+events — they bypass dedup/reasoning normalization (pass through untouched).
 
 **Three-bucket reconnect classification** (which events survive reconnect and
 how) — **load-bearing delegation, authoritative here**. Note: ALL `session.*`
