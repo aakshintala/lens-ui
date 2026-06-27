@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 const SPEC: &str = "vendor/omnigent-0.3.0.dev0/openapi.json";
@@ -36,6 +36,67 @@ fn diff_sets(vendored: &BTreeSet<String>, sibling: &BTreeSet<String>) -> SetDiff
     SetDiff {
         added: sibling.difference(vendored).cloned().collect(),
         removed: vendored.difference(sibling).cloned().collect(),
+    }
+}
+
+fn sse_mapping(doc: &serde_json::Value) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    doc.pointer("/components/schemas/ServerStreamEvent/discriminator/mapping")
+        .and_then(|m| m.as_object())
+}
+
+fn sse_event_types(doc: &serde_json::Value) -> BTreeSet<String> {
+    sse_mapping(doc)
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// wire-type → property-name set of its mapped member schema.
+fn member_shapes(doc: &serde_json::Value) -> BTreeMap<String, BTreeSet<String>> {
+    let Some(mapping) = sse_mapping(doc) else {
+        return BTreeMap::new();
+    };
+    let mut out = BTreeMap::new();
+    for (wire, ref_val) in mapping {
+        let Some(name) = ref_val.as_str().and_then(|r| r.rsplit('/').next()) else {
+            continue;
+        };
+        let props = doc
+            .pointer(&format!("/components/schemas/{name}/properties"))
+            .and_then(|p| p.as_object())
+            .map(|p| p.keys().cloned().collect())
+            .unwrap_or_default();
+        out.insert(wire.clone(), props);
+    }
+    out
+}
+
+#[derive(Debug, Default)]
+struct SseDiff {
+    types: SetDiff,
+    changed_shapes: Vec<(String, SetDiff)>, // shared types whose property sets differ
+}
+
+impl SseDiff {
+    fn is_empty(&self) -> bool {
+        self.types.is_empty() && self.changed_shapes.is_empty()
+    }
+}
+
+fn diff_sse(vendored: &serde_json::Value, sibling: &serde_json::Value) -> SseDiff {
+    let types = diff_sets(&sse_event_types(vendored), &sse_event_types(sibling));
+    let (vshapes, sshapes) = (member_shapes(vendored), member_shapes(sibling));
+    let mut changed_shapes = Vec::new();
+    for (wire, vprops) in &vshapes {
+        if let Some(sprops) = sshapes.get(wire) {
+            let shape = diff_sets(vprops, sprops);
+            if !shape.is_empty() {
+                changed_shapes.push((wire.clone(), shape));
+            }
+        }
+    }
+    SseDiff {
+        types,
+        changed_shapes,
     }
 }
 
@@ -160,6 +221,26 @@ fn drift(mut args: impl Iterator<Item = String>) -> Result<()> {
         }
     }
 
+    let sse = diff_sse(&vendored, &sibling);
+    if !sse.is_empty() {
+        drifted = true;
+        eprintln!("SSE TAXONOMY DRIFT:");
+        for t in &sse.types.added {
+            eprintln!("  + event type {t}  (upstream gained)");
+        }
+        for t in &sse.types.removed {
+            eprintln!("  - event type {t}  (upstream dropped)");
+        }
+        for (ty, shape) in &sse.changed_shapes {
+            for p in &shape.added {
+                eprintln!("  ~ {ty}: + field {p}");
+            }
+            for p in &shape.removed {
+                eprintln!("  ~ {ty}: - field {p}");
+            }
+        }
+    }
+
     if drifted {
         bail!("contract drift detected — re-vendor + re-run codegen, or update the pin");
     }
@@ -218,5 +299,55 @@ mod tests {
         // Identical specs → no drift.
         let same = diff_sets(&vp, &vp);
         assert!(same.is_empty());
+    }
+
+    fn doc_with_events(members: &[(&str, &str, &[&str])]) -> serde_json::Value {
+        // members: (wire_type, schema_name, property_names)
+        let mut mapping = serde_json::Map::new();
+        let mut schemas = serde_json::Map::new();
+        for (wire, name, props) in members {
+            mapping.insert(
+                (*wire).to_string(),
+                json!(format!("#/components/schemas/{name}")),
+            );
+            let mut props_obj = serde_json::Map::new();
+            for p in *props {
+                props_obj.insert((*p).to_string(), json!({}));
+            }
+            schemas.insert((*name).to_string(), json!({ "properties": props_obj }));
+        }
+        schemas.insert(
+            "ServerStreamEvent".to_string(),
+            json!({ "discriminator": { "propertyName": "type", "mapping": mapping } }),
+        );
+        json!({ "components": { "schemas": schemas } })
+    }
+
+    #[test]
+    fn sse_diff_reports_type_and_shape_changes() {
+        let vendored = doc_with_events(&[
+            ("response.completed", "CompletedEvent", &["type", "seq"]),
+            ("session.status", "SessionStatusEvent", &["type", "status"]),
+        ]);
+        let sibling = doc_with_events(&[
+            (
+                "response.completed",
+                "CompletedEvent",
+                &["type", "seq", "usage"],
+            ), // field added
+            ("turn.started", "TurnStartedEvent", &["type"]), // type added
+                                                             // session.status dropped
+        ]);
+
+        let diff = diff_sse(&vendored, &sibling);
+        assert_eq!(diff.types.added, vec!["turn.started".to_string()]);
+        assert_eq!(diff.types.removed, vec!["session.status".to_string()]);
+        assert_eq!(diff.changed_shapes.len(), 1);
+        let (ty, shape) = &diff.changed_shapes[0];
+        assert_eq!(ty, "response.completed");
+        assert_eq!(shape.added, vec!["usage".to_string()]);
+        assert!(shape.removed.is_empty());
+
+        assert!(diff_sse(&vendored, &vendored).is_empty());
     }
 }

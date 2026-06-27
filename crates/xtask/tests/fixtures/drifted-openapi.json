@@ -1,0 +1,21 @@
+{
+  "paths": {
+    "/v1/sessions": {},
+    "/v1/agents": {}
+  },
+  "components": {
+    "schemas": {
+      "CompletedEvent": { "properties": { "type": {}, "seq": {}, "usage": {} } },
+      "TurnStartedEvent": { "properties": { "type": {} } },
+      "ServerStreamEvent": {
+        "discriminator": {
+          "propertyName": "type",
+          "mapping": {
+            "response.completed": "#/components/schemas/CompletedEvent",
+            "turn.started": "#/components/schemas/TurnStartedEvent"
+          }
+        }
+      }
+    }
+  }
+}
