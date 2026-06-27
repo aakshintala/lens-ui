@@ -13,12 +13,10 @@ use crate::stream::ServerStreamEvent;
 use crate::stream::event::ResponseEvent;
 
 /// §7 backoff schedule (ms): 100→200→400→800→1600→3000→3000. ~7s through six.
-#[allow(dead_code)] // wired in Plan 3b-2b Task 5/6
 pub(crate) const BACKOFF_MS: &[u64] = &[100, 200, 400, 800, 1600, 3000, 3000];
 
 /// The reader's re-issue capability. `Send` so it can live on the reader thread;
 /// a trait so the reconnect state machine is unit-testable with a scripted mock.
-#[allow(dead_code)] // wired in Plan 3b-2b Task 5/6
 pub(crate) trait Reopen: Send {
     /// Open a fresh `GET /stream` body.
     fn open_stream(&self) -> Result<Box<dyn Read + Send>>;
@@ -26,6 +24,32 @@ pub(crate) trait Reopen: Send {
     fn snapshot(&self) -> Result<SessionSnapshot>;
     /// `GET /v1/sessions/{id}/items` (bucket A history).
     fn items(&self) -> Result<ItemList>;
+}
+
+/// Placeholder until Task 6 wires `HttpReopener` from `sessions::stream`.
+pub(crate) struct StubReopener;
+
+impl Reopen for StubReopener {
+    fn open_stream(&self) -> Result<Box<dyn Read + Send>> {
+        Err(crate::error::ClientError::Server {
+            status: 503,
+            body: serde_json::json!({}),
+        })
+    }
+
+    fn snapshot(&self) -> Result<SessionSnapshot> {
+        Err(crate::error::ClientError::Server {
+            status: 503,
+            body: serde_json::json!({}),
+        })
+    }
+
+    fn items(&self) -> Result<ItemList> {
+        Err(crate::error::ClientError::Server {
+            status: 503,
+            body: serde_json::json!({}),
+        })
+    }
 }
 
 /// Real impl: clones the cheap, `Send + 'static` request machinery. No `info`.
@@ -95,7 +119,6 @@ impl Reopen for HttpReopener {
 
 /// Bucket A: replay the durable transcript as `OutputItemDone` events. The
 /// consumer merges by `Item::id()` (idempotent upsert), so duplicates are safe.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn items_to_replay(list: ItemList) -> Vec<ServerStreamEvent> {
     list.into_items()
         .into_iter()

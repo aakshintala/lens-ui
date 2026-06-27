@@ -380,7 +380,6 @@ impl ItemList {
     pub fn items(&self) -> &[crate::stream::Item] {
         &self.items
     }
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn into_items(self) -> Vec<crate::stream::Item> {
         self.items
     }
@@ -1392,7 +1391,10 @@ impl<'a> Sessions<'a> {
             .send()?;
         let status = resp.status().as_u16();
         match crate::http::check_status("v1/sessions/stream", status) {
-            Ok(()) => Ok(crate::stream::EventStream::spawn(resp)),
+            Ok(()) => Ok(crate::stream::EventStream::spawn(
+                resp,
+                crate::reconnect::StubReopener,
+            )),
             Err(e) => Err(e),
         }
     }

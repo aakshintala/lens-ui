@@ -105,7 +105,6 @@ impl Normalizer {
     /// Clear the `OutputItemDone` dedup set. Called by the reader on
     /// `Reconnected { gap }` when `gap != Some(0)`, so `GET /items` history
     /// replay is not wrongly suppressed (typed-client §7 seam (a)).
-    #[allow(dead_code)] // reconnect reader (Plan 3b-2b Task 6)
     pub(crate) fn reset_seen_items(&mut self) {
         self.seen_items.clear();
     }

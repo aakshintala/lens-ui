@@ -72,7 +72,6 @@ impl SseFrame {
     /// Peek `sequence_number` off the frame's data JSON without full typing.
     /// `None` when absent, null, or unparseable — only seq-bearing live frames
     /// (heartbeats, response deltas) carry it (typed-client §7 / plan decision 3).
-    #[allow(dead_code)] // reconnect reader (Plan 3b-2b Task 5)
     pub(crate) fn sequence_number(&self) -> Option<u64> {
         #[derive(serde::Deserialize)]
         struct SeqPeek {
