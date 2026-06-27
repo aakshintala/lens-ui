@@ -1383,10 +1383,12 @@ impl<'a> Sessions<'a> {
         )
     }
 
-    /// Open the live SSE event stream for a session. Live-tail, no-replay:
-    /// the caller must subscribe BEFORE posting the message that should be
-    /// observed (transport spike §4). Returns an `EventStream` whose reader
-    /// thread is already running.
+    /// Open the live SSE event stream for a session. On first open the returned
+    /// `EventStream` emits a `SnapshotRestored` plus replayed `/items` prelude
+    /// (each as `OutputItemDone`) before the live tail — first-open single-writer
+    /// parity with reconnect (typed-client.md §7 "Bootstrap"). The caller must
+    /// subscribe BEFORE posting the message that should be observed (transport
+    /// spike §4). Returns an `EventStream` whose reader thread is already running.
     pub fn stream(
         &self,
         id: &crate::ids::SessionId,

@@ -59,6 +59,10 @@ impl EventStream {
     /// backoff tick (omnigent sends `session.heartbeat`, so this is bounded in
     /// practice). A fully silent socket is interrupted only when the next byte
     /// arrives — a read-idle backstop is deferred (it would race the reconnect path).
+    /// A reader parked in a blocking channel send (full bounded channel) is
+    /// unblocked by dropping the `EventStream` (which drops the receiver, so the
+    /// next send errors and the reader exits); `stop()` itself covers the read-park
+    /// case (heartbeat-bounded).
     pub fn stop(&self) {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
     }
@@ -91,12 +95,19 @@ fn stop_reason(e: &ClientError) -> Option<DisconnectReason> {
 /// reducer is the single writer (app-arch §4.1). Returns `false` to abort `run`
 /// (consumer gone, or a fatal fetch error for which Disconnected was sent).
 /// Retryable fetch failure degrades to live-tail-only (no regression vs pre-Plan-4).
-fn bootstrap<Re: Reopen>(reopener: &Re, tx: &mpsc::SyncSender<ServerStreamEvent>) -> bool {
+fn bootstrap<Re: Reopen>(
+    reopener: &Re,
+    tx: &mpsc::SyncSender<ServerStreamEvent>,
+    stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> bool {
     match reopener
         .snapshot()
         .and_then(|snap| reopener.items().map(|items| (snap, items)))
     {
         Ok((snap, items)) => {
+            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                return false;
+            }
             if tx
                 .send(ServerStreamEvent::SnapshotRestored(Box::new(snap)))
                 .is_err()
@@ -130,7 +141,7 @@ fn run<Re: Reopen>(
     if stop.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
-    if !bootstrap(&reopener, &tx) {
+    if !bootstrap(&reopener, &tx, stop) {
         return;
     }
     read_loop(body, tx, reopener, sleep, stop);
