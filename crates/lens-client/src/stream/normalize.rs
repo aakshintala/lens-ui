@@ -101,6 +101,14 @@ impl Normalizer {
     pub(crate) fn flush(&mut self) -> Vec<ServerStreamEvent> {
         self.close_reasoning().into_iter().collect()
     }
+
+    /// Clear the `OutputItemDone` dedup set. Called by the reader on
+    /// `Reconnected { gap }` when `gap != Some(0)`, so `GET /items` history
+    /// replay is not wrongly suppressed (typed-client §7 seam (a)).
+    #[allow(dead_code)] // reconnect reader (Plan 3b-2b Task 6)
+    pub(crate) fn reset_seen_items(&mut self) {
+        self.seen_items.clear();
+    }
 }
 
 #[cfg(test)]
@@ -169,6 +177,19 @@ mod tests {
                 output: "ok".into(),
             },
         })
+    }
+
+    #[test]
+    fn reset_seen_items_allows_a_previously_seen_item_through() {
+        let mut n = Normalizer::default();
+        let first = fn_call("toolu_1", "completed", "fc_a");
+        assert_eq!(n.push(first.clone()), vec![first.clone()]);
+        // Without reset, an identical re-fire is suppressed:
+        assert!(n.push(fn_call("toolu_1", "completed", "fc_b")).is_empty());
+        // After reset (reconnect with gap != Some(0)), the same item replays:
+        n.reset_seen_items();
+        let replay = fn_call("toolu_1", "completed", "fc_c");
+        assert_eq!(n.push(replay.clone()), vec![replay]);
     }
 
     #[test]
