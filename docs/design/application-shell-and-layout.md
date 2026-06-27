@@ -193,16 +193,15 @@ the nav rail (§6). **⌘⇧1–⌘⇧9 switch to board N** (separate modifier f
 
 ### 4.6 Archive
 
-Archive **hides** a card/group from a board **and reclaims its server resources**
-(`stop_session` — terminate the harness/PTY, conversation preserved; state model
-§3). It is the user-initiated housekeeping counterpart to Sleep (which dims but
-stays visible); both reclaim, differing only in visibility. (This supersedes the
-older "Archive is UI-only" stance — we reclaim resources to be a good citizen;
-restore = resume + re-bind a runner.) Archive is a **nav-rail destination** (§6)
-rendered with the *same recursive board UI* — so **archived groups represent
-themselves for free**. A scope filter (this board / all) + search +
-**restore-to-origin**. A group's inline "Completed (N)" peek is a glance that
-deep-links into Archive filtered to that group.
+Archive mirrors the server `archived` flag and **hides** a card/group from the
+default board/listing. It is visibility and organization, not resource
+lifecycle; Sleep is the action that closes Lens-local observation and sends
+best-effort `stop_session` (state model §3). Archive is a **nav-rail
+destination** (§6) rendered with the *same recursive board UI* — so **archived
+groups represent themselves for free**. A scope filter (this board / all) +
+search + **restore-to-origin**. A group's inline "Completed (N)" peek is a
+glance that deep-links into Archive filtered to that group. UI may offer a
+composed "Archive and Sleep" command, but plain Archive is the server flag.
 
 ---
 
@@ -246,19 +245,19 @@ Reference render: `docs/design/renders/board-home.html`.
   the **corrected ladder** (a Working agent is busy and does *not* need you →
   calm; Ready wants you; Needs-input is blocked on you). The full **5** session
   statuses (`idle / launching / running / waiting / failed`) come **only from the
-  SSE stream of Active sessions**; the REST poll that feeds Slept/Archived cards
-  is **coarse 3-state** (`idle / running / failed` — `waiting` collapses to
-  `running`, `launching` to `idle`). So a poll-fed card uses the persisted last
-  fine-grained status (state model §2.2) rather than regressing to `idle`. The
-  wave is **derived** from the status + `pending_elicitations` count + the Lens
-  lifecycle state:
+  SSE stream of Active sessions**; the REST poll that feeds Slept and
+  non-active archived cards is **coarse 3-state** (`idle / running / failed` —
+  `waiting` collapses to `running`, `launching` to `idle`). So a poll-fed card
+  uses the persisted last fine-grained status (state model §2.2) rather than
+  regressing to `idle`. The wave is **derived** from the status +
+  `pending_elicitations` count + the Lens lifecycle state:
 
 | Wave | Treatment | Urgency | Derived from |
 |--------|-----------|---------|---------|
 | **Needs-input** | fast pulse, red | highest | `pending_elicitations` non-empty (own or mirrored from a child; the wire field is a list / `pending_elicitations_count`). **Sticky** until acted on; **overrides Slept dimming** (the poll still carries the count, so a slept card with a pending approval still glows red) |
 | **Ready** | steady, blue | high | `status == idle` **and an unacknowledged turn completion** — there's a result to look at. Sticky until you focus/view it, then neutral |
 | **Working** | calm shimmer, green | medium | `status ∈ {running, launching, waiting}` with no pending elicitation (`launching` shows "starting…"; `waiting` = parked on its own async/sub-agent work — busy, doesn't need you) |
-| **Slept** | dimmed card + **Resume** | lowest | Lens lifecycle: `stop_session` reclaimed (§ state model 3); card stays visible, dimmed |
+| **Slept** | dimmed card + **Resume** | lowest | Lens lifecycle: local observation closed and best-effort `stop_session` sent after quiescence (§ state model 3); card stays visible, dimmed |
 | **Failed** | steady, red + **Retry** | ≈ Ready (rare) | `status == failed` / `last_task_error` |
 
 > **"Scheduled" is reserved but not in v1** — there is no scheduled/cron session
@@ -281,13 +280,12 @@ blank. Grounded in the API; degrades gracefully.
 Move-to-group ▸ · New-group · Pin │ Rename · Archive · **Stop session** ·
 **Delete…** │ Copy id · Share link · Export · Reveal workspace · **Switch
 agent ▸**`. State-dependent: Slept → **Resume**, Failed → **Retry**. The four
-"remove-ish" actions are distinct (state model §3) — note **Sleep and Archive
-both `stop_session`** (reclaim the harness/PTY; conversation preserved), they
-differ only in visibility: **Sleep** (reclaim + **dim, stays visible**; also the
-auto action after ~10-min quiet) / **Archive** (reclaim + **hide** in the
-drawer; manual housekeeping) / **Stop session** (the loud reclaim of a
-*still-working* session — interrupt-and-kill, owner-only) / **Delete** (remove
-server-side + local record, confirms). **Switch agent ▸** opens the
+"remove-ish" actions are distinct (state model §3): **Sleep** (after strict
+quiescence, close Lens observation, best-effort `stop_session`, **dim, stays
+visible**; also the auto action after ~10-min quiet) / **Archive** (PATCH server
+`archived=true`, **hide** in the drawer; manual housekeeping) / **Stop session**
+(the explicit user-facing server stop for a still-visible session, owner-only) /
+**Delete** (remove server-side + local record, confirms). **Switch agent ▸** opens the
 agent-definition picker for a live handoff (state model §12.2; capability map
 decision J) — **disabled while the session is busy (running)** and **hidden for
 sub-agent sessions** (the server rejects those: 409 / 400).

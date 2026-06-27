@@ -29,10 +29,11 @@ that is this layer.
 
 - The **domain model** — the Rust types the whole app reasons about (§2).
 - The **reduction pipeline** — `ServerStreamEvent` → canonical `Item` list (§4).
-- **Per-session state** and the **session lifecycle model** (Active / Slept / Archived / Deleted) (§3).
+- **Per-session state**, Lens lifecycle (Active / Slept / Deleted), and the
+  server `archived` visibility flag (§3).
 - **Local persistence** — the on-disk session/item store (§6).
 - **Command flow** — UI actions → the typed client's `SessionEventInput` (§7).
-- The **concurrency model** — pump tasks, channels, the runtime bridge (§8).
+- The **concurrency model** — `ActiveSession` actors, channels, the runtime bridge (§8).
 - **App-wide structure** — per-connection and cross-connection registries,
   focus, board layout, navigation (§9).
 - **Cross-session liveness** via the session-list poll (§10).
@@ -54,11 +55,11 @@ The seven load-bearing decisions and where they live:
 
 | # | Decision | Section | Status |
 |---|----------|---------|--------|
-| ① | Session lifecycle | §3 | Active / Slept / Archived / Deleted; Sleep+Archive `stop_session` (reclaim); auto-sleep on 10-min quiet (terminal-aware); no stream cap |
-| ② | Reduction pipeline | §4 | canonical reducer + render-time transforms |
+| ① | Session lifecycle | §3 | Active / Slept / Deleted + server `archived`; Sleep sends best-effort `stop_session`; Archive mirrors server `archived`; auto-sleep requires quiescence; no stream cap |
+| ② | Reduction pipeline | §4 | `ActiveSession` owns canonical reduction; `SessionStore` is a foreground replica |
 | ③ | App structure | §9 | per-connection `ConnectionApp`; cross-connection `AppState` |
 | ④ | Command flow | §7 | optimistic send + FIFO reconcile, via `SessionEventInput` |
-| ⑤ | Runtime bridge | §8 | pump task → bounded channel → store |
+| ⑤ | Runtime bridge | §8 | `ActiveSession` actor → bounded channel → foreground `SessionStore` replica |
 | ⑥ | Bridge router | §11 | Lens-side, on omnigent comments + labels + elicitation aggregation |
 | ⑦ | Multi-connection topology | §9 | one `Client` per omnigent server; sessions keyed by (connection, session_id) |
 
@@ -166,12 +167,14 @@ pub struct SessionState {
     pub pending_user: Vec<PendingUserMessage>,    // optimistic, pre-consumed (§7)
 
     // ── Lens-local persisted metadata ──
-    pub archived: bool,                           // UI drawer flag (§3.2)
+    pub archived: bool,                           // server `archived` flag (§3.1)
+    pub lifecycle: SessionLifecycle,              // Active | Slept | Deleted (Lens-local)
     pub last_focused_at: i64,                     // active-set LRU (§3.3)
     pub last_seen_seq: Option<u64>,               // reconcile cursor (§6, typed client §7)
 }
 
 pub enum HostType { External, Managed }
+pub enum SessionLifecycle { Active, Slept, Deleted }
 ```
 
 `pending_elicitations`, `todos`, `skills`, `permission_level`, `owner`,
@@ -293,113 +296,117 @@ internal and exposed by no endpoint).
 
 ## 3. State model & lifecycle — ① (LOCKED)
 
-> **Reshaped 2026-06-24.** The earlier "Sleeping = client-side disconnect, agent
-> keeps running" model was dropped. Lens owns no execution, so a pure
-> client-detach is a pointless middle state (it reclaims nothing server-side
-> while risking missed live observation). **Sleep and Archive now both
-> `stop_session`** — they reclaim the server-side harness/PTY — and differ only
-> in visibility. There is **no stream cap**: the stream count self-bounds via
-> auto-sleep.
+> **Reshaped 2026-06-27.** Sleep and Archive are no longer overloaded. **Sleep**
+> is Lens's lifecycle declaration that it is done actively observing a quiesced
+> session for now: close the stream/actor, flush durable state, drop heavy RAM,
+> and send `stop_session` as a best-effort server-side reclamation request.
+> The server owns the exact runner/process semantics of that request. **Archive**
+> is the server `archived` flag (`PATCH /v1/sessions/{id}`) and controls
+> visibility/listing only. There is **no stream cap**: the stream count
+> self-bounds via strict auto-sleep.
 
 ### 3.1 The session lifecycle
 
-A session is in exactly one lifecycle state. Three of them close the stream and
-**reclaim server resources** (`stop_session` — terminate the bound runner's
-harness subprocess + tmux PTYs, conversation preserved); they differ in UI:
+A session has one Lens-local lifecycle state, plus the server-owned `archived`
+flag. Lens-local lifecycle controls whether Lens is actively observing and
+holding in-memory state. Server `archived` controls whether the session is hidden
+from the default server listing.
 
-| State | Stream | Server (`stop_session`) | UI | Wake-back |
+| State | Stream | Server action | UI | Wake-back |
 |---|---|---|---|---|
-| **Active** | open, pump running | runner bound, harness live | normal card | — |
-| **Slept** | closed | **reclaimed** | **dimmed, stays on board** | resume + re-bind runner |
-| **Archived** | closed | **reclaimed** | **hidden** (drawer) | resume + re-bind runner |
+| **Active** | open, `ActiveSession` running | none | normal card | — |
+| **Slept** | closed | best-effort `stop_session` after quiescence | dimmed, stays on board | reconnect/reconcile; resume/rebind only if needed |
+| **Archived** | independent of stream | `PATCH archived=true` | hidden from default board/list | unarchive; wake only if also Slept |
 | **Deleted** | closed | **deleted server-side** | removed | — (gone) |
 
-- **Active** — SSE stream open, pump running, the reduction pipeline live.
-  `SessionState` held in RAM and **append-written to disk continuously** as
-  items finalize (§6).
-- **Slept** — `stop_session` reclaims the harness/PTY; the stream closes, the
-  pump aborts, RAM state is evicted. The **card stays visible but dimmed** with
-  a **Resume** affordance. The disk snapshot is the retained record; the coarse
-  badge refreshes via the session-list poll (§10).
-- **Archived** — identical to Slept at the data layer (`stop_session` +
-  reclaim), but the card is **hidden in the Archived drawer** (shell §4.6).
-  Manual housekeeping only — never automatic. (This supersedes the older
-  "Archive is UI-only" stance: Archive now reclaims server resources too — we're
-  a good citizen.)
-  > **⚠ Dual `archived` model — needs reconciliation (open, M8/T8).** The server
-  > has its OWN `archived: bool` on the session snapshot/list, toggled via
-  > `PATCH /v1/sessions/{id}` and filtered by `include_archived` on
-  > `GET /v1/sessions`. It is **independent** of `stop_session` (server archive
-  > does NOT stop the session). Lens's "Archive = local drawer-hide +
-  > `stop_session`" overloads the same word for a different concept, and on a
-  > multi-client fleet the two diverge. **Decision needed:** either (a) mirror the
-  > server `archived` flag via `PATCH` on the Archive action (single source of
-  > truth, and honor `include_archived`/`kind`/`search_query` poll filters), or
-  > (b) rename the Lens field to `hidden_in_drawer` and stop overloading
-  > "archived." Tracked in the discussion list — not resolved here.
+- **Active** — SSE stream open, `ActiveSession` actor running off the foreground
+  thread, the reduction pipeline live. Canonical `SessionState` is owned by the
+  actor and write-through persisted as items finalize (§6, §8).
+- **Slept** — Lens closes the stream, stops the `ActiveSession`, flushes durable
+  state, drops heavy canonical RAM state, and leaves the foreground
+  `SessionStore` replica painted from disk/list-poll summaries. Entering Sleep
+  sends `SessionEventInput::StopSession` by default as a best-effort server-side
+  reclamation request. The result is recorded for introspection/debug, but is
+  not card chrome unless it later blocks wake/rehydration.
+- **Archived** — Lens mirrors the server `archived` flag. Archive is visibility
+  and organization, not resource lifecycle: `PATCH /v1/sessions/{id}
+  {archived:true}` hides the session from the default listing, and `GET
+  /v1/sessions?include_archived=true` brings it back for the Archive drawer.
+  Archive may be combined with Sleep by UI policy, but the two states are
+  orthogonal.
 - **Deleted** — `DELETE /v1/sessions/{id}` removes the session server-side;
   the registry row becomes a read-only local tombstone (history viewable, never
   re-streamed) until pruned.
 
-**Wake from Slept/Archived** = paint instantly from the disk snapshot →
-**resume** the session (re-bind a runner) → typed-client reconnect (snapshot +
-`GET /items`, merged by item `id`) to reconcile drift. The runner re-bind is an
-explicit API sequence (server-lifecycle §6): optional `GET /v1/runners/{runner_id}/status`
-→ `POST /v1/hosts/{host_id}/runners` (relaunch) → `PATCH /v1/sessions/{id}` with the
-new `runner_id` (rebind) → reconnect; handle `409` (runner already coming up) by
-polling status and rebinding rather than launching a second runner. Disk-paint
-keeps it flash-free; the live-typing deltas
-emitted while slept are gone (transient events are never persisted), recovered
-in committed form via `GET /items`.
+**Wake from Slept** = paint instantly from the disk snapshot → open a fresh
+typed-client stream (bootstrap `SnapshotRestored` + `GET /items` + live tail) →
+reconcile by item `id`. If the server reports that no runner/resource path is
+available, Lens surfaces a resume/rebind action then; wake does not assume every
+Sleep requires a runner relaunch. The runner relaunch/rebind sequence remains
+the server-lifecycle fallback (§6): optional `GET /v1/runners/{runner_id}/status`
+→ `POST /v1/hosts/{host_id}/runners` → `PATCH /v1/sessions/{id}` with the new
+`runner_id` → reopen the stream. Disk-paint keeps wake flash-free; live typing
+deltas emitted while slept are gone, and committed state is recovered through
+`GET /items`.
 
-`archived: bool` and the Slept flag live on `SessionState` and persist; there is
-no separate storage tier and no "cold" rehydration policy — the server is always
-the source of truth.
+`archived: bool` is server-owned and persisted on `SessionState`. `lifecycle:
+Slept` is Lens-local and persists so a poll-fed card survives restart. There is
+no separate storage tier and no "cold" rehydration policy — the server remains
+the source of truth for session existence and server-owned fields.
 
 ### 3.2 Auto-sleep
 
-A session is **auto-slept** once it has **genuinely gone quiet** for a period
-(default ~10 min): status `idle`/finished, **no terminal activity**, no recent
-user interaction. Auto-sleep is the only automatic lifecycle move; Archive and
-Delete are always manual.
+A session is **auto-slept** once it has **genuinely quiesced** for a period
+(default ~10 min). Elapsed time alone is not enough; the `ActiveSession` must
+know the turn is over and no transient work is outstanding.
 
 Auto-sleep **excludes**:
 - **Pinned** sessions (held Active by intent).
 - Sessions with a **pending elicitation** (Needs-input — you still must act).
-- Sessions with **live or recent terminal activity** — because sleeping now
-  *kills* the PTY (`stop_session`), terminal-awareness is load-bearing, not a
-  nicety: a live terminal counts as not-quiet.
+- Sessions with a pending user message or unconsumed optimistic send.
+- Sessions with open `StreamScratch` accumulators (message/reasoning), pending
+  tool calls without outputs, reconnect/disconnected state that has not
+  reconciled, or any status other than authoritative `idle`.
+- Sessions with **live or recent terminal activity** — because Sleep sends
+  `stop_session` best-effort, terminal-awareness is load-bearing: a live terminal
+  counts as not-quiesced.
 
 ### 3.3 No stream cap (self-bounding)
 
 There is **no connection cap.** A session streams iff it is **Active**. The
-10-minute auto-sleep is the natural bound on concurrent streams — quiet sessions
-reclaim themselves. A zoomed-out board showing 50 cards opens a stream only for
-the genuinely-active ones; the rest are Slept (dimmed) or Archived. An optional
-**soft, informational** warning may surface past a high threshold of
+10-minute auto-sleep is the natural bound on concurrent streams — quiesced
+sessions close their local streams and request server-side stop. A zoomed-out
+board showing 50 cards opens a stream only for the genuinely-active ones; the
+rest are Slept (dimmed) or Archived. An optional **soft, informational** warning
+may surface past a high threshold of
 concurrently-live sessions; nothing is force-slept against intent.
 
-### 3.4 Sleep/Archive *do* stop the agent
+### 3.4 Sleep sends best-effort `stop_session`
 
-Unlike the earlier draft, a Lens **Sleep** (or Archive) **does** stop the
-agent: it issues `stop_session`, which terminates the bound runner's harness
-and PTYs server-side (the conversation is preserved). This is deliberate —
-reclaiming a naturally-ceased session's resources is the whole point ("good
-citizen"). The distinct **Stop session** command (§7) is the same mechanism
-used loudly on a *still-working* session you want to interrupt-and-kill;
-**Sleep** is the graceful auto/manual version for a session that has ceased.
+Sleep sends `SessionEventInput::StopSession` after the strict quiescence
+predicate passes. Lens's guarantee is local: it closes the stream, stops the
+actor, persists canonical state, and drops heavy RAM. The server's exact runner,
+harness, and PTY behavior is owned by the server. A failed/unknown stop result
+is recorded in introspection and the state-transition ring, not shown on the
+card by default. It becomes user-facing only if a later wake cannot rehydrate or
+resume.
+
+The explicit **Stop session** command (§7) uses the same wire event but carries
+different intent: the user is deliberately stopping a still-visible session.
+Archive does not imply stop; UI may offer "Archive and Sleep" as a composed
+command.
 
 ### 3.5 Lifecycle transitions
 
 ```
 focus / pin / resume ─▶ ACTIVE
-    (from Slept/Archived: disk-paint + resume (re-bind runner) + reconnect;
+    (from Slept: disk-paint + stream bootstrap/reconcile; resume/rebind if needed;
      from new:            typed client cold open: snapshot + items + stream)
 
-quiet ≥10min & not pinned & no pending-elicit & no terminal activity
-    ─▶ SLEPT     (stop_session: reclaim harness/PTY; dim card; abort pump, flush, free RAM)
+quiesced ≥10min & not pinned & no pending-elicit & no terminal activity
+    ─▶ SLEPT     (best-effort stop_session; dim card; stop actor; flush; free RAM)
 
-user archives ─▶ ARCHIVED  (stop_session: reclaim; hide card in drawer)
+user archives ─▶ ARCHIVED  (PATCH server archived=true; hide from default board/list)
 user deletes  ─▶ DELETED   (DELETE server-side; local tombstone)
 ```
 
@@ -407,14 +414,19 @@ user deletes  ─▶ DELETED   (DELETE server-side; local tombstone)
 
 ## 4. Reduction pipeline — ② (LOCKED)
 
-Two layers: a **stateful canonical reducer** for durable truth, and **pure
-render-time transforms** for per-surface views.
+Two layers: a **pure canonical reducer** for durable truth, invoked by the
+off-foreground `ActiveSession` actor (§8), and **pure render-time transforms**
+for per-surface views.
 
-### 4.1 Canonical reducer (stateful, in `SessionStore`)
+### 4.1 Canonical reducer (pure; invoked by `ActiveSession`)
 
-`reduce(&mut SessionState, ServerStreamEvent)` — the single writer of session
-state. Deterministic and replayable (the same event sequence yields the same
-state), which is what makes disk write-through and reconcile-on-wake sound.
+`reduce(&mut SessionState, &ServerStreamEvent) -> SmallVec<[StreamUpdate; 2]>`
+mutates the canonical state it is handed and returns semantic deltas for
+persistence/replication. It does no I/O, does not touch gpui, and does not write
+SQLite itself. The **single writer** is the `ActiveSession` actor (§8), which is
+the only production caller holding `&mut SessionState`. The reducer is
+deterministic and replayable (the same event sequence yields the same state),
+which is what makes disk write-through and reconcile-on-wake sound.
 
 Responsibilities:
 
@@ -427,7 +439,8 @@ Responsibilities:
 - **Tool pairing** — `OutputItemDone` with `item.type = function_call` creates
   a `FunctionCall` item; the matching `function_call_output` (same `call_id`)
   creates a `FunctionCallOutput` item. The typed client already deduped both,
-  so each fires once.
+  so each fires once. They remain separate canonical items paired by `call_id`
+  at render time (§2.3); the reducer does not merge them into one stored item.
 - **Reasoning bracketing** — `ReasoningStarted` opens a reasoning accumulator;
   `ReasoningTextDelta`/`ReasoningSummaryTextDelta` append; the synthetic
   `ReasoningClosed` (typed client §7a) finalizes a `Reasoning` item.
@@ -463,15 +476,16 @@ Responsibilities:
   wake) and emits no presence marker. Ordering is guaranteed by the crate:
   `Reconnected{gap}` (clears `StreamScratch` when `gap != Some(0)`) →
   `SnapshotRestored` → replayed `GET /items` history. **The same arm also folds
-  the bootstrap prelude** (first stream open, typed client §7 "Bootstrap", Plan 4):
+  the bootstrap prelude** (first stream open, typed client §7 "Bootstrap"):
   the crate emits `SnapshotRestored` + replayed items on first connect too (no
-  `Reconnected` marker — no gap), so the reducer is the single writer of initial
-  state as well — the consumer no longer applies the opening snapshot/items through
-  a separate path.
+  `Reconnected` marker — no gap), so initial state is folded through the same
+  reducer arm as reconnect — the consumer no longer applies the opening
+  snapshot/items through a separate path.
 
-What the reducer finalizes is what gets appended to disk (§6). In-progress
-accumulators in `StreamScratch` are RAM-only and never persisted — exactly the
-persisted/transient split the typed client §7 defines.
+What the reducer finalizes becomes durable via `ActiveSession` write-through
+effects (§6, §8). In-progress accumulators in `StreamScratch` are actor-local
+RAM and never persisted — exactly the persisted/transient split the typed
+client §7 defines.
 
 ### 4.2 `StreamScratch` — transient accumulators
 
@@ -602,9 +616,9 @@ CREATE TABLE sessions (
   -- NOTE: `presence` is transient/RAM-only (§2.5) and is intentionally NOT a
   -- persisted column — it re-derives from holding the SSE stream open.
   created_at      INTEGER NOT NULL,
-  -- Lens-local lifecycle (persisted so a poll-fed card survives restart)
-  lifecycle       TEXT NOT NULL DEFAULT 'active',  -- active|slept|archived|deleted
-  archived        INTEGER NOT NULL DEFAULT 0,      -- Lens drawer-hide (see dual-model caveat §3.2)
+  -- Server-owned visibility + Lens-local lifecycle.
+  archived        INTEGER NOT NULL DEFAULT 0,      -- server `archived` flag
+  lifecycle       TEXT NOT NULL DEFAULT 'active',  -- active|slept|deleted
   pinned          INTEGER NOT NULL DEFAULT 0,      -- was RAM-only; persist it
   tombstoned_at   INTEGER,              -- set when server-deleted; row kept read-only until pruned
   last_focused_at INTEGER,
@@ -618,8 +632,9 @@ CREATE TABLE sessions (
 CREATE TABLE items (
   connection_id TEXT NOT NULL,
   session_id   TEXT NOT NULL,
-  seq          INTEGER NOT NULL,
   item_id      TEXT NOT NULL,
+  live_seq     INTEGER,                    -- SSE-only overlap hint; NULL for GET /items
+  ordinal      INTEGER NOT NULL,           -- local canonical order within the session
   kind         TEXT NOT NULL,           -- message|function_call|function_call_output|
                                         -- reasoning|native_tool|compaction|
                                         -- slash_command|terminal_command|resource_event|
@@ -629,7 +644,8 @@ CREATE TABLE items (
   depth        INTEGER NOT NULL DEFAULT 0,
   turn         INTEGER NOT NULL DEFAULT 0,
   created_at   INTEGER NOT NULL,
-  PRIMARY KEY (connection_id, session_id, seq),
+  PRIMARY KEY (connection_id, session_id, item_id),
+  UNIQUE (connection_id, session_id, ordinal),
   FOREIGN KEY (connection_id, session_id) REFERENCES sessions(connection_id, id)
 );
 
@@ -657,13 +673,16 @@ CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);   -- schema_version, …
 
 ### 6.3 Write-through & reconcile
 
-- **Write-through while Active:** as the reducer finalizes each canonical item,
-  append it to `items`; fold session-field updates into `sessions`.
+- **Write-through while Active:** as `ActiveSession` finalizes each canonical
+  item, upsert it into `items` by `(connection_id, session_id, item_id)`; fold
+  session-field updates into `sessions`.
   In-progress accumulators are RAM-only (§4.2) — a crash mid-stream loses only
   unpersisted deltas, which the server still has.
-- **On sleep:** flush, then drop RAM state.
-- **On wake:** load the disk snapshot into RAM and paint immediately, then run
-  the typed-client reconnect (snapshot + `GET /items`) and **reconcile by item
+- **On sleep:** flush actor-local canonical state and persistence, send
+  best-effort `stop_session`, then stop the actor and drop heavy RAM state.
+- **On wake:** load the disk snapshot into the foreground replica and paint
+  immediately, then start a fresh `ActiveSession` stream bootstrap
+  (`SnapshotRestored` + `GET /items` + live tail) and **reconcile by item
   `id`** (persisted items carry no `sequence_number`) — the disk may lag the server (compaction rewrote history,
   items edited, new items committed while sleeping), so reconnect/dedup is what
   makes the card correct, not the disk read alone.
@@ -680,15 +699,21 @@ Commands exit through the typed client's `Sessions::send_event`, which takes a
 0.2.0: `message`, `function_call_output`, `approval`, `interrupt`,
 `stop_session`, and others the typed client enumerates.
 
+UI actions never mutate `SessionState` directly. Commands route to the
+`ActiveSession` actor for that session. The actor records any optimistic local
+state, performs or offloads the typed-client call, and reconciles from echoed
+stream events so the single-writer invariant remains intact.
+
 Command semantics, kept distinct:
 
-- **send** — `SessionEventInput::Message { … }`. **Optimistic**: render the
-  user bubble immediately into the RAM-only `pending_user` buffer, then
-  reconcile FIFO when `session.input.consumed` arrives — promote into the
-  canonical list (*then* it hits disk). Roll back the buffer entry on POST
-  failure. FIFO is safe because client posts and server consumed-events are
-  both ordered within a session. Because you can only send to an Active session
-  (focus makes it Active), optimistic bubbles always sit on a live stream.
+- **send** — `SessionEventInput::Message { … }`. **Optimistic**: the
+  `ActiveSession` actor adds the user bubble to its RAM-only `pending_user`
+  buffer and emits a `StreamUpdate` to the foreground replica, then reconciles
+  FIFO when `session.input.consumed` arrives — promote into the canonical list
+  (*then* it hits disk). Roll back the buffer entry on POST failure. FIFO is
+  safe because client posts and server consumed-events are both ordered within a
+  session. Because you can only send to an Active session (focus makes it
+  Active), optimistic bubbles always sit on a live stream.
 - **interrupt** — `SessionEventInput::Interrupt { … }`. No optimism. The echoed
   `session.interrupted` + `response.incomplete` drive state.
 - **compact** — `SessionEventInput::Compact` (`_COMPACT_TYPE`, `sessions.py:294`).
@@ -700,9 +725,10 @@ Command semantics, kept distinct:
 - **approve** — `SessionEventInput::Approval { elicitation_id, result }`. The
   typed client also exposes the RESTful `POST /elicitations/{id}/resolve`
   counterpart (preferred when an `elicitation_id` is on hand; permissions doc).
-- **stop_session** — terminate the live session server-side (owner-only);
-  conversation preserved. Distinct from both interrupt (cancel one turn) and
-  sleep (client-side disconnect, §3.4).
+- **stop_session** — request server-side stop (owner-only); conversation
+  preserved. The explicit Stop command is user-facing and immediate. Sleep uses
+  the same wire event only after the strict quiescence predicate passes (§3.4),
+  and treats failure/unknown as introspection state unless wake later fails.
 - **fork** — `POST /v1/sessions/{source_id}/fork` with `SessionForkRequest`
   — creates a new session from a fork point. Not an `events` dispatch; a
   dedicated endpoint. The new session arrives in the registry via the list poll
@@ -727,28 +753,60 @@ documents, not pinned here.
 ## 8. Runtime & concurrency — ⑤ (decided)
 
 ```
-[SSE] ─▶ EventStream (typed client) ─▶ pump task ─▶ bounded channel ─▶ reducer ─▶ SessionStore ─▶ subscribers
-                                       (tokio)                            (single writer)            (UI)
+background OS thread, one per Active session
+┌──────────────────────────────────────────────────────────────────────────┐
+│ ActiveSession — single writer of canonical SessionState                  │
+│ EventStream ─▶ reduce(&mut SessionState, &event) ─▶ canonical state      │
+│                  │                                                       │
+│                  ├─▶ SessionPersistence write-through (SQLite)           │
+│                  └─▶ StreamUpdate ───────────────┐                       │
+│ SessionCommand ◀──────────────────────────────┐  │                       │
+└────────────────────────────────────────────────┼──┼──────────────────────┘
+                                                 │  │ bounded channels
+foreground (gpui)                                │  ▼
+┌────────────────────────────────────────────────┼─────────────────────────┐
+│ UI action ─▶ SessionCommand ───────────────────┘                         │
+│ SessionStore = Entity<SessionState> replica: apply StreamUpdate + notify │
+│ surfaces observe SessionStore; surfaces never receive &mut SessionState   │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
-- Each Active session owns one **pump task** on the async runtime (tokio). Its
-  only job: drive the typed client's `EventStream`, run `reduce(...)`, and push
-  state deltas across a **bounded channel** to the store. The pump **never
-  touches the UI directly.**
-- The store applies the delta and **notifies its subscribers**. The store is
-  the single writer of `SessionState`; the UI is read-only + dispatches commands.
-- **Lifecycle:** spawn the pump on transition to Active; abort it when the
-  session is Slept/Archived (which also `stop_session`s server-side, §3).
-  Reconnect within an Active session is entirely the typed client's
-  `EventStream` (the pump just keeps reading); waking from Slept/Archived is a
-  resume + fresh open (§3.5).
-- **Backpressure:** the bounded channel applies backpressure if a surface
-  can't keep up with a delta flood; the pump awaits channel capacity rather
-  than unboundedly buffering.
+- Each Active session owns one **`ActiveSession` actor** on a dedicated
+  background OS thread. This matches the typed client's blocking stream reader
+  model; no tokio runtime is required for the core data path. The actor drives
+  the typed client's `EventStream`, calls the pure reducer, write-throughs
+  durable effects to `SessionPersistence`, and sends reduced `StreamUpdate`s to
+  the foreground.
+- **Single-writer invariant:** for each Active session, canonical
+  `SessionState` is owned and mutated by exactly one `ActiveSession` actor,
+  running off the foreground thread. Every canonical mutation flows through
+  `reduce(&mut SessionState, &ServerStreamEvent)` called by that actor's
+  run-loop and nowhere else. The foreground `SessionStore`
+  (`Entity<SessionState>` in gpui) is a read-only replica: it applies
+  self-contained `StreamUpdate`s and notifies subscribers, but never runs the
+  reducer and never originates state changes. UI commands go to the actor over
+  a `SessionCommand` channel; even optimistic `pending_user` entries are written
+  by the actor.
+- **Replica contract:** `SessionStore` exposes read/observe access to surfaces,
+  never mutable access. `StreamUpdate::apply` is cheap assignment/insert work
+  only; no wire parsing, reduction, persistence, search, or diffing happens on
+  the gpui foreground thread. Debug/introspection may keep a bounded raw event
+  ring, but raw `ServerStreamEvent`s are not the app's source of truth.
+- **Lifecycle:** spawn the `ActiveSession` actor on transition to Active; stop it
+  when the session is Slept/Deleted, and keep only the foreground replica plus
+  disk state. Reconnect within an Active session is entirely the typed client's
+  `EventStream` (the actor just keeps reading); waking from Slept starts a fresh
+  actor and stream bootstrap (§3.5).
+- **Backpressure/coalescing:** the bounded update channel applies backpressure
+  if the foreground cannot keep up. The actor coalesces bursty text deltas where
+  safe, and the foreground poller drains all available `StreamUpdate`s for a
+  session before a single `cx.notify()` so token streaming does not become a
+  per-byte redraw path.
 - **One poll task per connection** drives the cross-session list poll (§10).
 
-The tokio⇄UI-executor hand-off is isolated to the **one** channel crossing —
-see §14 for the framework divergence there.
+The foreground hand-off is isolated to one seam with two message directions:
+`StreamUpdate` out of the actor, `SessionCommand` into it. See §14 for the
+framework divergence there.
 
 ---
 
@@ -758,7 +816,7 @@ see §14 for the framework divergence there.
 pub struct AppState {
     pub connections: HashMap<ConnectionId, ConnectionApp>,  // one per omnigent server
     pub focused: Option<(ConnectionId, SessionId)>,        // cross-connection focus
-    pub board: BoardLayout,                                // card positions; drawer membership (capability map §0.6)
+    pub board: BoardLayout,                                // card positions + grouping (capability map §0.6)
     pub bridge: BridgeRouter,                // §11
     pub concierge: Option<ConciergeHandle>,                 // §12.3
     pub derived: CrossSessionSignals,                      // running / needs-attention badges (§10)
@@ -767,7 +825,7 @@ pub struct AppState {
 pub struct ConnectionApp {
     pub conn: Connection,                  // the typed-client Connection
     pub client: Arc<Client>,               // the typed-client Client
-    pub sessions: HashMap<SessionId, SessionHandle>,  // registry (Active + Slept/Archived)
+    pub sessions: HashMap<SessionId, SessionHandle>,  // registry (Active + Slept + server-archived)
     pub pinned: HashSet<SessionId>,
     pub active_set: ActiveSet,             // which sessions are Active (streaming); no cap (§3.3)
     pub health: ConnectionHealth,         // up / reconnecting / down / contract-mismatch
@@ -776,13 +834,21 @@ pub struct ConnectionApp {
 
 pub struct SessionHandle {
     pub session_id: SessionId,
-    pub state: SessionStore,     // Active: in-RAM; Slept/Archived: summary + disk pointer
-    pub pump: Option<JoinHandle<()>>,
+    pub store: SessionStore,              // foreground replica; exists in every lifecycle state
+    pub active: Option<ActiveSessionHandle>, // Some iff Active
+}
+
+pub struct ActiveSessionHandle {
+    pub thread: JoinHandle<()>,
+    pub commands: Sender<SessionCommand>,
 }
 ```
 
-- **Registry** — every known session has a `SessionHandle` (Active ones back
-  an in-RAM `SessionStore` + pump; Slept/Archived ones are summary + disk pointer).
+- **Registry** — every known session has a `SessionHandle`. Its `SessionStore`
+  is the foreground read/observe replica, hydrated from disk/poll state and
+  present even when the session is Slept/Archived. Active sessions additionally
+  have an `ActiveSessionHandle`, whose background actor owns canonical state and
+  emits `StreamUpdate`s into the replica.
 - **Subscription scopes** — the side pane subscribes **deeply** to the focused
   session's store; board cards subscribe to a **coarse summary** (status,
   title, cost, badge), never the focused session's fine-grained transcript.
@@ -790,10 +856,12 @@ pub struct SessionHandle {
   invalidating the foreground render. The per-session store beats the
   alternative single global store, which only ever streams one session.
 - **Navigation** — one `navigate_to_session(connection_id, session_id)` funnel:
-  sets focus, wakes the target if Slept/Archived (resume + re-bind runner,
-  §3.5), routes the side pane. No ad-hoc focus mutation.
-- **Board vs drawer** — `BoardLayout` tracks which cards are on the board vs the
-  Archived drawer (§3.2); both draw from the same registry.
+  sets focus, wakes the target if Slept (fresh actor + stream bootstrap, with
+  resume/rebind only if the server requires it, §3.5), routes the side pane. No
+  ad-hoc focus mutation.
+- **Board vs drawer** — `BoardLayout` tracks Lens-local board/group placement;
+  server `archived` controls the Archive drawer filter (§3.1). Both draw from
+  the same registry.
 - **Multi-window** is a capability-map decision G — `AppState` is
   framework-shared; per-window `WindowState` lives in the application shell.
 
@@ -802,8 +870,9 @@ pub struct SessionHandle {
 ## 10. Cross-session liveness (the list poll)
 
 There is **no global/aggregate event stream** — the only SSE endpoint is
-per-session (`GET /v1/sessions/{id}/stream`; verified). So Slept/Archived cards
-cannot stream their status. Instead:
+per-session (`GET /v1/sessions/{id}/stream`; verified). So Slept sessions, and
+archived sessions that are not currently Active, cannot stream their status.
+Instead:
 
 - A periodic **`GET /v1/sessions` poll** (default ~10s, configurable) refreshes
   the **coarse** state of all known sessions — `status`, `title`,
@@ -816,7 +885,8 @@ cannot stream their status. Instead:
 - The poll runs **per connection** (each `ConnectionApp` owns one poll task).
 - It updates only card-summary fields, never the transcript. Active sessions
   ignore polled status for fields their live stream owns (the stream is
-  authoritative); the poll exists for **Slept/Archived** cards.
+  authoritative); the poll exists for **Slept**, non-active archived, and
+  externally-created sessions.
 - `CrossSessionSignals` aggregates these into board badges ("3 running, 1
   needs you") **across connections** — the rollup is cross-connection; the
   per-connection health dot is per-connection (application shell owns the
@@ -834,7 +904,7 @@ It aggregates three input streams into one fleet-wide actionable queue:
 
 1. **Pending elicitations** from every session (the `response.elicitation_request`
    events across all Active streams + the polled `pending_elicitations_count`
-   for Slept/Archived sessions).
+   for Slept/non-active archived sessions).
 2. **Agent-to-agent relay messages** — Lens-side, built on omnigent's
    per-session `POST /comments` + `POST /comments/send`. An agent (e.g. the
    Concierge) can file a message to another session's comments and label it as
@@ -1059,18 +1129,24 @@ persistence, command logic, the Bridge router, presence folds,
 switch-agent flow — are framework-neutral. The framework choice touches
 exactly three points:
 
-1. **State primitive / observation.** `SessionStore`/`AppState` need a
-   reactive container with **per-session subscription granularity** (§9).
-   - *gpui:* each `SessionStore` is an `Entity<SessionState>`; subscribe via
-     `cx.observe`. Per-entity notify gives the granularity for free.
+1. **State primitive / observation.** The foreground `SessionStore` replica and
+   `AppState` need a reactive container with **per-session subscription
+   granularity** (§9).
+   - *gpui:* each foreground `SessionStore` is an `Entity<SessionState>`;
+     subscribe via `cx.observe`. Per-entity notify gives the granularity for
+     free. Canonical reduction happens in `ActiveSession`, which is plain
+     off-thread Rust and is not a gpui entity.
    - *Alternative (React/TS over Tauri):* a store-per-session (Zustand instance
      per id, or a Jotai atom family); selectors give granularity but require
      discipline. Re-introduces the IPC seam this whole design set out to avoid
      (capability map §0.1) — a primary input to the framework decision.
-2. **The runtime bridge (§8).** The one channel→UI crossing.
-   - *gpui:* `cx.spawn` + entity update on the foreground executor.
-   - *Alternative:* a Tauri IPC hop — `ServerStreamEvent`/state deltas must
-     cross the JS boundary. The typed client's typed Rust enum becomes JSON
+2. **The runtime bridge (§8).** One seam with two message directions:
+   `StreamUpdate` from `ActiveSession` to the foreground replica, and
+   `SessionCommand` from UI to `ActiveSession`.
+   - *gpui:* `cx.spawn` drains update channels and batches entity updates on the
+     foreground executor.
+   - *Alternative:* a Tauri IPC hop — reduced state deltas and commands must
+     cross the JS boundary. The typed client's all-Rust event path becomes JSON
      at the seam — loses the all-Rust win.
 3. **Transcript re-render** (progressive re-render semantics) — a
    conversation-transcript doc concern, noted here only because the substrate
@@ -1084,11 +1160,11 @@ framework-independent (Rust + SQLite + typed-client).
 
 ## 15. Open questions
 
-- **Auto-sleep quiet threshold & poll cadence** — §3.2 / §10 give starting
+- **Auto-sleep quiescence threshold & poll cadence** — §3.2 / §10 give starting
   values (~10 min quiet, ~10s poll); tune against real usage in the
   verification pass (capability map §0.8). (The old hard stream cap `N` was
   dropped — §3.3.)
-- **Disk retention policy** — how long Slept/Archived sessions keep their `items`
+- **Disk retention policy** — how long Slept/server-archived sessions keep their `items`
   rows before pruning to a summary tombstone; whether the user controls it.
   The schema (§6.2) supports either.
 - **Bridge integration depth** — §6.1 keeps the schema readable; whether Bridge

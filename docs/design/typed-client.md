@@ -194,8 +194,8 @@ server does not buffer past events. The crate opens one stream per *active*
 session; the state model's liveness layer decides which sessions are active —
 **no hard stream cap**: the active set self-bounds via 10-min terminal-aware
 auto-sleep (state-model §3.3). (An earlier draft cited a "~8 concurrent streams"
-cap; that cap was removed — do not reintroduce it.) Sleeping sessions are
-repoll-ed for status via `GET /v1/sessions`.
+cap; that cap was removed — do not reintroduce it.) Sleeping sessions and
+non-active archived sessions are repoll-ed for status via `GET /v1/sessions`.
 
 Every event carries `sequence_number: Option<i64>` for dedup. Heartbeats carry
 additional gap-detection fields:
@@ -412,9 +412,9 @@ back in the stream. What `GET /items` returns is a separate thing: the server's
 durable DB of persisted conversation items. The state model does not need to
 maintain a full history cache — it fetches from `GET /items` on reconnect.
 
-The crate owns the protocol; the state model just keeps draining the
-`ServerStreamEvent` stream (app-arch state-model §8: "the pump just keeps
-reading") and never sees raw reconnect mechanics. The crate emits
+The crate owns the protocol; the state model's `ActiveSession` actor just keeps
+draining the `ServerStreamEvent` stream (app-arch state-model §8) and never sees
+raw reconnect mechanics. The crate emits
 `ServerStreamEvent` — `StreamUpdate` is the state model's *reduced* output
 (§13), not the crate's emission. The reconnect-lifecycle markers ride the
 same stream as synthetic values: `Reconnecting { attempt }` → `Reconnected { gap }`
@@ -429,8 +429,8 @@ consumer apply and NOT as per-field synthetic `session.*` events.
   "this layer does NOT own reconnect" and "the boundary upstream is the
   `ServerStreamEvent` stream." A direct apply would make the consumer aware of
   reconnect and ingest a non-`ServerStreamEvent` payload, breaking that boundary
-  and the §4.1 single-writer/replayable invariant (the reducer is the only
-  writer of `SessionState`).
+  and the §4.1/§8 single-writer/replayable invariant (`ActiveSession` owns the
+  canonical `SessionState` and invokes the reducer).
 - **Why not per-field synthetic `session.*` events (Option A1):** replaying the
   snapshot through the existing per-event folds re-runs their side-effects — a
   `session.agent_changed` fold pushes an `AgentChanged` *item* into the
@@ -438,10 +438,10 @@ consumer apply and NOT as per-field synthetic `session.*` events.
   agent-change marker. It also needs a snapshot-field→event map maintained in
   lockstep with the wire forever.
 - **Why A2 (chosen):** one event carrying the typed `SessionSnapshot` keeps the
-  reducer the single writer and the consumer purely event-driven; the reducer
-  gets one dedicated arm that bulk-folds chrome scalars/collections with **no
-  transcript side-effects**; it reuses the typed snapshot reads (Plan 3b-2a)
-  wholesale — no per-field mapping. The state-model reducer (§4.1) must add a
+  consumer purely event-driven; the `ActiveSession` actor invokes one dedicated
+  reducer arm that bulk-folds chrome scalars/collections with **no transcript
+  side-effects**; it reuses the typed snapshot reads (Plan 3b-2a) wholesale — no
+  per-field mapping. The state-model reducer (§4.1) must add a
   `SnapshotRestored` arm: chrome-scalar/collection fold only, no `AgentChanged`
   item insertion, no presence-marker emission.
 
@@ -556,10 +556,11 @@ is unit-testable with a scripted mock — no server. As-built specifics:
 First open of `Sessions::stream()` emits the **same post-open prelude as
 reconnect, minus the `Reconnecting`/`Reconnected` markers** (there is no gap on
 first connect): `SnapshotRestored(SessionSnapshot)` → replayed `GET /items`
-history (each as `OutputItemDone`), then the live tail. This makes the consumer's
-reducer the **single writer** for initial state too (app-arch §4.1) — the
-consumer no longer loads the opening snapshot/items through a second path that
-must stay byte-aligned with the reconnect fold.
+history (each as `OutputItemDone`), then the live tail. This makes the
+state-model `ActiveSession` actor fold initial state through the same reducer
+path as reconnect (app-arch §4.1/§8) — the consumer no longer loads the opening
+snapshot/items through a second path that must stay byte-aligned with the
+reconnect fold.
 
 - The live body is already open before the prelude fetch (subscribe-first), so
   events buffered between open and the snapshot/items read are processed after the
@@ -970,8 +971,8 @@ Notable: `ContractMismatch` is **loud** (fails the connection); `Auth` propagate
 to the server lifecycle document for "re-login / re-token" UX. The SSE stream's
 own errors go through the channel as synthetic `ServerStreamEvent` values
 (`Reconnecting`/`Reconnected`/`Disconnected`), not synchronous `Result` returns:
-the crate auto-reconnects an open stream **internally** (the consumer's pump just
-keeps reading — app-arch state-model §8), so there is no `ClientError::Disconnected`
+the crate auto-reconnects an open stream **internally** (the consumer's
+`ActiveSession` actor just keeps reading — app-arch state-model §8), so there is no `ClientError::Disconnected`
 — give-up is the terminal `ServerStreamEvent::Disconnected`. (The "liveness
 watcher" that governs *non-active* sessions is the separate app-arch state-model
 §10 cross-session list poll, not this stream.)

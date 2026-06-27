@@ -42,7 +42,7 @@ connection flow — shell §17.1 / §17.2; the connection-auth UX).
 **This document does NOT own:**
 
 - The wire, endpoints, reconnect protocol, dedup (the typed client).
-- The session registry / liveness / pump tasks (the state model).
+- The session registry / liveness / `ActiveSession` actors (the state model).
 - The UI chrome / "Add connection" dialog visual (the application shell — this
   document owns the backend that the shell's wizard calls).
 - Agent execution (the server + runner do that; Lens never).
@@ -263,8 +263,10 @@ pub struct LaunchRunnerRequest {
 - **Managed** — Lens doesn't `POST /runners`. The server provisions a
   sandbox host and launches a runner on it (§7).
 
-**Wake / resume a slept session.** Waking a session whose runner was reclaimed
-(Sleep → `stop_session`) is a runner *relaunch*, not just a reconnect. Sequence:
+**Wake / resume a slept session.** Sleep sends `stop_session` best-effort, but
+the server owns the exact runner/process semantics. Waking first tries a normal
+stream bootstrap/reconcile. If the server reports that no runner/resource path
+is available, wake becomes a runner relaunch/rebind:
 1. (optional) `GET /v1/runners/{runner_id}/status` → `{runner_id, online}` to see
    if the prior runner is already back.
 2. `POST /v1/hosts/{host_id}/runners` (`LaunchRunnerRequest{session_id, workspace,

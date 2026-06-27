@@ -245,8 +245,8 @@ event stream — only per-session SSE [verified 0.2.0].** Fleet status comes
 from polling `GET /v1/sessions` (with cursor params `after/before`,
 `kind=default|sub_agent|any`, and filters). This split is what lets the
 dashboard show 50 cards while only the genuinely-active ones stream — the rest
-are Slept or Archived (the stream count self-bounds via ~10-min auto-sleep; no
-hard cap; see the state model doc's lifecycle model §3).
+are Slept or non-active archived sessions (the stream count self-bounds via
+~10-min auto-sleep; no hard cap; see the state model doc's lifecycle model §3).
 
 **`sequence_number`** (optional int) is on every event for dedup; pair it with
 `last_event_seq` to detect gaps (events emitted while you were disconnected).
@@ -300,8 +300,8 @@ not a normalization across backends. The state model document pins it; sketch:
   `reasoning{summary, encrypted?}`, `native_tool{kind, data}`,
   `compaction{summary, token_count}`, `slash_command`, `terminal_command`,
   `resource_event`.
-- **`StreamUpdate`** — the parsed-and-reduced form of the event taxonomy (§0.4)
-  the UI subscribes to.
+- **`StreamUpdate`** — the reduced semantic delta emitted by the state model's
+  `ActiveSession` actor; the UI subscribes to the foreground replica it feeds.
 - **`Elicitation`** — pending request state (id, params, target_session_id,
   received_at), with `ElicitationResult` for the reply.
 - **`ChildSession`** — a `ChildSessionSummary` mirror; the parent's view of a
@@ -310,10 +310,10 @@ not a normalization across backends. The state model document pins it; sketch:
   API models, owned by their surface documents (workspace & terminals, agent
   definition, permissions).
 
-The reduction from raw SSE → `StreamUpdate` → app state lives in the state
-model document; the per-surface rendering of that state lives in the surface
-documents (transcript, workspace, agent definition, permissions, sub-agent
-topology).
+The reduction from typed SSE events → canonical `SessionState` + `StreamUpdate`
+lives in the state model document; the per-surface rendering of that state lives
+in the surface documents (transcript, workspace, agent definition, permissions,
+sub-agent topology).
 
 ---
 
@@ -394,12 +394,14 @@ patterns the app will have. These are design decisions, not inherited baggage.
 - **Derived, authoritative status** — status is folded from events into a
   per-session state machine; "needs attention" is sticky until a real user
   action clears it.
-- **Auto-sleep quiet agents** — after a session has genuinely gone quiet
-  (idle, no terminal activity) for a period (default ~10 min), Lens **sleeps**
-  it: `stop_session` reclaims the server-side harness/PTY *and* the card dims
-  (stays visible). Auto-sleep skips pinned sessions and sessions with a pending
-  elicitation, and is terminal-aware (a live terminal counts as not-quiet).
-  Wake = resume + re-bind a runner (the §0.7 lifecycle; state model §3).
+- **Auto-sleep quiesced agents** — after a session has genuinely quiesced
+  (idle, no transient reducer state, no pending tools/user input/elicitation,
+  no terminal activity) for a period (default ~10 min), Lens **sleeps** it:
+  close Lens-local observation, send best-effort `stop_session`, and dim the
+  card while leaving it visible. Auto-sleep skips pinned sessions and sessions
+  with pending elicitations, and is terminal-aware (a live terminal counts as
+  not-quiesced). Wake = stream bootstrap/reconcile, with runner resume/rebind
+  only if the server requires it (state model §3).
 
 ### Power-user keyboard model
 

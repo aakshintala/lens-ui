@@ -53,10 +53,11 @@ GPUI has no built-in SSE/WS. Arbor's pattern (the load-bearing template):
   cx.notify() })` (gpui's reactive notify).
 - All I/O is in `cx.background_spawn`, never on the UI thread.
 
-This maps cleanly onto Lens's pump-task→bounded-channel→store→subscribers
-model (state model §8). The state model's §14 "framework divergence notes"
-calls out this single crossing as the one framework-specific point — gpui's
-`cx.spawn` + entity update on the foreground executor is the implementation.
+This maps cleanly onto Lens's `ActiveSession`-actor→bounded-channel→foreground
+`SessionStore` replica→subscribers model (state model §8). The state model's §14
+"framework divergence notes" calls out this single crossing as the one
+framework-specific point — gpui's `cx.spawn` + entity update on the foreground
+executor is the implementation.
 
 ### 2.2 Terminal widget
 
@@ -203,8 +204,8 @@ Each spec has a "framework divergence" section. What each one owns vs. here:
 
 | Spec | Owns there | Resolved here |
 |---|---|---|
-| typed client | (no framework impact) | The async runtime is tokio; the gpui→tokio hand-off is below |
-| state model §14 | State primitive (gpui `Entity::observe` vs alternative store); the channel→UI crossing (`cx.spawn` + entity update) | gpui's per-entity notify + `cx.spawn` is the implementation |
+| typed client | (no framework impact) | Blocking reader threads + `std::sync::mpsc`; no tokio requirement |
+| state model §14 | State primitive (gpui `Entity::observe` vs alternative store); the channel→UI crossing (`cx.spawn` + entity update) | gpui's per-entity notify + `cx.spawn` is the foreground replica implementation |
 | application shell §17 | The board (ordinal-slot responsive reflow vs a free-form canvas) | §2.4 of this doc — confirmed ordinal board is *simpler*, not harder, in gpui |
 | transcript §19 | Progressive re-render (stable-identity in-place diff); markdown library; virtualization | §4.1 markdown spike; `uniform_list` is gpui-native **but uniform-height only** — the variable-height transcript needs a custom virtualizer (spike, §4.1d) |
 | workspace §9 | Terminal widget | §2.2 — `alacritty_terminal` + `portable-pty`, Arbor template (MIT) |

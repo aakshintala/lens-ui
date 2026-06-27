@@ -245,11 +245,12 @@ Only shown if the buffer's tail < wall-clock-since-disconnect (i.e. we *know*
 we missed something); if the buffer holds the whole gap, no cue.
 
 **Scope: brief reconnects only — not a deliberate Sleep.** The ring buffer
-covers transient stream blips. It does **not** survive a Lens **Sleep**, which
-`stop_session`s the runner and **kills the tmux PTY** (state model §3): the
-terminal genuinely ends. This is why auto-sleep is **terminal-aware** — a
-session with live/recent terminal activity is not "quiet" and is excluded from
-auto-sleep, so Lens doesn't silently reclaim a terminal you were watching.
+covers transient stream blips. It does **not** survive a Lens **Sleep**: Sleep
+closes Lens-local observation and sends best-effort `stop_session` (state model
+§3), so the server may terminate the tmux PTY. This is why auto-sleep is
+**terminal-aware** — a session with live/recent terminal activity is not
+"quiet" and is excluded from auto-sleep, so Lens doesn't request stop for a
+terminal you were watching.
 
 ### 9.3 Terminal lifecycle
 
