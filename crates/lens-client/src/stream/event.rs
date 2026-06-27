@@ -215,6 +215,36 @@ impl TodoItem {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ElicitationParams {
+    mode: String,
+    message: String,
+    url: String,
+    phase: String,
+    policy_name: String,
+    content_preview: String,
+}
+impl ElicitationParams {
+    pub fn mode(&self) -> &str {
+        &self.mode
+    }
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+    pub fn phase(&self) -> &str {
+        &self.phase
+    }
+    pub fn policy_name(&self) -> &str {
+        &self.policy_name
+    }
+    pub fn content_preview(&self) -> &str {
+        &self.content_preview
+    }
+}
+
 // Internal raw shapes (private; never exposed) used only to deserialize.
 #[derive(Deserialize)]
 struct RawStatus {
@@ -332,14 +362,22 @@ struct RawStreamError {
 }
 #[derive(Deserialize)]
 struct RawElicitationParams {
-    #[serde(rename = "message")]
-    _message: String,
+    #[serde(default)]
+    mode: String,
+    message: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    phase: String,
+    #[serde(default)]
+    policy_name: String,
+    #[serde(default)]
+    content_preview: String,
 }
 #[derive(Deserialize)]
 struct RawElicitationRequest {
     elicitation_id: String,
-    #[serde(rename = "params")]
-    _params: RawElicitationParams,
+    params: RawElicitationParams,
 }
 #[derive(Deserialize)]
 struct RawElicitationResolved {
@@ -481,9 +519,9 @@ pub enum ResponseEvent {
         code: String,
         message: String,
     },
-    // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
     ElicitationRequest {
         elicitation_id: String,
+        params: ElicitationParams,
     },
     // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
     ElicitationResolved {
@@ -845,11 +883,18 @@ impl ResponseEvent {
                     message: r.error.message,
                 }
             }
-            // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
             "response.elicitation_request" => {
                 let r: RawElicitationRequest = serde_json::from_str(d).ok()?;
                 ResponseEvent::ElicitationRequest {
                     elicitation_id: r.elicitation_id,
+                    params: ElicitationParams {
+                        mode: r.params.mode,
+                        message: r.params.message,
+                        url: r.params.url,
+                        phase: r.params.phase,
+                        policy_name: r.params.policy_name,
+                        content_preview: r.params.content_preview,
+                    },
                 }
             }
             // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
@@ -1391,18 +1436,26 @@ mod tests {
     }
 
     #[test]
-    fn schema_elicitation_request() {
-        // SCHEMA-DERIVED.
+    fn bytes_elicitation_request_params() {
+        // Byte-verified: docs/spikes/captures/2026-06-26-live-recapture/elicitation-request.sse
         let ev = parse_event(&frame(
             "response.elicitation_request",
-            r#"{"elicitation_id":"elicit_abc","params":{"message":"approve?"}}"#,
+            r#"{"sequence_number":null,"type":"response.elicitation_request","elicitation_id":"elicit_17f","method":"elicitation/create","params":{"mode":"url","message":"approve_file_ops: Agent wants to call sys_os_write('/tmp/spike_elicit.txt'). Approve?","requestedSchema":{},"url":"/approve/conv_78/elicit_17f","phase":"tool_call","policy_name":"approve_file_ops","content_preview":"{\"path\": \"/tmp/spike_elicit.txt\"}","target_session_id":null}}"#,
         ));
-        assert_eq!(
-            ev,
-            ServerStreamEvent::Response(ResponseEvent::ElicitationRequest {
-                elicitation_id: "elicit_abc".into()
-            })
-        );
+        let ServerStreamEvent::Response(ResponseEvent::ElicitationRequest {
+            elicitation_id,
+            params,
+        }) = ev
+        else {
+            panic!("expected ElicitationRequest, got {ev:?}");
+        };
+        assert_eq!(elicitation_id, "elicit_17f");
+        assert_eq!(params.policy_name(), "approve_file_ops");
+        assert_eq!(params.phase(), "tool_call");
+        assert_eq!(params.mode(), "url");
+        assert!(params.message().contains("Approve?"));
+        assert!(params.content_preview().contains("spike_elicit.txt"));
+        assert_eq!(params.url(), "/approve/conv_78/elicit_17f");
     }
 
     #[test]

@@ -6,7 +6,7 @@ pub mod reader;
 pub(crate) mod sse;
 
 pub use event::{
-    ChildSession, ChildTaskStatus, DEFERRED_EVENT_TYPES, DisconnectReason, Item,
+    ChildSession, ChildTaskStatus, DEFERRED_EVENT_TYPES, DisconnectReason, ElicitationParams, Item,
     MODELED_EVENT_TYPES, MessageContentBlock, PresenceViewer, ResponseEvent, ServerStreamEvent,
     SessionEvent, SessionStatusValue,
 };
