@@ -321,7 +321,7 @@ Grow `SessionSnapshot` with the byte-grounded scalar chrome the §7 reconnect/wa
 - Modify: `crates/lens-client/src/sessions.rs` (`SessionSnapshot` struct + getters; new `ModelUsage`, `SkillRef`)
 
 **Interfaces:**
-- Produces (public): new fields + getters on `SessionSnapshot` — `harness() -> &str`, `title() -> Option<&str>`, `runner_id() -> Option<&str>`, `host_id() -> Option<&str>`, `llm_model() -> Option<&str>`, `model_override() -> Option<&str>`, `reasoning_effort() -> Option<&str>`, `context_window() -> Option<i64>`, `last_total_tokens() -> Option<i64>`, `total_cost_usd() -> Option<f64>`, `permission_level() -> Option<i64>`, `workspace() -> Option<&str>`, `git_branch() -> Option<&str>`, `root_conversation_id() -> Option<&str>`, `parent_session_id() -> Option<&str>`, `sub_agent_name() -> Option<&str>`, `last_task_error() -> Option<&str>`. New `pub struct ModelUsage` (tokens + cost), `pub struct SkillRef { name, description }` with getters (used in Task 4).
+- Produces (public): new fields + getters on `SessionSnapshot` — `harness() -> &str`, `title() -> Option<&str>`, `runner_id() -> Option<&str>`, `host_id() -> Option<&str>`, `llm_model() -> Option<&str>`, `model_override() -> Option<&str>`, `reasoning_effort() -> Option<&str>`, `context_window() -> Option<i64>`, `last_total_tokens() -> Option<i64>`, `total_cost_usd() -> Option<f64>`, `permission_level() -> Option<i64>`, `workspace() -> Option<&str>`, `git_branch() -> Option<&str>`, `root_conversation_id() -> Option<&str>`, `parent_session_id() -> Option<&str>`, `sub_agent_name() -> Option<&str>`. (⚠ `last_task_error` is **deferred** — it is null in the capture but the sibling `ChildSessionSummary` models it as `Option<BTreeMap<String,String>>` (`sessions.rs:309`); its non-string live shape would break the whole snapshot deser, so it is not modeled here. Model when a non-null shape is captured.) New `pub struct ModelUsage` (tokens + cost), `pub struct SkillRef { name, description }` with getters (used in Task 4).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -389,8 +389,11 @@ Add the new fields to the `SessionSnapshot` struct (all `#[serde(default)]`, aft
     parent_session_id: Option<String>,
     #[serde(default)]
     sub_agent_name: Option<String>,
-    #[serde(default)]
-    last_task_error: Option<String>,
+    // ⚠ DEFERRED: last_task_error — null in the capture, but the sibling
+    //   ChildSessionSummary models it as Option<BTreeMap<String,String>>
+    //   (sessions.rs:309). Its non-string live shape would fail the whole
+    //   snapshot deser, so it is left out (serde skips the unknown wire field).
+    //   Model when a non-null shape is captured.
 ```
 
 Add the getters to `impl SessionSnapshot`:
@@ -412,7 +415,6 @@ Add the getters to `impl SessionSnapshot`:
     pub fn root_conversation_id(&self) -> Option<&str> { self.root_conversation_id.as_deref() }
     pub fn parent_session_id(&self) -> Option<&str> { self.parent_session_id.as_deref() }
     pub fn sub_agent_name(&self) -> Option<&str> { self.sub_agent_name.as_deref() }
-    pub fn last_task_error(&self) -> Option<&str> { self.last_task_error.as_deref() }
 ```
 
 Add the helper structs (near `SessionSnapshot`), used by Task 4:
@@ -599,6 +601,6 @@ git commit -m "feat(lens-client): SessionSnapshot bucket-B collections + embedde
 - **Spec coverage:** `GET /items` typed + reconcile-by-id (§7 step 5) → Tasks 1–2 (`Item::id()` total, incl. `Other`); bucket-B snapshot chrome (§7 step 4 / app-arch §6.3 wake) → Tasks 3–4 (scalars + collections + embedded items). The reconnect *protocol* that consumes them → explicitly deferred to 3b-2b.
 - **No-Value rule:** `serde_json::Value` appears only internally (`RawItemList.data`, `de_items`, `Item::from_value`); `ItemList`/`SessionSnapshot` expose typed getters. ✓
 - **Never-panic / total:** `Item::from_value` stays total (unmodeled → `Other` with `id`); `Item::id()` is an exhaustive match; reads return `Result`. ✓
-- **Ground-truth:** every field/test value is from `happy_path.items.json` / `happy_path.snapshot.json`; empty/null-in-capture collections (`todos`, `model_options`, `sandbox_status`, `pending_elicitations`) are **deferred** (not guessed), flagged ⚠. ✓
+- **Ground-truth:** every field/test value is from `happy_path.items.json` / `happy_path.snapshot.json`; empty/null-in-capture collections (`todos`, `model_options`, `sandbox_status`, `pending_elicitations`) are **deferred** (not guessed), flagged ⚠. `last_task_error` is also **deferred** — null here but type-ambiguous (sibling `ChildSessionSummary` models it as `Option<BTreeMap<String,String>>`, `sessions.rs:309`); modeling it `Option<String>` would risk a live snapshot-deser break. ✓
 - **Type consistency:** `Item::id()`, `Item::ResourceEvent`, `Item::Other { item_type, id }`, `ItemList::items()`, `ItemsPage::to_query`, `ModelUsage`, `SkillRef`, and the `SessionSnapshot` getters are named identically across tasks and match the Plan 3a `Item` union. ✓
 - **Process:** static-shape, byte-grounded REST modeling = composer-2.5's strength; per-task cross-family review still applies at the seams (no-Value + reconcile-by-id are the load-bearing checks), but the temporal-logic intensity of Plan 3 lives in 3b-2b, not here.
