@@ -45,6 +45,8 @@ impl HttpReopener {
 
 impl Reopen for HttpReopener {
     fn open_stream(&self) -> Result<Box<dyn Read + Send>> {
+        // No total timeout: this is the long-lived SSE body. connect_timeout
+        // (client-level) bounds the handshake; idle is handled by the stop flag.
         let url = self
             .conn
             .url(&format!("/v1/sessions/{}/stream", self.session_id))?;
@@ -65,7 +67,12 @@ impl Reopen for HttpReopener {
         let resp = self
             .conn
             .auth
-            .apply(self.http.get(url).query(&opts.to_query()))
+            .apply(
+                self.http
+                    .get(url)
+                    .query(&opts.to_query())
+                    .timeout(crate::client::REST_TIMEOUT),
+            )
             .send()?;
         let status = resp.status().as_u16();
         let body = resp.text()?;
@@ -80,7 +87,12 @@ impl Reopen for HttpReopener {
         let resp = self
             .conn
             .auth
-            .apply(self.http.get(url).query(&page.to_query()))
+            .apply(
+                self.http
+                    .get(url)
+                    .query(&page.to_query())
+                    .timeout(crate::client::REST_TIMEOUT),
+            )
             .send()?;
         let status = resp.status().as_u16();
         let body = resp.text()?;

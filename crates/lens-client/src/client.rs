@@ -1,8 +1,17 @@
+use std::time::Duration;
+
 use crate::PINNED_OMNIGENT_VERSION;
 use crate::connection::Connection;
 use crate::error::{ClientError, Result};
 use crate::http::{check_contract, check_status, decode_json};
 use crate::info::{ServerInfo, VersionResponse};
+
+/// Connect-phase timeout for ALL requests. Safe for SSE: it bounds only the
+/// TCP/TLS handshake, never body reads — so a healthy quiet stream is untouched.
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Total per-request timeout for SHORT REST calls only. Never applied to the
+/// streaming GET (it would kill a healthy idle SSE body).
+pub(crate) const REST_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct Client {
     conn: Connection,
@@ -14,6 +23,7 @@ impl Client {
     /// Handshake + contract gate. Ready ladder: /health → /api/version → /v1/info.
     pub fn new(conn: Connection) -> Result<Self> {
         let http = reqwest::blocking::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
             .build()
             .map_err(ClientError::Network)?;
 
@@ -68,7 +78,7 @@ impl Client {
         let resp = self
             .conn()
             .auth
-            .apply(self.http().get(url).query(query))
+            .apply(self.http().get(url).query(query).timeout(REST_TIMEOUT))
             .send()?;
         let status = resp.status().as_u16();
         let body = resp.text()?;
@@ -90,6 +100,7 @@ impl Client {
     {
         let url = self.conn().url(path)?;
         let mut rb = self.http().request(method, url).query(query);
+        rb = rb.timeout(REST_TIMEOUT);
         if let Some(b) = body {
             rb = rb.json(b);
         }
@@ -101,11 +112,12 @@ impl Client {
 
     pub(crate) fn get_bytes(&self, path: &str) -> crate::error::Result<Vec<u8>> {
         let url = self.conn().url(path)?;
-        let resp = self.conn().auth.apply(self.http().get(url)).send()?;
-        let status = resp.status().as_u16();
-        if !(200..=299).contains(&status) {
-            return Err(crate::http::check_status(path, status).unwrap_err());
-        }
+        let resp = self
+            .conn()
+            .auth
+            .apply(self.http().get(url).timeout(REST_TIMEOUT))
+            .send()?;
+        crate::http::check_status(path, resp.status().as_u16())?;
         Ok(resp.bytes()?.to_vec())
     }
 
@@ -117,10 +129,27 @@ impl Client {
         form: reqwest::blocking::multipart::Form,
     ) -> crate::error::Result<T> {
         let url = self.conn().url(path)?;
-        let rb = self.http().request(method, url).multipart(form);
+        let rb = self
+            .http()
+            .request(method, url)
+            .multipart(form)
+            .timeout(REST_TIMEOUT);
         let resp = self.conn().auth.apply(rb).send()?;
         let status = resp.status().as_u16();
         let text = resp.text()?;
         crate::http::decode_json(path, status, &text)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CONNECT_TIMEOUT, REST_TIMEOUT};
+    use std::time::Duration;
+
+    #[test]
+    fn timeouts_are_bounded_and_connect_is_shorter() {
+        assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(REST_TIMEOUT, Duration::from_secs(30));
+        assert!(CONNECT_TIMEOUT < REST_TIMEOUT);
     }
 }
