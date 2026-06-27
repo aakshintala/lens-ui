@@ -507,6 +507,7 @@ pub enum ResponseEvent {
     },
     // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
     CompactionFailed,
+    // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
     Error {
         source: String,
         tool_name: Option<String>,
@@ -857,6 +858,7 @@ impl ResponseEvent {
             }
             // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
             "response.compaction.failed" => ResponseEvent::CompactionFailed,
+            // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
             "response.error" => {
                 let r: RawStreamError = serde_json::from_str(d).ok()?;
                 ResponseEvent::Error {
@@ -1400,8 +1402,8 @@ mod tests {
     }
 
     #[test]
-    fn bytes_response_error() {
-        // Byte-verified: docs/spikes/captures/2026-06-26-live-recapture/<various>.sse
+    fn schema_response_error() {
+        // SCHEMA-DERIVED.
         let ev = parse_event(&frame(
             "response.error",
             r#"{"source":"llm","tool_name":null,"error":{"code":"timeout","message":"timed out"}}"#,
