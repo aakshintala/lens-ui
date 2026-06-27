@@ -464,6 +464,65 @@ impl MessageContentBlock {
     }
 }
 
+/// Every `ServerStreamEvent` wire discriminator the pinned `0.3.0.dev0` contract
+/// declares, each accounted for. `parse_event` (above) is the SSOT for which are
+/// *modeled*; the rest are knowingly routed to `Unknown` (deferred — absent from
+/// the golden captures). The `taxonomy_drift` test asserts this equals the
+/// vendored openapi `ServerStreamEvent` discriminator mapping, so a new upstream
+/// event type fails offline. Keep in sync with `parse_event` when modeling a
+/// deferred type (move its comment, not the entry).
+pub const ACCOUNTED_EVENT_TYPES: &[&str] = &[
+    // --- modeled by parse_event ---
+    "response.cancelled",
+    "response.compaction.completed",
+    "response.compaction.failed",
+    "response.compaction.in_progress",
+    "response.completed",
+    "response.elicitation_request",
+    "response.elicitation_resolved",
+    "response.error",
+    "response.failed",
+    "response.in_progress",
+    "response.incomplete",
+    "response.output_item.done",
+    "response.output_text.delta",
+    "response.reasoning.started",
+    "response.reasoning_summary_text.delta",
+    "response.reasoning_text.delta",
+    "session.changed_files.invalidated",
+    "session.child_session.updated",
+    "session.heartbeat",
+    "session.input.consumed",
+    "session.interrupted",
+    "session.model",
+    "session.model_options",
+    "session.presence",
+    "session.reasoning_effort",
+    "session.resource.created",
+    "session.sandbox_status",
+    "session.skills",
+    "session.status",
+    "session.terminal.activity",
+    "session.terminal_pending",
+    "session.todos",
+    "session.usage",
+    // --- deferred: routed to Unknown today (not in golden captures) ---
+    "response.client_task.cancel",
+    "response.created",
+    "response.heartbeat",
+    "response.output_file.done",
+    "response.queued",
+    "response.retry",
+    "session.agent_changed",
+    "session.collaboration_mode",
+    "session.created",
+    "session.resource.deleted",
+    "turn.cancelled",
+    "turn.completed",
+    "turn.failed",
+    "turn.started",
+];
+
 /// Total: maps a raw frame to a typed event, degrading to `Unknown` on any
 /// unmodeled type or deserialization failure. Modeled-family dispatch is added
 /// by Tasks 3–4 (each returns `Some(event)` or `None` → fall through to Unknown).
