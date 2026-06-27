@@ -9,6 +9,7 @@ pub mod generated;
 pub mod http;
 pub mod ids;
 pub mod info;
+mod reconnect;
 pub mod registries;
 pub mod sessions;
 pub mod stream;

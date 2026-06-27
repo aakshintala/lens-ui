@@ -301,7 +301,7 @@ impl Default for GetOpts {
 }
 
 impl GetOpts {
-    fn to_query(self) -> Vec<(&'static str, String)> {
+    pub(crate) fn to_query(self) -> Vec<(&'static str, String)> {
         vec![
             ("include_items", self.include_items.to_string()),
             ("include_liveness", self.include_liveness.to_string()),
@@ -380,6 +380,10 @@ impl ItemList {
     pub fn items(&self) -> &[crate::stream::Item] {
         &self.items
     }
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn into_items(self) -> Vec<crate::stream::Item> {
+        self.items
+    }
     pub fn has_more(&self) -> bool {
         self.has_more
     }
@@ -431,7 +435,7 @@ pub struct ItemsPage {
 }
 
 impl ItemsPage {
-    fn to_query(&self) -> Vec<(&'static str, String)> {
+    pub(crate) fn to_query(&self) -> Vec<(&'static str, String)> {
         let mut q = Vec::new();
         if let Some(n) = self.limit {
             q.push(("limit", n.to_string()));
