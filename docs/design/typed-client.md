@@ -504,6 +504,9 @@ types, families are either **byte-verified** (captured on the wire) or
 - `response.compaction.in_progress`
 - `session.terminal.activity` — **SSE**, not WS attach (terminal *content* remains
   WS, §5)
+- `session.skills`
+- `response.failed`
+- `response.elicitation_resolved`
 
 **Still blocked** (environment / harness — remain `DEFERRED` or schema-derived; a
 live `Unknown` or uncaptured shape is expected):
