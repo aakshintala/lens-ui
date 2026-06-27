@@ -112,12 +112,22 @@ and roll older "Recent" pointers off this page as they age.
        `plan3b2a-embedded-item-envelope`). **Deferred (byte-grounded gaps):** `last_task_error`
        (type-ambiguous null — sibling models it as a map), `todos`/`pending_elicitations`/`model_options`/
        `sandbox_status` (empty/null in the only capture). ⚠ `live_stream` NOT run (no server) — unit only.
-     - **Next: Plan 3b-2b — §7 reconnect state machine. GATED on one design decision:** bucket-B
-       chrome-restore *ownership* on reconnect — crate emits synthetic chrome `SessionEvent`s (A) vs.
-       consumer applies the snapshot (B). Resolve A/B (Opus design → ADR in typed-client §7) **before**
-       writing the 3b-2b plan. Scope then: backoff + `Reconnecting/Reconnected/Disconnected` lifecycle,
-       items-replay as `OutputItemDone` (`Reconnected` precedes history, §7a), seq-dedup + normalizer
-       `seen_items` reset on `gap≠Some(0)`, reader re-open capability. Full handoff in the linked doc.
+     - **Plan 3b-2b design decision RESOLVED + plan WRITTEN (2026-06-26, Opus; commit `74c28fd`).**
+       Chrome-restore ownership decided **A2**: the crate emits **one** synthetic
+       `ServerStreamEvent::SnapshotRestored(SessionSnapshot)` (NOT consumer-applies-snapshot — B breaks
+       the LOCKED state-model §1 boundary "does NOT own reconnect" + §4.1 single-writer; NOT per-field
+       `session.*` replay — A1 injects a spurious `AgentChanged` transcript marker on every wake). ADR
+       recorded in typed-client §7 (decision block + step 4/6 ordering `Reconnected`→`SnapshotRestored`
+       →history + synthetic-markers-bypass-normalization seam) and app-arch §4.1 (reducer
+       `SnapshotRestored` fold = scalar restore only, no transcript side-effects). **Plan written:**
+       [`plan`](./superpowers/plans/2026-06-26-lens-client-plan3b2b-reconnect-state-machine.md) — 7 TDD
+       tasks (synthetic variants → `Normalizer::reset_seen_items` → frame seq-peek → `reconnect` module
+       `Reopen`-trait/`HttpReopener`/backoff/items-replay → state machine in reader → wire
+       `Sessions::stream` → docs). The `Reopen` trait makes the state machine unit-testable with a
+       scripted mock (no server). Four plan-level decisions flagged for review + §7 reconciliation:
+       `Disconnected{reason}` payload, `gap:None` v1 (no `Some(0)` proof), frame-level seq-dedup,
+       single-page items replay. **Next: EXECUTE 3b-2b** (subagent-driven recommended — composer-2.5
+       build + mandatory cross-family review at the temporal seams; `[[review-spend-policy]]`).
   3. **Stand up contract-drift CI** (outstanding B6) — the passive alarm that makes tracking
      dev0 safe when `0.3.0` eventually tags.
   - Plan 3b-2b is temporal/stateful (reconnect state machine), so **cross-family review stays
