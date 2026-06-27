@@ -28,11 +28,54 @@ pub enum SessionStatus {
     Failed,
 }
 
+/// This server emits explicit `null` (not `[]`/`{}`) for empty collections on
+/// some snapshots; `#[serde(default)]` covers a *missing* key but NOT a present
+/// `null`, so map `null` → `Default` for the collection fields.
+fn de_null_default<'de, D, T>(d: D) -> std::result::Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + serde::Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
+fn de_items<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Vec<crate::stream::Item>, D::Error> {
+    let raw: Vec<serde_json::Value> =
+        Option::<Vec<serde_json::Value>>::deserialize(d)?.unwrap_or_default();
+    Ok(raw
+        .into_iter()
+        .map(hoist_embedded_item_payload)
+        .map(crate::stream::Item::from_value)
+        .collect())
+}
+
+/// The embedded `items` on a `SessionSnapshot` nest their payload under a `data`
+/// envelope (`{id, type, status, data: {role, content, …}}`), whereas the
+/// standalone `GET /items` corpus and the live stream carry those payload fields
+/// at the top level — the shape `Item::from_value` reads. Hoist `data`'s fields
+/// up so embedded items type the same as the flat form; `data` wins on the
+/// payload keys, while `id`/`type`/`status` are preserved from the top level
+/// (they never appear inside `data`). Non-object or `data`-less values pass
+/// through unchanged.
+fn hoist_embedded_item_payload(v: Value) -> Value {
+    match v {
+        Value::Object(mut top) => {
+            if let Some(Value::Object(data)) = top.remove("data") {
+                top.extend(data);
+            }
+            Value::Object(top)
+        }
+        other => other,
+    }
+}
+
 /// A session snapshot (`GET /v1/sessions/{id}`). Mirrors the CORE fields of
 /// omnigent's `SessionResponse` (`schemas.py:1601-1642`); unmodeled fields are
 /// ignored. Fields are private — access is via the typed getters, so the wire
 /// shape stays an lens-client implementation detail (single edit site for drift).
-#[derive(Clone, Debug, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
 pub struct SessionSnapshot {
     id: SessionId,
     status: SessionStatus,
@@ -42,7 +85,7 @@ pub struct SessionSnapshot {
     #[serde(default)]
     archived: bool,
     created_at: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_null_default")]
     labels: BTreeMap<String, String>,
     #[serde(default)]
     runner_online: Option<bool>,
@@ -50,6 +93,54 @@ pub struct SessionSnapshot {
     host_online: Option<bool>,
     #[serde(default)]
     host_resumable: bool,
+    #[serde(default)]
+    harness: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    runner_id: Option<String>,
+    #[serde(default)]
+    host_id: Option<String>,
+    #[serde(default)]
+    llm_model: Option<String>,
+    #[serde(default)]
+    model_override: Option<String>,
+    #[serde(default)]
+    reasoning_effort: Option<String>,
+    #[serde(default)]
+    context_window: Option<i64>,
+    #[serde(default)]
+    last_total_tokens: Option<i64>,
+    #[serde(default)]
+    total_cost_usd: Option<f64>,
+    #[serde(default)]
+    permission_level: Option<i64>,
+    #[serde(default)]
+    workspace: Option<String>,
+    #[serde(default)]
+    git_branch: Option<String>,
+    #[serde(default)]
+    root_conversation_id: Option<String>,
+    #[serde(default)]
+    parent_session_id: Option<String>,
+    #[serde(default)]
+    sub_agent_name: Option<String>,
+    // ⚠ DEFERRED: last_task_error — null in the capture, but the sibling
+    //   ChildSessionSummary models it as Option<BTreeMap<String,String>>
+    //   (sessions.rs:309). Its non-string live shape would fail the whole
+    //   snapshot deser, so it is left out (serde skips the unknown wire field).
+    //   Model when a non-null shape is captured.
+    #[serde(default, deserialize_with = "de_null_default")]
+    usage_by_model: std::collections::BTreeMap<String, ModelUsage>,
+    #[serde(default, deserialize_with = "de_null_default")]
+    skills: Vec<SkillRef>,
+    #[serde(default, deserialize_with = "de_items")]
+    items: Vec<crate::stream::Item>,
+    // ⚠ DEFERRED (empty/null in the only capture — model when non-empty, Plan 3b-2b/
+    //   config-time): todos (TodoItem is not Deserialize; wire key `activeForm`),
+    //   pending_elicitations (likely objects, not id strings), model_options,
+    //   sandbox_status. Left out of the struct: serde skips unknown wire fields,
+    //   so the snapshot still parses with them present-but-empty.
 }
 
 impl SessionSnapshot {
@@ -85,6 +176,122 @@ impl SessionSnapshot {
     pub fn host_resumable(&self) -> bool {
         self.host_resumable
     }
+    pub fn harness(&self) -> &str {
+        &self.harness
+    }
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+    pub fn runner_id(&self) -> Option<&str> {
+        self.runner_id.as_deref()
+    }
+    pub fn host_id(&self) -> Option<&str> {
+        self.host_id.as_deref()
+    }
+    pub fn llm_model(&self) -> Option<&str> {
+        self.llm_model.as_deref()
+    }
+    pub fn model_override(&self) -> Option<&str> {
+        self.model_override.as_deref()
+    }
+    pub fn reasoning_effort(&self) -> Option<&str> {
+        self.reasoning_effort.as_deref()
+    }
+    pub fn context_window(&self) -> Option<i64> {
+        self.context_window
+    }
+    pub fn last_total_tokens(&self) -> Option<i64> {
+        self.last_total_tokens
+    }
+    pub fn total_cost_usd(&self) -> Option<f64> {
+        self.total_cost_usd
+    }
+    pub fn permission_level(&self) -> Option<i64> {
+        self.permission_level
+    }
+    pub fn workspace(&self) -> Option<&str> {
+        self.workspace.as_deref()
+    }
+    pub fn git_branch(&self) -> Option<&str> {
+        self.git_branch.as_deref()
+    }
+    pub fn root_conversation_id(&self) -> Option<&str> {
+        self.root_conversation_id.as_deref()
+    }
+    pub fn parent_session_id(&self) -> Option<&str> {
+        self.parent_session_id.as_deref()
+    }
+    pub fn sub_agent_name(&self) -> Option<&str> {
+        self.sub_agent_name.as_deref()
+    }
+    pub fn usage_by_model(&self) -> &std::collections::BTreeMap<String, ModelUsage> {
+        &self.usage_by_model
+    }
+    pub fn skills(&self) -> &[SkillRef] {
+        &self.skills
+    }
+    /// The transcript items embedded in the snapshot — non-empty only when fetched
+    /// with `GetOpts { include_items: true }`. The standalone paginated read is
+    /// `Sessions::items()`.
+    pub fn items(&self) -> &[crate::stream::Item] {
+        &self.items
+    }
+}
+
+/// Per-model token+cost usage from `usage_by_model` on the session snapshot.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+pub struct ModelUsage {
+    #[serde(default)]
+    input_tokens: i64,
+    #[serde(default)]
+    output_tokens: i64,
+    #[serde(default)]
+    total_tokens: i64,
+    #[serde(default)]
+    cache_read_input_tokens: i64,
+    #[serde(default)]
+    cache_creation_input_tokens: i64,
+    #[serde(default)]
+    total_cost_usd: f64,
+}
+
+impl ModelUsage {
+    pub fn input_tokens(&self) -> i64 {
+        self.input_tokens
+    }
+    pub fn output_tokens(&self) -> i64 {
+        self.output_tokens
+    }
+    pub fn total_tokens(&self) -> i64 {
+        self.total_tokens
+    }
+    pub fn cache_read_input_tokens(&self) -> i64 {
+        self.cache_read_input_tokens
+    }
+    pub fn cache_creation_input_tokens(&self) -> i64 {
+        self.cache_creation_input_tokens
+    }
+    pub fn total_cost_usd(&self) -> f64 {
+        self.total_cost_usd
+    }
+}
+
+/// An attached skill summary from `skills` on the session snapshot.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+pub struct SkillRef {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    description: String,
+}
+
+impl SkillRef {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn description(&self) -> &str {
+        &self.description
+    }
 }
 
 /// Options for `Sessions::get`. Defaults: liveness on, items off, no refresh.
@@ -106,7 +313,7 @@ impl Default for GetOpts {
 }
 
 impl GetOpts {
-    fn to_query(self) -> Vec<(&'static str, String)> {
+    pub(crate) fn to_query(self) -> Vec<(&'static str, String)> {
         vec![
             ("include_items", self.include_items.to_string()),
             ("include_liveness", self.include_liveness.to_string()),
@@ -169,6 +376,92 @@ pub struct SessionList {
     pub last_id: Option<String>,
     #[serde(default)]
     pub has_more: bool,
+}
+
+/// `GET /v1/sessions/{id}/items` — the durable, paginated transcript. Persisted
+/// items carry no `sequence_number`; reconcile by `Item::id()` (typed-client §7).
+#[derive(Debug)]
+pub struct ItemList {
+    items: Vec<crate::stream::Item>,
+    has_more: bool,
+    first_id: Option<String>,
+    last_id: Option<String>,
+}
+
+impl ItemList {
+    pub fn items(&self) -> &[crate::stream::Item] {
+        &self.items
+    }
+    pub(crate) fn into_items(self) -> Vec<crate::stream::Item> {
+        self.items
+    }
+    pub fn has_more(&self) -> bool {
+        self.has_more
+    }
+    pub fn first_id(&self) -> Option<&str> {
+        self.first_id.as_deref()
+    }
+    pub fn last_id(&self) -> Option<&str> {
+        self.last_id.as_deref()
+    }
+}
+
+// Internal wire envelope (private; `data` is Value only to feed Item::from_value).
+#[derive(serde::Deserialize)]
+struct RawItemList {
+    #[serde(default)]
+    data: Vec<serde_json::Value>,
+    #[serde(default)]
+    has_more: bool,
+    #[serde(default)]
+    first_id: Option<String>,
+    #[serde(default)]
+    last_id: Option<String>,
+}
+
+impl<'de> serde::Deserialize<'de> for ItemList {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let raw = RawItemList::deserialize(d)?;
+        Ok(ItemList {
+            items: raw
+                .data
+                .into_iter()
+                .map(crate::stream::Item::from_value)
+                .collect(),
+            has_more: raw.has_more,
+            first_id: raw.first_id,
+            last_id: raw.last_id,
+        })
+    }
+}
+
+/// Pagination for `Sessions::items` (openapi `/v1/sessions/{id}/items`: limit,
+/// after, before, order). All optional; `None` fields are omitted from the query.
+#[derive(Debug, Default, Clone)]
+pub struct ItemsPage {
+    pub limit: Option<u32>,
+    pub after: Option<String>,
+    pub before: Option<String>,
+    pub order: Option<String>,
+}
+
+impl ItemsPage {
+    pub(crate) fn to_query(&self) -> Vec<(&'static str, String)> {
+        let mut q = Vec::new();
+        if let Some(n) = self.limit {
+            q.push(("limit", n.to_string()));
+        }
+        if let Some(a) = &self.after {
+            q.push(("after", a.clone()));
+        }
+        if let Some(b) = &self.before {
+            q.push(("before", b.clone()));
+        }
+        if let Some(o) = &self.order {
+            q.push(("order", o.clone()));
+        }
+        q
+    }
 }
 
 /// `kind` filter for the fleet poll.
@@ -937,6 +1230,12 @@ impl<'a> Sessions<'a> {
         self.client.get_json("/v1/sessions", &filter.to_query())
     }
 
+    /// `GET /v1/sessions/{id}/items` — the durable transcript. Blocking.
+    pub fn items(&self, id: &SessionId, page: &ItemsPage) -> Result<ItemList> {
+        self.client
+            .get_json(&format!("/v1/sessions/{id}/items"), &page.to_query())
+    }
+
     /// `GET /v1/sessions/{id}/child_sessions` — list sub-sessions. Blocking.
     pub fn child_sessions(
         &self,
@@ -1082,6 +1381,35 @@ impl<'a> Sessions<'a> {
             &[],
             Some(result),
         )
+    }
+
+    /// Open the live SSE event stream for a session. Live-tail, no-replay:
+    /// the caller must subscribe BEFORE posting the message that should be
+    /// observed (transport spike §4). Returns an `EventStream` whose reader
+    /// thread is already running.
+    pub fn stream(
+        &self,
+        id: &crate::ids::SessionId,
+    ) -> crate::error::Result<crate::stream::EventStream> {
+        let url = self
+            .client
+            .conn()
+            .url(&format!("/v1/sessions/{id}/stream"))?;
+        let resp = self
+            .client
+            .conn()
+            .auth
+            .apply(self.client.http().get(url))
+            .send()?;
+        let status = resp.status().as_u16();
+        match crate::http::check_status("v1/sessions/stream", status) {
+            Ok(()) => {
+                // TODO(3b-2b follow-up): gated live reconnect smoke test (Task 6 step 3)
+                let reopener = crate::reconnect::HttpReopener::new(self.client, id.clone());
+                crate::stream::EventStream::spawn(resp, reopener)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// `POST /v1/sessions/{id}/events` — submit a typed event. Returns the
@@ -1598,6 +1926,19 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_tolerates_null_collections() {
+        // The live server sends `null` (not [] / {}) for empty collections.
+        let body = r#"{
+            "id":"conv_1","status":"idle","agent_id":"ag_1","created_at":1,
+            "labels":null,"usage_by_model":null,"skills":null,"items":null
+        }"#;
+        let snap: SessionSnapshot = serde_json::from_str(body).unwrap();
+        assert!(snap.labels().is_empty());
+        assert!(snap.usage_by_model().is_empty());
+        assert_eq!(snap.id().as_str(), "conv_1");
+    }
+
+    #[test]
     fn session_snapshot_parses_core_fields_and_liveness() {
         let body = r#"{
             "id": "sess_1", "status": "running", "agent_id": "ag_1",
@@ -1732,5 +2073,97 @@ mod tests {
         .unwrap();
         assert_eq!(list.data[0].id(), "r1");
         assert!(!list.has_more);
+    }
+
+    #[test]
+    fn item_list_parses_the_golden_items_envelope() {
+        let raw = include_str!("../tests/fixtures/sse/happy_path.items.json");
+        let list: super::ItemList = serde_json::from_str(raw).expect("parse items envelope");
+        assert_eq!(list.items().len(), 11);
+        assert!(!list.has_more());
+        // The corpus opens with a resource_event and contains the function_call pair.
+        assert!(matches!(
+            list.items()[0],
+            crate::stream::Item::ResourceEvent { .. }
+        ));
+        assert!(
+            list.items()
+                .iter()
+                .any(|i| matches!(i, crate::stream::Item::FunctionCall { .. }))
+        );
+        assert!(
+            list.items()
+                .iter()
+                .any(|i| matches!(i, crate::stream::Item::FunctionCallOutput { .. }))
+        );
+        // Every item is reconcilable by a non-empty id.
+        assert!(list.items().iter().all(|i| !i.id().is_empty()));
+    }
+
+    #[test]
+    fn items_page_to_query_skips_none() {
+        let q = super::ItemsPage {
+            limit: Some(50),
+            order: Some("asc".into()),
+            ..Default::default()
+        }
+        .to_query();
+        assert!(q.contains(&("limit", "50".to_string())));
+        assert!(q.contains(&("order", "asc".to_string())));
+        assert!(!q.iter().any(|(k, _)| *k == "after" || *k == "before"));
+    }
+
+    #[test]
+    fn snapshot_parses_bucket_b_scalars_from_golden() {
+        let raw = include_str!("../tests/fixtures/sse/happy_path.snapshot.json");
+        let s: super::SessionSnapshot = serde_json::from_str(raw).expect("parse snapshot");
+        assert_eq!(s.harness(), "claude-sdk");
+        assert_eq!(s.workspace(), Some("/Users/aakshintala/work/lens"));
+        assert_eq!(s.permission_level(), Some(4));
+        assert_eq!(
+            s.root_conversation_id(),
+            Some("conv_91d8bde71cae41e7b32e01a648e00f72")
+        );
+        // Byte fact: total_cost_usd present, llm_model/context_window null on this turn.
+        assert!(s.total_cost_usd().unwrap() > 0.0);
+        assert_eq!(s.llm_model(), None);
+        assert_eq!(s.context_window(), None);
+    }
+
+    #[test]
+    fn snapshot_parses_bucket_b_collections_from_golden() {
+        let raw = include_str!("../tests/fixtures/sse/happy_path.snapshot.json");
+        let s: super::SessionSnapshot = serde_json::from_str(raw).expect("parse snapshot");
+        // usage_by_model: one model with token+cost detail.
+        let usage = s.usage_by_model();
+        assert!(usage.contains_key("claude-opus-4-8"));
+        assert!(usage["claude-opus-4-8"].total_tokens() > 0);
+        // skills: 20 attached, each with a name.
+        assert_eq!(s.skills().len(), 20);
+        assert!(s.skills().iter().all(|sk| !sk.name().is_empty()));
+        // embedded items: 11 (snapshot was captured with include_items).
+        assert_eq!(s.items().len(), 11);
+        assert!(!s.items()[0].id().is_empty());
+        // Payload is hoisted out of the snapshot's `data` envelope, so embedded
+        // items are fully typed (not just id-bearing shells). The corpus opens
+        // with the resource_event; its typed fields come from `data`.
+        assert!(matches!(
+            &s.items()[0],
+            crate::stream::Item::ResourceEvent { event_type, resource_type, .. }
+                if event_type == "session.resource.created" && resource_type == "terminal"
+        ));
+        // An assistant message carries its role + non-empty content (both under `data`).
+        assert!(s.items().iter().any(|i| matches!(
+            i,
+            crate::stream::Item::Message { role, content, .. }
+                if role == "assistant" && !content.is_empty()
+        )));
+        // A function_call carries its name (under `data`).
+        assert!(s.items().iter().any(|i| matches!(
+            i,
+            crate::stream::Item::FunctionCall { name, .. } if !name.is_empty()
+        )));
+        // (todos/pending_elicitations/model_options are empty in this capture and
+        //  deferred — the snapshot still parses with them present-but-empty.)
     }
 }

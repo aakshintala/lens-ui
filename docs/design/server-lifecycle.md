@@ -349,7 +349,7 @@ the user sees the real reason.
 - The typed client's reconnect loop handles transient network blips
   transparently (the typed client §7). The user sees a thin amber "↻
   Reconnecting" indicator only if it lingers.
-- If the reconnect gives up (`ClientError::Disconnected`), the
+- If the reconnect gives up (terminal `ServerStreamEvent::Disconnected`), the
   `ConnectionHealth::Down` flips; this document surfaces "Remote server
   unreachable — retry / switch to read-only". Sessions on a dead remote
   still have their local SQLite snapshots — the state model lets the user

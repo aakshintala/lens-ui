@@ -31,11 +31,156 @@ and roll older "Recent" pointers off this page as they age.
     ⚠ minimal wrappers (FileContent/ShellResult/FileResource/Host/Policy*) — grow
     getters + verify field names with golden captures when the state-model consumes
     them. Full rollup in `.superpowers/sdd/progress.md`.
-- **⚠ CHECKPOINT before Plan 3 (SSE taxonomy/state-model):** reassess tracking
-  `0.3.0.dev0` vs waiting for a `0.3.0` release tag. The REST surface (2a–2e) is cheap +
-  re-vendor-safe; the streaming taxonomy encodes the semantically-unstable parts (3 status
-  vocabularies, partial-merge child summaries, the events body) where dev0 churn is
-  expensive. Build REST now; gate the taxonomy investment on a conscious dev0-vs-0.3.0 call.
+- **Checkpoint RESOLVED (2026-06-25): build Plan 3 on `0.3.0.dev0` now.** No signal on
+  `0.3.0` timing or whether it'll materially change the API — not worth idling a project
+  with a live server to extract ground truth from. Treat dev0 instability as a *planning
+  input*, not a blocker. **Plan 3 approach (decided):**
+  1. **Golden-SSE capture spike — DONE (2026-06-26).** Captured 13 stream event types from
+     real bytes vs pinned dev0 (happy-path item union, lifecycle, chrome, interrupt, error
+     family). Found **3 undocumented events** (`session.input.consumed`,
+     `session.changed_files.invalidated`, `session.interrupted`) to fold into §7, confirmed the
+     seq-null-vs-int split + no-seq persisted items + full snapshot chrome. **Only claude-sdk
+     works on this box** (codex binary quarantined; no `OPENAI_API_KEY`; claude-native is
+     TUI-only; cursor needs `pip install omnigent[cursor]`+key) and it folds reasoning into
+     `output_text` — so `reasoning_text.delta`/`reasoning_summary_text.delta` get schema-modeled
+     (trivial `{delta,seq,type}`, flagged), plus compact/elicitation/sub-agent/terminal deferred
+     to config-time. Findings: [`docs/spikes/2026-06-26-golden-sse-capture.md`](./spikes/2026-06-26-golden-sse-capture.md);
+     raw corpus under `docs/spikes/captures/2026-06-26-sse/`; memory `plan3-sse-capture-findings`.
+  2. **Split by stability** — reader-thread + reconnect plumbing is already de-risked (transport
+     spike: subscribe-first + mid-stream-drop recovery), build confidently; gate only the
+     semantic event union on the captures. **Plan 3a written** (2026-06-26,
+     [`docs/superpowers/plans/2026-06-26-lens-client-plan3a-sse-transport.md`](./superpowers/plans/2026-06-26-lens-client-plan3a-sse-transport.md)):
+     6 tasks — pure SSE frame parser, `ServerStreamEvent` taxonomy from bytes (incl. the 3
+     capture corrections), reader-thread/`EventStream` bridge, schema-derived variants flagged.
+     Normalization (§7a) + no-replay reconnect (§7) = Plan 3b; contract-drift CI = Plan 3c.
+     - **Plan 3a EXECUTED & COMPLETE** (2026-06-26, subagent-driven: composer-2.5 build +
+       per-task cross-family review gpt-5.5/gemini-3.1-pro; `67541a5..f0c5431`, 9 commits).
+       85 lib tests + live `live_stream` pass vs warm claude-sdk session; fmt + clippy
+       `--all-targets` clean. Final review (gpt-5.5) caught 3 real Important bugs — **split-UTF-8
+       corruption** (per-chunk lossy decode → parser reworked to a `Vec<u8>` byte-buffer with a
+       mid-codepoint TDD test), an `unwrap_err`/`unreachable!` **panic path** in `Sessions::stream`
+       (now a panic-free `match check_status`), and **`Todos`/`SandboxStatus` dropping their
+       payload** (now typed subsets, no `Value`) — all fixed + re-reviewed. The cross-family
+       review earned its keep: composer's own "drop joins the reader" self-concern was factually
+       wrong (JoinHandle drop detaches), caught by the reviewer.
+     - **Deferred to Plan 3b** (3 Minors): redundant `serde(default)` on `Option`; `try_recv`
+       idle-vs-closed liveness signal; reqwest read-timeout vs reader-thread leak on a hard hang.
+     - **Plan 3b split by stability** (decided 2026-06-26): **3b-1 = pure §7a normalization**
+       (no new endpoints, de-risked); **3b-2 = §7 no-replay reconnect** (pulls in typed
+       `Sessions::items()` + the session snapshot read, both deferred from 2a–2e — folded into 3b-2).
+     - **Plan 3b-1 EXECUTED & COMPLETE** (2026-06-26, subagent-driven: composer-2.5 build +
+       per-task cross-family review gpt-5.5; `2f9a46e..3b39412`, 4 tasks + 1 fix wave;
+       [`plan`](./superpowers/plans/2026-06-26-lens-client-plan3b1-normalization.md)). A pure
+       `stream::normalize::Normalizer` threaded into the reader thread: **`OutputItemDone` re-fire
+       suppression** (key `(kind, call_id, status)` — **literal-duplicate only**, so the captured
+       `function_call` `in_progress`→`completed` pair is preserved; §7a's "exactly once" wording
+       relaxed per the golden bytes) + **synthetic `ReasoningClosed`** (close-trigger byte-grounded
+       in `happy_path`; `full_text`/`summary_text` accumulation flagged NOT-byte-verified — claude-sdk
+       folds reasoning into `output_text`). 103 lib tests, clippy `--all-targets`/fmt clean,
+       `generated.rs` untouched. Final review (gpt-5.5) caught 1 real **Important**: the reader's
+       `Err(_)` transport-error path shared EOF's `normalizer.flush()`, falsely emitting a synthetic
+       `ReasoningClosed` on a mid-reasoning drop — fixed (`run` now generic over `io::Read`,
+       `Err(_) => return`, no flush; +2 regression tests), re-reviewed clean. §7a doc updated to the
+       pinned semantics. ⚠ `live_stream` NOT run this session (no server) — unit coverage only.
+     - **Plan 3b-2 split (2026-06-26): 3b-2a = typed reconnect *reads* (DONE); 3b-2b = §7 reconnect
+       *state machine* (next).** The reads (`Sessions::items()` + grown snapshot) were carved out as
+       their own static/byte-grounded plan; the temporal state machine attaches at the reader's
+       `Err(_) => return` seam (now reconnect-ready) and is gated on one design decision (below).
+     - **Reconnect ownership RESOLVED (2026-06-26, Opus cross-doc).** The §7-vs-§11 ambiguity was
+       decided by the consumer doc (app-arch state-model §1/§8: EventStream is "reconnect-safe", "the
+       pump just keeps reading"): **the crate owns reconnect end-to-end, internally.** §7's "StreamUpdate"
+       term was wrong (crate emits `ServerStreamEvent`; `StreamUpdate` is the state model's reduced
+       output, §13); §11's "triggered by the state model's liveness watcher" was wrong (that's the §10
+       cross-session poll for *non-active* sessions). **Designed the reconnect-lifecycle event surface:**
+       three crate-synthetic `ServerStreamEvent` variants — `Reconnecting { attempt }` → `Reconnected
+       { gap }` → terminal `Disconnected` — all on the existing mpsc channel (no `recv()` API break, no
+       `ClientError::Disconnected`). Two 3b-2 seams recorded in §7: normalizer `seen_items` must reset on
+       `Reconnected{gap≠0}`; lifecycle markers bypass normalization. Docs fixed (typed-client §7/§10/§11,
+       app-arch §13.1, server-lifecycle §9.2). 3b-2 plan can be written from these.
+     - **Plan 3b-2a EXECUTED & COMPLETE** (2026-06-26, subagent-driven: composer-2.5 build +
+       one consolidated gpt-5.5 cross-family review; commits `1360819..2ff93c3`, 4 tasks + plan
+       edit + 1 review fix; [`plan`](./superpowers/plans/2026-06-26-lens-client-plan3b2a-reconnect-reads.md),
+       [`handoff`](./handoffs/2026-06-26-lens-client-plan3b2a-execution.md)). The two typed reconnect
+       *read* surfaces, byte-grounded from the golden captures: completed the `stream::Item` union
+       (`ResourceEvent` variant, `id` on `Other`, total `Item::id()` accessor) so `/items` is
+       reconcilable; `Sessions::items()` + typed `ItemList` envelope; `SessionSnapshot` grown with
+       bucket-B scalars + `usage_by_model`/`skills`/embedded `items` (`ModelUsage`/`SkillRef`). 110 lib
+       tests, clippy `--all-targets`/fmt clean, `generated.rs` untouched, no `Value` to consumers.
+       Review caught 1 real bug the plan missed: `/items` carries item payload **flat** but the
+       snapshot's embedded `items` **wrap it under a `data` envelope** → `de_items` now hoists `data`
+       before `Item::from_value` (test hardened to assert typed payload; memory
+       `plan3b2a-embedded-item-envelope`). **Deferred (byte-grounded gaps):** `last_task_error`
+       (type-ambiguous null — sibling models it as a map), `todos`/`pending_elicitations`/`model_options`/
+       `sandbox_status` (empty/null in the only capture). ⚠ `live_stream` NOT run (no server) — unit only.
+     - **Plan 3b-2b design decision RESOLVED + plan WRITTEN (2026-06-26, Opus; commit `74c28fd`).**
+       Chrome-restore ownership decided **A2**: the crate emits **one** synthetic
+       `ServerStreamEvent::SnapshotRestored(SessionSnapshot)` (NOT consumer-applies-snapshot — B breaks
+       the LOCKED state-model §1 boundary "does NOT own reconnect" + §4.1 single-writer; NOT per-field
+       `session.*` replay — A1 injects a spurious `AgentChanged` transcript marker on every wake). ADR
+       recorded in typed-client §7 (decision block + step 4/6 ordering `Reconnected`→`SnapshotRestored`
+       →history + synthetic-markers-bypass-normalization seam) and app-arch §4.1 (reducer
+       `SnapshotRestored` fold = scalar restore only, no transcript side-effects). **Plan written:**
+       [`plan`](./superpowers/plans/2026-06-26-lens-client-plan3b2b-reconnect-state-machine.md) — 7 TDD
+       tasks (synthetic variants → `Normalizer::reset_seen_items` → frame seq-peek → `reconnect` module
+       `Reopen`-trait/`HttpReopener`/backoff/items-replay → state machine in reader → wire
+       `Sessions::stream` → docs). The `Reopen` trait makes the state machine unit-testable with a
+       scripted mock (no server). Four plan-level decisions flagged for review + §7 reconciliation:
+       `Disconnected{reason}` payload, `gap:None` v1 (no `Some(0)` proof), frame-level seq-dedup,
+       single-page items replay.
+     - **Plan 3b-2b EXECUTED & COMPLETE** (2026-06-26, subagent-driven: composer-2.5 build + Opus
+       per-task review + one consolidated gpt-5.5 cross-family review; commits `3d4048b..6d4dde3`,
+       6 code tasks + 1 review fix wave + xtask fmt housekeeping + docs;
+       [`plan`](./superpowers/plans/2026-06-26-lens-client-plan3b2b-reconnect-state-machine.md),
+       [`handoff`](./handoffs/2026-06-26-lens-client-plan3b2b-execution.md)). The §7 no-replay
+       reconnect state machine lives in `stream::reader`, generic over a `Reopen` capability
+       (unit-testable with a scripted mock — no server). On a drop it backs off
+       (`[100,200,400,800,1600,3000,3000]`ms), re-reads snapshot + `/items`, re-opens the live
+       stream, and emits the synthetic lifecycle on the existing channel:
+       `Reconnecting{attempt}` → `Reconnected{gap}` → `SnapshotRestored(SessionSnapshot)` →
+       replayed `OutputItemDone` history → seq-deduped live tail; terminal `Disconnected{reason}`
+       on give-up/stop. 119 lib tests (4 order-asserting reconnect tests + the 2 updated §7a tests
+       + 1 review-regression test), clippy `--all-targets`/fmt clean, `generated.rs` untouched, no
+       `Value` to consumers. **Cross-family review (gpt-5.5) caught 1 Critical** the author + green
+       tests missed: `reconnect` opened the new body *before* fetching `/items`, so a retryable
+       `/items` error dropped the already-opened no-replay body → fixed by making `open_stream` the
+       last fallible call (`snapshot → items → open_stream`). Two user-decided review fixes:
+       failed-status path emits `SnapshotRestored → Disconnected{SessionFailed}` (no `Reconnected`);
+       `EventStream::spawn` returns `Result` (`ClientError::ThreadSpawn`, no panic). §7 reconciled
+       with the 4 plan decisions + as-built (`gap:None` v1, frame-level seq-peek, single-page items,
+       `DisconnectReason` table). **Deferred (flagged):** `gap==Some(0)` proof; `/items` pagination;
+       gated live reconnect smoke test (no server-kill harness this session). ⚠ `live_stream` NOT
+       run (no server) — unit coverage only.
+  3. **Contract-drift CI (outstanding B6): DONE** (Plan 3c, 2026-06-26, subagent-driven:
+     composer-2.5 build + Opus per-task review + one consolidated gpt-5.5 cross-family review;
+     commits `087ef6f..8a7bb2e`, 5 tasks + 2 live-caught fixes + 1 review fix;
+     [`plan`](./superpowers/plans/2026-06-26-lens-client-plan3c-contract-drift.md)). The passive
+     alarm, three layers by what each needs: **`xtask drift`** (`cargo run -p xtask -- drift` —
+     semantic path-set + SSE discriminator/member-shape diff vs sibling pin, `/hooks/*`-excluded
+     per ADR-0001; green vs identical sibling, red vs synthetic fixture); **offline `taxonomy_drift`
+     test** (always-on `cargo test`: pinned openapi `ServerStreamEvent` mapping == `MODELED`(33)∪
+     `DEFERRED`(14), disjoint — new upstream event fails with no server); **gated live checks**
+     (`--features live-tests`): `live_taxonomy` (wire types modeled, or deferred-as-`Unknown`; a
+     **modeled** type as `Unknown` is drift) + `live_reachability` (every consumed read endpoint
+     reachable). **LIVE RUN EXECUTED this session** vs a real `0.3.0.dev0` server — **both gated
+     tests green**, and the reachability sweep immediately **caught 2 real pre-existing bugs** the
+     prior serverless plans missed: `HostObject` deserialized `id` from wire `id` (real key is
+     `host_id`; `/v1/hosts` is openapi-untyped so live bytes are truth) and `SessionSnapshot`
+     collections failed on the server's explicit `null`-for-empty (`labels`/`usage_by_model`/`skills`/
+     `items` — `#[serde(default)]` covers missing, not `null`). The consolidated gpt-5.5 review
+     caught 1 Important the author + green tests missed: `live_taxonomy` allowed `Unknown` for any
+     *accounted* type, masking a **modeled** event degrading to `Unknown` on payload drift → fixed
+     by the MODELED/DEFERRED split (only deferred types may be `Unknown`), re-verified live. 122 lib
+     tests + 2 xtask tests, clippy `--all-targets`/fmt clean, `generated.rs` untouched, no `Value`
+     to consumers. **CI surface = local `xtask` only** (design D3; no `.github/workflows` — drift
+     needs the sibling checkout). **Deferred (flagged):** `xtask drift` member-shape diff is
+     property-*names* only (deliberate scope bound); `ResourceList` live decode not exercised (no
+     runner-bound session — `/v1/sessions/{id}/resources` returned a typed 409). **Plan 3 / B6 thread
+     CLOSED.**
+  - Plan 3b-2b is temporal/stateful (reconnect state machine), so **cross-family review stays
+    mandatory** at the seams (`[[composer-delegation-profile]]`) — it caught the envelope bug in 3b-2a
+    that author + green test both missed. (The earlier "composer is weak on temporal logic" claim was
+    retracted as unsupported N=1.) Mind the Cursor-credit cost (`[[review-spend-policy]]`).
+  - Now on branch `feat/lens-client-streaming` (off `main` @ `78fdaa3`).
 - **Doc walkthrough complete** (all 11 design docs in `docs/design/` reviewed);
   every surfaced decision is resolved or consciously deferred.
 - **Deferred, with a clean seam:**
@@ -61,6 +206,41 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Recent
 
+- **2026-06-26** — **Plan 3c (contract-drift CI / B6) executed & complete — closes the Plan 3
+  thread** (subagent-driven: composer-2.5 build + Opus per-task review + one consolidated gpt-5.5
+  cross-family review; `087ef6f..8a7bb2e`, 5 tasks + 2 live-caught fixes + 1 review fix). Three
+  layers: `xtask drift` (semantic path + SSE discriminator/shape diff vs sibling, `/hooks/*`-excluded),
+  always-on offline `taxonomy_drift` (openapi mapping == `MODELED`(33)∪`DEFERRED`(14), disjoint),
+  and gated `--features live-tests` `live_taxonomy` + `live_reachability`. **Live run executed vs a
+  real `0.3.0.dev0` server — both gated tests green**; the reachability sweep **caught 2 real
+  pre-existing bugs** (`HostObject` `id`→`host_id`; `SessionSnapshot` null-collection intolerance).
+  gpt-5.5 review caught 1 Important (live taxonomy masked modeled-as-`Unknown` degradation → MODELED/
+  DEFERRED split, re-verified live). 122 lib + 2 xtask tests, clippy/fmt clean, `generated.rs`
+  untouched. Local `xtask`-only CI (D3). Memory: `plan3c-contract-drift-findings`.
+- **2026-06-26** — **Plan 3b-2b (§7 no-replay reconnect state machine) executed & complete**
+  (subagent-driven: composer-2.5 build + Opus per-task review + one consolidated gpt-5.5
+  cross-family review; `3d4048b..6d4dde3`, 6 code tasks + fix wave + xtask fmt + docs). Reconnect
+  lives in `stream::reader`, generic over a `Reopen` mock-able capability: backoff → snapshot →
+  `/items` → re-open → synthetic lifecycle (`Reconnecting`/`Reconnected{gap:None}`/`SnapshotRestored`/
+  `Disconnected{reason}`) + seq-deduped live tail. 119 lib tests, clippy/fmt clean. Cross-family
+  review caught 1 Critical (opened body dropped on `/items` retry → reordered so `open_stream` is
+  last fallible). §7 reconciled. ⚠ live reconnect smoke deferred (no server-kill harness). Next:
+  Plan 3c contract-drift CI.
+- **2026-06-26** — **Plan 3b-1 (§7a SSE normalization) executed & complete**
+  (subagent-driven: composer-2.5 + per-task cross-family gpt-5.5; `2f9a46e..3b39412`,
+  4 tasks + fix wave). `Normalizer` in the reader thread: `OutputItemDone` literal-re-fire
+  suppression (preserves `in_progress`→`completed`) + synthetic `ReasoningClosed`
+  (flagged not-byte-verified). 103 lib tests, clippy/fmt clean. Final review caught the
+  `Err(_)`-path false-`ReasoningClosed` bug (fixed, reader now `io::Read`-generic +
+  reconnect-ready). Two design calls pinned from the captured bytes: dedup = literal-re-fire
+  only (relaxed §7a "exactly once"); build+flag `ReasoningClosed` rather than defer.
+  Next: Plan 3b-2 reconnect (§7) — resolve the §7-vs-§11 reconnect-ownership ambiguity first.
+- **2026-06-26** — **Plan 3 golden-SSE capture spike DONE** (live claude-sdk drive,
+  subscribe-first, throwaway bash rig). 13 stream event types captured from bytes; 3
+  undocumented events found; bucket A/B/C + seq-split confirmed; error family captured.
+  Reasoning-delta + compact/elicitation/sub-agent/terminal blocked by the single-harness
+  box (claude-sdk only) → schema-model the trivial reasoning deltas, defer the rest. Next:
+  write the Plan 3 plan, model `ServerStreamEvent` from the captures.
 - **2026-06-25 (eve)** — lens-client **REST surface 2a–2e executed** end-to-end
   (subagent-driven: composer-2.5 build, Opus per-task review, gpt-5.5 cross-family
   at seams + one consolidated 2c–2e review). 31 commits, 47 tests, live-verified.

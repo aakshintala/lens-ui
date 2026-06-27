@@ -452,6 +452,18 @@ Responsibilities:
   composer re-render from the updated scalar; the transcript keeps its
   history with the marker visible (decision J, capability map §0.7).
 
+- **`SnapshotRestored` fold (reconnect chrome)** — on
+  `ServerStreamEvent::SnapshotRestored(SessionSnapshot)` (typed client §7, A2
+  decision) the reducer bulk-folds the snapshot's bucket-B chrome
+  scalars/collections into `SessionState` — status/usage/model/todos/
+  model_options/reasoning_effort/collaboration_mode/skills/archived/
+  presence-count/`agent_id`+`agent_name`. **Scalar restore only: no transcript
+  side-effects** — unlike the live `session.agent_changed` fold above, this
+  arm does NOT push an `AgentChanged` item (no agent transition happened, just a
+  wake) and emits no presence marker. Ordering is guaranteed by the crate:
+  `Reconnected{gap}` (clears `StreamScratch` when `gap != Some(0)`) →
+  `SnapshotRestored` → replayed `GET /items` history.
+
 What the reducer finalizes is what gets appended to disk (§6). In-progress
 accumulators in `StreamScratch` are RAM-only and never persisted — exactly the
 persisted/transient split the typed client §7 defines.
@@ -983,8 +995,9 @@ Concierge per Lens, never per-connection.
 
 | `ClientError` / signal | App-state effect |
 |---|---|
-| `Disconnected` (retry phase expired, typed client §7) | Active → "hard disconnected" UI; offer user-retry (restarts the typed client's retry). Session stays in registry. |
-| `Reconnected { gap }` (typed client §7) | `gap == Some(0)`: keep state. Else: clear `StreamScratch` (§4.2), show `↻` break, reconcile. |
+| `ServerStreamEvent::Reconnecting { attempt }` (typed client §7) | Active → health `Reconnecting`; raise the amber `↻` immediately; record `since`/`attempts`. |
+| `ServerStreamEvent::Disconnected` (retry phase expired, typed client §7) | Active → "hard disconnected" UI; offer user-retry (reopens via `Sessions::stream`). Session stays in registry. (A stream signal, not a `ClientError` variant — see typed client §11.) |
+| `ServerStreamEvent::Reconnected { gap }` (typed client §7) | `gap == Some(0)`: keep state. Else: clear `StreamScratch` (§4.2), show `↻` break, reconcile. |
 | `Auth { 401 }` | Prompt re-auth (permissions + server-lifecycle docs); do not drop sessions. |
 | `Auth { 403 }` | Lost access → remove session from registry + UI. |
 | `NotFound` (404) | Session deleted server-side → remove from registry; any disk rows remain as a read-only local tombstone (history viewable, never re-streamed). |

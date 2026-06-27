@@ -308,29 +308,43 @@ SSE is no-replay. Correct reconnect:
 1. **Detect disconnect** — stream closes or errors. Record `last_seen_seq`
    from the most recent heartbeat.
 2. **Short retry phase** — exponential backoff, 3s cap:
-   `100ms → 200ms → 400ms → 800ms → 1600ms → 3000ms → 3000ms → …`. The
-   application shell surfaces a "↻ Reconnecting" indicator immediately on
+   `100ms → 200ms → 400ms → 800ms → 1600ms → 3000ms → 3000ms → …`. The crate
+   emits `ServerStreamEvent::Reconnecting { attempt }` on each retry, so the
+   application shell can raise its "↻ Reconnecting" indicator immediately on
    disconnect — not gated on this phase completing. Total wall-clock before
    giving up: ~7s.
-3. **Give up** — if the retry phase expires, the crate surfaces
-   `ClientError::Disconnected` and stops. A user-initiated retry restarts the
-   retry phase from step 2.
+3. **Give up** — if the retry phase expires, the crate emits a terminal
+   `ServerStreamEvent::Disconnected { reason: DisconnectReason }` (the last event
+   before the channel closes; `recv()` returns `None` after) and stops. Because
+   reconnect runs *after* the stream is open, give-up cannot be a synchronous
+   `Result` — it is a stream value, **not** a `ClientError` variant. The typed
+   `reason` (see the stop-immediately table) tells the app whether to re-auth,
+   remove the session, surface a failure, or offer a manual retry. A
+   user-initiated retry reopens via `Sessions::stream()`, restarting from step 2.
 4. **On success — snapshot (bucket B: chrome)** — `GET /v1/sessions/{id}` (with
    `include_items=true, include_liveness=true`) confirms the session exists and
-   **restores all session chrome** by applying the snapshot's scalars/collections
-   directly (status, usage, model, todos, model_options, reasoning_effort,
-   collaboration_mode, skills, archived, presence-count, …). This chrome is
-   **SSE-only/transient on the wire** — it is NOT replayed from `GET /items`; it
-   is reconstructed from the snapshot. Do not expect a `session.agent_changed`
-   marker on wake — apply the snapshot's current `agent_id`/`agent_name` instead.
+   **restores all session chrome** (status, usage, model, todos, model_options,
+   reasoning_effort, collaboration_mode, skills, archived, presence-count, …).
+   This chrome is **SSE-only/transient on the wire** — it is NOT replayed from
+   `GET /items`; it is reconstructed from the snapshot. The crate emits the
+   restore as a **single synthetic `ServerStreamEvent::SnapshotRestored(SessionSnapshot)`**
+   carrying the typed snapshot payload (the consumer never applies the snapshot
+   itself — see the ownership decision below). Do not expect a
+   `session.agent_changed` marker on wake — the snapshot's current
+   `agent_id`/`agent_name` ride inside `SnapshotRestored`, and the reducer's
+   arm for it folds the scalar **without** the live-transition transcript
+   side-effect (no spurious `AgentChanged` item).
 5. **History (bucket A: transcript)** — `GET /v1/sessions/{id}/items` fills the
    durable conversation items. **Persisted `ConversationItem` has no
    `sequence_number`** (`entities/conversation.py:644` — only `id`), so items are
    merged into the transcript by **item `id`** (idempotent upsert), NOT by
    sequence. The rest are replayed into the stream as `ServerStreamEvent` values.
-6. **Emit `Reconnected { gap }`** — before any replayed history items. The
-   ordering guarantee is load-bearing: the state model must clear transient
-   state *before* history lands.
+6. **Emit `Reconnected { gap }` → `SnapshotRestored`** — before any replayed
+   history items, in this order: `Reconnected { gap }` first (so the state model
+   clears transient accumulators when `gap != Some(0)`), then
+   `SnapshotRestored(SessionSnapshot)` (bucket-B chrome), then the replayed
+   `GET /items` history (bucket A). The ordering is load-bearing: transient state
+   is cleared, chrome is restored, *then* history lands.
 7. **Re-open stream + dedup (bucket C: live overlap)** — `GET /v1/sessions/{id}/stream`.
    `sequence_number` dedup applies **only to the live SSE overlap window**: events
    that fire between the snapshot/history read and the stream re-opening may arrive
@@ -346,12 +360,27 @@ live event. `sequence_number` is a live-stream dedup key only — never an item 
 
 ### Stop-immediately conditions (no retry)
 
-| Error | Meaning | App action |
-|---|---|---|
-| 401 | Auth invalid or expired | The connection-auth model prompts re-auth |
-| 403 | Lost permission to session | Show access-denied, remove session |
-| 404 | Session deleted | Remove session from UI |
-| `session.status = "failed"` in snapshot | Server-side terminal failure | Surface error, no retry |
+Each maps to a `DisconnectReason` carried by the terminal `Disconnected { reason }`:
+
+| Error | `DisconnectReason` | Meaning | App action |
+|---|---|---|---|
+| 401 | `Unauthorized` | Auth invalid or expired | The connection-auth model prompts re-auth |
+| 403 | `Forbidden` | Lost permission to session | Show access-denied, remove session |
+| 404 | `NotFound` | Session deleted | Remove session from UI |
+| `session.status = "failed"` in snapshot | `SessionFailed` | Server-side terminal failure | Surface error, no retry |
+| backoff window elapsed | `RetriesExhausted` | Transient drop never recovered | Offer a manual retry (re-`stream()`) |
+
+`DisconnectReason` is a stream value, not a `ClientError`. The crate's
+`stop_reason` maps HTTP status off the snapshot/open-stream call: **401/403 →
+`Unauthorized`/`Forbidden`** (encoded as `ClientError::Auth`), **404 →
+`NotFound`** (encoded as `ClientError::Server { status: 404 }`); every other
+error (network/5xx/parse) is **retryable** and keeps backing off.
+
+**`SessionFailed` is terminal, not a resume.** When the reconnect snapshot
+reports `status == failed`, the crate emits `SnapshotRestored(snapshot)` (so the
+UI gets the terminal failure state) immediately followed by
+`Disconnected { reason: SessionFailed }` — it does **not** emit `Reconnected`
+(no live tail resumes), and it does not reset the normalizer.
 
 ### `Reconnected { gap: Option<u64> }`
 
@@ -363,6 +392,15 @@ live event. `sequence_number` is a live-stream dedup key only — never an item 
   is gone; no recovery is possible. The transcript surface shows a visual break
   (`↻ reconnected`) so the jump is legible.
 
+**v1 (Plan 3b-2b) emits `gap: None` unconditionally.** The snapshot carries no
+`sequence_number`, so contiguity cannot be proven from it; rather than synthesize
+a fragile heuristic, v1 always emits `None` (the always-safe path — it only clears
+transient accumulators the drop likely lost anyway). The `Some(0)` clean-overlap
+proof is deliberately deferred: `resume_floor = last_seen_seq` is still tracked and
+used to **drop the duplicate live overlap** (frames whose `sequence_number ≤ floor`
+after re-open), but it is never promoted to `gap = Some(0)`. `Some(N > 0)` is never
+synthesized (folded into `None`).
+
 ### The SSE stream vs. the items DB
 
 The SSE stream (`GET /stream`) is live-tail, no-replay. The server never seeks
@@ -370,8 +408,45 @@ back in the stream. What `GET /items` returns is a separate thing: the server's
 durable DB of persisted conversation items. The state model does not need to
 maintain a full history cache — it fetches from `GET /items` on reconnect.
 
-The crate owns the protocol; the state model subscribes to a `StreamUpdate`
-stream the crate emits and never sees raw reconnect mechanics.
+The crate owns the protocol; the state model just keeps draining the
+`ServerStreamEvent` stream (app-arch state-model §8: "the pump just keeps
+reading") and never sees raw reconnect mechanics. The crate emits
+`ServerStreamEvent` — `StreamUpdate` is the state model's *reduced* output
+(§13), not the crate's emission. The reconnect-lifecycle markers ride the
+same stream as synthetic values: `Reconnecting { attempt }` → `Reconnected { gap }`
+→ `SnapshotRestored(SessionSnapshot)` (on success) … → terminal `Disconnected`
+(on give-up).
+
+**Decision — bucket-B chrome restore ownership (2026-06-26, Opus design; A2).**
+On reconnect the crate emits chrome restore as **one synthetic
+`ServerStreamEvent::SnapshotRestored(SessionSnapshot)`**, NOT as direct
+consumer apply and NOT as per-field synthetic `session.*` events.
+- **Why not consumer-applies-snapshot (Option B):** state-model §1 is LOCKED —
+  "this layer does NOT own reconnect" and "the boundary upstream is the
+  `ServerStreamEvent` stream." A direct apply would make the consumer aware of
+  reconnect and ingest a non-`ServerStreamEvent` payload, breaking that boundary
+  and the §4.1 single-writer/replayable invariant (the reducer is the only
+  writer of `SessionState`).
+- **Why not per-field synthetic `session.*` events (Option A1):** replaying the
+  snapshot through the existing per-event folds re-runs their side-effects — a
+  `session.agent_changed` fold pushes an `AgentChanged` *item* into the
+  transcript (state-model §4.1), so every wake would inject a spurious
+  agent-change marker. It also needs a snapshot-field→event map maintained in
+  lockstep with the wire forever.
+- **Why A2 (chosen):** one event carrying the typed `SessionSnapshot` keeps the
+  reducer the single writer and the consumer purely event-driven; the reducer
+  gets one dedicated arm that bulk-folds chrome scalars/collections with **no
+  transcript side-effects**; it reuses the typed snapshot reads (Plan 3b-2a)
+  wholesale — no per-field mapping. The state-model reducer (§4.1) must add a
+  `SnapshotRestored` arm: chrome-scalar/collection fold only, no `AgentChanged`
+  item insertion, no presence-marker emission.
+
+**Two seams this opens for the reconnect implementation (Plan 3b-2):** (a) the
+crate's §7a normalizer holds per-stream dedup state (`seen_items`) — it MUST be
+reset on `Reconnected { gap != Some(0) }`, or the `GET /items` history replay is
+wrongly suppressed as an already-seen re-fire; (b) the synthetic markers
+(`Reconnecting`, `Reconnected`, `SnapshotRestored`, `Disconnected`) are not wire
+events — they bypass dedup/reasoning normalization (pass through untouched).
 
 **Three-bucket reconnect classification** (which events survive reconnect and
 how) — **load-bearing delegation, authoritative here**. Note: ALL `session.*`
@@ -403,6 +478,38 @@ events themselves replay from `GET /items`.
 The state model and every surface document that reasons about reconnect relies
 on it being authoritative here.
 
+### v1 as-built (Plan 3b-2b)
+
+The reconnect state machine lives in the SSE reader thread (`stream::reader`),
+generic over a `Reopen` capability (`snapshot` / `items` / `open_stream`) so it
+is unit-testable with a scripted mock — no server. As-built specifics:
+
+- **Backoff schedule:** `[100, 200, 400, 800, 1600, 3000, 3000]` ms (7 attempts,
+  ~9s worst case). Each attempt emits `Reconnecting { attempt }` (1-based).
+- **`sequence_number` is peeked off the raw `SseFrame` JSON**, not the typed
+  event (typed events strip it; only `Heartbeat` exposes it). The peek is `None`
+  for persisted items, lifecycle frames, and malformed data — those are never
+  dropped by the overlap filter.
+- **Fetch order on a successful attempt is `snapshot → items → open_stream`** —
+  `open_stream` is the *last* fallible call, so a retryable `/items` (or snapshot)
+  failure re-loops the backoff **without** discarding an already-opened no-replay
+  body. Markers are emitted only after all three succeed, in the load-bearing
+  order: `Reconnected { gap: None }` → `reset_seen_items` → `SnapshotRestored` →
+  replayed `/items` history (each item as `OutputItemDone`, sent directly,
+  bypassing the normalizer).
+- **Items replay is single-page, best-effort** (server default order). `has_more`
+  truncation is not paginated in v1; the reducer merges by `Item::id()`, so a
+  later live event or subsequent reconnect fills any gap. Flagged for follow-up if
+  captures show truncation in practice.
+- **Clean EOF (`Ok(0)`) flushes the synthetic `ReasoningClosed` bracket before
+  reconnecting; a transport error (`Err`) does not** (the bracket did not end, the
+  connection did — §7a invariant).
+- **No panic on the data path.** `Sessions::stream` / `EventStream::spawn` return
+  `Result`; a thread-spawn failure surfaces as `ClientError::ThreadSpawn` rather
+  than an `expect`.
+- **Deferred:** `gap == Some(0)` contiguity proof; `/items` pagination/backfill;
+  a gated live reconnect smoke test (no scripted server-kill harness this session).
+
 ---
 
 ## 7a. Normalization guarantees
@@ -410,16 +517,23 @@ on it being authoritative here.
 The crate normalizes the raw SSE stream before handing events to the state
 model. The following guarantees hold; nothing beyond them:
 
-- **`ToolCall` dedup** — each `call_id` appears exactly once in `ToolCall`
-  events, even if the wire fires it twice (the claude-sdk MCP path double-fires).
-- **`ToolResult` dedup** — each `call_id` appears exactly once in `ToolResult`
-  events (the `response.completed` flush fires twice on some paths).
+- **`OutputItemDone` re-fire suppression** — a second `output_item.done` whose
+  `(kind, call_id, status)` was already emitted is dropped (claude-sdk's MCP path
+  double-fires identical items). This is **literal-duplicate suppression, not a
+  collapse to one event per `call_id`**: the captured `function_call`
+  `in_progress`→`completed` progression (same `call_id`, differing `status`) is
+  preserved as two events so the state model keeps the "tool starting" signal.
+  (Earlier drafts said "each `call_id` appears exactly once"; relaxed 2026-06-26
+  per the golden-SSE bytes — see `docs/spikes/2026-06-26-golden-sse-capture.md`.)
 - **`ReasoningClosed` synthesis (synthetic event)** — the SSE stream has no
-  explicit reasoning-end event. The crate emits `ReasoningClosed` when the
-  first `OutputTextDelta` or `ResponseCompleted` arrives after a
-  `ReasoningStarted`. The state model can treat reasoning as a proper
-  open/close bracket without tracking implicit state. Carries `full_text` +
-  `summary_text` so the transcript renderer doesn't re-accumulate.
+  explicit reasoning-end event. The crate emits `ReasoningClosed` when the first
+  `OutputTextDelta` or `Completed` arrives after a `ReasoningStarted`, carrying
+  the accumulated `full_text` + `summary_text` so the renderer need not
+  re-accumulate. The state model treats reasoning as a proper open/close bracket
+  without tracking implicit state. **NOT byte-verified**: claude-sdk (the only
+  harness on the capture box) folds reasoning into `output_text` and emits no
+  `reasoning_text.delta` frames, so the close *trigger* is byte-grounded but the
+  text accumulation is schema-derived — re-capture at config-time.
 - **`Reconnected { gap }` precedes all replayed history items** — ordering
   guaranteed. The state model must clear transient accumulators *before*
   history lands (per §7).
@@ -563,6 +677,10 @@ pub enum ServerStreamEvent {
     Session(SessionEvent),
     Response(ResponseEvent),
     Turn(TurnEvent),
+    // ── synthetic stream-lifecycle (crate-generated, never on the wire) ──
+    Reconnecting { attempt: u32 },     // entered backoff — drives ↻ now (§7 step 2)
+    Reconnected  { gap: Option<u64> }, // success — precedes replayed history (§7a)
+    Disconnected,                      // retry phase (~7s) expired — terminal
 }
 
 // ── Session events ───────────────────────────────────────────────────
@@ -674,7 +792,7 @@ pub enum ResponseEvent {
 
     // ── tool calls & results ─────────────────────────────────────────────
     // Emitted via OutputItemDone with item.type = function_call | function_call_output.
-    // The crate dedups by call_id (see §7a).
+    // The crate suppresses literal (kind, call_id, status) re-fires (see §7a), preserving in_progress→completed progression.
     OutputItemDone {
         item: Item,                    // heterogeneous — see Item union below
     },
@@ -728,12 +846,12 @@ pub enum TurnEvent {
 }
 
 // ── Synthetic events (generated by the crate, not from the wire) ─────
-// Stitched into the SessionEvent / ResponseEvent families above where the
-// ordering matters, plus this top-level event for reconnect handoff:
-pub enum SyntheticEvent {
-    Reconnected { gap: Option<u64> },   // see §7 — precedes all replayed items
-    // (ReasoningClosed lives inside ResponseEvent — see §7a)
-}
+// NOT a separate enum — folded into ServerStreamEvent above so the consumer
+// drains ONE stream and reduce(&mut SessionState, ServerStreamEvent) is the
+// single writer. The reconnect-lifecycle trio (Reconnecting / Reconnected /
+// Disconnected) are top-level ServerStreamEvent variants; ReasoningClosed lives
+// inside ResponseEvent (see §7a). Reconnected { gap } precedes all replayed
+// history items on a resync (§7).
 ```
 
 `Item` is the typed union mirroring omnigent conversation items
@@ -785,8 +903,13 @@ pub enum ClientError {
 
 Notable: `ContractMismatch` is **loud** (fails the connection); `Auth` propagates
 to the server lifecycle document for "re-login / re-token" UX. The SSE stream's
-own errors go through the channel — reconnect is triggered by the state model's
-liveness watcher on stream termination, not by synchronous `Result` returns.
+own errors go through the channel as synthetic `ServerStreamEvent` values
+(`Reconnecting`/`Reconnected`/`Disconnected`), not synchronous `Result` returns:
+the crate auto-reconnects an open stream **internally** (the consumer's pump just
+keeps reading — app-arch state-model §8), so there is no `ClientError::Disconnected`
+— give-up is the terminal `ServerStreamEvent::Disconnected`. (The "liveness
+watcher" that governs *non-active* sessions is the separate app-arch state-model
+§10 cross-session list poll, not this stream.)
 
 ---
 

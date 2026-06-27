@@ -1,0 +1,39 @@
+event: session.heartbeat
+data: {"sequence_number": null, "type": "session.heartbeat", "server_time": null}
+
+event: session.resource.created
+data: {"sequence_number": null, "type": "session.resource.created", "resource": {"id": "terminal_tui_main", "object": "session.resource", "type": "terminal", "session_id": "conv_91d8bde71cae41e7b32e01a648e00f72", "name": "tui:main", "metadata": {"terminal_name": "tui", "session_key": "main", "running": true, "tmux_socket": "/var/folders/dq/_c83wftd34g281_1002c_gl00000gn/T/omnigent-terminal-ed2m_rtd/tmux.sock", "tmux_target": "main"}, "environment": "env_terminal_tui_main"}}
+
+event: session.changed_files.invalidated
+data: {"sequence_number": null, "type": "session.changed_files.invalidated", "session_id": "conv_91d8bde71cae41e7b32e01a648e00f72", "environment_id": "default"}
+
+event: session.presence
+data: {"sequence_number": null, "type": "session.presence", "conversation_id": "conv_91d8bde71cae41e7b32e01a648e00f72", "viewers": []}
+
+event: session.input.consumed
+data: {"sequence_number": null, "type": "session.input.consumed", "data": {"item_id": "msg_017ccb336a0f44a7bff0100997b26db3", "type": "message", "data": {"role": "user", "content": [{"type": "input_text", "text": "Count slowly from 1 to 200, writing a short sentence about each number. Take your time and be thorough."}], "agent": null}, "created_by": null, "cleared_pending_id": null}}
+
+event: session.status
+data: {"sequence_number": null, "type": "session.status", "conversation_id": "conv_91d8bde71cae41e7b32e01a648e00f72", "status": "running", "response_id": null, "error": null}
+
+event: response.in_progress
+data: {"sequence_number": 1, "type": "response.in_progress", "response": {"id": "resp_4e30b598eb9946fd8fb9dd05", "object": "response", "status": "in_progress", "model": "claude-sdk", "created_at": 1782502909, "completed_at": null, "output": [], "background": false, "store": true, "usage": null, "previous_response_id": null, "conversation": null, "instructions": null, "reasoning": null, "error": null, "incomplete_details": null}}
+
+event: response.output_text.delta
+data: {"sequence_number": 3, "type": "response.output_text.delta", "delta": "There's an issue with the selected model (this-model-does-not-exist-xyz). It may not exist or you may not have access to it.", "message_id": null, "index": null, "final": null}
+
+event: response.output_item.done
+data: {"sequence_number": null, "type": "response.output_item.done", "item": {"id": "msg_202333da04cb4f8ab8aca15a6a466aaf", "response_id": "resp_4e30b598eb9946fd8fb9dd05", "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": "There's an issue with the selected model (this-model-does-not-exist-xyz). It may not exist or you may not have access to it."}], "model": "claude-sdk"}}
+
+event: session.usage
+data: {"sequence_number": null, "type": "session.usage", "conversation_id": "conv_91d8bde71cae41e7b32e01a648e00f72", "context_tokens": null, "context_window": null, "total_cost_usd": 0.19558275000000003, "usage_by_model": {"claude-opus-4-8": {"input_tokens": 5418, "output_tokens": 1492, "total_tokens": 6910, "cache_read_input_tokens": 56648, "cache_creation_input_tokens": 16459, "total_cost_usd": 0.19558275000000003}}}
+
+event: response.completed
+data: {"sequence_number": 5, "type": "response.completed", "response": {"id": "resp_4e30b598eb9946fd8fb9dd05", "object": "response", "status": "completed", "model": "claude-sdk", "created_at": 1782502909, "completed_at": null, "output": [], "background": false, "store": true, "usage": {"input_tokens": 0, "output_tokens": 0, "output_tokens_details": {"reasoning_tokens": 0}, "total_tokens": 0, "context_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0, "model": "<synthetic>"}, "previous_response_id": null, "conversation": null, "instructions": null, "reasoning": null, "error": null, "incomplete_details": null}}
+
+event: session.status
+data: {"sequence_number": null, "type": "session.status", "conversation_id": "conv_91d8bde71cae41e7b32e01a648e00f72", "status": "idle", "response_id": null, "error": null}
+
+event: session.interrupted
+data: {"sequence_number": null, "type": "session.interrupted", "data": {"requested_at": 1782502914, "response_id": null}}
+

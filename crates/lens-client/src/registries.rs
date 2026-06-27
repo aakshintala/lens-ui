@@ -57,17 +57,13 @@ pub struct AgentList {
 
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct HostObject {
+    #[serde(rename = "host_id")]
     id: HostId,
-    #[serde(default, rename = "object")]
-    object: String,
     // ⚠ grow getters (name, online, provider, …) as the host-picker UI needs them.
 }
 impl HostObject {
     pub fn id(&self) -> &HostId {
         &self.id
-    }
-    pub fn object(&self) -> &str {
-        &self.object
     }
 }
 
@@ -257,8 +253,7 @@ mod tests {
 
     #[test]
     fn host_list_parses_hosts_key() {
-        let list: HostList =
-            serde_json::from_str(r#"{"hosts":[{"id":"host_1","object":"host"}]}"#).unwrap();
+        let list: HostList = serde_json::from_str(r#"{"hosts":[{"host_id":"host_1"}]}"#).unwrap();
         assert_eq!(list.data[0].id().as_str(), "host_1");
     }
 

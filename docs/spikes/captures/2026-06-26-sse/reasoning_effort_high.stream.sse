@@ -1,0 +1,90 @@
+event: session.heartbeat
+data: {"sequence_number": null, "type": "session.heartbeat", "server_time": null}
+
+event: session.resource.created
+data: {"sequence_number": null, "type": "session.resource.created", "resource": {"id": "terminal_tui_main", "object": "session.resource", "type": "terminal", "session_id": "conv_91d8bde71cae41e7b32e01a648e00f72", "name": "tui:main", "metadata": {"terminal_name": "tui", "session_key": "main", "running": true, "tmux_socket": "/var/folders/dq/_c83wftd34g281_1002c_gl00000gn/T/omnigent-terminal-ed2m_rtd/tmux.sock", "tmux_target": "main"}, "environment": "env_terminal_tui_main"}}
+
+event: session.changed_files.invalidated
+data: {"sequence_number": null, "type": "session.changed_files.invalidated", "session_id": "conv_91d8bde71cae41e7b32e01a648e00f72", "environment_id": "default"}
+
+event: session.presence
+data: {"sequence_number": null, "type": "session.presence", "conversation_id": "conv_91d8bde71cae41e7b32e01a648e00f72", "viewers": []}
+
+event: session.input.consumed
+data: {"sequence_number": null, "type": "session.input.consumed", "data": {"item_id": "msg_628e25bcba794ec4a588b5b8b0313137", "type": "message", "data": {"role": "user", "content": [{"type": "input_text", "text": "Think carefully and at length about the tradeoffs between depth-first and breadth-first search before answering. Then give me a two-sentence recommendation."}], "agent": null}, "created_by": null, "cleared_pending_id": null}}
+
+event: session.status
+data: {"sequence_number": null, "type": "session.status", "conversation_id": "conv_91d8bde71cae41e7b32e01a648e00f72", "status": "running", "response_id": null, "error": null}
+
+event: response.in_progress
+data: {"sequence_number": 1, "type": "response.in_progress", "response": {"id": "resp_f558d15555904f92ab471203", "object": "response", "status": "in_progress", "model": "claude-sdk", "created_at": 1782502834, "completed_at": null, "output": [], "background": false, "store": true, "usage": null, "previous_response_id": null, "conversation": null, "instructions": null, "reasoning": null, "error": null, "incomplete_details": null}}
+
+event: response.reasoning.started
+data: {"sequence_number": 3, "type": "response.reasoning.started"}
+
+event: response.output_text.delta
+data: {"sequence_number": 4, "type": "response.output_text.delta", "delta": "**Reasoning through the tradeoffs:**\n\nDFS and BFS differ along a few axes that", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 5, "type": "response.output_text.delta", "delta": " actually matter in practice:\n\n- **Memory:** BFS holds an entire frontier in memory,", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 6, "type": "response.output_text.delta", "delta": " which grows exponentially with depth (O(b^d)) \u2014 often the real killer. DFS only hol", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 7, "type": "response.output_text.delta", "delta": "ds the current path plus siblings (O(b\u00b7d)), making it dramatically cheaper for wide or deep sp", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 8, "type": "response.output_text.delta", "delta": "aces.\n- **Optimality:** BFS finds the shallowest/shortest-h", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 9, "type": "response.output_text.delta", "delta": "op solution first, so it's optimal when edge costs are uniform. DFS finds *a* solution, not necessarily the clos", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 10, "type": "response.output_text.delta", "delta": "est, and can plunge down a long fruitless branch.\n- **Completeness:** BFS is complete (it", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 11, "type": "response.output_text.delta", "delta": "'ll find a solution if one exists, even in infinite-depth graphs). Plain DFS is not complete on infinite or c", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 12, "type": "response.output_text.delta", "delta": "yclic graphs \u2014 it can run forever \u2014 unless you add depth limits or visited-tracking (iterative deepening rec", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 13, "type": "response.output_text.delta", "delta": "overs BFS's completeness/optimality with DFS's memory profile).\n- **Solution location:** If solutions tend to be shallow,", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 14, "type": "response.output_text.delta", "delta": " BFS wins; if they're deep or the tree is bushy near the root, DFS reaches them faster.\n- **Implementation/tra", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 15, "type": "response.output_text.delta", "delta": "versal use:** DFS is naturally recursive and shines for problems needing full exploration \u2014 topological sort, cycle detection, conn", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 16, "type": "response.output_text.delta", "delta": "ected components, backtracking. BFS is the natural fit for shortest-path-in-hops and level-order", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 17, "type": "response.output_text.delta", "delta": " processing.\n\n**Recommendation:** Use BFS when you need the shortest/shallowest solution and can", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 18, "type": "response.output_text.delta", "delta": " afford the exponential memory, or when solutions sit near the root; reach for DFS when memory is tight, the graph is deep or you", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 19, "type": "response.output_text.delta", "delta": " must fully explore it (backtracking, topological sort, cycle detection). When you want", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 20, "type": "response.output_text.delta", "delta": " BFS's optimality and completeness but DFS's low memory footprint, use iterative-deepening DFS as the default comp", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 21, "type": "response.output_text.delta", "delta": "romise.", "message_id": null, "index": null, "final": null}
+
+event: response.output_item.done
+data: {"sequence_number": null, "type": "response.output_item.done", "item": {"id": "msg_27d105af698d455b8b43466e5f348f8b", "response_id": "resp_f558d15555904f92ab471203", "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": "**Reasoning through the tradeoffs:**\n\nDFS and BFS differ along a few axes that actually matter in practice:\n\n- **Memory:** BFS holds an entire frontier in memory, which grows exponentially with depth (O(b^d)) \u2014 often the real killer. DFS only holds the current path plus siblings (O(b\u00b7d)), making it dramatically cheaper for wide or deep spaces.\n- **Optimality:** BFS finds the shallowest/shortest-hop solution first, so it's optimal when edge costs are uniform. DFS finds *a* solution, not necessarily the closest, and can plunge down a long fruitless branch.\n- **Completeness:** BFS is complete (it'll find a solution if one exists, even in infinite-depth graphs). Plain DFS is not complete on infinite or cyclic graphs \u2014 it can run forever \u2014 unless you add depth limits or visited-tracking (iterative deepening recovers BFS's completeness/optimality with DFS's memory profile).\n- **Solution location:** If solutions tend to be shallow, BFS wins; if they're deep or the tree is bushy near the root, DFS reaches them faster.\n- **Implementation/traversal use:** DFS is naturally recursive and shines for problems needing full exploration \u2014 topological sort, cycle detection, connected components, backtracking. BFS is the natural fit for shortest-path-in-hops and level-order processing.\n\n**Recommendation:** Use BFS when you need the shortest/shallowest solution and can afford the exponential memory, or when solutions sit near the root; reach for DFS when memory is tight, the graph is deep or you must fully explore it (backtracking, topological sort, cycle detection). When you want BFS's optimality and completeness but DFS's low memory footprint, use iterative-deepening DFS as the default compromise."}], "model": "claude-sdk"}}
+
+event: session.usage
+data: {"sequence_number": null, "type": "session.usage", "conversation_id": "conv_91d8bde71cae41e7b32e01a648e00f72", "context_tokens": null, "context_window": null, "total_cost_usd": 0.19558275000000003, "usage_by_model": {"claude-opus-4-8": {"input_tokens": 5418, "output_tokens": 1492, "total_tokens": 6910, "cache_read_input_tokens": 56648, "cache_creation_input_tokens": 16459, "total_cost_usd": 0.19558275000000003}}}
+
+event: response.completed
+data: {"sequence_number": 23, "type": "response.completed", "response": {"id": "resp_f558d15555904f92ab471203", "object": "response", "status": "completed", "model": "claude-sdk", "created_at": 1782502844, "completed_at": null, "output": [], "background": false, "store": true, "usage": {"input_tokens": 2, "output_tokens": 645, "output_tokens_details": {"reasoning_tokens": 0}, "total_tokens": 647, "context_tokens": 16461, "cache_read_input_tokens": 16295, "cache_creation_input_tokens": 164, "model": "claude-opus-4-8"}, "previous_response_id": null, "conversation": null, "instructions": null, "reasoning": null, "error": null, "incomplete_details": null}}
+
+event: session.status
+data: {"sequence_number": null, "type": "session.status", "conversation_id": "conv_91d8bde71cae41e7b32e01a648e00f72", "status": "idle", "response_id": null, "error": null}
+
