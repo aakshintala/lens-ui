@@ -27,6 +27,12 @@ and roll older "Recent" pointers off this page as they age.
     the golden corpus with longer sessions / a real Lens work pass (current ~22KB is
     thin); benches load any corpus file via `include_bytes!`. WS + state/render benches
     deferred to those paths. CI regression gate deferred (no CI yet).
+  - **`crates/lens-capture` (new binary `lens_capture`):** `lens_capture omnigent
+    claude` spawns the harness, auto-detects its session, taps the SSE stream, and
+    writes a `.stream.sse` (+ snapshot/items) corpus on exit. Use it to grow the
+    corpus. **Open decision:** best-effort subscribe-first (poll-then-subscribe) is
+    fine for corpus growth but not race-free; a fully race-free version needs the
+    omnigent harness to attach to a pre-created session id — verify that flag exists.
 - **lens-client Foundation: DONE** (Plan 1 executed, 9 commits `043214e..f12050f`) —
   crate skeleton/error/ids/connection, typify codegen (`generated.rs`, 88 schemas,
   rustfmt-canonical via xtask), HTTP core + contract gate + ready-ladder handshake.
