@@ -24,6 +24,8 @@ struct Config {
     base_url: url::Url,
     out_prefix: PathBuf,
     harness: Vec<String>,
+    /// Known session id for race-free capture (`--session conv_...`).
+    session_id: Option<SessionId>,
 }
 
 fn main() {
@@ -39,10 +41,25 @@ fn die_usage(msg: impl std::fmt::Display) -> ! {
 }
 
 fn run() -> Result<(), String> {
-    let config = parse_config();
+    let mut config = parse_config();
     let auth = auth_from_env();
-    let conn = Connection::new(ConnectionId::new("lens-capture"), config.base_url, auth);
+    let conn = Connection::new(
+        ConnectionId::new("lens-capture"),
+        config.base_url.clone(),
+        auth,
+    );
 
+    if let Some(sid) = config.session_id.take() {
+        run_race_free(config, sid, conn)?;
+    } else {
+        run_auto_detect(config, conn)?;
+    }
+
+    Ok(())
+}
+
+/// Default mode: poll for a new session id after harness spawn.
+fn run_auto_detect(config: Config, conn: Connection) -> Result<SessionId, String> {
     let client = Client::new(conn.clone()).map_err(|e| format!("connect failed: {e}"))?;
 
     let known = snapshot_session_ids(&client)?;
@@ -84,6 +101,81 @@ fn run() -> Result<(), String> {
         }
     });
 
+    finish_capture(
+        conn,
+        &session_id,
+        &mut child,
+        stop,
+        &stream_path,
+        &snapshot_path,
+        &items_path,
+    )
+}
+
+/// Race-free mode: subscribe to the known session id before the harness emits anything.
+fn run_race_free(
+    mut config: Config,
+    session_id: SessionId,
+    conn: Connection,
+) -> Result<SessionId, String> {
+    append_resume_if_needed(&mut config.harness, &session_id);
+
+    let stream_path = path_with_suffix(&config.out_prefix, ".stream.sse");
+    let snapshot_path = path_with_suffix(&config.out_prefix, ".snapshot.json");
+    let items_path = path_with_suffix(&config.out_prefix, ".items.json");
+
+    ensure_parent_dirs(&config.out_prefix)?;
+
+    eprintln!(
+        "capturing session {} → {}",
+        session_id,
+        stream_path.display()
+    );
+
+    // Open the SSE subscription on the main thread so it is live before the harness
+    // process starts — the stream does not replay, so this ordering is the guarantee.
+    let stream_resp = open_stream(&conn, &session_id)?;
+
+    let harness_cmd = config.harness.join(" ");
+    eprintln!("spawning harness: {harness_cmd}");
+
+    let mut child = Command::new(&config.harness[0])
+        .args(&config.harness[1..])
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| format!("failed to spawn `{harness_cmd}`: {e}"))?;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let capture_path = stream_path.clone();
+    let stop_for_thread = Arc::clone(&stop);
+    let _capture_handle = thread::spawn(move || {
+        if let Err(e) = read_stream_to_file(stream_resp, &capture_path, stop_for_thread) {
+            eprintln!("lens_capture: capture thread: {e}");
+        }
+    });
+
+    finish_capture(
+        conn,
+        &session_id,
+        &mut child,
+        stop,
+        &stream_path,
+        &snapshot_path,
+        &items_path,
+    )
+}
+
+fn finish_capture(
+    conn: Connection,
+    session_id: &SessionId,
+    child: &mut std::process::Child,
+    stop: Arc<AtomicBool>,
+    stream_path: &Path,
+    snapshot_path: &Path,
+    items_path: &Path,
+) -> Result<SessionId, String> {
     let status = child
         .wait()
         .map_err(|e| format!("failed to wait on harness: {e}"))?;
@@ -107,26 +199,27 @@ fn run() -> Result<(), String> {
         &sid_path,
         &[("include_items", "true"), ("include_liveness", "true")],
     )?;
-    write_file(&snapshot_path, &snapshot_bytes)?;
+    write_file(snapshot_path, &snapshot_bytes)?;
 
     let items_bytes = fetch_bytes(&conn, &format!("{sid_path}/items"), &[])?;
-    write_file(&items_path, &items_bytes)?;
+    write_file(items_path, &items_bytes)?;
 
-    let stream_bytes = fs::read(&stream_path)
+    let stream_bytes = fs::read(stream_path)
         .map_err(|e| format!("failed to read {} for summary: {e}", stream_path.display()))?;
 
     let frame_count = count_sse_frames(&stream_bytes);
     print_summary(
-        &stream_path,
+        stream_path,
         stream_bytes.len(),
         frame_count,
-        &snapshot_path,
+        snapshot_path,
         snapshot_bytes.len(),
-        &items_path,
+        items_path,
         items_bytes.len(),
     );
+    println!("  session: {session_id}");
 
-    Ok(())
+    Ok(session_id.clone())
 }
 
 fn parse_config() -> Config {
@@ -138,6 +231,7 @@ fn parse_config() -> Config {
 
     let mut url: Option<String> = None;
     let mut out_prefix = PathBuf::from("./capture");
+    let mut session_id: Option<SessionId> = None;
     let mut harness_start = None;
     let mut i = 0;
 
@@ -155,6 +249,12 @@ fn parse_config() -> Config {
             "--out" => {
                 i += 1;
                 out_prefix = PathBuf::from(next_flag_value(&args, i, "--out"));
+                i += 1;
+            }
+            "--session" => {
+                i += 1;
+                let id = next_flag_value(&args, i, "--session");
+                session_id = Some(SessionId::new(id));
                 i += 1;
             }
             "--" => {
@@ -192,6 +292,7 @@ fn parse_config() -> Config {
         base_url,
         out_prefix,
         harness,
+        session_id,
     }
 }
 
@@ -208,10 +309,17 @@ fn print_help() {
 lens_capture — capture an omnigent session's raw SSE stream while driving a harness interactively
 
 Usage:
-  lens_capture [--url URL] [--out PREFIX] [--] <harness cmd...>
+  lens_capture [--url URL] [--out PREFIX] [--session CONV_ID] [--] <harness cmd...>
+
+Race-free mode (--session):
+  Pass the session's conv_... id (same value shown by omnigent's session picker, a prior
+  capture's printed summary, or GET /v1/sessions). The tool subscribes to the SSE stream
+  before spawning the harness, so no events are missed. If the harness argv does not already
+  include --resume or -r, --resume <CONV_ID> is appended automatically.
 
 Examples:
   lens_capture omnigent claude
+  lens_capture --session conv_abc123 omnigent claude
   lens_capture --out docs/spikes/captures/2026-06-27-sessionstore/work omnigent codex
 
 Environment:
@@ -223,7 +331,7 @@ Output files (PREFIX defaults to ./capture):
   <PREFIX>.snapshot.json  final GET /v1/sessions/{{id}}?include_items=true&include_liveness=true
   <PREFIX>.items.json     final GET /v1/sessions/{{id}}/items
 
-The harness is spawned with inherited stdio. A background thread subscribes to the
+Default mode: the harness is spawned with inherited stdio. A background thread subscribes to the
 session SSE stream as soon as a new session id appears — before you send the first
 prompt — because omnigent creates the session during harness startup."
     );
@@ -234,6 +342,22 @@ fn auth_from_env() -> Auth {
         Ok(token) if !token.is_empty() => Auth::Bearer { token },
         _ => Auth::None,
     }
+}
+
+/// Append `--resume <id>` when the harness argv has no resume flag so omnigent reattaches
+/// to the session we are already subscribed to.
+fn append_resume_if_needed(harness: &mut Vec<String>, session_id: &SessionId) {
+    if harness_has_resume_flag(harness) {
+        return;
+    }
+    harness.push("--resume".into());
+    harness.push(session_id.to_string());
+}
+
+fn harness_has_resume_flag(harness: &[String]) -> bool {
+    harness[1..]
+        .iter()
+        .any(|arg| arg == "--resume" || arg == "-r" || arg.starts_with("--resume="))
 }
 
 fn snapshot_session_ids(client: &Client) -> Result<HashSet<String>, String> {
@@ -316,21 +440,10 @@ fn ensure_parent_dirs(prefix: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Raw SSE GET on a dedicated thread. Chunks are written straight to disk so a
-/// hard exit still leaves a usable partial corpus.
-fn capture_stream(
-    conn: Connection,
+fn open_stream(
+    conn: &Connection,
     session_id: &SessionId,
-    stream_path: &Path,
-    stop: Arc<AtomicBool>,
-) -> Result<u64, String> {
-    let mut file = File::create(stream_path).map_err(|e| {
-        format!(
-            "failed to create stream file {}: {e}",
-            stream_path.display()
-        )
-    })?;
-
+) -> Result<reqwest::blocking::Response, String> {
     let http = reqwest::blocking::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .build()
@@ -345,9 +458,22 @@ fn capture_stream(
         .apply(http.get(url))
         .send()
         .map_err(|e| format!("stream GET failed: {e}"))?;
-    let mut resp = resp
-        .error_for_status()
-        .map_err(|e| format!("stream GET error status: {e}"))?;
+    resp.error_for_status()
+        .map_err(|e| format!("stream GET error status: {e}"))
+}
+
+/// Write-through read loop for an already-open SSE response body.
+fn read_stream_to_file(
+    mut resp: reqwest::blocking::Response,
+    stream_path: &Path,
+    stop: Arc<AtomicBool>,
+) -> Result<u64, String> {
+    let mut file = File::create(stream_path).map_err(|e| {
+        format!(
+            "failed to create stream file {}: {e}",
+            stream_path.display()
+        )
+    })?;
 
     let mut buf = [0u8; 8192];
     let mut total = 0u64;
@@ -374,6 +500,17 @@ fn capture_stream(
     }
 
     Ok(total)
+}
+
+/// Default-mode capture: open subscription then read on the capture thread.
+fn capture_stream(
+    conn: Connection,
+    session_id: &SessionId,
+    stream_path: &Path,
+    stop: Arc<AtomicBool>,
+) -> Result<u64, String> {
+    let resp = open_stream(&conn, session_id)?;
+    read_stream_to_file(resp, stream_path, stop)
 }
 
 fn fetch_bytes(conn: &Connection, path: &str, query: &[(&str, &str)]) -> Result<Vec<u8>, String> {

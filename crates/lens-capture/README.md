@@ -9,6 +9,19 @@ lens_capture omnigent claude
 lens_capture --out docs/spikes/captures/2026-06-27-sessionstore/work omnigent codex
 ```
 
+### Race-free mode
+
+When you already know the session id (`conv_...` — the same value omnigent shows in
+its picker, a prior capture's summary, or `GET /v1/sessions`), subscribe before the
+harness starts so no SSE events are missed:
+
+```sh
+lens_capture --session conv_abc123 omnigent claude
+```
+
+`--resume <id>` is appended to the harness command automatically unless `--resume` or
+`-r` is already present.
+
 **Environment**
 
 - `LENS_OMNIGENT_URL` — base URL (required unless `--url` is passed)
@@ -23,17 +36,16 @@ lens_capture --out docs/spikes/captures/2026-06-27-sessionstore/work omnigent co
 **Bench wiring:** drop the `.stream.sse` under `docs/spikes/captures/...` and add
 an entry to the `CORPORA` array in `crates/lens-client/benches/sse_pipeline.rs`.
 
-**Known limitations (best-effort capture, fine for corpus growth):**
+**Known limitations (default mode is best-effort, fine for corpus growth):**
 
-- *Subscribe-first is best-effort, not guaranteed.* The tool detects the harness
+- *Subscribe-first is best-effort, not guaranteed.* Default mode detects the harness
   session by polling `GET /v1/sessions`, then subscribes. The stream endpoint does
   not replay, so any events emitted before the subscription lands are missed. In
   practice the session is created during the harness's idle startup (before you
   type the first prompt), so it's caught in time. If the harness creates the
   session lazily on the first message, send a throwaway first prompt (`hi`), let it
-  complete, then do the real work on turn 2+. A fully race-free design (create the
-  session via the API → subscribe → attach the harness to that id) depends on the
-  harness supporting attach-to-existing-session.
+  complete, then do the real work on turn 2+. Use `--session conv_...` for
+  race-free capture when you know the id and the harness supports `--resume`.
 - *Session pick is a single-harness heuristic.* The first session id not present
   before spawn is assumed to be the harness's. Don't run two session-creating
   things at once against the same server during a capture.
