@@ -1391,10 +1391,11 @@ impl<'a> Sessions<'a> {
             .send()?;
         let status = resp.status().as_u16();
         match crate::http::check_status("v1/sessions/stream", status) {
-            Ok(()) => Ok(crate::stream::EventStream::spawn(
-                resp,
-                crate::reconnect::StubReopener,
-            )),
+            Ok(()) => {
+                // TODO(3b-2b follow-up): gated live reconnect smoke test (Task 6 step 3)
+                let reopener = crate::reconnect::HttpReopener::new(self.client, id.clone());
+                Ok(crate::stream::EventStream::spawn(resp, reopener))
+            }
             Err(e) => Err(e),
         }
     }

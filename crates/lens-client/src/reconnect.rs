@@ -26,41 +26,13 @@ pub(crate) trait Reopen: Send {
     fn items(&self) -> Result<ItemList>;
 }
 
-/// Placeholder until Task 6 wires `HttpReopener` from `sessions::stream`.
-pub(crate) struct StubReopener;
-
-impl Reopen for StubReopener {
-    fn open_stream(&self) -> Result<Box<dyn Read + Send>> {
-        Err(crate::error::ClientError::Server {
-            status: 503,
-            body: serde_json::json!({}),
-        })
-    }
-
-    fn snapshot(&self) -> Result<SessionSnapshot> {
-        Err(crate::error::ClientError::Server {
-            status: 503,
-            body: serde_json::json!({}),
-        })
-    }
-
-    fn items(&self) -> Result<ItemList> {
-        Err(crate::error::ClientError::Server {
-            status: 503,
-            body: serde_json::json!({}),
-        })
-    }
-}
-
 /// Real impl: clones the cheap, `Send + 'static` request machinery. No `info`.
-#[allow(dead_code)] // wired in Plan 3b-2b Task 5/6
 pub(crate) struct HttpReopener {
     http: reqwest::blocking::Client,
     conn: Connection,
     session_id: SessionId,
 }
 
-#[allow(dead_code)] // wired in Plan 3b-2b Task 5/6
 impl HttpReopener {
     pub(crate) fn new(client: &Client, session_id: SessionId) -> Self {
         Self {
@@ -71,7 +43,6 @@ impl HttpReopener {
     }
 }
 
-#[allow(dead_code)] // wired in Plan 3b-2b Task 5/6
 impl Reopen for HttpReopener {
     fn open_stream(&self) -> Result<Box<dyn Read + Send>> {
         let url = self
