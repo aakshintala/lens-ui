@@ -231,6 +231,22 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Recent
 
+- **2026-06-27** — **Event-modeling branch (`feat/lens-client-event-modeling`) executed,
+  final-reviewed, and MERGED to `main`** (fast-forward `82769b7..bb03992`, 12 commits; solo
+  workflow — no PR, memory `integration-workflow`). 7 modeling tasks acted on the live recapture
+  spike: typed arms for `session.agent_changed` / child `session.created` / `session.resource.deleted`
+  (promoted from `DEFERRED`), exposed `child{}` on `child_session.updated` + elicitation `params`,
+  flag-flips to byte-verified, §7 reconciled (terminal.activity is SSE). **Final whole-branch
+  gpt-5.5 review → 1 fix wave** (commits `7eb90fb`+`bb03992`): the hand-written `Raw*` shapes were
+  STRICTER than the generated contract (3 Important) → a contract-valid sparse/null payload would
+  silently degrade to `Unknown`. Relaxed `RawChild` (open-dict → all fields `Option`),
+  `RawElicitationParams` url/phase/policy_name/content_preview → `Option<String>` (null-tolerant) +
+  contract-faithful `"form"` mode default, `RawSessionCreated` agent_id/parent_session_id →
+  `Option<String>`; public getters/variant fields → `Option`; +3 sparse/null regression tests.
+  gpt-5.5 diversity re-review: 3 target raws clean, caught the `mode` default + a null-test-coverage
+  Minor (both folded). FINAL GATE: 133 lib tests, clippy `--all-targets --all-features` zero-warning,
+  fmt clean, `xtask drift` green (55 paths), `generated.rs` untouched, no `Value` to consumers.
+  **lens-client is now feature-complete on `main` through the recapture-driven event model.**
 - **2026-06-26** — **Live event-surface recapture spike (Plan 4 #5) — CAPTURE DONE.** Drove the
   live pinned server headless via native harnesses (`omnigent claude`/`cursor`/`polly` — persistent
   runner survives the launcher, drive via subscribe-first + REST `message` injection) + a Cursor
