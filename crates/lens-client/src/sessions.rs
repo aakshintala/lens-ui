@@ -34,8 +34,29 @@ fn de_items<'de, D: serde::Deserializer<'de>>(
     let raw: Vec<serde_json::Value> = Vec::deserialize(d)?;
     Ok(raw
         .into_iter()
+        .map(hoist_embedded_item_payload)
         .map(crate::stream::Item::from_value)
         .collect())
+}
+
+/// The embedded `items` on a `SessionSnapshot` nest their payload under a `data`
+/// envelope (`{id, type, status, data: {role, content, …}}`), whereas the
+/// standalone `GET /items` corpus and the live stream carry those payload fields
+/// at the top level — the shape `Item::from_value` reads. Hoist `data`'s fields
+/// up so embedded items type the same as the flat form; `data` wins on the
+/// payload keys, while `id`/`type`/`status` are preserved from the top level
+/// (they never appear inside `data`). Non-object or `data`-less values pass
+/// through unchanged.
+fn hoist_embedded_item_payload(v: Value) -> Value {
+    match v {
+        Value::Object(mut top) => {
+            if let Some(Value::Object(data)) = top.remove("data") {
+                top.extend(data);
+            }
+            Value::Object(top)
+        }
+        other => other,
+    }
 }
 
 /// A session snapshot (`GET /v1/sessions/{id}`). Mirrors the CORE fields of
@@ -2091,6 +2112,25 @@ mod tests {
         // embedded items: 11 (snapshot was captured with include_items).
         assert_eq!(s.items().len(), 11);
         assert!(!s.items()[0].id().is_empty());
+        // Payload is hoisted out of the snapshot's `data` envelope, so embedded
+        // items are fully typed (not just id-bearing shells). The corpus opens
+        // with the resource_event; its typed fields come from `data`.
+        assert!(matches!(
+            &s.items()[0],
+            crate::stream::Item::ResourceEvent { event_type, resource_type, .. }
+                if event_type == "session.resource.created" && resource_type == "terminal"
+        ));
+        // An assistant message carries its role + non-empty content (both under `data`).
+        assert!(s.items().iter().any(|i| matches!(
+            i,
+            crate::stream::Item::Message { role, content, .. }
+                if role == "assistant" && !content.is_empty()
+        )));
+        // A function_call carries its name (under `data`).
+        assert!(s.items().iter().any(|i| matches!(
+            i,
+            crate::stream::Item::FunctionCall { name, .. } if !name.is_empty()
+        )));
         // (todos/pending_elicitations/model_options are empty in this capture and
         //  deferred — the snapshot still parses with them present-but-empty.)
     }
