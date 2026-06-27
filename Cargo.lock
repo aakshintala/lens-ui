@@ -623,6 +623,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "lens-capture"
+version = "0.1.0"
+dependencies = [
+ "lens-client",
+ "reqwest",
+ "serde_json",
+ "url",
+]
+
+[[package]]
 name = "lens-client"
 version = "0.1.0"
 dependencies = [
