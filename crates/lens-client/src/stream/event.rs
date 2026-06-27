@@ -410,10 +410,18 @@ pub enum Item {
         code: Option<String>,
         message: Option<String>,
     },
-    /// Forward-compat for item types not yet modeled (native_tool, reasoning,
-    /// compaction, slash_command, terminal_command, resource_event) — added in
-    /// Task 6 / at config-time capture.
-    Other { item_type: String },
+    /// A persisted resource lifecycle item (`/items` only; the live stream carries
+    /// these as `session.resource.*` SessionEvents instead). `resource_type` is
+    /// e.g. `terminal`; `event_type` is the wire `session.resource.created` form.
+    ResourceEvent {
+        id: String,
+        resource_id: String,
+        resource_type: String,
+        event_type: String,
+    },
+    /// Forward-compat for item types not yet modeled. Retains `id` so the state
+    /// model can still reconcile it by `id` (typed-client §7 step 5).
+    Other { item_type: String, id: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -655,8 +663,21 @@ impl ResponseEvent {
 }
 
 impl Item {
+    /// The item's stable `id` — the reconcile key for `GET /items` merge
+    /// (persisted items carry no `sequence_number`; typed-client §7 step 5).
+    pub fn id(&self) -> &str {
+        match self {
+            Item::Message { id, .. }
+            | Item::FunctionCall { id, .. }
+            | Item::FunctionCallOutput { id, .. }
+            | Item::Error { id, .. }
+            | Item::ResourceEvent { id, .. }
+            | Item::Other { id, .. } => id,
+        }
+    }
+
     /// Total over a wire item object; unmodeled `type`s map to `Other`.
-    fn from_value(v: serde_json::Value) -> Self {
+    pub(crate) fn from_value(v: serde_json::Value) -> Self {
         let id = v
             .get("id")
             .and_then(|x| x.as_str())
@@ -721,8 +742,15 @@ impl Item {
                     message: data.message,
                 }
             }
+            "resource_event" => Item::ResourceEvent {
+                id,
+                resource_id: s("resource_id"),
+                resource_type: s("resource_type"),
+                event_type: s("event_type"),
+            },
             other => Item::Other {
                 item_type: other.to_string(),
+                id,
             },
         }
     }
@@ -929,6 +957,57 @@ mod tests {
             }
             other => panic!("wrong event: {other:?}"),
         }
+    }
+
+    #[test]
+    fn resource_event_item_is_typed_with_id() {
+        let item = Item::from_value(serde_json::json!({
+            "id": "rse_1", "type": "resource_event", "status": "completed",
+            "event_type": "session.resource.created",
+            "resource_id": "terminal_tui_main", "resource_type": "terminal",
+            "resource": {"id": "terminal_tui_main", "object": "resource"}
+        }));
+        assert_eq!(
+            item,
+            Item::ResourceEvent {
+                id: "rse_1".into(),
+                resource_id: "terminal_tui_main".into(),
+                resource_type: "terminal".into(),
+                event_type: "session.resource.created".into(),
+            }
+        );
+        assert_eq!(item.id(), "rse_1");
+    }
+
+    #[test]
+    fn other_item_retains_its_id_for_reconcile() {
+        let item = Item::from_value(serde_json::json!({
+            "id": "x_9", "type": "native_tool", "kind": "web_search_call"
+        }));
+        assert_eq!(
+            item,
+            Item::Other {
+                item_type: "native_tool".into(),
+                id: "x_9".into()
+            }
+        );
+        assert_eq!(item.id(), "x_9"); // reconcile-by-id works even for unmodeled types
+    }
+
+    #[test]
+    fn id_accessor_is_total_over_all_variants() {
+        let msg = Item::from_value(
+            serde_json::json!({"id":"m1","type":"message","role":"assistant","content":[]}),
+        );
+        let fc = Item::from_value(
+            serde_json::json!({"id":"fc1","type":"function_call","call_id":"c","name":"n","arguments":"{}","status":"completed"}),
+        );
+        let fco = Item::from_value(
+            serde_json::json!({"id":"fco1","type":"function_call_output","call_id":"c","output":"o"}),
+        );
+        assert_eq!(msg.id(), "m1");
+        assert_eq!(fc.id(), "fc1");
+        assert_eq!(fco.id(), "fco1");
     }
 
     #[test]
