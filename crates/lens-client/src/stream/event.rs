@@ -79,9 +79,9 @@ pub enum SessionEvent {
     Interrupted {
         requested_at: Option<i64>,
     },
-    // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
     ChildSessionUpdated {
         child_session_id: String,
+        child: ChildSession,
     },
     // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
     TerminalActivity {
@@ -143,6 +143,47 @@ pub struct PresenceViewer {
 impl PresenceViewer {
     pub fn user_id(&self) -> Option<&str> {
         self.user_id.as_deref()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildTaskStatus {
+    Launching,
+    InProgress,
+    Completed,
+    /// Any status this crate version does not know (dev0 churn safety).
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChildSession {
+    id: String,
+    title: String,
+    tool: String,
+    session_name: String,
+    busy: bool,
+    current_task_status: ChildTaskStatus,
+}
+impl ChildSession {
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+    pub fn tool(&self) -> &str {
+        &self.tool
+    }
+    pub fn session_name(&self) -> &str {
+        &self.session_name
+    }
+    pub fn busy(&self) -> bool {
+        self.busy
+    }
+    pub fn current_task_status(&self) -> ChildTaskStatus {
+        self.current_task_status
     }
 }
 
@@ -305,12 +346,20 @@ struct RawElicitationResolved {
     elicitation_id: String,
 }
 #[derive(Deserialize)]
+struct RawChild {
+    id: String,
+    title: String,
+    tool: String,
+    session_name: String,
+    busy: bool,
+    current_task_status: ChildTaskStatus,
+}
+#[derive(Deserialize)]
 struct RawChildSessionUpdated {
     child_session_id: String,
+    child: RawChild,
     #[serde(rename = "conversation_id")]
     _conversation_id: String,
-    #[serde(rename = "child")]
-    _child: serde_json::Map<String, serde_json::Value>,
 }
 #[derive(Deserialize)]
 struct RawTerminalActivity {
@@ -647,11 +696,18 @@ impl SessionEvent {
                     requested_at: r.data.and_then(|x| x.requested_at),
                 }
             }
-            // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
             "session.child_session.updated" => {
                 let r: RawChildSessionUpdated = serde_json::from_str(d).ok()?;
                 SessionEvent::ChildSessionUpdated {
                     child_session_id: r.child_session_id,
+                    child: ChildSession {
+                        id: r.child.id,
+                        title: r.child.title,
+                        tool: r.child.tool,
+                        session_name: r.child.session_name,
+                        busy: r.child.busy,
+                        current_task_status: r.child.current_task_status,
+                    },
                 }
             }
             // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
@@ -1365,18 +1421,39 @@ mod tests {
     }
 
     #[test]
-    fn schema_child_session_updated() {
-        // SCHEMA-DERIVED: session.child_session.updated — flat child_session_id per openapi.
+    fn bytes_child_session_updated() {
+        // Byte-verified: docs/spikes/captures/2026-06-26-live-recapture/polly-child-session.sse
         let ev = parse_event(&frame(
             "session.child_session.updated",
-            r#"{"conversation_id":"conv_parent","child_session_id":"conv_child","child":{}}"#,
+            r#"{"sequence_number":null,"type":"session.child_session.updated","conversation_id":"conv_parent","child_session_id":"conv_child","child":{"id":"conv_child","title":"claude_code:spike-hello-file","tool":"claude_code","session_name":"spike-hello-file","busy":false,"current_task_status":"launching"}}"#,
         ));
-        assert_eq!(
-            ev,
-            ServerStreamEvent::Session(SessionEvent::ChildSessionUpdated {
-                child_session_id: "conv_child".into()
-            })
-        );
+        let ServerStreamEvent::Session(SessionEvent::ChildSessionUpdated {
+            child_session_id,
+            child,
+        }) = ev
+        else {
+            panic!("expected ChildSessionUpdated, got {ev:?}");
+        };
+        assert_eq!(child_session_id, "conv_child");
+        assert_eq!(child.id(), "conv_child");
+        assert_eq!(child.title(), "claude_code:spike-hello-file");
+        assert_eq!(child.tool(), "claude_code");
+        assert_eq!(child.session_name(), "spike-hello-file");
+        assert!(!child.busy());
+        assert_eq!(child.current_task_status(), ChildTaskStatus::Launching);
+    }
+
+    #[test]
+    fn child_task_status_unknown_for_novel_value() {
+        // dev0 churn safety: an unknown status string degrades, never panics.
+        let ev = parse_event(&frame(
+            "session.child_session.updated",
+            r#"{"sequence_number":null,"type":"session.child_session.updated","conversation_id":"c","child_session_id":"cc","child":{"id":"cc","title":"t","tool":"claude_code","session_name":"n","busy":true,"current_task_status":"some_future_state"}}"#,
+        ));
+        let ServerStreamEvent::Session(SessionEvent::ChildSessionUpdated { child, .. }) = ev else {
+            panic!("expected ChildSessionUpdated");
+        };
+        assert_eq!(child.current_task_status(), ChildTaskStatus::Unknown);
     }
 
     #[test]
