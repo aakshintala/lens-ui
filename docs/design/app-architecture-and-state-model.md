@@ -983,8 +983,9 @@ Concierge per Lens, never per-connection.
 
 | `ClientError` / signal | App-state effect |
 |---|---|
-| `Disconnected` (retry phase expired, typed client §7) | Active → "hard disconnected" UI; offer user-retry (restarts the typed client's retry). Session stays in registry. |
-| `Reconnected { gap }` (typed client §7) | `gap == Some(0)`: keep state. Else: clear `StreamScratch` (§4.2), show `↻` break, reconcile. |
+| `ServerStreamEvent::Reconnecting { attempt }` (typed client §7) | Active → health `Reconnecting`; raise the amber `↻` immediately; record `since`/`attempts`. |
+| `ServerStreamEvent::Disconnected` (retry phase expired, typed client §7) | Active → "hard disconnected" UI; offer user-retry (reopens via `Sessions::stream`). Session stays in registry. (A stream signal, not a `ClientError` variant — see typed client §11.) |
+| `ServerStreamEvent::Reconnected { gap }` (typed client §7) | `gap == Some(0)`: keep state. Else: clear `StreamScratch` (§4.2), show `↻` break, reconcile. |
 | `Auth { 401 }` | Prompt re-auth (permissions + server-lifecycle docs); do not drop sessions. |
 | `Auth { 403 }` | Lost access → remove session from registry + UI. |
 | `NotFound` (404) | Session deleted server-side → remove from registry; any disk rows remain as a read-only local tombstone (history viewable, never re-streamed). |

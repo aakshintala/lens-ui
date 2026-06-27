@@ -84,10 +84,18 @@ and roll older "Recent" pointers off this page as they age.
        pinned semantics. ⚠ `live_stream` NOT run this session (no server) — unit coverage only.
      - **Next: Plan 3b-2 — no-replay reconnect (§7).** Attaches at the reader's `Err(_) => return`
        seam (now reconnect-ready). Needs typed `Sessions::items()` (→ `Item` union) + typed snapshot
-       (`GET /v1/sessions/{id}` `include_items`/`include_liveness`) built as part of it; emits
-       `Reconnected { gap }` (the §7a bullet still pending); three-bucket dedup. The §7 reconnect
-       *ownership/trigger* ambiguity (§7 "crate owns protocol" vs §11 "state-model liveness watcher
-       triggers") is an **open Opus cross-doc question to resolve before writing 3b-2**.
+       (`GET /v1/sessions/{id}` `include_items`/`include_liveness`) built as part of it; three-bucket dedup.
+     - **Reconnect ownership RESOLVED (2026-06-26, Opus cross-doc).** The §7-vs-§11 ambiguity was
+       decided by the consumer doc (app-arch state-model §1/§8: EventStream is "reconnect-safe", "the
+       pump just keeps reading"): **the crate owns reconnect end-to-end, internally.** §7's "StreamUpdate"
+       term was wrong (crate emits `ServerStreamEvent`; `StreamUpdate` is the state model's reduced
+       output, §13); §11's "triggered by the state model's liveness watcher" was wrong (that's the §10
+       cross-session poll for *non-active* sessions). **Designed the reconnect-lifecycle event surface:**
+       three crate-synthetic `ServerStreamEvent` variants — `Reconnecting { attempt }` → `Reconnected
+       { gap }` → terminal `Disconnected` — all on the existing mpsc channel (no `recv()` API break, no
+       `ClientError::Disconnected`). Two 3b-2 seams recorded in §7: normalizer `seen_items` must reset on
+       `Reconnected{gap≠0}`; lifecycle markers bypass normalization. Docs fixed (typed-client §7/§10/§11,
+       app-arch §13.1, server-lifecycle §9.2). 3b-2 plan can be written from these.
   3. **Stand up contract-drift CI** (outstanding B6) — the passive alarm that makes tracking
      dev0 safe when `0.3.0` eventually tags.
   - composer-2.5 is weakest on temporal/stateful logic (`[[composer-delegation-profile]]`) — Plan 3
