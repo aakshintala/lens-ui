@@ -108,6 +108,10 @@ pub enum SessionEvent {
     },
     // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
     Skills,
+    AgentChanged {
+        agent_id: String,
+        agent_name: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -343,6 +347,13 @@ struct RawSessionSandboxStatus {
     #[serde(default)]
     error: Option<String>,
 }
+#[derive(Deserialize)]
+struct RawAgentChanged {
+    agent_id: String,
+    agent_name: String,
+    #[serde(rename = "conversation_id")]
+    _conversation_id: String,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResponseEvent {
@@ -487,6 +498,7 @@ pub const MODELED_EVENT_TYPES: &[&str] = &[
     "response.reasoning.started",
     "response.reasoning_summary_text.delta",
     "response.reasoning_text.delta",
+    "session.agent_changed",
     "session.changed_files.invalidated",
     "session.child_session.updated",
     "session.heartbeat",
@@ -517,7 +529,6 @@ pub const DEFERRED_EVENT_TYPES: &[&str] = &[
     "response.output_file.done",
     "response.queued",
     "response.retry",
-    "session.agent_changed",
     "session.collaboration_mode",
     "session.created",
     "session.resource.deleted",
@@ -668,6 +679,13 @@ impl SessionEvent {
             "session.skills" => {
                 let _: RawSessionConversationOnly = serde_json::from_str(d).ok()?;
                 SessionEvent::Skills
+            }
+            "session.agent_changed" => {
+                let r: RawAgentChanged = serde_json::from_str(d).ok()?;
+                SessionEvent::AgentChanged {
+                    agent_id: r.agent_id,
+                    agent_name: r.agent_name,
+                }
             }
             _ => return None,
         })
@@ -1433,5 +1451,21 @@ mod tests {
             r#"{"conversation_id":"conv_abc"}"#,
         ));
         assert_eq!(ev, ServerStreamEvent::Session(SessionEvent::Skills));
+    }
+
+    #[test]
+    fn bytes_session_agent_changed() {
+        // Byte-verified: docs/spikes/captures/2026-06-26-live-recapture/agent-switched.sse
+        let ev = parse_event(&frame(
+            "session.agent_changed",
+            r#"{"sequence_number":null,"type":"session.agent_changed","conversation_id":"conv_2a9","agent_id":"ag_2e9","agent_name":"debby"}"#,
+        ));
+        assert_eq!(
+            ev,
+            ServerStreamEvent::Session(SessionEvent::AgentChanged {
+                agent_id: "ag_2e9".into(),
+                agent_name: "debby".into(),
+            })
+        );
     }
 }
