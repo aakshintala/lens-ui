@@ -11,9 +11,12 @@
 - **MANDATORY** Escalate to a Claude **Opus** subagent (the `Agent` tool) only
   for Opus-level work: architecture/design, cross-doc ambiguity resolution,
   security-sensitive code, final review synthesis.
-- **MANDATORY** Review diversity — route reviews through `cursor-delegate` to a
-  model family *other* than the author's (`gpt-5.5`, `gemini-3.5`). Every
-  non-trivial change gets ≥1 review from a different family than wrote it.
+- **MANDATORY** Review diversity — every non-trivial change gets ≥1 review from
+  a model family *other* than the author's.
+- **MANDATORY** Route **all `gpt-5.5` delegation through `codex`**
+  (`codex exec -s read-only`), **not** `cursor-delegate` — codex is the free
+  gpt-5.5 path (memory `codex-as-reviewer`). Other families (`gemini-3.5`) still
+  route through `cursor-delegate`.
 
 ## Skills
 
