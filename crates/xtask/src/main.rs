@@ -1,14 +1,50 @@
 use anyhow::{Context, Result, bail};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 const SPEC: &str = "vendor/omnigent-0.3.0.dev0/openapi.json";
 const OUT: &str = "crates/lens-client/src/generated.rs";
+const SIBLING_DEFAULT: &str = "../omnigent/openapi.json";
+
+/// Published client path set, excluding runner-callback `/hooks/*` routes
+/// (`runner→server` callbacks `ap-web` never calls — not client API; ADR-0001).
+fn client_paths(doc: &serde_json::Value) -> BTreeSet<String> {
+    doc.get("paths")
+        .and_then(|p| p.as_object())
+        .map(|m| {
+            m.keys()
+                .filter(|p| !p.contains("/hooks/"))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[derive(Debug, Default)]
+struct SetDiff {
+    added: Vec<String>,   // in sibling, not vendored (upstream gained)
+    removed: Vec<String>, // in vendored, not sibling (upstream dropped)
+}
+
+impl SetDiff {
+    fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty()
+    }
+}
+
+fn diff_sets(vendored: &BTreeSet<String>, sibling: &BTreeSet<String>) -> SetDiff {
+    SetDiff {
+        added: sibling.difference(vendored).cloned().collect(),
+        removed: vendored.difference(sibling).cloned().collect(),
+    }
+}
 
 fn main() -> Result<()> {
     let cmd = std::env::args().nth(1).unwrap_or_default();
     match cmd.as_str() {
         "codegen" => codegen(),
-        other => bail!("unknown xtask command: {other:?} (expected: codegen)"),
+        "drift" => drift(std::env::args().skip(2)),
+        other => bail!("unknown xtask command: {other:?} (expected: codegen | drift)"),
     }
 }
 
@@ -91,4 +127,96 @@ vendor/omnigent-0.3.0.dev0/openapi.json — DO NOT EDIT BY HAND.\n\
 fn workspace_root() -> Result<PathBuf> {
     // xtask is invoked from the workspace root via `cargo run -p xtask`.
     Ok(std::env::current_dir()?)
+}
+
+/// Diff the vendored contract against the sibling omnigent pin — the ADR-0001
+/// "passive alarm." Path enumeration now; SSE taxonomy/shape in Task 2.
+fn drift(mut args: impl Iterator<Item = String>) -> Result<()> {
+    let mut against = PathBuf::from(SIBLING_DEFAULT);
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--against" => {
+                against = PathBuf::from(args.next().context("--against needs a path argument")?);
+            }
+            other => bail!("unknown drift arg: {other:?} (expected: --against <path>)"),
+        }
+    }
+
+    let root = workspace_root()?;
+    let vendored: serde_json::Value = read_json(&root.join(SPEC))?;
+    let sibling: serde_json::Value = read_json(&against)?;
+
+    let paths = diff_sets(&client_paths(&vendored), &client_paths(&sibling));
+
+    let mut drifted = false;
+    if !paths.is_empty() {
+        drifted = true;
+        eprintln!("PATH DRIFT (vendored {SPEC} vs {}):", against.display());
+        for p in &paths.added {
+            eprintln!("  + {p}  (upstream gained)");
+        }
+        for p in &paths.removed {
+            eprintln!("  - {p}  (upstream dropped)");
+        }
+    }
+
+    if drifted {
+        bail!("contract drift detected — re-vendor + re-run codegen, or update the pin");
+    }
+    println!(
+        "no drift: {} client paths match {}",
+        client_paths(&vendored).len(),
+        against.display()
+    );
+    Ok(())
+}
+
+fn read_json(path: &std::path::Path) -> Result<serde_json::Value> {
+    let raw = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn doc_with_paths(paths: &[&str]) -> serde_json::Value {
+        let mut map = serde_json::Map::new();
+        for p in paths {
+            map.insert((*p).to_string(), json!({}));
+        }
+        json!({ "paths": map })
+    }
+
+    #[test]
+    fn path_diff_ignores_hooks_and_reports_added_removed() {
+        let vendored = doc_with_paths(&[
+            "/v1/sessions",
+            "/v1/sessions/{session_id}/hooks/permission-request", // runner callback — ignored
+            "/v1/policies",
+        ]);
+        let sibling = doc_with_paths(&[
+            "/v1/sessions",
+            "/v1/sessions/{session_id}/hooks/permission-request",
+            "/v1/agents", // upstream gained
+                          // /v1/policies upstream dropped
+        ]);
+
+        let vp = client_paths(&vendored);
+        let sp = client_paths(&sibling);
+        assert!(
+            !vp.iter().any(|p| p.contains("/hooks/")),
+            "hooks must be filtered"
+        );
+
+        let diff = diff_sets(&vp, &sp);
+        assert_eq!(diff.added, vec!["/v1/agents".to_string()]);
+        assert_eq!(diff.removed, vec!["/v1/policies".to_string()]);
+        assert!(!diff.is_empty());
+
+        // Identical specs → no drift.
+        let same = diff_sets(&vp, &vp);
+        assert!(same.is_empty());
+    }
 }
