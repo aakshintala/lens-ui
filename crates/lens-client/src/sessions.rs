@@ -28,6 +28,16 @@ pub enum SessionStatus {
     Failed,
 }
 
+fn de_items<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Vec<crate::stream::Item>, D::Error> {
+    let raw: Vec<serde_json::Value> = Vec::deserialize(d)?;
+    Ok(raw
+        .into_iter()
+        .map(crate::stream::Item::from_value)
+        .collect())
+}
+
 /// A session snapshot (`GET /v1/sessions/{id}`). Mirrors the CORE fields of
 /// omnigent's `SessionResponse` (`schemas.py:1601-1642`); unmodeled fields are
 /// ignored. Fields are private — access is via the typed getters, so the wire
@@ -87,6 +97,17 @@ pub struct SessionSnapshot {
     //   (sessions.rs:309). Its non-string live shape would fail the whole
     //   snapshot deser, so it is left out (serde skips the unknown wire field).
     //   Model when a non-null shape is captured.
+    #[serde(default)]
+    usage_by_model: std::collections::BTreeMap<String, ModelUsage>,
+    #[serde(default)]
+    skills: Vec<SkillRef>,
+    #[serde(default, deserialize_with = "de_items")]
+    items: Vec<crate::stream::Item>,
+    // ⚠ DEFERRED (empty/null in the only capture — model when non-empty, Plan 3b-2b/
+    //   config-time): todos (TodoItem is not Deserialize; wire key `activeForm`),
+    //   pending_elicitations (likely objects, not id strings), model_options,
+    //   sandbox_status. Left out of the struct: serde skips unknown wire fields,
+    //   so the snapshot still parses with them present-but-empty.
 }
 
 impl SessionSnapshot {
@@ -169,6 +190,18 @@ impl SessionSnapshot {
     }
     pub fn sub_agent_name(&self) -> Option<&str> {
         self.sub_agent_name.as_deref()
+    }
+    pub fn usage_by_model(&self) -> &std::collections::BTreeMap<String, ModelUsage> {
+        &self.usage_by_model
+    }
+    pub fn skills(&self) -> &[SkillRef] {
+        &self.skills
+    }
+    /// The transcript items embedded in the snapshot — non-empty only when fetched
+    /// with `GetOpts { include_items: true }`. The standalone paginated read is
+    /// `Sessions::items()`.
+    pub fn items(&self) -> &[crate::stream::Item] {
+        &self.items
     }
 }
 
@@ -2042,5 +2075,23 @@ mod tests {
         assert!(s.total_cost_usd().unwrap() > 0.0);
         assert_eq!(s.llm_model(), None);
         assert_eq!(s.context_window(), None);
+    }
+
+    #[test]
+    fn snapshot_parses_bucket_b_collections_from_golden() {
+        let raw = include_str!("../tests/fixtures/sse/happy_path.snapshot.json");
+        let s: super::SessionSnapshot = serde_json::from_str(raw).expect("parse snapshot");
+        // usage_by_model: one model with token+cost detail.
+        let usage = s.usage_by_model();
+        assert!(usage.contains_key("claude-opus-4-8"));
+        assert!(usage["claude-opus-4-8"].total_tokens() > 0);
+        // skills: 20 attached, each with a name.
+        assert_eq!(s.skills().len(), 20);
+        assert!(s.skills().iter().all(|sk| !sk.name().is_empty()));
+        // embedded items: 11 (snapshot was captured with include_items).
+        assert_eq!(s.items().len(), 11);
+        assert!(!s.items()[0].id().is_empty());
+        // (todos/pending_elicitations/model_options are empty in this capture and
+        //  deferred — the snapshot still parses with them present-but-empty.)
     }
 }
