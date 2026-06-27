@@ -21,7 +21,16 @@ url = { version = "2", features = ["serde"] }
 regress = "0.10"
 
 [dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
 url = "2"
 
 [features]
+# Both gate the internal `stream::bench_api` wrappers (additive, independent —
+# neither implies the other, so a live-tests build never pulls in the bench harness).
+bench = []
 live-tests = []
+
+[[bench]]
+name = "sse_pipeline"
+harness = false
+required-features = ["bench"]

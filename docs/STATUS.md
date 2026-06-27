@@ -9,6 +9,24 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Open threads & next up
 
+- **lens-client benchmarks: DONE** (2026-06-27, composer-2.5 build + free codex
+  cross-family review → 4 Important + 1 Nit, all applied). Closes the MANDATORY
+  perf-doc gap. Two categories, split by gate-ability:
+  - **Category 1 — criterion micro-benches** (`benches/sse_pipeline.rs`, `bench`
+    feature, `bench_api` doc-hidden wrappers over the `pub(crate)` pipeline):
+    `sse_frame_parse`, `event_decode`, `normalize`, `full_pipeline` over the golden
+    SSE corpus. **Baseline (Apple Silicon, release):** full pipeline of a complete
+    happy-path session = **~23µs** (~333 MiB/s); event_decode ~8µs/~1 GiB/s;
+    normalize ~1µs/~7 GiB/s. The typing pass is ~0.3% of one 8.3ms frame — **I/O-bound
+    confirmed by number**. Run: `cargo bench -p lens-client --features bench`.
+  - **Category 2 — live overhead harness** (`tests/live_overhead.rs`, behind
+    `live-tests`, informational/not-gated): REST p50/p90, send-ack→first-frame,
+    inter-frame-gap-vs-parse ratio. Needs a live server + idle session.
+  - Baseline detail + bench gotchas in memory `lens-client-benchmarks`. Plan:
+    `docs/superpowers/plans/2026-06-27-lens-client-benchmarks.md`. **Follow-up:** grow
+    the golden corpus with longer sessions / a real Lens work pass (current ~22KB is
+    thin); benches load any corpus file via `include_bytes!`. WS + state/render benches
+    deferred to those paths. CI regression gate deferred (no CI yet).
 - **lens-client Foundation: DONE** (Plan 1 executed, 9 commits `043214e..f12050f`) —
   crate skeleton/error/ids/connection, typify codegen (`generated.rs`, 88 schemas,
   rustfmt-canonical via xtask), HTTP core + contract gate + ready-ladder handshake.
