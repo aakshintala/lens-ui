@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
 
 const SPEC: &str = "vendor/omnigent-0.3.0.dev0/openapi.json";
@@ -36,13 +36,12 @@ fn codegen() -> Result<()> {
         parsed.push((name.clone(), schema));
     }
 
-    if let Err(e) =
-        type_space.add_ref_types(parsed.iter().map(|(n, s)| (n.as_str(), s.clone())))
-    {
+    if let Err(e) = type_space.add_ref_types(parsed.iter().map(|(n, s)| (n.as_str(), s.clone()))) {
         let mut failures: Vec<(String, String)> = Vec::new();
         for (name, schema) in &parsed {
             let mut probe = typify::TypeSpace::new(&settings);
-            if let Err(err) = probe.add_ref_types(std::iter::once((name.as_str(), schema.clone()))) {
+            if let Err(err) = probe.add_ref_types(std::iter::once((name.as_str(), schema.clone())))
+            {
                 failures.push((name.clone(), err.to_string()));
             }
         }
