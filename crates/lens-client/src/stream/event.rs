@@ -65,6 +65,10 @@ pub enum SessionEvent {
         server_time: Option<String>,
     },
     ResourceCreated,
+    ResourceDeleted {
+        resource_id: String,
+        resource_type: String,
+    },
     InputConsumed {
         item_id: String,
         item_type: String,
@@ -202,6 +206,13 @@ struct RawHeartbeat {
     sequence_number: Option<i64>,
     #[serde(default)]
     server_time: Option<String>,
+}
+#[derive(Deserialize)]
+struct RawResourceDeleted {
+    resource_id: String,
+    resource_type: String,
+    #[serde(rename = "session_id")]
+    _session_id: String,
 }
 #[derive(Deserialize)]
 struct RawChangedFiles {
@@ -523,6 +534,7 @@ pub const MODELED_EVENT_TYPES: &[&str] = &[
     "session.presence",
     "session.reasoning_effort",
     "session.resource.created",
+    "session.resource.deleted",
     "session.sandbox_status",
     "session.skills",
     "session.status",
@@ -544,7 +556,6 @@ pub const DEFERRED_EVENT_TYPES: &[&str] = &[
     "response.queued",
     "response.retry",
     "session.collaboration_mode",
-    "session.resource.deleted",
     "turn.cancelled",
     "turn.completed",
     "turn.failed",
@@ -610,6 +621,13 @@ impl SessionEvent {
                 }
             }
             "session.resource.created" => SessionEvent::ResourceCreated,
+            "session.resource.deleted" => {
+                let r: RawResourceDeleted = serde_json::from_str(d).ok()?;
+                SessionEvent::ResourceDeleted {
+                    resource_id: r.resource_id,
+                    resource_type: r.resource_type,
+                }
+            }
             "session.input.consumed" => {
                 let r: RawInputConsumed = serde_json::from_str(d).ok()?;
                 SessionEvent::InputConsumed {
@@ -1503,6 +1521,22 @@ mod tests {
                 child_session_id: "conv_child".into(),
                 agent_id: "ag_b".into(),
                 parent_session_id: "conv_parent".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn bytes_session_resource_deleted() {
+        // Byte-verified: docs/spikes/captures/2026-06-26-live-recapture/agent-switched.sse
+        let ev = parse_event(&frame(
+            "session.resource.deleted",
+            r#"{"sequence_number":null,"type":"session.resource.deleted","resource_id":"terminal_tui_main","resource_type":"terminal","session_id":"conv_2a9"}"#,
+        ));
+        assert_eq!(
+            ev,
+            ServerStreamEvent::Session(SessionEvent::ResourceDeleted {
+                resource_id: "terminal_tui_main".into(),
+                resource_type: "terminal".into(),
             })
         );
     }
