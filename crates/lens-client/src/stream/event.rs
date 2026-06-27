@@ -464,15 +464,12 @@ impl MessageContentBlock {
     }
 }
 
-/// Every `ServerStreamEvent` wire discriminator the pinned `0.3.0.dev0` contract
-/// declares, each accounted for. `parse_event` (above) is the SSOT for which are
-/// *modeled*; the rest are knowingly routed to `Unknown` (deferred — absent from
-/// the golden captures). The `taxonomy_drift` test asserts this equals the
-/// vendored openapi `ServerStreamEvent` discriminator mapping, so a new upstream
-/// event type fails offline. Keep in sync with `parse_event` when modeling a
-/// deferred type (move its comment, not the entry).
-pub const ACCOUNTED_EVENT_TYPES: &[&str] = &[
-    // --- modeled by parse_event ---
+/// Wire `ServerStreamEvent` discriminators the crate MODELS — `parse_event`
+/// dispatches each to a typed `SessionEvent`/`ResponseEvent` variant. A modeled
+/// type arriving as `Unknown` (e.g. its payload shape drifted and dispatch
+/// degraded) is a contract problem the live taxonomy test must catch.
+/// `parse_event` (below) is the SSOT for this set.
+pub const MODELED_EVENT_TYPES: &[&str] = &[
     "response.cancelled",
     "response.compaction.completed",
     "response.compaction.failed",
@@ -506,7 +503,13 @@ pub const ACCOUNTED_EVENT_TYPES: &[&str] = &[
     "session.terminal_pending",
     "session.todos",
     "session.usage",
-    // --- deferred: routed to Unknown today (not in golden captures) ---
+];
+
+/// Wire discriminators the pinned contract declares but the crate knowingly
+/// routes to `Unknown` (deferred — absent from the golden captures). A deferred
+/// type arriving as `Unknown` is EXPECTED; only these may legitimately surface
+/// as `Unknown` on the live stream.
+pub const DEFERRED_EVENT_TYPES: &[&str] = &[
     "response.client_task.cancel",
     "response.created",
     "response.heartbeat",

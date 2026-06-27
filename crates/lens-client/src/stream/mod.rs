@@ -6,7 +6,7 @@ pub mod reader;
 pub(crate) mod sse;
 
 pub use event::{
-    ACCOUNTED_EVENT_TYPES, DisconnectReason, Item, MessageContentBlock, PresenceViewer,
-    ResponseEvent, ServerStreamEvent, SessionEvent, SessionStatusValue,
+    DEFERRED_EVENT_TYPES, DisconnectReason, Item, MODELED_EVENT_TYPES, MessageContentBlock,
+    PresenceViewer, ResponseEvent, ServerStreamEvent, SessionEvent, SessionStatusValue,
 };
 pub use reader::EventStream;

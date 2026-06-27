@@ -22,19 +22,29 @@ fn accounted_event_types_match_pinned_contract() {
         .cloned()
         .collect();
 
-    let accounted: BTreeSet<String> = lens_client::stream::ACCOUNTED_EVENT_TYPES
+    let modeled: BTreeSet<String> = lens_client::stream::MODELED_EVENT_TYPES
         .iter()
         .map(|s| s.to_string())
         .collect();
+    let deferred: BTreeSet<String> = lens_client::stream::DEFERRED_EVENT_TYPES
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let overlap: Vec<&String> = modeled.intersection(&deferred).collect();
+    assert!(
+        overlap.is_empty(),
+        "an event type is listed as both modeled and deferred: {overlap:?}"
+    );
+    let accounted: BTreeSet<String> = modeled.union(&deferred).cloned().collect();
 
     let unaccounted: Vec<&String> = contract.difference(&accounted).collect();
     let phantom: Vec<&String> = accounted.difference(&contract).collect();
     assert!(
         unaccounted.is_empty(),
-        "contract event types not accounted for (model them or add to ACCOUNTED_EVENT_TYPES): {unaccounted:?}"
+        "contract event types not accounted for (model them or add to DEFERRED_EVENT_TYPES): {unaccounted:?}"
     );
     assert!(
         phantom.is_empty(),
-        "ACCOUNTED_EVENT_TYPES lists types the contract no longer declares: {phantom:?}"
+        "MODELED/DEFERRED list types the contract no longer declares: {phantom:?}"
     );
 }

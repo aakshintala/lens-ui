@@ -7,7 +7,7 @@
 #![cfg(feature = "live-tests")]
 
 use lens_client::ids::{ConnectionId, SessionId};
-use lens_client::stream::{ACCOUNTED_EVENT_TYPES, ResponseEvent, ServerStreamEvent};
+use lens_client::stream::{DEFERRED_EVENT_TYPES, ResponseEvent, ServerStreamEvent};
 use lens_client::{Auth, Connection, SessionEventInput};
 
 #[test]
@@ -48,7 +48,10 @@ fn live_wire_types_are_declared_by_contract() {
                 break;
             }
             Some(ServerStreamEvent::Unknown { event_type }) => {
-                if !ACCOUNTED_EVENT_TYPES.contains(&event_type.as_str()) {
+                // Only knowingly-deferred types may legitimately surface as
+                // Unknown. A modeled type as Unknown means its payload drifted
+                // and dispatch degraded — real contract drift.
+                if !DEFERRED_EVENT_TYPES.contains(&event_type.as_str()) {
                     undeclared.push(event_type);
                 }
             }
@@ -59,6 +62,6 @@ fn live_wire_types_are_declared_by_contract() {
     assert!(saw_completed, "never observed response.completed");
     assert!(
         undeclared.is_empty(),
-        "wire event types absent from the pinned contract (re-vendor + model): {undeclared:?}"
+        "wire event types that are modeled-but-degraded or absent from the contract (model/re-vendor): {undeclared:?}"
     );
 }
