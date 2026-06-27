@@ -373,6 +373,10 @@ struct RawElicitationParams {
     policy_name: String,
     #[serde(default)]
     content_preview: String,
+    #[serde(default, rename = "requestedSchema")]
+    _requested_schema: serde_json::Value,
+    #[serde(default, rename = "target_session_id")]
+    _target_session_id: Option<String>,
 }
 #[derive(Deserialize)]
 struct RawElicitationRequest {
