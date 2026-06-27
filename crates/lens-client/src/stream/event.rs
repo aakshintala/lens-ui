@@ -20,7 +20,8 @@ pub enum ServerStreamEvent {
         gap: Option<u64>,
     },
     /// Crate-synthetic: bucket-B chrome restore (decision A2, typed-client §7).
-    /// Emitted after `Reconnected`, before replayed history. Boxed (large payload).
+    /// Emitted on reconnect (after `Reconnected`) and on first-open bootstrap
+    /// (without a preceding `Reconnected`), before replayed history. Boxed (large payload).
     SnapshotRestored(Box<crate::sessions::SessionSnapshot>),
     /// Crate-synthetic: terminal. Last event before the channel closes (§7 step 3).
     Disconnected {

@@ -184,6 +184,21 @@ and roll older "Recent" pointers off this page as they age.
 - **Doc walkthrough complete** (all 11 design docs in `docs/design/` reviewed);
   every surfaced decision is resolved or consciously deferred.
 - **Deferred, with a clean seam:**
+  - **lens-client review deferrals (Plan 4 triage, 2026-06-26):**
+    - **#5 event-surface recapture (capture spike)** — `session.agent_changed`,
+      `response.created`/`queued`, `turn.*` are `DEFERRED→Unknown` and ABSENT from the golden
+      corpus (claude-sdk emits none); a *live* agent switch currently surfaces as `Unknown`, which
+      the design (typed-client §3/§10) assumes the reducer consumes. Gated on a live server + a
+      harness that drives them; model from real bytes (decided), schema-model fallback if undrivable.
+      **Most consequential pre-consumer item** — folds in the `ChildSessionUpdated`/`Terminal*`/
+      poke-only chrome payload-loss family (all `SCHEMA-DERIVED, re-capture at config-time`).
+    - **Small hardening:** `info.databricks_features: Value` (one read-side `Value` leak — type or
+      make opaque); `ClientError::NotFound` false-friend rename + typed `Validation`/422 variant;
+      `gap==Some(0)` proof, `/items` pagination, gated live reconnect smoke (no server-kill harness).
+    - **Document for the reducer:** two status vocabularies (`SessionStatusValue` 6-val live vs
+      `SessionStatus` 3-val snapshot) + two usage representations must be normalized by the consumer.
+    - **WS terminal attach client (Plan 7)** — no `terminal.rs`/`tungstenite`; the workspace/terminal
+      half of the contract can't be built on the crate yet (known build-order deferral).
   - **Notifications v2** — server-side push for the *fully-quit* case (needs an
     upstream omnigent push channel; v1 covers resident/backgrounded, shell §17.4).
   - **Server-stability spike** (capability §0.8) — **trending PASS; the
@@ -206,6 +221,21 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Recent
 
+- **2026-06-26** — **Consolidated lens-client review + Plan 4 (pre-consumer hardening) executed &
+  complete.** After lens-client reached feature-complete (Plans 1–3c), ran a whole-crate review
+  (gpt-5.5 cross-family **+ Opus architecture synthesis**) before building a consumer on it. Findings
+  triaged into a hardening branch `feat/lens-client-hardening` (base `3dfadd9` off main `8a5a8b3` →
+  `8fe4dd5`), executed subagent-driven (composer-2.5 build + per-task gpt-5.5 cross-family + Opus
+  spot-check on the protocol task + one final whole-branch gpt-5.5 review). **5 tasks:** (1) fix
+  phantom `ReasoningClosed` after mid-reasoning reconnect (`reset_transient` clears the open reasoning
+  bracket too — real bug); (2) `connect_timeout` + per-request REST timeout (NOT on the SSE body) +
+  `get_bytes` panic-free; (3) bounded `sync_channel` backpressure; (4) `EventStream::stop()`
+  cooperative shutdown; (5) bootstrap emits `SnapshotRestored`+items like reconnect → reducer is the
+  single writer on first open too (`run` split into `bootstrap`+`read_loop`; typed-client §7
+  "Bootstrap" + app-arch §4.1 reconciled). Final review caught 1 scoped Important (stop()/bootstrap
+  composition → scoped fix, not a try_send rewrite) + 2 doc Minors. 126 lib tests, clippy/fmt clean,
+  `xtask drift` green (55 paths), `generated.rs` untouched, no `Value` to consumers. Ledger in
+  `.superpowers/sdd/progress.md`.
 - **2026-06-26** — **Plan 3c (contract-drift CI / B6) executed & complete — closes the Plan 3
   thread** (subagent-driven: composer-2.5 build + Opus per-task review + one consolidated gpt-5.5
   cross-family review; `087ef6f..8a7bb2e`, 5 tasks + 2 live-caught fixes + 1 review fix). Three

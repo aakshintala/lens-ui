@@ -494,7 +494,7 @@ is unit-testable with a scripted mock — no server. As-built specifics:
   `open_stream` is the *last* fallible call, so a retryable `/items` (or snapshot)
   failure re-loops the backoff **without** discarding an already-opened no-replay
   body. Markers are emitted only after all three succeed, in the load-bearing
-  order: `Reconnected { gap: None }` → `reset_seen_items` → `SnapshotRestored` →
+  order: `Reconnected { gap: None }` → `reset_transient` → `SnapshotRestored` →
   replayed `/items` history (each item as `OutputItemDone`, sent directly,
   bypassing the normalizer).
 - **Items replay is single-page, best-effort** (server default order). `has_more`
@@ -509,6 +509,29 @@ is unit-testable with a scripted mock — no server. As-built specifics:
   than an `expect`.
 - **Deferred:** `gap == Some(0)` contiguity proof; `/items` pagination/backfill;
   a gated live reconnect smoke test (no scripted server-kill harness this session).
+
+### Bootstrap (first open) — Plan 4
+
+First open of `Sessions::stream()` emits the **same post-open prelude as
+reconnect, minus the `Reconnecting`/`Reconnected` markers** (there is no gap on
+first connect): `SnapshotRestored(SessionSnapshot)` → replayed `GET /items`
+history (each as `OutputItemDone`), then the live tail. This makes the consumer's
+reducer the **single writer** for initial state too (app-arch §4.1) — the
+consumer no longer loads the opening snapshot/items through a second path that
+must stay byte-aligned with the reconnect fold.
+
+- The live body is already open before the prelude fetch (subscribe-first), so
+  events buffered between open and the snapshot/items read are processed after the
+  prelude; bucket-A items dedupe by `Item::id()`.
+- **Failure policy:** a *retryable* prelude-fetch failure (no `stop_reason`)
+  degrades to live-tail-only — no prelude emitted, no regression versus
+  pre-Plan-4 behavior. A *fatal* failure (`stop_reason`: 401/403/404) emits the
+  terminal `Disconnected { reason }` and stops. Bootstrap never emits
+  `Reconnecting`/`Reconnected`.
+- The synthetic `SnapshotRestored` and replayed items bypass normalization,
+  exactly as on reconnect (the markers-bypass seam, above). The reducer folds a
+  bootstrap `SnapshotRestored` with the *same* arm as reconnect — chrome
+  scalar/collection restore only, no transcript side-effects.
 
 ---
 
