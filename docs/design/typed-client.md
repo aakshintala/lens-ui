@@ -232,8 +232,12 @@ query param controls write access.
 - **No replay buffer** — live attach only. Reconnect loses scrollback;
   `workspace-and-terminals.md` decision §0.7-C pins the Lens-side ring buffer
   for reconnect scrollback.
-- Events `session.terminal.activity` and `session.terminal_pending` (0.2.0
-  net-new) drive the workspace drawer.
+- `session.terminal.activity` is delivered on the **SSE stream** (byte-verified
+  2026-06-26 — `docs/spikes/2026-06-26-live-event-recapture.md`), not via the WS
+  terminal attach; it signals which terminal is active so the workspace drawer can
+  highlight/focus without opening an attach. Live terminal **content** remains
+  WS-only (above). `session.terminal_pending` (0.2.0 net-new) also drives the
+  workspace drawer.
 
 The crate's WS client uses `tungstenite` (the same crate the recon's Arbor
 reference uses) wrapped in the same thread → channel → UI-poller bridge as the
@@ -478,6 +482,40 @@ events themselves replay from `GET /items`.
 The state model and every surface document that reasons about reconnect relies
 on it being authoritative here.
 
+### Event taxonomy — byte-verification & blocked families
+
+The crate partitions wire discriminators into `MODELED_EVENT_TYPES` and
+`DEFERRED_EVENT_TYPES` (`stream/event.rs`); the offline `taxonomy_drift` test
+asserts their disjoint union equals the pinned openapi mapping. Within modeled
+types, families are either **byte-verified** (captured on the wire) or
+**schema-derived** (openapi-shaped, not yet captured). Ground-truth corpus:
+`docs/spikes/2026-06-26-live-event-recapture.md` (15 `.sse` streams, 2026-06-26).
+
+**Byte-verified** (promoted or de-flagged per the live recapture spike):
+
+- `session.agent_changed`
+- `session.created` (child spawn)
+- `session.resource.deleted`
+- `session.child_session.updated` (now carries typed `child{}`)
+- `response.elicitation_request` (now carries typed `params`)
+- `response.reasoning_text.delta`
+- `session.model`, `session.reasoning_effort`, `session.todos`
+- `response.cancelled`, `session.interrupted`
+- `response.compaction.in_progress`
+- `session.terminal.activity` — **SSE**, not WS attach (terminal *content* remains
+  WS, §5)
+
+**Still blocked** (environment / harness — remain `DEFERRED` or schema-derived; a
+live `Unknown` or uncaptured shape is expected):
+
+| Family | Reason |
+|---|---|
+| `turn.*` | Codex-native / Codex app-server protocol only — needs a codex subscription |
+| `response.created` / `response.queued` | openai-agents / open-responses scaffold; runner defers `response.created` before the session stream |
+| `response.reasoning_summary_text.delta` | Codex `summaryTextDelta` only |
+| `response.compaction.completed` | Requires a configured `llm_model` (subscription auth here uses `llm_model: null`) |
+| `response.error` | Schema-derived — not captured on the wire in the recapture corpus |
+
 ### v1 as-built (Plan 3b-2b)
 
 The reconnect state machine lives in the SSE reader thread (`stream::reader`),
@@ -553,10 +591,11 @@ model. The following guarantees hold; nothing beyond them:
   `OutputTextDelta` or `Completed` arrives after a `ReasoningStarted`, carrying
   the accumulated `full_text` + `summary_text` so the renderer need not
   re-accumulate. The state model treats reasoning as a proper open/close bracket
-  without tracking implicit state. **NOT byte-verified**: claude-sdk (the only
-  harness on the capture box) folds reasoning into `output_text` and emits no
-  `reasoning_text.delta` frames, so the close *trigger* is byte-grounded but the
-  text accumulation is schema-derived — re-capture at config-time.
+  without tracking implicit state. `response.reasoning_text.delta` is
+  **byte-verified** (cursor SDK — `docs/spikes/2026-06-26-live-event-recapture.md`);
+  the `ReasoningClosed` event itself remains **synthetic** (no wire counterpart).
+  claude-sdk still folds reasoning into `output_text` and emits no reasoning
+  deltas — the close *trigger* on that harness path is inferred, not delta-driven.
 - **`Reconnected { gap }` precedes all replayed history items** — ordering
   guaranteed. The state model must clear transient accumulators *before*
   history lands (per §7).
