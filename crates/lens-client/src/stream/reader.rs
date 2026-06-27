@@ -86,8 +86,42 @@ fn stop_reason(e: &ClientError) -> Option<DisconnectReason> {
     }
 }
 
+/// First-open prelude: emit the same post-open sequence as reconnect, minus the
+/// Reconnecting/Reconnected markers (no gap on first connect), so the consumer's
+/// reducer is the single writer (app-arch §4.1). Returns `false` to abort `run`
+/// (consumer gone, or a fatal fetch error for which Disconnected was sent).
+/// Retryable fetch failure degrades to live-tail-only (no regression vs pre-Plan-4).
+fn bootstrap<Re: Reopen>(reopener: &Re, tx: &mpsc::SyncSender<ServerStreamEvent>) -> bool {
+    match reopener
+        .snapshot()
+        .and_then(|snap| reopener.items().map(|items| (snap, items)))
+    {
+        Ok((snap, items)) => {
+            if tx
+                .send(ServerStreamEvent::SnapshotRestored(Box::new(snap)))
+                .is_err()
+            {
+                return false;
+            }
+            for ev in items_to_replay(items) {
+                if tx.send(ev).is_err() {
+                    return false;
+                }
+            }
+            true
+        }
+        Err(e) => match stop_reason(&e) {
+            Some(r) => {
+                let _ = tx.send(ServerStreamEvent::Disconnected { reason: r });
+                false
+            }
+            None => true, // retryable: skip prelude, proceed to live tail
+        },
+    }
+}
+
 fn run<Re: Reopen>(
-    mut body: Box<dyn Read + Send>,
+    body: Box<dyn Read + Send>,
     tx: mpsc::SyncSender<ServerStreamEvent>,
     reopener: Re,
     sleep: impl Fn(Duration),
@@ -96,6 +130,19 @@ fn run<Re: Reopen>(
     if stop.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
+    if !bootstrap(&reopener, &tx) {
+        return;
+    }
+    read_loop(body, tx, reopener, sleep, stop);
+}
+
+fn read_loop<Re: Reopen>(
+    mut body: Box<dyn Read + Send>,
+    tx: mpsc::SyncSender<ServerStreamEvent>,
+    reopener: Re,
+    sleep: impl Fn(Duration),
+    stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
     let mut parser = SseParser::default();
     let mut normalizer = Normalizer::default();
     let mut buf = [0u8; 8192];
@@ -579,7 +626,7 @@ mod reconnect_tests {
         };
         let (tx, rx) = mpsc::sync_channel(EVENT_CHANNEL_BOUND);
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        run(
+        read_loop(
             Box::new(Cursor::new(body1)) as Box<dyn Read + Send>,
             tx,
             mock,
@@ -613,7 +660,7 @@ mod reconnect_tests {
         };
         let (tx, rx) = mpsc::sync_channel(EVENT_CHANNEL_BOUND);
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        run(
+        read_loop(
             Box::new(Cursor::new(Vec::<u8>::new())) as Box<dyn Read + Send>,
             tx,
             mock,
@@ -653,7 +700,7 @@ mod reconnect_tests {
         };
         let (tx, rx) = mpsc::sync_channel(EVENT_CHANNEL_BOUND);
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        run(
+        read_loop(
             Box::new(Cursor::new(Vec::<u8>::new())) as Box<dyn Read + Send>,
             tx,
             mock,
@@ -703,7 +750,7 @@ mod reconnect_tests {
         };
         let (tx, rx) = mpsc::sync_channel(EVENT_CHANNEL_BOUND);
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        run(
+        read_loop(
             Box::new(Cursor::new(Vec::<u8>::new())) as Box<dyn Read + Send>,
             tx,
             mock,
@@ -747,7 +794,7 @@ mod reconnect_tests {
         };
         let (tx, rx) = mpsc::sync_channel(EVENT_CHANNEL_BOUND);
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        run(
+        read_loop(
             Box::new(Cursor::new(Vec::<u8>::new())) as Box<dyn Read + Send>,
             tx,
             mock,
@@ -773,5 +820,38 @@ mod reconnect_tests {
                 reason: DisconnectReason::RetriesExhausted
             })
         ));
+    }
+
+    #[test]
+    fn first_open_emits_snapshot_then_items_before_live_tail() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        let reopener = MockReopen {
+            snapshot: happy_idle_snapshot(),
+            snapshot_auth_401: false,
+            items: Mutex::new(Some(happy_items())),
+            items_retry_503_first: false,
+            items_call_count: Mutex::new(0),
+            bodies: Mutex::new(vec![]),
+            open_stream_always_503: true,
+        };
+        let (tx, rx) = mpsc::sync_channel(EVENT_CHANNEL_BOUND);
+        let body: Box<dyn Read + Send> = Box::new(Cursor::new(Vec::<u8>::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        run(body, tx, reopener, |_d| {}, &stop);
+        let evs: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            matches!(evs[0], ServerStreamEvent::SnapshotRestored(_)),
+            "first: {:?}",
+            evs[0]
+        );
+        assert!(
+            matches!(
+                evs[1],
+                ServerStreamEvent::Response(ResponseEvent::OutputItemDone { .. })
+            ),
+            "second: {:?}",
+            evs[1]
+        );
     }
 }
