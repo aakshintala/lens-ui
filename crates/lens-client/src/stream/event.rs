@@ -113,8 +113,8 @@ pub enum SessionEvent {
     },
     Created {
         child_session_id: String,
-        agent_id: String,
-        parent_session_id: String,
+        agent_id: Option<String>,
+        parent_session_id: Option<String>,
     },
 }
 
@@ -154,30 +154,30 @@ pub enum ChildTaskStatus {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChildSession {
-    id: String,
-    title: String,
-    tool: String,
-    session_name: String,
-    busy: bool,
-    current_task_status: ChildTaskStatus,
+    id: Option<String>,
+    title: Option<String>,
+    tool: Option<String>,
+    session_name: Option<String>,
+    busy: Option<bool>,
+    current_task_status: Option<ChildTaskStatus>,
 }
 impl ChildSession {
-    pub fn id(&self) -> &str {
-        &self.id
+    pub fn id(&self) -> Option<&str> {
+        self.id.as_deref()
     }
-    pub fn title(&self) -> &str {
-        &self.title
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
     }
-    pub fn tool(&self) -> &str {
-        &self.tool
+    pub fn tool(&self) -> Option<&str> {
+        self.tool.as_deref()
     }
-    pub fn session_name(&self) -> &str {
-        &self.session_name
+    pub fn session_name(&self) -> Option<&str> {
+        self.session_name.as_deref()
     }
-    pub fn busy(&self) -> bool {
+    pub fn busy(&self) -> Option<bool> {
         self.busy
     }
-    pub fn current_task_status(&self) -> ChildTaskStatus {
+    pub fn current_task_status(&self) -> Option<ChildTaskStatus> {
         self.current_task_status
     }
 }
@@ -214,10 +214,10 @@ impl TodoItem {
 pub struct ElicitationParams {
     mode: String,
     message: String,
-    url: String,
-    phase: String,
-    policy_name: String,
-    content_preview: String,
+    url: Option<String>,
+    phase: Option<String>,
+    policy_name: Option<String>,
+    content_preview: Option<String>,
 }
 impl ElicitationParams {
     pub fn mode(&self) -> &str {
@@ -226,17 +226,17 @@ impl ElicitationParams {
     pub fn message(&self) -> &str {
         &self.message
     }
-    pub fn url(&self) -> &str {
-        &self.url
+    pub fn url(&self) -> Option<&str> {
+        self.url.as_deref()
     }
-    pub fn phase(&self) -> &str {
-        &self.phase
+    pub fn phase(&self) -> Option<&str> {
+        self.phase.as_deref()
     }
-    pub fn policy_name(&self) -> &str {
-        &self.policy_name
+    pub fn policy_name(&self) -> Option<&str> {
+        self.policy_name.as_deref()
     }
-    pub fn content_preview(&self) -> &str {
-        &self.content_preview
+    pub fn content_preview(&self) -> Option<&str> {
+        self.content_preview.as_deref()
     }
 }
 
@@ -355,19 +355,24 @@ struct RawStreamError {
     tool_name: Option<String>,
     error: RawStreamErrorDetail,
 }
+/// Contract default for `ElicitationRequestParams.mode` (generated.rs maps a
+/// missing `mode` to `Mode::Form`); keep our `String` model faithful on omission.
+fn default_elicitation_mode() -> String {
+    "form".to_string()
+}
 #[derive(Deserialize)]
 struct RawElicitationParams {
-    #[serde(default)]
+    #[serde(default = "default_elicitation_mode")]
     mode: String,
     message: String,
     #[serde(default)]
-    url: String,
+    url: Option<String>,
     #[serde(default)]
-    phase: String,
+    phase: Option<String>,
     #[serde(default)]
-    policy_name: String,
+    policy_name: Option<String>,
     #[serde(default)]
-    content_preview: String,
+    content_preview: Option<String>,
     #[serde(default, rename = "requestedSchema")]
     _requested_schema: serde_json::Value,
     #[serde(default, rename = "target_session_id")]
@@ -384,12 +389,18 @@ struct RawElicitationResolved {
 }
 #[derive(Deserialize)]
 struct RawChild {
-    id: String,
-    title: String,
-    tool: String,
-    session_name: String,
-    busy: bool,
-    current_task_status: ChildTaskStatus,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    tool: Option<String>,
+    #[serde(default)]
+    session_name: Option<String>,
+    #[serde(default)]
+    busy: Option<bool>,
+    #[serde(default)]
+    current_task_status: Option<ChildTaskStatus>,
 }
 #[derive(Deserialize)]
 struct RawChildSessionUpdated {
@@ -459,8 +470,10 @@ struct RawAgentChanged {
 #[derive(Deserialize)]
 struct RawSessionCreated {
     child_session_id: String,
-    agent_id: String,
-    parent_session_id: String,
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    parent_session_id: Option<String>,
     #[serde(rename = "conversation_id")]
     _conversation_id: String,
 }
@@ -1434,12 +1447,39 @@ mod tests {
             panic!("expected ElicitationRequest, got {ev:?}");
         };
         assert_eq!(elicitation_id, "elicit_17f");
-        assert_eq!(params.policy_name(), "approve_file_ops");
-        assert_eq!(params.phase(), "tool_call");
+        assert_eq!(params.policy_name(), Some("approve_file_ops"));
+        assert_eq!(params.phase(), Some("tool_call"));
         assert_eq!(params.mode(), "url");
         assert!(params.message().contains("Approve?"));
-        assert!(params.content_preview().contains("spike_elicit.txt"));
-        assert_eq!(params.url(), "/approve/conv_78/elicit_17f");
+        assert!(
+            params
+                .content_preview()
+                .is_some_and(|s| s.contains("spike_elicit.txt"))
+        );
+        assert_eq!(params.url(), Some("/approve/conv_78/elicit_17f"));
+    }
+
+    #[test]
+    fn elicitation_request_nullable_params_stay_typed() {
+        let ev = parse_event(&frame(
+            "response.elicitation_request",
+            r#"{"elicitation_id":"elicit_sparse","params":{"message":"approve?","url":null,"phase":null,"policy_name":null,"content_preview":null}}"#,
+        ));
+        assert_eq!(
+            ev,
+            ServerStreamEvent::Response(ResponseEvent::ElicitationRequest {
+                elicitation_id: "elicit_sparse".into(),
+                params: ElicitationParams {
+                    // `mode` omitted on the wire → contract default "form".
+                    mode: "form".into(),
+                    message: "approve?".into(),
+                    url: None,
+                    phase: None,
+                    policy_name: None,
+                    content_preview: None,
+                },
+            })
+        );
     }
 
     #[test]
@@ -1472,12 +1512,39 @@ mod tests {
             panic!("expected ChildSessionUpdated, got {ev:?}");
         };
         assert_eq!(child_session_id, "conv_child");
-        assert_eq!(child.id(), "conv_child");
-        assert_eq!(child.title(), "claude_code:spike-hello-file");
-        assert_eq!(child.tool(), "claude_code");
-        assert_eq!(child.session_name(), "spike-hello-file");
-        assert!(!child.busy());
-        assert_eq!(child.current_task_status(), ChildTaskStatus::Launching);
+        assert_eq!(child.id(), Some("conv_child"));
+        assert_eq!(child.title(), Some("claude_code:spike-hello-file"));
+        assert_eq!(child.tool(), Some("claude_code"));
+        assert_eq!(child.session_name(), Some("spike-hello-file"));
+        assert_eq!(child.busy(), Some(false));
+        assert_eq!(
+            child.current_task_status(),
+            Some(ChildTaskStatus::Launching)
+        );
+    }
+
+    #[test]
+    fn sparse_child_session_delta_stays_typed() {
+        // Mixes MISSING fields (tool, session_name) with explicit `null`
+        // (title, busy) — both must deserialize to `None`, not drop to Unknown.
+        let ev = parse_event(&frame(
+            "session.child_session.updated",
+            r#"{"conversation_id":"conv_parent","child_session_id":"conv_child","child":{"id":"conv_child","title":null,"busy":null,"current_task_status":"in_progress"}}"#,
+        ));
+        assert_eq!(
+            ev,
+            ServerStreamEvent::Session(SessionEvent::ChildSessionUpdated {
+                child_session_id: "conv_child".into(),
+                child: ChildSession {
+                    id: Some("conv_child".into()),
+                    title: None,
+                    tool: None,
+                    session_name: None,
+                    busy: None,
+                    current_task_status: Some(ChildTaskStatus::InProgress),
+                },
+            })
+        );
     }
 
     #[test]
@@ -1490,7 +1557,7 @@ mod tests {
         let ServerStreamEvent::Session(SessionEvent::ChildSessionUpdated { child, .. }) = ev else {
             panic!("expected ChildSessionUpdated");
         };
-        assert_eq!(child.current_task_status(), ChildTaskStatus::Unknown);
+        assert_eq!(child.current_task_status(), Some(ChildTaskStatus::Unknown));
     }
 
     #[test]
@@ -1633,8 +1700,24 @@ mod tests {
             ev,
             ServerStreamEvent::Session(SessionEvent::Created {
                 child_session_id: "conv_child".into(),
-                agent_id: "ag_b".into(),
-                parent_session_id: "conv_parent".into(),
+                agent_id: Some("ag_b".into()),
+                parent_session_id: Some("conv_parent".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn session_created_nullable_ids_stay_typed() {
+        let ev = parse_event(&frame(
+            "session.created",
+            r#"{"conversation_id":"conv_parent","child_session_id":"conv_child","agent_id":null,"parent_session_id":null}"#,
+        ));
+        assert_eq!(
+            ev,
+            ServerStreamEvent::Session(SessionEvent::Created {
+                child_session_id: "conv_child".into(),
+                agent_id: None,
+                parent_session_id: None,
             })
         );
     }
