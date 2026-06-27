@@ -126,10 +126,32 @@ and roll older "Recent" pointers off this page as they age.
        `Sessions::stream` → docs). The `Reopen` trait makes the state machine unit-testable with a
        scripted mock (no server). Four plan-level decisions flagged for review + §7 reconciliation:
        `Disconnected{reason}` payload, `gap:None` v1 (no `Some(0)` proof), frame-level seq-dedup,
-       single-page items replay. **Next: EXECUTE 3b-2b** (subagent-driven recommended — composer-2.5
-       build + mandatory cross-family review at the temporal seams; `[[review-spend-policy]]`).
-  3. **Stand up contract-drift CI** (outstanding B6) — the passive alarm that makes tracking
-     dev0 safe when `0.3.0` eventually tags.
+       single-page items replay.
+     - **Plan 3b-2b EXECUTED & COMPLETE** (2026-06-26, subagent-driven: composer-2.5 build + Opus
+       per-task review + one consolidated gpt-5.5 cross-family review; commits `3d4048b..6d4dde3`,
+       6 code tasks + 1 review fix wave + xtask fmt housekeeping + docs;
+       [`plan`](./superpowers/plans/2026-06-26-lens-client-plan3b2b-reconnect-state-machine.md),
+       [`handoff`](./handoffs/2026-06-26-lens-client-plan3b2b-execution.md)). The §7 no-replay
+       reconnect state machine lives in `stream::reader`, generic over a `Reopen` capability
+       (unit-testable with a scripted mock — no server). On a drop it backs off
+       (`[100,200,400,800,1600,3000,3000]`ms), re-reads snapshot + `/items`, re-opens the live
+       stream, and emits the synthetic lifecycle on the existing channel:
+       `Reconnecting{attempt}` → `Reconnected{gap}` → `SnapshotRestored(SessionSnapshot)` →
+       replayed `OutputItemDone` history → seq-deduped live tail; terminal `Disconnected{reason}`
+       on give-up/stop. 119 lib tests (4 order-asserting reconnect tests + the 2 updated §7a tests
+       + 1 review-regression test), clippy `--all-targets`/fmt clean, `generated.rs` untouched, no
+       `Value` to consumers. **Cross-family review (gpt-5.5) caught 1 Critical** the author + green
+       tests missed: `reconnect` opened the new body *before* fetching `/items`, so a retryable
+       `/items` error dropped the already-opened no-replay body → fixed by making `open_stream` the
+       last fallible call (`snapshot → items → open_stream`). Two user-decided review fixes:
+       failed-status path emits `SnapshotRestored → Disconnected{SessionFailed}` (no `Reconnected`);
+       `EventStream::spawn` returns `Result` (`ClientError::ThreadSpawn`, no panic). §7 reconciled
+       with the 4 plan decisions + as-built (`gap:None` v1, frame-level seq-peek, single-page items,
+       `DisconnectReason` table). **Deferred (flagged):** `gap==Some(0)` proof; `/items` pagination;
+       gated live reconnect smoke test (no server-kill harness this session). ⚠ `live_stream` NOT
+       run (no server) — unit coverage only.
+  3. **Stand up contract-drift CI** (outstanding B6, **NEXT**) — the passive alarm that makes
+     tracking dev0 safe when `0.3.0` eventually tags. Plan 3c.
   - Plan 3b-2b is temporal/stateful (reconnect state machine), so **cross-family review stays
     mandatory** at the seams (`[[composer-delegation-profile]]`) — it caught the envelope bug in 3b-2a
     that author + green test both missed. (The earlier "composer is weak on temporal logic" claim was
@@ -160,6 +182,15 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Recent
 
+- **2026-06-26** — **Plan 3b-2b (§7 no-replay reconnect state machine) executed & complete**
+  (subagent-driven: composer-2.5 build + Opus per-task review + one consolidated gpt-5.5
+  cross-family review; `3d4048b..6d4dde3`, 6 code tasks + fix wave + xtask fmt + docs). Reconnect
+  lives in `stream::reader`, generic over a `Reopen` mock-able capability: backoff → snapshot →
+  `/items` → re-open → synthetic lifecycle (`Reconnecting`/`Reconnected{gap:None}`/`SnapshotRestored`/
+  `Disconnected{reason}`) + seq-deduped live tail. 119 lib tests, clippy/fmt clean. Cross-family
+  review caught 1 Critical (opened body dropped on `/items` retry → reordered so `open_stream` is
+  last fallible). §7 reconciled. ⚠ live reconnect smoke deferred (no server-kill harness). Next:
+  Plan 3c contract-drift CI.
 - **2026-06-26** — **Plan 3b-1 (§7a SSE normalization) executed & complete**
   (subagent-driven: composer-2.5 + per-task cross-family gpt-5.5; `2f9a46e..3b39412`,
   4 tasks + fix wave). `Normalizer` in the reader thread: `OutputItemDone` literal-re-fire

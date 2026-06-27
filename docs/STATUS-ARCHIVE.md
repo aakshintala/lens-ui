@@ -57,3 +57,66 @@ infinite canvas), kept the real reference apps (Arbor/Paneflow/gpui-flow) + Poll
 fixed editing-artifact typos.
 
 **Docs touched:** all 11 in `docs/design/` + README.
+
+---
+
+### 2026-06-26 — Plan 3b-2b: §7 no-replay reconnect state machine (executed & complete)
+
+**What.** Made the SSE reader thread reconnect-safe end-to-end inside the crate.
+On a transport drop / clean EOF it backs off, re-reads the session snapshot +
+`/items`, re-opens the live stream, and emits synthetic lifecycle markers on the
+existing mpsc channel so the consumer stays purely event-driven and never sees
+raw reconnect mechanics.
+
+**Execution.** Subagent-driven, same session: `cursor-delegate`/composer-2.5 build
+per task (red→green→commit), Opus controller per-task review, one consolidated
+gpt-5.5 cross-family review at the end (`[[review-spend-policy]]`). Commits
+`3d4048b..6d4dde3` — 6 code tasks + 1 review fix wave + an xtask fmt-housekeeping
+commit (`b838a66`, pre-existing drift unblocking the workspace `cargo fmt --check`
+gate) + docs. 119 lib tests, clippy `--all-targets`/fmt clean, `generated.rs`
+untouched, no `Value` to consumers.
+
+**Shipped.**
+- T1: 4 synthetic `ServerStreamEvent` variants (`Reconnecting{attempt}`,
+  `Reconnected{gap:Option<u64>}`, `SnapshotRestored(Box<SessionSnapshot>)`,
+  `Disconnected{reason}`) + `DisconnectReason` (5 variants); `PartialEq` on
+  `SessionSnapshot`/`ModelUsage`/`SkillRef`.
+- T2: `Normalizer::reset_seen_items` (dedup-reset seam for history replay).
+- T3: `SseFrame::sequence_number()` raw-JSON peek (`Option<u64>`).
+- T4: `reconnect` module — `Reopen` trait + `HttpReopener` + `BACKOFF_MS`
+  `[100,200,400,800,1600,3000,3000]` + `items_to_replay`; `ItemList::into_items`;
+  `GetOpts`/`ItemsPage` `to_query` → `pub(crate)`.
+- T5: the state machine in `stream::reader` — generic `run<Re:Reopen>` + injected
+  `sleep`; `stop_reason` (401→Unauthorized, 403→Forbidden, 404→NotFound); clean-EOF
+  flush vs transport-drop no-flush; overlap seq-dedup window; 4 order-asserting
+  reconnect tests + 2 updated §7a tests.
+- T6: `Sessions::stream` builds the real `HttpReopener` (StubReopener bridge deleted).
+- T7: §7 reconciled (this) — `DisconnectReason` table, `gap:None` v1, frame-seq
+  peek, single-page items, `items→open_stream` ordering, fallible spawn.
+
+**Cross-family review (gpt-5.5) — 1 Critical, 3 Important, 1 Minor, all valid:**
+- **CRITICAL:** `reconnect` opened the new body *before* fetching `/items`, then
+  `continue`d the backoff on a retryable `/items` error — dropping the already-opened
+  no-replay body (lost live frames). The author + green tests both missed it.
+  Fixed: `snapshot → items → open_stream` (open_stream last fallible); markers
+  emitted only after all three succeed; + a regression test
+  (`retryable_items_failure_does_not_drop_the_reopened_body`).
+- **IMPORTANT (user-decided):** failed-status path emitted `Reconnected` then
+  `Disconnected{SessionFailed}` (contradictory; plan pseudocode had mandated it) →
+  now emits `SnapshotRestored → Disconnected{SessionFailed}` only. And the
+  pre-existing (Plan 3a) `spawn` `.expect` panic → `EventStream::spawn` now returns
+  `Result` via new `ClientError::ThreadSpawn`.
+- **MINOR:** removed unused `_last_seen_seq` param.
+- Re-review done by Opus controller (fix == reviewer's prescribed remedy + regression
+  test); 2nd paid cross-family pass forgone per budget policy.
+
+**Deferred (flagged, safe fallbacks):** `gap==Some(0)` contiguity proof (v1 always
+`None`); `/items` pagination/backfill (reducer merges by id); gated live reconnect
+smoke test (no scripted server-kill harness this session). ⚠ `live_stream` NOT run
+(no server) — unit coverage only.
+
+**Minor rollup (final-triage, deferred):** reconnect.rs test-module redundant
+re-imports (clippy-clean); `MockReopen` redundant `open_stream_always_503` branch;
+`happy_idle_snapshot()` duplicated across the two reader test modules. None ship-blocking.
+
+**Next:** Plan 3c — contract-drift CI (outstanding B6).

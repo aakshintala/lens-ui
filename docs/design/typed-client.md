@@ -314,11 +314,13 @@ SSE is no-replay. Correct reconnect:
    disconnect — not gated on this phase completing. Total wall-clock before
    giving up: ~7s.
 3. **Give up** — if the retry phase expires, the crate emits a terminal
-   `ServerStreamEvent::Disconnected` (the last event before the channel closes;
-   `recv()` returns `None` after) and stops. Because reconnect runs *after* the
-   stream is open, give-up cannot be a synchronous `Result` — it is a stream
-   value, **not** a `ClientError` variant. A user-initiated retry reopens via
-   `Sessions::stream()`, restarting from step 2.
+   `ServerStreamEvent::Disconnected { reason: DisconnectReason }` (the last event
+   before the channel closes; `recv()` returns `None` after) and stops. Because
+   reconnect runs *after* the stream is open, give-up cannot be a synchronous
+   `Result` — it is a stream value, **not** a `ClientError` variant. The typed
+   `reason` (see the stop-immediately table) tells the app whether to re-auth,
+   remove the session, surface a failure, or offer a manual retry. A
+   user-initiated retry reopens via `Sessions::stream()`, restarting from step 2.
 4. **On success — snapshot (bucket B: chrome)** — `GET /v1/sessions/{id}` (with
    `include_items=true, include_liveness=true`) confirms the session exists and
    **restores all session chrome** (status, usage, model, todos, model_options,
@@ -358,12 +360,27 @@ live event. `sequence_number` is a live-stream dedup key only — never an item 
 
 ### Stop-immediately conditions (no retry)
 
-| Error | Meaning | App action |
-|---|---|---|
-| 401 | Auth invalid or expired | The connection-auth model prompts re-auth |
-| 403 | Lost permission to session | Show access-denied, remove session |
-| 404 | Session deleted | Remove session from UI |
-| `session.status = "failed"` in snapshot | Server-side terminal failure | Surface error, no retry |
+Each maps to a `DisconnectReason` carried by the terminal `Disconnected { reason }`:
+
+| Error | `DisconnectReason` | Meaning | App action |
+|---|---|---|---|
+| 401 | `Unauthorized` | Auth invalid or expired | The connection-auth model prompts re-auth |
+| 403 | `Forbidden` | Lost permission to session | Show access-denied, remove session |
+| 404 | `NotFound` | Session deleted | Remove session from UI |
+| `session.status = "failed"` in snapshot | `SessionFailed` | Server-side terminal failure | Surface error, no retry |
+| backoff window elapsed | `RetriesExhausted` | Transient drop never recovered | Offer a manual retry (re-`stream()`) |
+
+`DisconnectReason` is a stream value, not a `ClientError`. The crate's
+`stop_reason` maps HTTP status off the snapshot/open-stream call: **401/403 →
+`Unauthorized`/`Forbidden`** (encoded as `ClientError::Auth`), **404 →
+`NotFound`** (encoded as `ClientError::Server { status: 404 }`); every other
+error (network/5xx/parse) is **retryable** and keeps backing off.
+
+**`SessionFailed` is terminal, not a resume.** When the reconnect snapshot
+reports `status == failed`, the crate emits `SnapshotRestored(snapshot)` (so the
+UI gets the terminal failure state) immediately followed by
+`Disconnected { reason: SessionFailed }` — it does **not** emit `Reconnected`
+(no live tail resumes), and it does not reset the normalizer.
 
 ### `Reconnected { gap: Option<u64> }`
 
@@ -374,6 +391,15 @@ live event. `sequence_number` is a live-stream dedup key only — never an item 
   before processing replayed history. Mid-stream text that was never persisted
   is gone; no recovery is possible. The transcript surface shows a visual break
   (`↻ reconnected`) so the jump is legible.
+
+**v1 (Plan 3b-2b) emits `gap: None` unconditionally.** The snapshot carries no
+`sequence_number`, so contiguity cannot be proven from it; rather than synthesize
+a fragile heuristic, v1 always emits `None` (the always-safe path — it only clears
+transient accumulators the drop likely lost anyway). The `Some(0)` clean-overlap
+proof is deliberately deferred: `resume_floor = last_seen_seq` is still tracked and
+used to **drop the duplicate live overlap** (frames whose `sequence_number ≤ floor`
+after re-open), but it is never promoted to `gap = Some(0)`. `Some(N > 0)` is never
+synthesized (folded into `None`).
 
 ### The SSE stream vs. the items DB
 
@@ -451,6 +477,38 @@ events themselves replay from `GET /items`.
 **Adding a new event type requires updating this classification in lockstep.**
 The state model and every surface document that reasons about reconnect relies
 on it being authoritative here.
+
+### v1 as-built (Plan 3b-2b)
+
+The reconnect state machine lives in the SSE reader thread (`stream::reader`),
+generic over a `Reopen` capability (`snapshot` / `items` / `open_stream`) so it
+is unit-testable with a scripted mock — no server. As-built specifics:
+
+- **Backoff schedule:** `[100, 200, 400, 800, 1600, 3000, 3000]` ms (7 attempts,
+  ~9s worst case). Each attempt emits `Reconnecting { attempt }` (1-based).
+- **`sequence_number` is peeked off the raw `SseFrame` JSON**, not the typed
+  event (typed events strip it; only `Heartbeat` exposes it). The peek is `None`
+  for persisted items, lifecycle frames, and malformed data — those are never
+  dropped by the overlap filter.
+- **Fetch order on a successful attempt is `snapshot → items → open_stream`** —
+  `open_stream` is the *last* fallible call, so a retryable `/items` (or snapshot)
+  failure re-loops the backoff **without** discarding an already-opened no-replay
+  body. Markers are emitted only after all three succeed, in the load-bearing
+  order: `Reconnected { gap: None }` → `reset_seen_items` → `SnapshotRestored` →
+  replayed `/items` history (each item as `OutputItemDone`, sent directly,
+  bypassing the normalizer).
+- **Items replay is single-page, best-effort** (server default order). `has_more`
+  truncation is not paginated in v1; the reducer merges by `Item::id()`, so a
+  later live event or subsequent reconnect fills any gap. Flagged for follow-up if
+  captures show truncation in practice.
+- **Clean EOF (`Ok(0)`) flushes the synthetic `ReasoningClosed` bracket before
+  reconnecting; a transport error (`Err`) does not** (the bracket did not end, the
+  connection did — §7a invariant).
+- **No panic on the data path.** `Sessions::stream` / `EventStream::spawn` return
+  `Result`; a thread-spawn failure surfaces as `ClientError::ThreadSpawn` rather
+  than an `expect`.
+- **Deferred:** `gap == Some(0)` contiguity proof; `/items` pagination/backfill;
+  a gated live reconnect smoke test (no scripted server-kill harness this session).
 
 ---
 
