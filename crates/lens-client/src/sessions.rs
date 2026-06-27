@@ -1394,7 +1394,7 @@ impl<'a> Sessions<'a> {
             Ok(()) => {
                 // TODO(3b-2b follow-up): gated live reconnect smoke test (Task 6 step 3)
                 let reopener = crate::reconnect::HttpReopener::new(self.client, id.clone());
-                Ok(crate::stream::EventStream::spawn(resp, reopener))
+                crate::stream::EventStream::spawn(resp, reopener)
             }
             Err(e) => Err(e),
         }

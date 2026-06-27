@@ -27,6 +27,9 @@ pub enum ClientError {
 
     #[error("parse error: {0}")]
     Parse(#[from] serde_json::Error),
+
+    #[error("reader thread spawn failed: {0}")]
+    ThreadSpawn(String),
 }
 
 #[cfg(test)]

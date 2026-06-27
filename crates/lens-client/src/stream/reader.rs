@@ -26,7 +26,7 @@ impl EventStream {
     pub(crate) fn spawn<Re: Reopen + 'static>(
         resp: reqwest::blocking::Response,
         reopener: Re,
-    ) -> Self {
+    ) -> crate::error::Result<Self> {
         let (tx, rx) = mpsc::channel();
         let handle = std::thread::Builder::new()
             .name("lens-sse-reader".into())
@@ -35,11 +35,11 @@ impl EventStream {
                     std::thread::sleep(d)
                 })
             })
-            .expect("spawn SSE reader thread");
-        EventStream {
+            .map_err(|e| crate::error::ClientError::ThreadSpawn(e.to_string()))?;
+        Ok(EventStream {
             rx,
             _handle: handle,
-        }
+        })
     }
 
     /// Block until the next event, or `None` when the stream closes.
@@ -92,7 +92,7 @@ fn run<Re: Reopen>(
                         return;
                     }
                 }
-                match reconnect(&reopener, &sleep, &tx, &mut normalizer, last_seen_seq) {
+                match reconnect(&reopener, &sleep, &tx, &mut normalizer) {
                     Some(nb) => {
                         body = nb;
                         parser = SseParser::default();
@@ -125,7 +125,7 @@ fn run<Re: Reopen>(
                 }
             }
             // TRANSPORT DROP: do NOT flush (the bracket did not end, the connection did — §7a).
-            Err(_) => match reconnect(&reopener, &sleep, &tx, &mut normalizer, last_seen_seq) {
+            Err(_) => match reconnect(&reopener, &sleep, &tx, &mut normalizer) {
                 Some(nb) => {
                     body = nb;
                     parser = SseParser::default();
@@ -142,7 +142,6 @@ fn reconnect<Re: Reopen>(
     sleep: &impl Fn(Duration),
     tx: &mpsc::Sender<ServerStreamEvent>,
     normalizer: &mut Normalizer,
-    _last_seen_seq: Option<u64>,
 ) -> Option<Box<dyn Read + Send>> {
     for (i, &delay) in BACKOFF_MS.iter().enumerate() {
         if tx
@@ -165,16 +164,18 @@ fn reconnect<Re: Reopen>(
             }
         };
         if snap.status() == SessionStatus::Failed {
-            let _ = tx.send(ServerStreamEvent::Reconnected { gap: None });
-            normalizer.reset_seen_items();
+            // Terminal: no live tail resumes, so we do NOT emit `Reconnected`. Deliver
+            // the terminal snapshot (it carries the failure state) then Disconnect.
             let _ = tx.send(ServerStreamEvent::SnapshotRestored(Box::new(snap)));
             let _ = tx.send(ServerStreamEvent::Disconnected {
                 reason: DisconnectReason::SessionFailed,
             });
             return None;
         }
-        let new_body = match reopener.open_stream() {
-            Ok(b) => b,
+        // Fetch durable history BEFORE opening the live body: a retryable `/items`
+        // failure must never discard an already-opened no-replay stream.
+        let list = match reopener.items() {
+            Ok(l) => l,
             Err(e) => {
                 if let Some(r) = stop_reason(&e) {
                     let _ = tx.send(ServerStreamEvent::Disconnected { reason: r });
@@ -183,8 +184,10 @@ fn reconnect<Re: Reopen>(
                 continue;
             }
         };
-        let list = match reopener.items() {
-            Ok(l) => l,
+        // open_stream is the LAST fallible call: if it fails retryably, no body was
+        // opened, so `continue` drops nothing.
+        let new_body = match reopener.open_stream() {
+            Ok(b) => b,
             Err(e) => {
                 if let Some(r) = stop_reason(&e) {
                     let _ = tx.send(ServerStreamEvent::Disconnected { reason: r });
@@ -409,6 +412,8 @@ mod reconnect_tests {
         snapshot: SessionSnapshot,
         snapshot_auth_401: bool,
         items: Mutex<Option<ItemList>>,
+        items_retry_503_first: bool,
+        items_call_count: Mutex<u32>,
         bodies: Mutex<Vec<Vec<u8>>>,
         open_stream_always_503: bool,
     }
@@ -440,6 +445,16 @@ mod reconnect_tests {
         }
 
         fn items(&self) -> crate::error::Result<ItemList> {
+            if self.items_retry_503_first {
+                let mut count = self.items_call_count.lock().unwrap();
+                *count += 1;
+                if *count == 1 {
+                    return Err(ClientError::Server {
+                        status: 503,
+                        body: serde_json::json!({}),
+                    });
+                }
+            }
             match self.items.lock().unwrap().take() {
                 Some(list) => Ok(list),
                 None => Err(ClientError::Server {
@@ -498,6 +513,8 @@ mod reconnect_tests {
             snapshot: happy_idle_snapshot(),
             snapshot_auth_401: false,
             items: Mutex::new(Some(happy_items())),
+            items_retry_503_first: false,
+            items_call_count: Mutex::new(0),
             bodies: Mutex::new(vec![body2]),
             open_stream_always_503: false,
         };
@@ -528,6 +545,8 @@ mod reconnect_tests {
             snapshot: happy_idle_snapshot(),
             snapshot_auth_401: true,
             items: Mutex::new(None),
+            items_retry_503_first: false,
+            items_call_count: Mutex::new(0),
             bodies: Mutex::new(vec![]),
             open_stream_always_503: false,
         };
@@ -564,6 +583,8 @@ mod reconnect_tests {
             snapshot: failed_snapshot(),
             snapshot_auth_401: false,
             items: Mutex::new(None),
+            items_retry_503_first: false,
+            items_call_count: Mutex::new(0),
             bodies: Mutex::new(vec![]),
             open_stream_always_503: false,
         };
@@ -576,7 +597,6 @@ mod reconnect_tests {
         );
         let events: Vec<_> = rx.iter().collect();
 
-        let rec = idx_reconnected(&events).expect("Reconnected");
         let snap = idx_snapshot_restored(&events).expect("SnapshotRestored");
         let disc = events
             .iter()
@@ -590,8 +610,12 @@ mod reconnect_tests {
             })
             .expect("Disconnected SessionFailed");
 
-        assert!(rec < snap);
         assert!(snap < disc);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ServerStreamEvent::Reconnected { .. }))
+        );
         assert!(!events.iter().any(|e| {
             matches!(
                 e,
@@ -601,11 +625,56 @@ mod reconnect_tests {
     }
 
     #[test]
+    fn retryable_items_failure_does_not_drop_the_reopened_body() {
+        let reopen_body = output_text_delta_frame(99, "live after items retry");
+        let mock = MockReopen {
+            snapshot: happy_idle_snapshot(),
+            snapshot_auth_401: false,
+            items: Mutex::new(Some(happy_items())),
+            items_retry_503_first: true,
+            items_call_count: Mutex::new(0),
+            bodies: Mutex::new(vec![reopen_body]),
+            open_stream_always_503: false,
+        };
+        let (tx, rx) = mpsc::channel();
+        run(
+            Box::new(Cursor::new(Vec::<u8>::new())) as Box<dyn Read + Send>,
+            tx,
+            mock,
+            |_| {},
+        );
+        let events: Vec<_> = rx.iter().collect();
+
+        assert!(idx_reconnecting(&events, 1).is_some());
+        assert!(idx_reconnecting(&events, 2).is_some());
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, ServerStreamEvent::Reconnected { gap: None }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, ServerStreamEvent::SnapshotRestored(_)))
+                .count(),
+            1
+        );
+        assert!(
+            idx_live_delta(&events, "live after items retry").is_some(),
+            "live delta from open_stream body must be delivered"
+        );
+    }
+
+    #[test]
     fn exhausted_backoff_emits_retries_exhausted() {
         let mock = MockReopen {
             snapshot: happy_idle_snapshot(),
             snapshot_auth_401: false,
             items: Mutex::new(None),
+            items_retry_503_first: false,
+            items_call_count: Mutex::new(0),
             bodies: Mutex::new(vec![]),
             open_stream_always_503: true,
         };
