@@ -112,6 +112,11 @@ pub enum SessionEvent {
         agent_id: String,
         agent_name: String,
     },
+    Created {
+        child_session_id: String,
+        agent_id: String,
+        parent_session_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -354,6 +359,14 @@ struct RawAgentChanged {
     #[serde(rename = "conversation_id")]
     _conversation_id: String,
 }
+#[derive(Deserialize)]
+struct RawSessionCreated {
+    child_session_id: String,
+    agent_id: String,
+    parent_session_id: String,
+    #[serde(rename = "conversation_id")]
+    _conversation_id: String,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResponseEvent {
@@ -501,6 +514,7 @@ pub const MODELED_EVENT_TYPES: &[&str] = &[
     "session.agent_changed",
     "session.changed_files.invalidated",
     "session.child_session.updated",
+    "session.created",
     "session.heartbeat",
     "session.input.consumed",
     "session.interrupted",
@@ -530,7 +544,6 @@ pub const DEFERRED_EVENT_TYPES: &[&str] = &[
     "response.queued",
     "response.retry",
     "session.collaboration_mode",
-    "session.created",
     "session.resource.deleted",
     "turn.cancelled",
     "turn.completed",
@@ -685,6 +698,14 @@ impl SessionEvent {
                 SessionEvent::AgentChanged {
                     agent_id: r.agent_id,
                     agent_name: r.agent_name,
+                }
+            }
+            "session.created" => {
+                let r: RawSessionCreated = serde_json::from_str(d).ok()?;
+                SessionEvent::Created {
+                    child_session_id: r.child_session_id,
+                    agent_id: r.agent_id,
+                    parent_session_id: r.parent_session_id,
                 }
             }
             _ => return None,
@@ -1465,6 +1486,23 @@ mod tests {
             ServerStreamEvent::Session(SessionEvent::AgentChanged {
                 agent_id: "ag_2e9".into(),
                 agent_name: "debby".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn bytes_session_created_child() {
+        // Byte-verified: docs/spikes/captures/2026-06-26-live-recapture/polly-child-session.sse
+        let ev = parse_event(&frame(
+            "session.created",
+            r#"{"sequence_number":null,"type":"session.created","conversation_id":"conv_parent","child_session_id":"conv_child","agent_id":"ag_b","parent_session_id":"conv_parent"}"#,
+        ));
+        assert_eq!(
+            ev,
+            ServerStreamEvent::Session(SessionEvent::Created {
+                child_session_id: "conv_child".into(),
+                agent_id: "ag_b".into(),
+                parent_session_id: "conv_parent".into(),
             })
         );
     }
