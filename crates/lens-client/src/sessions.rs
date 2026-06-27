@@ -171,6 +171,89 @@ pub struct SessionList {
     pub has_more: bool,
 }
 
+/// `GET /v1/sessions/{id}/items` — the durable, paginated transcript. Persisted
+/// items carry no `sequence_number`; reconcile by `Item::id()` (typed-client §7).
+#[derive(Debug)]
+pub struct ItemList {
+    items: Vec<crate::stream::Item>,
+    has_more: bool,
+    first_id: Option<String>,
+    last_id: Option<String>,
+}
+
+impl ItemList {
+    pub fn items(&self) -> &[crate::stream::Item] {
+        &self.items
+    }
+    pub fn has_more(&self) -> bool {
+        self.has_more
+    }
+    pub fn first_id(&self) -> Option<&str> {
+        self.first_id.as_deref()
+    }
+    pub fn last_id(&self) -> Option<&str> {
+        self.last_id.as_deref()
+    }
+}
+
+// Internal wire envelope (private; `data` is Value only to feed Item::from_value).
+#[derive(serde::Deserialize)]
+struct RawItemList {
+    #[serde(default)]
+    data: Vec<serde_json::Value>,
+    #[serde(default)]
+    has_more: bool,
+    #[serde(default)]
+    first_id: Option<String>,
+    #[serde(default)]
+    last_id: Option<String>,
+}
+
+impl<'de> serde::Deserialize<'de> for ItemList {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let raw = RawItemList::deserialize(d)?;
+        Ok(ItemList {
+            items: raw
+                .data
+                .into_iter()
+                .map(crate::stream::Item::from_value)
+                .collect(),
+            has_more: raw.has_more,
+            first_id: raw.first_id,
+            last_id: raw.last_id,
+        })
+    }
+}
+
+/// Pagination for `Sessions::items` (openapi `/v1/sessions/{id}/items`: limit,
+/// after, before, order). All optional; `None` fields are omitted from the query.
+#[derive(Debug, Default, Clone)]
+pub struct ItemsPage {
+    pub limit: Option<u32>,
+    pub after: Option<String>,
+    pub before: Option<String>,
+    pub order: Option<String>,
+}
+
+impl ItemsPage {
+    fn to_query(&self) -> Vec<(&'static str, String)> {
+        let mut q = Vec::new();
+        if let Some(n) = self.limit {
+            q.push(("limit", n.to_string()));
+        }
+        if let Some(a) = &self.after {
+            q.push(("after", a.clone()));
+        }
+        if let Some(b) = &self.before {
+            q.push(("before", b.clone()));
+        }
+        if let Some(o) = &self.order {
+            q.push(("order", o.clone()));
+        }
+        q
+    }
+}
+
 /// `kind` filter for the fleet poll.
 #[derive(Clone, Copy, Debug)]
 pub enum SessionKind {
@@ -935,6 +1018,12 @@ impl<'a> Sessions<'a> {
     /// `GET /v1/sessions` — fleet poll. Blocking.
     pub fn list(&self, filter: &SessionFilter) -> Result<SessionList> {
         self.client.get_json("/v1/sessions", &filter.to_query())
+    }
+
+    /// `GET /v1/sessions/{id}/items` — the durable transcript. Blocking.
+    pub fn items(&self, id: &SessionId, page: &ItemsPage) -> Result<ItemList> {
+        self.client
+            .get_json(&format!("/v1/sessions/{id}/items"), &page.to_query())
     }
 
     /// `GET /v1/sessions/{id}/child_sessions` — list sub-sessions. Blocking.
@@ -1757,5 +1846,43 @@ mod tests {
         .unwrap();
         assert_eq!(list.data[0].id(), "r1");
         assert!(!list.has_more);
+    }
+
+    #[test]
+    fn item_list_parses_the_golden_items_envelope() {
+        let raw = include_str!("../tests/fixtures/sse/happy_path.items.json");
+        let list: super::ItemList = serde_json::from_str(raw).expect("parse items envelope");
+        assert_eq!(list.items().len(), 11);
+        assert!(!list.has_more());
+        // The corpus opens with a resource_event and contains the function_call pair.
+        assert!(matches!(
+            list.items()[0],
+            crate::stream::Item::ResourceEvent { .. }
+        ));
+        assert!(
+            list.items()
+                .iter()
+                .any(|i| matches!(i, crate::stream::Item::FunctionCall { .. }))
+        );
+        assert!(
+            list.items()
+                .iter()
+                .any(|i| matches!(i, crate::stream::Item::FunctionCallOutput { .. }))
+        );
+        // Every item is reconcilable by a non-empty id.
+        assert!(list.items().iter().all(|i| !i.id().is_empty()));
+    }
+
+    #[test]
+    fn items_page_to_query_skips_none() {
+        let q = super::ItemsPage {
+            limit: Some(50),
+            order: Some("asc".into()),
+            ..Default::default()
+        }
+        .to_query();
+        assert!(q.contains(&("limit", "50".to_string())));
+        assert!(q.contains(&("order", "asc".to_string())));
+        assert!(!q.iter().any(|(k, _)| *k == "after" || *k == "before"));
     }
 }
