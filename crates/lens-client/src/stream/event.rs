@@ -10,6 +10,22 @@ use serde::Deserialize;
 pub enum ServerStreamEvent {
     Session(SessionEvent),
     Response(ResponseEvent),
+    /// Crate-synthetic: a reconnect attempt is in flight (typed-client §7 step 2).
+    Reconnecting {
+        attempt: u32,
+    },
+    /// Crate-synthetic: stream re-opened. `gap` per §7 / plan decision 2:
+    /// `Some(0)` = provably contiguous overlap; `None` = clear transient state.
+    Reconnected {
+        gap: Option<u64>,
+    },
+    /// Crate-synthetic: bucket-B chrome restore (decision A2, typed-client §7).
+    /// Emitted after `Reconnected`, before replayed history. Boxed (large payload).
+    SnapshotRestored(Box<crate::sessions::SessionSnapshot>),
+    /// Crate-synthetic: terminal. Last event before the channel closes (§7 step 3).
+    Disconnected {
+        reason: DisconnectReason,
+    },
     /// Forward-compat escape hatch for an event type this crate version does not
     /// model. Carries only the wire `type` (no `Value` to consumers); the raw
     /// payload is dropped. The contract test (Plan 3c) alarms when a live stream
@@ -17,6 +33,16 @@ pub enum ServerStreamEvent {
     Unknown {
         event_type: String,
     },
+}
+
+/// Why the stream gave up (typed-client §7 stop-immediately table + retries-exhausted).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisconnectReason {
+    Unauthorized,     // 401 — re-auth
+    Forbidden,        // 403 — access denied, remove session
+    NotFound,         // 404 — session deleted, remove
+    SessionFailed,    // snapshot status == failed — surface, no retry
+    RetriesExhausted, // backoff window elapsed
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -765,6 +791,23 @@ mod tests {
             event: event.into(),
             data: data.into(),
         }
+    }
+
+    #[test]
+    fn synthetic_lifecycle_variants_exist_and_compare() {
+        let a = ServerStreamEvent::Reconnecting { attempt: 2 };
+        let b = ServerStreamEvent::Reconnected { gap: None };
+        let c = ServerStreamEvent::Disconnected {
+            reason: DisconnectReason::NotFound,
+        };
+        assert_eq!(a, ServerStreamEvent::Reconnecting { attempt: 2 });
+        assert_ne!(b, ServerStreamEvent::Reconnected { gap: Some(0) });
+        assert_ne!(
+            c,
+            ServerStreamEvent::Disconnected {
+                reason: DisconnectReason::Unauthorized
+            }
+        );
     }
 
     #[test]

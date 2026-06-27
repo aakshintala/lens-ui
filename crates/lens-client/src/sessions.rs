@@ -63,7 +63,7 @@ fn hoist_embedded_item_payload(v: Value) -> Value {
 /// omnigent's `SessionResponse` (`schemas.py:1601-1642`); unmodeled fields are
 /// ignored. Fields are private — access is via the typed getters, so the wire
 /// shape stays an lens-client implementation detail (single edit site for drift).
-#[derive(Clone, Debug, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
 pub struct SessionSnapshot {
     id: SessionId,
     status: SessionStatus,
@@ -227,7 +227,7 @@ impl SessionSnapshot {
 }
 
 /// Per-model token+cost usage from `usage_by_model` on the session snapshot.
-#[derive(Clone, Debug, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
 pub struct ModelUsage {
     #[serde(default)]
     input_tokens: i64,
@@ -265,7 +265,7 @@ impl ModelUsage {
 }
 
 /// An attached skill summary from `skills` on the session snapshot.
-#[derive(Clone, Debug, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
 pub struct SkillRef {
     #[serde(default)]
     name: String,
