@@ -5,9 +5,13 @@ session SSE stream as soon as the harness creates it, and writes a golden
 corpus on exit.
 
 ```sh
-lens_capture omnigent claude
-lens_capture --out docs/spikes/captures/2026-06-27-sessionstore/work omnigent codex
+lens_capture omnigent claude     # zero flags — that's the whole thing
+lens_capture omnigent codex
 ```
+
+Captures auto-name into `docs/spikes/captures/live/<UTC-stamp>-<harness>.{stream.sse,
+snapshot.json,items.json}` (e.g. `…/live/20260627-170641-claude.stream.sse`). Pass
+`--out <prefix>` only to override the location.
 
 ### Race-free mode
 
@@ -27,7 +31,7 @@ lens_capture --session conv_abc123 omnigent claude
 - `LENS_OMNIGENT_URL` — base URL (required unless `--url` is passed)
 - `LENS_OMNIGENT_TOKEN` — optional bearer token
 
-**Output** (prefix defaults to `./capture`):
+**Output** (`<PREFIX>` defaults to `docs/spikes/captures/live/<UTC-stamp>-<harness>`):
 
 - `<PREFIX>.stream.sse` — raw SSE bytes
 - `<PREFIX>.snapshot.json` — final session snapshot

@@ -9,7 +9,7 @@ use std::process::{self, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use lens_client::ids::{ConnectionId, SessionId};
 use lens_client::sessions::SessionFilter;
@@ -19,6 +19,10 @@ const POLL_INTERVAL: Duration = Duration::from_millis(150);
 const POLL_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Local dev tool: captures land here by default so `lens_capture omnigent claude`
+/// needs zero flags even when installed and run from another cwd. Override with `--out`.
+const DEFAULT_CAPTURE_DIR: &str = "/Users/aakshintala/work/lens/docs/spikes/captures/live";
 
 struct Config {
     base_url: url::Url,
@@ -230,7 +234,7 @@ fn parse_config() -> Config {
     }
 
     let mut url: Option<String> = None;
-    let mut out_prefix = PathBuf::from("./capture");
+    let mut out_prefix: Option<PathBuf> = None;
     let mut session_id: Option<SessionId> = None;
     let mut harness_start = None;
     let mut i = 0;
@@ -248,7 +252,7 @@ fn parse_config() -> Config {
             }
             "--out" => {
                 i += 1;
-                out_prefix = PathBuf::from(next_flag_value(&args, i, "--out"));
+                out_prefix = Some(PathBuf::from(next_flag_value(&args, i, "--out")));
                 i += 1;
             }
             "--session" => {
@@ -276,6 +280,8 @@ fn parse_config() -> Config {
     if harness.is_empty() {
         die_usage("missing harness command");
     }
+
+    let out_prefix = out_prefix.unwrap_or_else(|| default_out_prefix(&harness));
 
     let url = url
         .or_else(|| std::env::var("LENS_OMNIGENT_URL").ok())
@@ -326,7 +332,8 @@ Environment:
   LENS_OMNIGENT_URL    omnigent base URL (required if --url omitted)
   LENS_OMNIGENT_TOKEN  optional bearer token
 
-Output files (PREFIX defaults to ./capture):
+Output files (PREFIX defaults to <captures>/live/<UTC-stamp>-<harness>, e.g.
+  docs/spikes/captures/live/20260627-153012-claude.stream.sse — just run with no --out):
   <PREFIX>.stream.sse     raw SSE bytes (write-through while the harness runs)
   <PREFIX>.snapshot.json  final GET /v1/sessions/{{id}}?include_items=true&include_liveness=true
   <PREFIX>.items.json     final GET /v1/sessions/{{id}}/items
@@ -422,6 +429,48 @@ fn find_first_new_session(
         .iter()
         .find(|s| !known.contains(&s.id().to_string()))
         .map(|s| s.id().clone()))
+}
+
+/// `<DEFAULT_CAPTURE_DIR>/<utc-stamp>-<harness-label>` when `--out` is omitted.
+/// The label is the first non-flag token after the program name (e.g. `claude`,
+/// `codex`), so files self-describe which harness produced them.
+fn default_out_prefix(harness: &[String]) -> PathBuf {
+    let label = harness
+        .iter()
+        .skip(1)
+        .find(|a| !a.starts_with('-'))
+        .or_else(|| harness.first())
+        .map(|s| s.as_str())
+        .unwrap_or("capture");
+    Path::new(DEFAULT_CAPTURE_DIR).join(format!("{}-{label}", utc_stamp()))
+}
+
+/// UTC `YYYYMMDD-HHMMSS` from the wall clock (days-from-civil; no time-zone db,
+/// no chrono). Used only to name capture files uniquely and sortably.
+fn utc_stamp() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    utc_stamp_from_secs(secs)
+}
+
+fn utc_stamp_from_secs(secs: u64) -> String {
+    let (days, rem) = ((secs / 86_400) as i64, secs % 86_400);
+    let (h, mi, s) = (rem / 3_600, (rem % 3_600) / 60, rem % 60);
+
+    // Howard Hinnant's days→civil-date algorithm (UTC).
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let day = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = yoe + era * 400 + i64::from(month <= 2);
+
+    format!("{year:04}{month:02}{day:02}-{h:02}{mi:02}{s:02}")
 }
 
 fn path_with_suffix(prefix: &Path, suffix: &str) -> PathBuf {
@@ -570,4 +619,17 @@ fn print_summary(
     );
     println!("  {} — {snapshot_bytes} bytes", snapshot_path.display());
     println!("  {} — {items_bytes} bytes", items_path.display());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::utc_stamp_from_secs;
+
+    #[test]
+    fn stamps_known_epochs() {
+        // Cross-checked against `date -u -r <epoch>`.
+        assert_eq!(utc_stamp_from_secs(0), "19700101-000000");
+        assert_eq!(utc_stamp_from_secs(1_782_580_001), "20260627-170641");
+        assert_eq!(utc_stamp_from_secs(1_782_600_204), "20260627-224324");
+    }
 }
