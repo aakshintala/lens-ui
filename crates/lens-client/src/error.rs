@@ -32,9 +32,40 @@ pub enum ClientError {
     ThreadSpawn(String),
 }
 
+impl ClientError {
+    /// A transport/connection failure — the server was unreachable (vs. it
+    /// answering with a domain error).
+    pub fn is_transport(&self) -> bool {
+        matches!(self, ClientError::Network(_))
+    }
+
+    /// A response the client could not decode against the pinned contract —
+    /// itself a drift signal (vs. an unreachable server).
+    pub fn is_decode(&self) -> bool {
+        matches!(
+            self,
+            ClientError::Parse(_) | ClientError::ContractMismatch { .. }
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transport_and_decode_predicates() {
+        assert!(!ClientError::Auth { status: 401 }.is_transport());
+        assert!(!ClientError::NotFound { what: "x".into() }.is_decode());
+        assert!(
+            ClientError::ContractMismatch {
+                expected: "0.3.0.dev0",
+                actual: "0.2.0".into(),
+            }
+            .is_decode()
+        );
+        assert!(ClientError::from(serde_json::from_str::<i32>("x").unwrap_err()).is_decode());
+    }
 
     #[test]
     fn contract_mismatch_displays_expected_and_actual() {
