@@ -27,12 +27,16 @@ and roll older "Recent" pointers off this page as they age.
     the golden corpus with longer sessions / a real Lens work pass (current ~22KB is
     thin); benches load any corpus file via `include_bytes!`. WS + state/render benches
     deferred to those paths. CI regression gate deferred (no CI yet).
-  - **`crates/lens-capture` (new binary `lens_capture`):** `lens_capture omnigent
-    claude` spawns the harness, auto-detects its session, taps the SSE stream, and
-    writes a `.stream.sse` (+ snapshot/items) corpus on exit. Use it to grow the
-    corpus. **Open decision:** best-effort subscribe-first (poll-then-subscribe) is
-    fine for corpus growth but not race-free; a fully race-free version needs the
-    omnigent harness to attach to a pre-created session id — verify that flag exists.
+  - **`crates/lens-capture` (new binary `lens_capture`):** spawns the harness, taps
+    the SSE stream, writes a `.stream.sse` (+ snapshot/items) corpus on exit. Two modes:
+    *default* (`lens_capture omnigent claude`) auto-detects the session by polling —
+    best-effort subscribe-first, fine for corpus growth; *race-free*
+    (`lens_capture --session conv_abc omnigent claude`) opens the stream before
+    launching and auto-appends `--resume <id>`, so no events are missed. **Resolved:**
+    session id IS the `conv_` id (`GET /v1/sessions` → `id: conv_...`), so the same
+    value drives the stream subscription and `omnigent claude --resume`; harnesses take
+    `--resume <conv_id>`, not create-with-id. Cross-family reviewed (codex). README has
+    usage + limitations. **Next:** drive a real session through it to grow the corpus.
 - **lens-client Foundation: DONE** (Plan 1 executed, 9 commits `043214e..f12050f`) —
   crate skeleton/error/ids/connection, typify codegen (`generated.rs`, 88 schemas,
   rustfmt-canonical via xtask), HTTP core + contract gate + ready-ladder handshake.
