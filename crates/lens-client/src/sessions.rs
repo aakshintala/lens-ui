@@ -28,10 +28,22 @@ pub enum SessionStatus {
     Failed,
 }
 
+/// This server emits explicit `null` (not `[]`/`{}`) for empty collections on
+/// some snapshots; `#[serde(default)]` covers a *missing* key but NOT a present
+/// `null`, so map `null` → `Default` for the collection fields.
+fn de_null_default<'de, D, T>(d: D) -> std::result::Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + serde::Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
 fn de_items<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> std::result::Result<Vec<crate::stream::Item>, D::Error> {
-    let raw: Vec<serde_json::Value> = Vec::deserialize(d)?;
+    let raw: Vec<serde_json::Value> =
+        Option::<Vec<serde_json::Value>>::deserialize(d)?.unwrap_or_default();
     Ok(raw
         .into_iter()
         .map(hoist_embedded_item_payload)
@@ -73,7 +85,7 @@ pub struct SessionSnapshot {
     #[serde(default)]
     archived: bool,
     created_at: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_null_default")]
     labels: BTreeMap<String, String>,
     #[serde(default)]
     runner_online: Option<bool>,
@@ -118,9 +130,9 @@ pub struct SessionSnapshot {
     //   (sessions.rs:309). Its non-string live shape would fail the whole
     //   snapshot deser, so it is left out (serde skips the unknown wire field).
     //   Model when a non-null shape is captured.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_null_default")]
     usage_by_model: std::collections::BTreeMap<String, ModelUsage>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_null_default")]
     skills: Vec<SkillRef>,
     #[serde(default, deserialize_with = "de_items")]
     items: Vec<crate::stream::Item>,
@@ -1911,6 +1923,19 @@ mod tests {
         assert!(q.contains(&("include_archived", "true".to_string())));
         assert!(q.contains(&("search_query", "foo".to_string())));
         assert!(q.contains(&("limit", "50".to_string())));
+    }
+
+    #[test]
+    fn snapshot_tolerates_null_collections() {
+        // The live server sends `null` (not [] / {}) for empty collections.
+        let body = r#"{
+            "id":"conv_1","status":"idle","agent_id":"ag_1","created_at":1,
+            "labels":null,"usage_by_model":null,"skills":null,"items":null
+        }"#;
+        let snap: SessionSnapshot = serde_json::from_str(body).unwrap();
+        assert!(snap.labels().is_empty());
+        assert!(snap.usage_by_model().is_empty());
+        assert_eq!(snap.id().as_str(), "conv_1");
     }
 
     #[test]
