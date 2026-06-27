@@ -150,8 +150,32 @@ and roll older "Recent" pointers off this page as they age.
        `DisconnectReason` table). **Deferred (flagged):** `gap==Some(0)` proof; `/items` pagination;
        gated live reconnect smoke test (no server-kill harness this session). ⚠ `live_stream` NOT
        run (no server) — unit coverage only.
-  3. **Stand up contract-drift CI** (outstanding B6, **NEXT**) — the passive alarm that makes
-     tracking dev0 safe when `0.3.0` eventually tags. Plan 3c.
+  3. **Contract-drift CI (outstanding B6): DONE** (Plan 3c, 2026-06-26, subagent-driven:
+     composer-2.5 build + Opus per-task review + one consolidated gpt-5.5 cross-family review;
+     commits `087ef6f..8a7bb2e`, 5 tasks + 2 live-caught fixes + 1 review fix;
+     [`plan`](./superpowers/plans/2026-06-26-lens-client-plan3c-contract-drift.md)). The passive
+     alarm, three layers by what each needs: **`xtask drift`** (`cargo run -p xtask -- drift` —
+     semantic path-set + SSE discriminator/member-shape diff vs sibling pin, `/hooks/*`-excluded
+     per ADR-0001; green vs identical sibling, red vs synthetic fixture); **offline `taxonomy_drift`
+     test** (always-on `cargo test`: pinned openapi `ServerStreamEvent` mapping == `MODELED`(33)∪
+     `DEFERRED`(14), disjoint — new upstream event fails with no server); **gated live checks**
+     (`--features live-tests`): `live_taxonomy` (wire types modeled, or deferred-as-`Unknown`; a
+     **modeled** type as `Unknown` is drift) + `live_reachability` (every consumed read endpoint
+     reachable). **LIVE RUN EXECUTED this session** vs a real `0.3.0.dev0` server — **both gated
+     tests green**, and the reachability sweep immediately **caught 2 real pre-existing bugs** the
+     prior serverless plans missed: `HostObject` deserialized `id` from wire `id` (real key is
+     `host_id`; `/v1/hosts` is openapi-untyped so live bytes are truth) and `SessionSnapshot`
+     collections failed on the server's explicit `null`-for-empty (`labels`/`usage_by_model`/`skills`/
+     `items` — `#[serde(default)]` covers missing, not `null`). The consolidated gpt-5.5 review
+     caught 1 Important the author + green tests missed: `live_taxonomy` allowed `Unknown` for any
+     *accounted* type, masking a **modeled** event degrading to `Unknown` on payload drift → fixed
+     by the MODELED/DEFERRED split (only deferred types may be `Unknown`), re-verified live. 122 lib
+     tests + 2 xtask tests, clippy `--all-targets`/fmt clean, `generated.rs` untouched, no `Value`
+     to consumers. **CI surface = local `xtask` only** (design D3; no `.github/workflows` — drift
+     needs the sibling checkout). **Deferred (flagged):** `xtask drift` member-shape diff is
+     property-*names* only (deliberate scope bound); `ResourceList` live decode not exercised (no
+     runner-bound session — `/v1/sessions/{id}/resources` returned a typed 409). **Plan 3 / B6 thread
+     CLOSED.**
   - Plan 3b-2b is temporal/stateful (reconnect state machine), so **cross-family review stays
     mandatory** at the seams (`[[composer-delegation-profile]]`) — it caught the envelope bug in 3b-2a
     that author + green test both missed. (The earlier "composer is weak on temporal logic" claim was
@@ -182,6 +206,17 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Recent
 
+- **2026-06-26** — **Plan 3c (contract-drift CI / B6) executed & complete — closes the Plan 3
+  thread** (subagent-driven: composer-2.5 build + Opus per-task review + one consolidated gpt-5.5
+  cross-family review; `087ef6f..8a7bb2e`, 5 tasks + 2 live-caught fixes + 1 review fix). Three
+  layers: `xtask drift` (semantic path + SSE discriminator/shape diff vs sibling, `/hooks/*`-excluded),
+  always-on offline `taxonomy_drift` (openapi mapping == `MODELED`(33)∪`DEFERRED`(14), disjoint),
+  and gated `--features live-tests` `live_taxonomy` + `live_reachability`. **Live run executed vs a
+  real `0.3.0.dev0` server — both gated tests green**; the reachability sweep **caught 2 real
+  pre-existing bugs** (`HostObject` `id`→`host_id`; `SessionSnapshot` null-collection intolerance).
+  gpt-5.5 review caught 1 Important (live taxonomy masked modeled-as-`Unknown` degradation → MODELED/
+  DEFERRED split, re-verified live). 122 lib + 2 xtask tests, clippy/fmt clean, `generated.rs`
+  untouched. Local `xtask`-only CI (D3). Memory: `plan3c-contract-drift-findings`.
 - **2026-06-26** — **Plan 3b-2b (§7 no-replay reconnect state machine) executed & complete**
   (subagent-driven: composer-2.5 build + Opus per-task review + one consolidated gpt-5.5
   cross-family review; `3d4048b..6d4dde3`, 6 code tasks + fix wave + xtask fmt + docs). Reconnect

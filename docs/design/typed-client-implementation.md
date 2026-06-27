@@ -65,9 +65,24 @@ Contract/unit tests are written *with* each unit, not bolted on at the end.
 
 ## 5. Local verification
 
-- `cargo test` — golden-SSE parse + unit tests; always green, no server.
-- `xtask drift` — diff vendored `openapi.json` (paths + SSE schema) vs sibling checkout. The ADR-0001 "passive alarm," run locally.
-- `xtask live-test` — spawn the daemon (transport-stability spike §3 path), run taxonomy-diff + endpoint reachability against it.
+- `cargo test` — golden-SSE parse + unit tests **+ the offline taxonomy-completeness
+  test** (`taxonomy_drift`: the pinned openapi's `ServerStreamEvent` discriminator
+  mapping must set-equal `MODELED_EVENT_TYPES ∪ DEFERRED_EVENT_TYPES`, and the two
+  are disjoint — a new upstream event type fails here with no server). Always green.
+- `xtask drift` **(built, Plan 3c)** — `cargo run -p xtask -- drift` diffs the vendored
+  `openapi.json` vs the sibling pin (default `../omnigent/openapi.json`, override
+  `--against <path>`): semantic path-set diff (excluding `/hooks/*` runner-callback
+  routes per ADR-0001) + SSE discriminator-mapping diff + per-member property-name
+  shape diff; non-zero exit on drift. The ADR-0001 "passive alarm," run locally.
+  ⚠ Member-shape diff is property-**names** only (not requiredness/type/nullability/
+  nested) — a deliberate scope bound; deepen to a canonicalized subtree compare if a
+  field's *type* (vs presence) ever needs guarding.
+- **Gated live checks** (`cargo test -p lens-client --features live-tests`, Plan 3c) —
+  against a running daemon (`LENS_OMNIGENT_URL` + a claude-sdk `LENS_OMNIGENT_SESSION_ID`):
+  `live_taxonomy` (every wire event type is modeled, or a *deferred* type legitimately
+  surfacing as `Unknown` — a **modeled** type arriving as `Unknown` is drift) and
+  `live_reachability` (every consumed read endpoint reachable: typed `Ok` or a typed
+  domain error, never transport/decode). Both executed & green vs pinned `0.3.0.dev0`.
 
 ## 6. Recorded doc corrections / deferred items
 
