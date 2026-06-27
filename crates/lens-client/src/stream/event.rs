@@ -79,6 +79,16 @@ pub enum SessionEvent {
     Interrupted {
         requested_at: Option<i64>,
     },
+    /// This conversation was superseded by another (e.g. a Claude `/clear`
+    /// rotation); an actively-viewing client should follow to
+    /// `target_conversation_id`. Transient (SSE-only, no replay) — the durable
+    /// counterpart is a persisted notice message on the old conversation.
+    Superseded {
+        conversation_id: String,
+        target_conversation_id: String,
+        /// Why it was superseded; currently always `"clear"`.
+        reason: String,
+    },
     ChildSessionUpdated {
         child_session_id: String,
         child: ChildSession,
@@ -283,6 +293,15 @@ struct RawResourceDeleted {
 #[derive(Deserialize)]
 struct RawChangedFiles {
     environment_id: String,
+}
+// FLAT shape (not enveloped under `data`): `{conversation_id,
+// target_conversation_id, reason?}`. `reason` defaults to "clear" server-side.
+#[derive(Deserialize)]
+struct RawSuperseded {
+    conversation_id: String,
+    target_conversation_id: String,
+    #[serde(default)]
+    reason: Option<String>,
 }
 #[derive(Deserialize)]
 struct RawInputConsumed {
@@ -632,6 +651,7 @@ pub const MODELED_EVENT_TYPES: &[&str] = &[
     "session.sandbox_status",
     "session.skills",
     "session.status",
+    "session.superseded",
     "session.terminal.activity",
     "session.terminal_pending",
     "session.todos",
@@ -739,6 +759,14 @@ impl SessionEvent {
                 let r: RawInterrupted = serde_json::from_str(d).ok()?;
                 SessionEvent::Interrupted {
                     requested_at: r.data.and_then(|x| x.requested_at),
+                }
+            }
+            "session.superseded" => {
+                let r: RawSuperseded = serde_json::from_str(d).ok()?;
+                SessionEvent::Superseded {
+                    conversation_id: r.conversation_id,
+                    target_conversation_id: r.target_conversation_id,
+                    reason: r.reason.unwrap_or_else(|| "clear".to_string()),
                 }
             }
             "session.child_session.updated" => {

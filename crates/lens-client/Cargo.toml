@@ -15,6 +15,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 url = { version = "2", features = ["serde"] }
+# Pattern-validated newtypes in `generated.rs` (e.g. MCP `Name`) compile to
+# `regress`-backed regex checks — typify's runtime companion, pulled in by the
+# 0.3.0 mcp-servers schemas. Pinned to typify's own regress major.
+regress = "0.10"
 
 [dev-dependencies]
 url = "2"

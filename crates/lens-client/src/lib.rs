@@ -15,7 +15,7 @@ pub mod sessions;
 pub mod stream;
 
 /// The omnigent contract version this crate is pinned to (ADR-0001).
-pub const PINNED_OMNIGENT_VERSION: &str = "0.3.0.dev0";
+pub const PINNED_OMNIGENT_VERSION: &str = "0.3.0";
 
 pub use client::Client;
 pub use connection::{Auth, Connection};
@@ -26,9 +26,9 @@ pub use registries::{
 };
 pub use sessions::{
     ChildSessionList, ChildSessionSummary, CommentObject, ConversationDeleted,
-    CreateSessionRequest, CreatedSessionResponse, ElicitationAction, ElicitationState, FileContent,
-    FileDiff, FileResource, FilesList, FilesystemEntry, FilesystemList, HostType, OwnerInfo,
-    PermissionsInfo, ResourceList, ResourceObject, SearchQuery, SendEventAck, SessionEventInput,
-    SessionFilter, SessionKind, SessionList, SessionSnapshot, SessionStatus, SessionSummary,
-    Sessions, ShellResult,
+    CreateSessionRequest, CreatedSessionResponse, ElicitationAction, ElicitationResult,
+    ElicitationState, FileContent, FileDiff, FileResource, FilesList, FilesystemEntry,
+    FilesystemList, HostType, OwnerInfo, PermissionsInfo, ResourceList, ResourceObject,
+    SearchQuery, SendEventAck, SessionEventInput, SessionFilter, SessionKind, SessionList,
+    SessionSnapshot, SessionStatus, SessionSummary, Sessions, ShellResult,
 };

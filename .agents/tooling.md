@@ -57,5 +57,5 @@ share it).
 
 ## Contract
 
-- Ground truth: `vendor/omnigent-0.3.0.dev0/openapi.json` (pin: `OMNIGENT_PIN`).
+- Ground truth: `vendor/omnigent-0.3.0/openapi.json` (pin: `OMNIGENT_PIN`).
 - `lens-client` codegens + contract-tests against the vendored openapi.

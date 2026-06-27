@@ -1,27 +1,30 @@
 ---
 name: installing-omnigent-from-source
-description: Use when you need a running omnigent server that matches the design's pinned 0.3.0.dev0 contract, when `omnigent --version` reports the wrong version (e.g. a 0.2.0 PyPI/uv release), or when (re)installing/updating omnigent for spikes, contract tests, or local runs.
+description: Use when you need a running omnigent server that matches the design's pinned 0.3.0 contract, when `omnigent --version` reports the wrong version (e.g. an older PyPI/uv release), or when (re)installing/updating omnigent for spikes, contract tests, or local runs.
 ---
 
 # Installing omnigent from source
 
 ## Why this exists
 
-Lens is grounded against a **specific** omnigent commit. Two files in
+Lens is grounded against a **specific** omnigent release tag. Two files in
 `vendor/omnigent-<ver>/` record the pin: `OMNIGENT_PIN` holds the package
-version (`0.3.0.dev0`); `README.md` records the **Source HEAD commit**
-(`36b2a11c`) — that commit is the real ground truth. The released package on
-PyPI (`uv tool install omnigent` → `0.2.0`) is a **different contract**:
-different SSE schemas, REST paths, and it lacks the source-only WebSocket
-channels (terminal-attach, session updates) that aren't in `openapi.json`.
-Probing or testing against the wrong version yields misleading results. The
-server must run from the source checkout at the pinned commit.
+version (`0.3.0`); `README.md` records the **Source tag** (`v0.3.0`) and its
+**Source HEAD commit** (`4edb4d95`) — that commit is the real ground truth. A
+mismatched release on PyPI (`uv tool install omnigent`) is a **different
+contract**: different SSE schemas, REST paths, and it lacks the source-only
+WebSocket channels (terminal-attach, session updates) that aren't in
+`openapi.json`. Probing or testing against the wrong version yields misleading
+results. The server must run from the source checkout at the pinned tag.
 
 ## Procedure (verified)
 
 Sibling source checkout lives at `../omnigent` (i.e. `/Users/aakshintala/work/omnigent`).
 
 ```bash
+# 0. Put the checkout ON the pinned tag (detached HEAD is expected).
+git -C ../omnigent checkout v0.3.0     # the Source tag in vendor README
+
 # 1. Remove any release install so the wrong version can't launch by accident.
 uv tool uninstall omnigent            # no-op if not installed
 
@@ -29,7 +32,7 @@ uv tool uninstall omnigent            # no-op if not installed
 uv tool install --editable ../omnigent
 
 # 3. Verify the binary embeds the PINNED commit, not just a version string.
-omnigent --version                    # -> omnigent 0.3.0.dev0 (36b2a11c, built ...)
+omnigent --version                    # -> omnigent 0.3.0 (4edb4d95, built ...)
 ```
 
 It exposes two executables: `omnigent` and `omni`. The shebang points into
@@ -43,17 +46,17 @@ omnigent server status && omnigent server stop && omnigent server start
 
 ## Critical: do NOT `git pull` the checkout by reflex
 
-The checkout should sit **on the pin commit**, not on the latest HEAD. Pulling
-it forward moves the live server off the contract the vendored `openapi.json`
-was generated from — silent contract drift, and an explicitly-open human
-decision (handoff #5: "track moving `0.3.0.dev0` vs freeze a commit?").
+The checkout should sit **on the pin tag**, not on the latest `main`. Moving it
+forward puts the live server off the contract the vendored `openapi.json` was
+generated from — silent contract drift. The pin advances on a deliberate,
+owned cadence (ADR-0001; omnigent ships ~weekly), never by reflex.
 
 - **Spike/test against the current contract:** stay frozen. Verify the checkout
   is on the pin first: `git -C ../omnigent rev-parse --short HEAD` must match the
-  **Source HEAD** commit in `vendor/omnigent-<ver>/README.md` (`36b2a11c`).
-- **Deliberately advancing the pin:** that is a separate, owned task — `git pull`,
-  re-vendor `openapi.json`, bump `OMNIGENT_PIN`, re-ground the affected docs.
-  Don't fold it into a routine reinstall.
+  **Source HEAD** commit in `vendor/omnigent-<ver>/README.md` (`4edb4d95`).
+- **Deliberately advancing the pin:** that is a separate, owned task — run the
+  `bumping-the-omnigent-pin` skill (re-vendor, re-codegen, fix lens-client,
+  re-ground docs). Don't fold it into a routine reinstall.
 
 ## Quick reference
 

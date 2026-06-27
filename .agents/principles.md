@@ -11,9 +11,9 @@ High-level engineering principles. Severity per `AGENTS.md`.
   substantial implementation. A consumer understands a module without reading
   its internals; internals change without breaking consumers.
 - **MANDATORY** Ground-truth discipline. Cite the pinned
-  `vendor/omnigent-0.3.0.dev0/openapi.json` for every contract assertion.
-  Pin-and-verify — never trust memory. omnigent `0.3.0.dev0` is a moving target;
-  each module keeps a "what breaks if X changes" seam.
+  `vendor/omnigent-0.3.0/openapi.json` for every contract assertion.
+  Pin-and-verify — never trust memory. omnigent ships ~weekly (`0.3.0`, `0.3.1`…),
+  so the contract moves; each module keeps a "what breaks if X changes" seam.
 - **MANDATORY** Errors are values. Model failure explicitly with `Result` and
   typed error states; the UI degrades gracefully (see `rust-ui.md`).
 - **MANDATORY** Introspectable at every layer (debuggability + extensibility).

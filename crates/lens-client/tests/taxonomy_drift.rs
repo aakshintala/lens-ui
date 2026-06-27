@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 fn accounted_event_types_match_pinned_contract() {
     let spec = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../vendor/omnigent-0.3.0.dev0/openapi.json"
+        "/../../vendor/omnigent-0.3.0/openapi.json"
     );
     let raw = std::fs::read_to_string(spec).expect("read vendored openapi.json");
     let doc: serde_json::Value = serde_json::from_str(&raw).expect("parse openapi.json");

@@ -231,6 +231,30 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Recent
 
+- **2026-06-27** — **omnigent pin advanced `0.3.0.dev0` → `v0.3.0`** (first real
+  divergence-infra run; done inline, not subagent-driven). v0.3.0 shipped as a tag
+  (commit `4edb4d95`; pyproject semver now a clean `0.3.0`). `xtask drift` flagged
+  the delta; verdict = **not cosmetic, not breaking**: +5 additive routes
+  (`/sessions/projects`, per-session `agent/mcp-servers`, `codex_goal`), +1 SSE event
+  (`session.superseded`), and 6 "upstream dropped" paths that are all **hidden-not-removed**
+  (`include_in_schema=False`; incl. the load-bearing `POST …/events`) — the exact
+  ADR-0001 pattern. **Infra gap found:** `xtask drift`'s "removed" signal is a
+  false-positive generator (diffs openapi presence, can't see hidden routes) — verify
+  against route source before believing a removal. Re-vendored `vendor/omnigent-0.3.0/`,
+  re-codegen (88→113 schemas). lens-client fixes: hand-authored `ElicitationResult`
+  (dropped hidden-route schema, still contract); modeled `SessionEvent::Superseded`
+  (+ MODELED list); added `regress` dep (new MCP `Name` pattern); bumped
+  `PINNED_OMNIGENT_VERSION`→`0.3.0` (exact-match gate). 133 lib + 2 xtask tests, clippy/
+  fmt clean, `drift` → no-drift. New skill `bumping-the-omnigent-pin` captures the
+  runbook (weekly cadence); `installing-omnigent-from-source` re-grounded to the tag.
+  Installed omnigent reinstalled editable to v0.3.0 (`4edb4d95`). **Cross-family review
+  (codex / gpt-5.5) clean — "Findings: none"**; it cross-checked the hand-authored
+  `ElicitationResult`, `session.superseded` modeling, version gate, and `regress` dep vs
+  omnigent source. **Live-verify vs the v0.3.0 server: handshake + reachability + lifecycle
+  green** (driven through a `codex-native` agent); the drive-a-turn `live_taxonomy` check is
+  blocked by no network — codex runner `runner_failed_to_start` (offline on a plane), surfaced
+  by lens-client as a typed error, not a contract miss. Retry the turn with connectivity to
+  fully close. Memory: `omnigent-pin-bump-0.3.0`, `codex-as-reviewer`.
 - **2026-06-27** — **Event-modeling branch (`feat/lens-client-event-modeling`) executed,
   final-reviewed, and MERGED to `main`** (fast-forward `82769b7..bb03992`, 12 commits; solo
   workflow — no PR, memory `integration-workflow`). 7 modeling tasks acted on the live recapture

@@ -3,7 +3,7 @@
 //! `SessionEventInput` here is the **hand-written** typed enum for the subset of
 //! events Lens sends — distinct from `crate::generated::SessionEventInput`, which
 //! is the raw `{type, data, model_override, tools}` wire container. Discriminators
-//! and payload shapes are pinned to omnigent 0.3.0.dev0 source
+//! and payload shapes are pinned to omnigent 0.3.0 source
 //! (`server/routes/sessions.py`, `entities/conversation.py`); never guess them.
 
 use serde::{Deserialize, Serialize};
@@ -813,7 +813,7 @@ impl SessionEventInput {
 }
 
 /// The full set of `type` discriminators the server's `POST /events` route
-/// accepts (`_ALLOWED_EVENT_TYPES`, omnigent 0.3.0.dev0). Lens only *sends* the
+/// accepts (`_ALLOWED_EVENT_TYPES`, omnigent 0.3.0). Lens only *sends* the
 /// six modeled by `SessionEventInput`, but the contract test pins the whole set
 /// so a re-vendor that adds/removes a type is a conscious change. Kept sorted.
 pub const ALLOWED_EVENT_TYPES: [&str; 30] = [
@@ -972,6 +972,26 @@ impl ElicitationState {
     pub fn status(&self) -> Option<&str> {
         self.status.as_deref()
     }
+}
+
+/// Consumer reply body for `POST …/elicitations/{eid}/resolve`. Mirrors MCP's
+/// `ElicitResult` verbatim (`omnigent/server/schemas.py::ElicitationResult`).
+///
+/// **Hand-authored.** As of omnigent `0.3.0` the elicitation routes are
+/// `include_in_schema=False`, so this schema no longer appears in the vendored
+/// openapi and codegen drops it — but the routes are still live contract
+/// (ADR-0001). `content` uses `Map<String, Value>` to match the sibling
+/// `SessionEventInput::Approval` reply path (MCP restricts values to JSON
+/// scalars / string lists; `Value` is a safe serialize superset).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ElicitationResult {
+    /// `accept` (submitted / confirmed) · `decline` (explicit refusal) ·
+    /// `cancel` (dismissed without a choice; also the server's timeout verdict).
+    pub action: ElicitationAction,
+    /// Form data when `action == accept` and the request carried a schema;
+    /// omitted for binary approve/reject and for `decline` / `cancel`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<Map<String, Value>>,
 }
 
 /// A filesystem entry (`runner/app.py:14548-14556`).
@@ -1367,13 +1387,14 @@ impl<'a> Sessions<'a> {
     }
 
     /// `POST …/elicitations/{eid}/resolve` — RESTful resolve (preferred over the
-    /// `approval` event when an elicitation_id is on hand). Body is the generated
-    /// `ElicitationResult {action, content?}`.
+    /// `approval` event when an elicitation_id is on hand). Body is the
+    /// hand-authored `ElicitationResult {action, content?}` (hidden route; see
+    /// the type's note).
     pub fn resolve_elicitation(
         &self,
         sid: &SessionId,
         eid: &ElicitationId,
-        result: &crate::generated::ElicitationResult,
+        result: &ElicitationResult,
     ) -> Result<crate::sessions::SendEventAck> {
         self.client.send_json(
             reqwest::Method::POST,
@@ -1808,7 +1829,7 @@ mod tests {
 
     #[test]
     fn allowed_event_types_is_the_pinned_30() {
-        // Pinned to omnigent 0.3.0.dev0 (sessions.py _ALLOWED_EVENT_TYPES,
+        // Pinned to omnigent 0.3.0 (sessions.py _ALLOWED_EVENT_TYPES,
         // = ITEM_TYPE_TO_DATA_CLS keys ∪ control/external extras). Sorted.
         assert_eq!(ALLOWED_EVENT_TYPES.len(), 30);
         let mut sorted = ALLOWED_EVENT_TYPES;

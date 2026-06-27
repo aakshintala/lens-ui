@@ -42,4 +42,4 @@ Claude reads `CLAUDE.md` in addition.
 
 Start at `docs/design/README.md`, then the keystone
 `docs/design/capability-map-and-design-language.md`. Ground truth is
-`vendor/omnigent-0.3.0.dev0/openapi.json` (pin: `OMNIGENT_PIN`).
+`vendor/omnigent-0.3.0/openapi.json` (pin: `OMNIGENT_PIN`).

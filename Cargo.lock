@@ -431,6 +431,7 @@ dependencies = [
 name = "lens-client"
 version = "0.1.0"
 dependencies = [
+ "regress",
  "reqwest",
  "serde",
  "serde_json",
