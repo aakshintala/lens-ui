@@ -16,6 +16,11 @@ use super::event::{DisconnectReason, ServerStreamEvent, parse_event};
 use super::normalize::Normalizer;
 use super::sse::SseParser;
 
+/// Bound on the reader→poller channel. A full channel blocks the reader thread
+/// (off the foreground), propagating backpressure to TCP (impl-spec §6). Sized
+/// for a generous burst without unbounded growth under a stalled UI poller.
+pub(crate) const EVENT_CHANNEL_BOUND: usize = 1024;
+
 pub struct EventStream {
     rx: mpsc::Receiver<ServerStreamEvent>,
     _handle: JoinHandle<()>,
@@ -27,7 +32,7 @@ impl EventStream {
         resp: reqwest::blocking::Response,
         reopener: Re,
     ) -> crate::error::Result<Self> {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(EVENT_CHANNEL_BOUND);
         let handle = std::thread::Builder::new()
             .name("lens-sse-reader".into())
             .spawn(move || {
@@ -67,7 +72,7 @@ fn stop_reason(e: &ClientError) -> Option<DisconnectReason> {
 
 fn run<Re: Reopen>(
     mut body: Box<dyn Read + Send>,
-    tx: mpsc::Sender<ServerStreamEvent>,
+    tx: mpsc::SyncSender<ServerStreamEvent>,
     reopener: Re,
     sleep: impl Fn(Duration),
 ) {
@@ -140,7 +145,7 @@ fn run<Re: Reopen>(
 fn reconnect<Re: Reopen>(
     reopener: &Re,
     sleep: &impl Fn(Duration),
-    tx: &mpsc::Sender<ServerStreamEvent>,
+    tx: &mpsc::SyncSender<ServerStreamEvent>,
     normalizer: &mut Normalizer,
 ) -> Option<Box<dyn Read + Send>> {
     for (i, &delay) in BACKOFF_MS.iter().enumerate() {
@@ -290,6 +295,11 @@ mod tests {
     }
 
     #[test]
+    fn channel_is_bounded() {
+        assert_eq!(EVENT_CHANNEL_BOUND, 1024);
+    }
+
+    #[test]
     fn transport_error_does_not_synthesize_reasoning_closed() {
         let reader = StepRead {
             steps: vec![
@@ -301,7 +311,7 @@ mod tests {
             ],
             next: 0,
         };
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(EVENT_CHANNEL_BOUND);
         run(
             Box::new(reader) as Box<dyn Read + Send>,
             tx,
@@ -333,7 +343,7 @@ mod tests {
             steps: vec![Ok(reasoning_started_frame())],
             next: 0,
         };
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(EVENT_CHANNEL_BOUND);
         run(
             Box::new(reader) as Box<dyn Read + Send>,
             tx,
@@ -518,7 +528,7 @@ mod reconnect_tests {
             bodies: Mutex::new(vec![body2]),
             open_stream_always_503: false,
         };
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(EVENT_CHANNEL_BOUND);
         run(
             Box::new(Cursor::new(body1)) as Box<dyn Read + Send>,
             tx,
@@ -550,7 +560,7 @@ mod reconnect_tests {
             bodies: Mutex::new(vec![]),
             open_stream_always_503: false,
         };
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(EVENT_CHANNEL_BOUND);
         run(
             Box::new(Cursor::new(Vec::<u8>::new())) as Box<dyn Read + Send>,
             tx,
@@ -588,7 +598,7 @@ mod reconnect_tests {
             bodies: Mutex::new(vec![]),
             open_stream_always_503: false,
         };
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(EVENT_CHANNEL_BOUND);
         run(
             Box::new(Cursor::new(Vec::<u8>::new())) as Box<dyn Read + Send>,
             tx,
@@ -636,7 +646,7 @@ mod reconnect_tests {
             bodies: Mutex::new(vec![reopen_body]),
             open_stream_always_503: false,
         };
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(EVENT_CHANNEL_BOUND);
         run(
             Box::new(Cursor::new(Vec::<u8>::new())) as Box<dyn Read + Send>,
             tx,
@@ -678,7 +688,7 @@ mod reconnect_tests {
             bodies: Mutex::new(vec![]),
             open_stream_always_503: true,
         };
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(EVENT_CHANNEL_BOUND);
         run(
             Box::new(Cursor::new(Vec::<u8>::new())) as Box<dyn Read + Send>,
             tx,
