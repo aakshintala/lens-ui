@@ -82,9 +82,10 @@ and roll older "Recent" pointers off this page as they age.
        `ReasoningClosed` on a mid-reasoning drop — fixed (`run` now generic over `io::Read`,
        `Err(_) => return`, no flush; +2 regression tests), re-reviewed clean. §7a doc updated to the
        pinned semantics. ⚠ `live_stream` NOT run this session (no server) — unit coverage only.
-     - **Next: Plan 3b-2 — no-replay reconnect (§7).** Attaches at the reader's `Err(_) => return`
-       seam (now reconnect-ready). Needs typed `Sessions::items()` (→ `Item` union) + typed snapshot
-       (`GET /v1/sessions/{id}` `include_items`/`include_liveness`) built as part of it; three-bucket dedup.
+     - **Plan 3b-2 split (2026-06-26): 3b-2a = typed reconnect *reads* (DONE); 3b-2b = §7 reconnect
+       *state machine* (next).** The reads (`Sessions::items()` + grown snapshot) were carved out as
+       their own static/byte-grounded plan; the temporal state machine attaches at the reader's
+       `Err(_) => return` seam (now reconnect-ready) and is gated on one design decision (below).
      - **Reconnect ownership RESOLVED (2026-06-26, Opus cross-doc).** The §7-vs-§11 ambiguity was
        decided by the consumer doc (app-arch state-model §1/§8: EventStream is "reconnect-safe", "the
        pump just keeps reading"): **the crate owns reconnect end-to-end, internally.** §7's "StreamUpdate"
@@ -96,11 +97,33 @@ and roll older "Recent" pointers off this page as they age.
        `ClientError::Disconnected`). Two 3b-2 seams recorded in §7: normalizer `seen_items` must reset on
        `Reconnected{gap≠0}`; lifecycle markers bypass normalization. Docs fixed (typed-client §7/§10/§11,
        app-arch §13.1, server-lifecycle §9.2). 3b-2 plan can be written from these.
+     - **Plan 3b-2a EXECUTED & COMPLETE** (2026-06-26, subagent-driven: composer-2.5 build +
+       one consolidated gpt-5.5 cross-family review; commits `1360819..2ff93c3`, 4 tasks + plan
+       edit + 1 review fix; [`plan`](./superpowers/plans/2026-06-26-lens-client-plan3b2a-reconnect-reads.md),
+       [`handoff`](./handoffs/2026-06-26-lens-client-plan3b2a-execution.md)). The two typed reconnect
+       *read* surfaces, byte-grounded from the golden captures: completed the `stream::Item` union
+       (`ResourceEvent` variant, `id` on `Other`, total `Item::id()` accessor) so `/items` is
+       reconcilable; `Sessions::items()` + typed `ItemList` envelope; `SessionSnapshot` grown with
+       bucket-B scalars + `usage_by_model`/`skills`/embedded `items` (`ModelUsage`/`SkillRef`). 110 lib
+       tests, clippy `--all-targets`/fmt clean, `generated.rs` untouched, no `Value` to consumers.
+       Review caught 1 real bug the plan missed: `/items` carries item payload **flat** but the
+       snapshot's embedded `items` **wrap it under a `data` envelope** → `de_items` now hoists `data`
+       before `Item::from_value` (test hardened to assert typed payload; memory
+       `plan3b2a-embedded-item-envelope`). **Deferred (byte-grounded gaps):** `last_task_error`
+       (type-ambiguous null — sibling models it as a map), `todos`/`pending_elicitations`/`model_options`/
+       `sandbox_status` (empty/null in the only capture). ⚠ `live_stream` NOT run (no server) — unit only.
+     - **Next: Plan 3b-2b — §7 reconnect state machine. GATED on one design decision:** bucket-B
+       chrome-restore *ownership* on reconnect — crate emits synthetic chrome `SessionEvent`s (A) vs.
+       consumer applies the snapshot (B). Resolve A/B (Opus design → ADR in typed-client §7) **before**
+       writing the 3b-2b plan. Scope then: backoff + `Reconnecting/Reconnected/Disconnected` lifecycle,
+       items-replay as `OutputItemDone` (`Reconnected` precedes history, §7a), seq-dedup + normalizer
+       `seen_items` reset on `gap≠Some(0)`, reader re-open capability. Full handoff in the linked doc.
   3. **Stand up contract-drift CI** (outstanding B6) — the passive alarm that makes tracking
      dev0 safe when `0.3.0` eventually tags.
-  - composer-2.5 is weakest on temporal/stateful logic (`[[composer-delegation-profile]]`) — Plan 3
-    is exactly that, so **per-task cross-family review returns here** (was relaxed for the static
-    REST surface). Mind the Cursor-credit cost (`[[review-spend-policy]]`).
+  - Plan 3b-2b is temporal/stateful (reconnect state machine), so **cross-family review stays
+    mandatory** at the seams (`[[composer-delegation-profile]]`) — it caught the envelope bug in 3b-2a
+    that author + green test both missed. (The earlier "composer is weak on temporal logic" claim was
+    retracted as unsupported N=1.) Mind the Cursor-credit cost (`[[review-spend-policy]]`).
   - Now on branch `feat/lens-client-streaming` (off `main` @ `78fdaa3`).
 - **Doc walkthrough complete** (all 11 design docs in `docs/design/` reviewed);
   every surfaced decision is resolved or consciously deferred.
