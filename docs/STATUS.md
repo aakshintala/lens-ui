@@ -259,6 +259,24 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Recent
 
+- **2026-06-27** — **state-model concurrency RESOLVED + Sleep/Archive de-overloaded**
+  (Opus opinion + GPT-5.5 doc edits across 9 docs; commit `cd474fa` +
+  pump-terminology cleanup). Fixes the §8 single-writer contradiction *before* the
+  reducer/session-store layer is built. **Decision:** `ActiveSession` actor
+  (background **blocking OS thread**, per typed-client D2 — not tokio) owns
+  canonical `SessionState` and is the single writer; `reduce()` is a **pure** fn
+  returning `StreamUpdate` deltas (no I/O); `SessionStore` is the **foreground
+  gpui replica** (read/observe only), never reduces. One seam, two directions
+  (`StreamUpdate` out / `SessionCommand` in); optimistic `pending_user` is
+  actor-owned. *Why:* gpui `Entity` mutation is foreground-only, so a
+  store-as-writer would put `reduce` on the UI thread — forcing the off-thread
+  actor + replica split. **Sleep ≠ Archive now:** Sleep = close observation +
+  flush + best-effort `stop_session` (server owns runner/PTY); Archive = server
+  `archived` flag via `PATCH` (visibility only) — resolves the dual-archived
+  M8/T8 caveat. `SessionLifecycle` = `Active|Slept|Deleted`. `items` schema → PK
+  by `item_id`, `ordinal` order, nullable `live_seq` hint (reconcile by `id`).
+  Memory `state-model-single-writer-decision`. **This unblocks building the
+  reducer/session-store (the next component).**
 - **2026-06-27** — **omnigent pin advanced `0.3.0.dev0` → `v0.3.0`** (first real
   divergence-infra run; done inline, not subagent-driven). v0.3.0 shipped as a tag
   (commit `4edb4d95`; pyproject semver now a clean `0.3.0`). `xtask drift` flagged
