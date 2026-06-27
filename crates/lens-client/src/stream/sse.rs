@@ -68,6 +68,22 @@ fn parse_block(block: &str) -> Option<SseFrame> {
     })
 }
 
+impl SseFrame {
+    /// Peek `sequence_number` off the frame's data JSON without full typing.
+    /// `None` when absent, null, or unparseable — only seq-bearing live frames
+    /// (heartbeats, response deltas) carry it (typed-client §7 / plan decision 3).
+    #[allow(dead_code)] // reconnect reader (Plan 3b-2b Task 5)
+    pub(crate) fn sequence_number(&self) -> Option<u64> {
+        #[derive(serde::Deserialize)]
+        struct SeqPeek {
+            sequence_number: Option<u64>,
+        }
+        serde_json::from_str::<SeqPeek>(&self.data)
+            .ok()?
+            .sequence_number
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,5 +155,32 @@ mod tests {
                 .iter()
                 .all(|f| !f.event.is_empty() && f.data.starts_with('{'))
         );
+    }
+
+    #[test]
+    fn frame_sequence_number_peeks_data_json() {
+        let f = SseFrame {
+            event: "response.output_text.delta".into(),
+            data: r#"{"sequence_number":7,"delta":"hi"}"#.into(),
+        };
+        assert_eq!(f.sequence_number(), Some(7));
+
+        let no_seq = SseFrame {
+            event: "x".into(),
+            data: r#"{"id":"item_1"}"#.into(),
+        };
+        assert_eq!(no_seq.sequence_number(), None);
+
+        let null_seq = SseFrame {
+            event: "x".into(),
+            data: r#"{"sequence_number":null}"#.into(),
+        };
+        assert_eq!(null_seq.sequence_number(), None);
+
+        let junk = SseFrame {
+            event: "x".into(),
+            data: "not json".into(),
+        };
+        assert_eq!(junk.sequence_number(), None);
     }
 }
