@@ -202,7 +202,7 @@ fn reconnect<Re: Reopen>(
         {
             return None;
         }
-        normalizer.reset_seen_items();
+        normalizer.reset_transient();
         if tx
             .send(ServerStreamEvent::SnapshotRestored(Box::new(snap)))
             .is_err()

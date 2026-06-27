@@ -102,11 +102,13 @@ impl Normalizer {
         self.close_reasoning().into_iter().collect()
     }
 
-    /// Clear the `OutputItemDone` dedup set. Called by the reader on
-    /// `Reconnected { gap }` when `gap != Some(0)`, so `GET /items` history
-    /// replay is not wrongly suppressed (typed-client §7 seam (a)).
-    pub(crate) fn reset_seen_items(&mut self) {
+    /// Clear ALL transient mid-stream state — the `OutputItemDone` dedup set and
+    /// any open reasoning bracket. Called by the reader on reconnect so neither
+    /// `GET /items` replay is wrongly suppressed nor a stale synthetic
+    /// `ReasoningClosed` leaks into the new live tail (typed-client §7 seam (a)).
+    pub(crate) fn reset_transient(&mut self) {
         self.seen_items.clear();
+        self.reasoning = None;
     }
 }
 
@@ -179,14 +181,47 @@ mod tests {
     }
 
     #[test]
-    fn reset_seen_items_allows_a_previously_seen_item_through() {
+    fn reset_transient_drops_open_reasoning_so_no_phantom_close_after_reconnect() {
+        use super::super::event::{ResponseEvent, ServerStreamEvent};
+        let mut n = Normalizer::default();
+        // Open a reasoning bracket and accumulate a delta (mimics pre-drop state).
+        let _ = n.push(ServerStreamEvent::Response(ResponseEvent::ReasoningStarted));
+        let _ = n.push(ServerStreamEvent::Response(
+            ResponseEvent::ReasoningTextDelta {
+                delta: "pre-drop".into(),
+            },
+        ));
+        // Reconnect clears transient state.
+        n.reset_transient();
+        // First live event after reconnect must NOT carry a synthetic ReasoningClosed.
+        let out = n.push(ServerStreamEvent::Response(
+            ResponseEvent::OutputTextDelta {
+                delta: "fresh".into(),
+                message_id: None,
+                index: None,
+                last: None,
+            },
+        ));
+        assert_eq!(
+            out.len(),
+            1,
+            "expected only the delta, got a phantom close: {out:?}"
+        );
+        assert!(matches!(
+            out[0],
+            ServerStreamEvent::Response(ResponseEvent::OutputTextDelta { .. })
+        ));
+    }
+
+    #[test]
+    fn reset_transient_allows_a_previously_seen_item_through() {
         let mut n = Normalizer::default();
         let first = fn_call("toolu_1", "completed", "fc_a");
         assert_eq!(n.push(first.clone()), vec![first.clone()]);
         // Without reset, an identical re-fire is suppressed:
         assert!(n.push(fn_call("toolu_1", "completed", "fc_b")).is_empty());
         // After reset (reconnect with gap != Some(0)), the same item replays:
-        n.reset_seen_items();
+        n.reset_transient();
         let replay = fn_call("toolu_1", "completed", "fc_c");
         assert_eq!(n.push(replay.clone()), vec![replay]);
     }
