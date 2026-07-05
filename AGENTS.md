@@ -1,7 +1,7 @@
 # Lens — agent guide (shared)
 
 **Lens** is a native macOS desktop client for the **omnigent** AI agent framework
-(`omnigent-ai/omnigent`, pinned `0.3.0.dev0`), built in **Rust + gpui**. It is a
+(`omnigent-ai/omnigent`, pinned `0.4.0`), built in **Rust + gpui**. It is a
 pure *client* of omnigent's HTTP+SSE+WS API. The core bet: all-Rust, no IPC/JS
 boundary — server enums stay typed from client to render.
 
@@ -42,4 +42,4 @@ Claude reads `CLAUDE.md` in addition.
 
 Start at `docs/design/README.md`, then the keystone
 `docs/design/capability-map-and-design-language.md`. Ground truth is
-`vendor/omnigent-0.3.0/openapi.json` (pin: `OMNIGENT_PIN`).
+`vendor/omnigent-0.4.0/openapi.json` (pin: `OMNIGENT_PIN`).

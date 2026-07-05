@@ -259,6 +259,22 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Recent
 
+- **2026-07-05** — **omnigent pin bumped 0.3.0 → 0.4.0** (`bumping-the-omnigent-pin`
+  runbook; tag `v0.4.0`, Source HEAD `31669e1b`). Small, clean contract delta:
+  **+3 routes** (`/v1/harnesses`, `/v1/runners/{id}/token`,
+  `/v1/sessions/{id}/read-state`), **+1 schema** (`ReadStatePutRequest`), and one
+  SSE field — `background_task_count` added to `session.status`. No dropped
+  schemas/routes, **no new SSE event type** (`taxonomy_drift` stayed green), and
+  `regress` was already a dep (no new-regex work). Re-vendored to
+  `vendor/omnigent-0.4.0/`, re-codegen'd `generated.rs` (114 schemas), bumped
+  `PINNED_OMNIGENT_VERSION` + http/error test literals, re-grounded AGENTS/.agents/
+  install-skill docs. Gate green: fmt · clippy(0 warn) · 133 tests · `no drift: 57
+  client paths match`. Installed server reinstalled editable + daemon restarted
+  → serves `0.4.0 (31669e1b)`. **Follow-ups:** (1) `background_task_count` is
+  tolerated but not surfaced — decide whether `SessionEvent::Status` should carry
+  it; (2) the 3 new routes are unmodeled in lens-client (no consumer yet);
+  (3) ~25 leaked sessions persist in the server store across restart — separate
+  cleanup.
 - **2026-06-27** — **state-model concurrency RESOLVED + Sleep/Archive de-overloaded**
   (Opus opinion + GPT-5.5 doc edits across 9 docs; commit `cd474fa` +
   pump-terminology cleanup). Fixes the §8 single-writer contradiction *before* the
