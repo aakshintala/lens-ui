@@ -259,6 +259,17 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Recent
 
+- **2026-07-05** — **0.4.0 client surface modeled: read-state + background_task_count**
+  (commit `22857d0`; composer-2.5 authored, cross-family review codex/gpt-5.5 + Opus,
+  both LGTM). `background_task_count` (nullable i64) now on `SessionSnapshot` + the SSE
+  `SessionEvent::Status`; `put_read_state` → `PUT …/read-state` (204, via new
+  `send_no_content` helper — `check_status` only, since `decode_json`'s 2xx `from_str`
+  chokes on an empty 204 body); `viewer_last_seen`/`viewer_unread` on `SessionSummary`.
+  +4 lib tests. Gate: fmt · clippy(0) · 137 tests · drift clean. **Deferred from the
+  0.4.0 bump:** #3 `GET /v1/harnesses` (dynamic harness registry) — no design needed,
+  just follow the spec + eat pre-v1 churn when we wire the catalog; #4 runner-token /
+  `/hooks/*` routes stay out (runner-side infra, not client API); ~25 leaked sessions
+  in the server store (separate cleanup).
 - **2026-07-05** — **omnigent pin bumped 0.3.0 → 0.4.0** (`bumping-the-omnigent-pin`
   runbook; tag `v0.4.0`, Source HEAD `31669e1b`). Small, clean contract delta:
   **+3 routes** (`/v1/harnesses`, `/v1/runners/{id}/token`,
