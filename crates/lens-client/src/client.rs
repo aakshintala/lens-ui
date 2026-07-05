@@ -110,6 +110,25 @@ impl Client {
         crate::http::decode_json(path, status, &text)
     }
 
+    /// Send a JSON body and check status only, decoding no response body — for
+    /// endpoints that return `204 No Content` (an empty body would fail
+    /// `decode_json`'s 2xx `from_str`).
+    pub(crate) fn send_no_content<B: serde::Serialize>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: &B,
+    ) -> crate::error::Result<()> {
+        let url = self.conn().url(path)?;
+        let rb = self
+            .http()
+            .request(method, url)
+            .timeout(REST_TIMEOUT)
+            .json(body);
+        let resp = self.conn().auth.apply(rb).send()?;
+        crate::http::check_status(path, resp.status().as_u16())
+    }
+
     pub(crate) fn get_bytes(&self, path: &str) -> crate::error::Result<Vec<u8>> {
         let url = self.conn().url(path)?;
         let resp = self

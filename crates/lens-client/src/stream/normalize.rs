@@ -121,6 +121,7 @@ mod tests {
         ServerStreamEvent::Session(SessionEvent::Status {
             status: s,
             response_id: None,
+            background_task_count: None,
         })
     }
 

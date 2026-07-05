@@ -114,6 +114,8 @@ pub struct SessionSnapshot {
     #[serde(default)]
     total_cost_usd: Option<f64>,
     #[serde(default)]
+    background_task_count: Option<i64>,
+    #[serde(default)]
     permission_level: Option<i64>,
     #[serde(default)]
     workspace: Option<String>,
@@ -205,6 +207,9 @@ impl SessionSnapshot {
     }
     pub fn total_cost_usd(&self) -> Option<f64> {
         self.total_cost_usd
+    }
+    pub fn background_task_count(&self) -> Option<i64> {
+        self.background_task_count
     }
     pub fn permission_level(&self) -> Option<i64> {
         self.permission_level
@@ -337,6 +342,10 @@ pub struct SessionSummary {
     updated_at: i64,
     #[serde(default)]
     labels: BTreeMap<String, String>,
+    #[serde(default)]
+    viewer_last_seen: Option<i64>,
+    #[serde(default)]
+    viewer_unread: bool,
 }
 
 impl SessionSummary {
@@ -363,6 +372,12 @@ impl SessionSummary {
     }
     pub fn labels(&self) -> &BTreeMap<String, String> {
         &self.labels
+    }
+    pub fn viewer_last_seen(&self) -> Option<i64> {
+        self.viewer_last_seen
+    }
+    pub fn viewer_unread(&self) -> bool {
+        self.viewer_unread
     }
 }
 
@@ -1318,6 +1333,18 @@ impl<'a> Sessions<'a> {
         )
     }
 
+    /// `PUT /v1/sessions/{id}/read-state` — set the calling user's read tracking
+    /// (`204 No Content`). `last_seen` is a wall-clock epoch-seconds baseline;
+    /// `unread` pins an explicit "marked unread" override. Pairs with the
+    /// `viewer_last_seen`/`viewer_unread` read fields on `SessionSummary`.
+    pub fn put_read_state(&self, id: &SessionId, last_seen: i64, unread: bool) -> Result<()> {
+        self.client.send_no_content(
+            reqwest::Method::PUT,
+            &format!("/v1/sessions/{id}/read-state"),
+            &crate::generated::ReadStatePutRequest { last_seen, unread },
+        )
+    }
+
     /// `DELETE /v1/sessions/{id}` — delete; `delete_branch` cleans the worktree.
     pub fn delete(&self, id: &SessionId, delete_branch: bool) -> Result<ConversationDeleted> {
         self.client.send_json::<ConversationDeleted, ()>(
@@ -1980,6 +2007,52 @@ mod tests {
         assert_eq!(s.runner_online(), Some(true));
         assert_eq!(s.host_online(), None);
         assert!(!s.host_resumable());
+    }
+
+    #[test]
+    fn session_snapshot_background_task_count_present_and_absent() {
+        let with_count = r#"{
+            "id":"sess_1","status":"idle","agent_id":"ag_1","created_at":1,
+            "background_task_count": 3
+        }"#;
+        let s: SessionSnapshot = serde_json::from_str(with_count).unwrap();
+        assert_eq!(s.background_task_count(), Some(3));
+
+        let without_count = r#"{
+            "id":"sess_1","status":"idle","agent_id":"ag_1","created_at":1
+        }"#;
+        let s: SessionSnapshot = serde_json::from_str(without_count).unwrap();
+        assert_eq!(s.background_task_count(), None);
+    }
+
+    #[test]
+    fn session_summary_viewer_read_state_present_and_absent() {
+        let with_fields = r#"{
+            "id":"s1","status":"idle","agent_id":"ag","created_at":1,"updated_at":2,
+            "viewer_last_seen":1717000000,"viewer_unread":true
+        }"#;
+        let s: SessionSummary = serde_json::from_str(with_fields).unwrap();
+        assert_eq!(s.viewer_last_seen(), Some(1717000000));
+        assert!(s.viewer_unread());
+
+        let without_fields = r#"{
+            "id":"s1","status":"idle","agent_id":"ag","created_at":1,"updated_at":2
+        }"#;
+        let s: SessionSummary = serde_json::from_str(without_fields).unwrap();
+        assert_eq!(s.viewer_last_seen(), None);
+        assert!(!s.viewer_unread());
+    }
+
+    #[test]
+    fn read_state_put_request_serializes_body_shape() {
+        let req = crate::generated::ReadStatePutRequest {
+            last_seen: 1717000000,
+            unread: true,
+        };
+        assert_eq!(
+            serde_json::to_value(&req).unwrap(),
+            json!({"last_seen": 1717000000, "unread": true})
+        );
     }
 
     #[test]

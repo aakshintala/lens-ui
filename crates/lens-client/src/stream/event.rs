@@ -51,6 +51,7 @@ pub enum SessionEvent {
     Status {
         status: SessionStatusValue,
         response_id: Option<String>,
+        background_task_count: Option<i64>,
     },
     Usage {
         context_tokens: Option<i64>,
@@ -256,6 +257,8 @@ struct RawStatus {
     status: SessionStatusValue,
     #[serde(default)]
     response_id: Option<String>,
+    #[serde(default)]
+    background_task_count: Option<i64>,
 }
 #[derive(Deserialize)]
 struct RawUsage {
@@ -707,6 +710,7 @@ impl SessionEvent {
                 SessionEvent::Status {
                     status: r.status,
                     response_id: r.response_id,
+                    background_task_count: r.background_task_count,
                 }
             }
             "session.usage" => {
@@ -1084,6 +1088,33 @@ mod tests {
             ServerStreamEvent::Session(SessionEvent::Status {
                 status: SessionStatusValue::Running,
                 response_id: None,
+                background_task_count: None,
+            })
+        );
+    }
+
+    #[test]
+    fn status_background_task_count_present_and_absent() {
+        let with_count = parse_event(&frame(
+            "session.status",
+            r#"{"status":"idle","background_task_count":3}"#,
+        ));
+        assert_eq!(
+            with_count,
+            ServerStreamEvent::Session(SessionEvent::Status {
+                status: SessionStatusValue::Idle,
+                response_id: None,
+                background_task_count: Some(3),
+            })
+        );
+
+        let without_count = parse_event(&frame("session.status", r#"{"status":"idle"}"#));
+        assert_eq!(
+            without_count,
+            ServerStreamEvent::Session(SessionEvent::Status {
+                status: SessionStatusValue::Idle,
+                response_id: None,
+                background_task_count: None,
             })
         );
     }
@@ -1096,6 +1127,7 @@ mod tests {
             ServerStreamEvent::Session(SessionEvent::Status {
                 status: SessionStatusValue::Unknown,
                 response_id: None,
+                background_task_count: None,
             })
         );
     }
