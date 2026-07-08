@@ -360,7 +360,13 @@ impl ProbeHarness {
             "row entity {before:?}→{after:?} markdown_inits {markdown_inits_before}→{markdown_inits_after}"
         );
         let entity_ok = before == after;
-        let md_ok = markdown_inits_after == markdown_inits_before && markdown_inits_before <= 1;
+        // Identity invariant: the row's markdown state is initialized AT MOST ONCE,
+        // ever — the off+back round-trip must not RE-initialize it. `before` can read
+        // 0 when the baseline is captured before the off-screen target's first paint,
+        // so comparing after==before is wrong; what matters is that after the
+        // round-trip the count is still <= 1 (a genuine re-init shows 1->2 => fail).
+        let md_ok = markdown_inits_after <= 1;
+        let _ = markdown_inits_before;
         self.identity = if entity_ok && md_ok {
             ProbeVerdict::Pass
         } else {
