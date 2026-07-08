@@ -1,3 +1,5 @@
+mod replay;
+
 // Task 1 — dependency-feasibility probe + static markdown render.
 // Goal: confirm gpui-component 0.5.1 builds and opens a window rendering
 // markdown via `TextView::markdown`. See NOTES.md for the discovered API.
