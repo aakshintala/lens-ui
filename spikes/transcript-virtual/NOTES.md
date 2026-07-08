@@ -201,3 +201,74 @@ selection eyeball: drag in a CodeBlock row after shift-6.
   heights (gpui list contract).
 - Probe counters sample **one frame after keypress** (list closure runs post-
   `render()` return).
+
+---
+
+## Phase 2 — Backend B (`v_virtual_list`) (2026-07-08)
+
+### Backend selection
+
+```bash
+cargo run -p transcript-virtual                              # Backend A (default)
+cargo run -p transcript-virtual -- --backend=b               # Backend B
+TV_BACKEND=b cargo run -p transcript-virtual                 # env var
+```
+
+Same keybindings as Phase 1; readout header shows `A (gpui list)` vs
+`B (gpui-component v_virtual_list)`.
+
+### Stick-to-bottom (1a + UX)
+
+No `ListAlignment::Bottom`. Harness sets `follow_bottom=true` on open, calls
+`scroll_handle.scroll_to_bottom()` via `pending_scroll_bottom` on first frame,
+and re-calls `scroll_to_bottom()` after each append while following.
+
+Probe **1a (B)** asserts `is_at_bottom()` (pixel: `offset.y ≈ max_offset.height`)
+after append, not `logical_scroll_top`.
+
+### Anchor 1b derivation (Backend B only)
+
+**No native logical anchor.** Harness derives `(top_ix, sub_offset)` in
+`anchor.rs`:
+
+```
+content_top = (-scroll_y - padding_top).max(0)
+top_ix      = first i where sum(heights[0..=i]) > content_top
+sub_offset  = content_top - sum(heights[0..top_ix)
+```
+
+`heights[]` is the same table backing `v_virtual_list`'s `item_sizes` Rc.
+`padding_top = 0` (no extra padding on harness list).
+
+**Setup (key 4):** scroll via inverse mapping `scroll_y = -content_top`.
+**Mutate (key 5):** bump `heights[mutable_ix] += delta`, replace `item_sizes`
+Rc, **do not** adjust `scroll_offset.y` — tests whether the component
+compensates scroll when off-screen-above content grows.
+
+### Is the derived 1b verdict trustworthy?
+
+| Condition | Verdict quality |
+|-----------|-----------------|
+| Heights are exact (measured or delta-updated) and match `item_sizes` | **Machine-checkable** for the offset+table model |
+| Markdown rows still on height *estimates* | **Approximate** — table may diverge from true layout |
+| `v_virtual_list` does not auto-shift `scroll_y` when above-viewport content grows | Derived anchor **will shift** → FAIL (valid: no anchor preservation) |
+| Visual stability but scroll_y unchanged | Machine FAIL, eyeball PASS → record as **PARTIAL** |
+
+The derivation mirrors `v_virtual_list` prepaint (`virtual_list.rs` ~656–664) so
+it is internally consistent with how B computes visible range. It does **not**
+prove visual stability — only that the `(offset, height-table)` logical anchor
+is unchanged. If that is the contract, it is a real machine verdict; if the
+contract is pixel-stable viewport, eyeball qualifies B's 1b as PARTIAL per
+spec §5.
+
+### API surprises (Backend B)
+
+- `v_virtual_list` takes `Rc<Vec<Size<Pixels>>>`; height changes need a **new
+  Rc** (pointer equality gate in element state) — harness replaces `item_sizes`
+  on each height bump.
+- `scroll_to_bottom()` → `scroll_to_item(n-1, ScrollStrategy::Top)` — last item
+  top-aligned, not a persistent bottom-alignment mode.
+- `ScrollHandle::max_offset()` needed for `is_at_bottom()`; no `ListScrollEvent`.
+- Render closure signature differs: `Fn(&mut V, Range<usize>, …) -> Vec<_>` vs
+  gpui `list()`'s per-index `AnyElement`.
+

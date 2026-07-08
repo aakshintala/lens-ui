@@ -1,13 +1,10 @@
 //! Backend A — gpui native `list()` + `ListState` + `ListAlignment::Bottom`.
 
-use gpui::{
-    div, prelude::*, App, Entity, EntityId, ListAlignment, ListState, Pixels, SharedString, Window,
-    px,
-};
-use gpui_component::text::TextView;
+use gpui::{div, prelude::*, App, Entity, EntityId, ListAlignment, ListState, Pixels, Window, px};
 
-use crate::fixture::{Fixture, RowKind};
-use crate::rowsource::{RowId, RowSource, RowState, RowStore};
+use crate::fixture::Fixture;
+use crate::row_render::render_row;
+use crate::rowsource::{RowId, RowSource, RowStore};
 
 const OVERDRAW: Pixels = px(200.);
 
@@ -40,10 +37,6 @@ impl BackendA {
         self.store.len()
     }
 
-    pub fn mutable_offscreen_ix(&self) -> usize {
-        self.fixture.mutable_offscreen_id as usize
-    }
-
     pub fn scroll_anchor_ix(&self) -> usize {
         self.item_count() / 2
     }
@@ -73,17 +66,10 @@ impl BackendA {
         let Some(entity) = self.store.entity(id) else {
             return div().into_any_element();
         };
-
-        entity.update(cx, |state, cx| {
-            if state.use_markdown && !state.markdown_initialized {
-                state.markdown_initialized = true;
-                state.markdown_init_count += 1;
-            }
-            render_row(state, window, cx)
-        })
+        entity.update(cx, |state, cx| render_row(state, window, cx))
     }
 
-    pub fn identity_target_entity_id(&self, ix: usize, cx: &App) -> Option<EntityId> {
+    pub fn identity_target_entity_id(&self, ix: usize, _cx: &App) -> Option<EntityId> {
         let id = self.store.id_at(ix)?;
         let entity = self.store.entity(id)?;
         Some(entity.entity_id())
@@ -109,7 +95,7 @@ impl RowSource for BackendA {
         self.store.id_at(index)
     }
 
-    fn row_entity(&self, id: RowId, cx: &App) -> Option<Entity<RowState>> {
+    fn row_entity(&self, id: RowId, _cx: &App) -> Option<gpui::Entity<crate::rowsource::RowState>> {
         self.store.entity(id).cloned()
     }
 
@@ -122,51 +108,8 @@ impl RowSource for BackendA {
     fn mutate_height(&mut self, id: RowId, delta: Pixels, _window: &mut Window, cx: &mut App) {
         self.fixture.mutate_offscreen_height(delta);
         self.store.mutate_height(id, delta, cx);
-        if let Some(ix) = self
-            .store
-            .order
-            .iter()
-            .position(|&rid| rid == id)
-        {
+        if let Some(ix) = self.store.order.iter().position(|&rid| rid == id) {
             self.invalidate_row_height(ix);
         }
-    }
-}
-
-fn render_row(state: &mut RowState, window: &mut Window, cx: &mut App) -> gpui::AnyElement {
-    let pad = px(4.) + state.height_delta;
-    match state.kind {
-        RowKind::CodeBlock => div()
-            .w_full()
-            .pb(pad)
-            .child(
-                TextView::markdown(
-                    SharedString::from(format!("md-{}", state.id.0)),
-                    state.text.clone(),
-                    window,
-                    cx,
-                )
-                .selectable(true)
-                .scrollable(false),
-            )
-            .into_any_element(),
-        RowKind::ImagePlaceholder => div()
-            .w_full()
-            .h(px(120.) + state.height_delta)
-            .p_2()
-            .child(state.text.clone())
-            .into_any_element(),
-        RowKind::ToolSpan => div()
-            .w_full()
-            .pb(pad)
-            .p_2()
-            .child(format!("{}\n(extra tool output line)\n(more output)", state.text))
-            .into_any_element(),
-        RowKind::OneLiner => div()
-            .w_full()
-            .pb(pad)
-            .px_2()
-            .child(state.text.clone())
-            .into_any_element(),
     }
 }

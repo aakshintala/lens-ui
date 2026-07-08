@@ -263,7 +263,38 @@ impl ProbeHarness {
         };
     }
 
-    /// Contract 1a — stay pinned to bottom across appends.
+    /// Contract 1a (Backend B) — bottom-follow keeps last row visible after append.
+    pub fn assert_anchor_1a_bottom(&mut self, at_bottom: bool) {
+        self.anchor_1a_appends += 1;
+        self.anchor_1a_detail = format!(
+            "append #{} at_bottom={at_bottom} (manual scroll_to_bottom follow)",
+            self.anchor_1a_appends
+        );
+        if at_bottom {
+            if self.anchor_1a_appends >= 3 {
+                self.anchor_1a = ProbeVerdict::Pass;
+            } else {
+                self.anchor_1a = ProbeVerdict::Pending;
+                self.anchor_1a_detail
+                    .push_str(" — press 3 again for more appends");
+            }
+        } else {
+            self.anchor_1a = ProbeVerdict::Fail("drifted off bottom after append".into());
+        }
+    }
+
+    /// Contract 4 (Backend B) — initial scroll_to_bottom lands at bottom.
+    pub fn assert_jump_to_bottom_bottom(&mut self, at_bottom: bool, item_count: usize) {
+        self.jump_to_bottom_detail =
+            format!("initial at_bottom={at_bottom} item_count={item_count}");
+        self.jump_to_bottom = if at_bottom {
+            ProbeVerdict::Pass
+        } else {
+            ProbeVerdict::Fail("scroll_to_bottom did not pin on open".into())
+        };
+    }
+
+    /// Contract 1a (Backend A) — stay pinned to bottom across appends.
     pub fn assert_anchor_1a(&mut self, item_count: usize, offset: ListOffset) {
         self.anchor_1a_appends += 1;
         let pinned = offset.item_ix == item_count && offset.offset_in_item == Pixels::ZERO;

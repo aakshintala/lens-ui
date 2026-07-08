@@ -19,6 +19,7 @@ pub struct RowState {
     pub use_markdown: bool,
     pub markdown_initialized: bool,
     pub markdown_init_count: u32,
+    pub measured_height: Option<Pixels>,
 }
 
 impl RowState {
@@ -31,6 +32,7 @@ impl RowState {
             use_markdown: row.kind == RowKind::CodeBlock,
             markdown_initialized: false,
             markdown_init_count: 0,
+            measured_height: None,
         }
     }
 }
