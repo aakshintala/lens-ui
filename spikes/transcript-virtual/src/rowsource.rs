@@ -16,6 +16,9 @@ pub struct RowState {
     pub kind: RowKind,
     pub text: String,
     pub height_delta: Pixels,
+    pub use_markdown: bool,
+    pub markdown_initialized: bool,
+    pub markdown_init_count: u32,
 }
 
 impl RowState {
@@ -25,6 +28,9 @@ impl RowState {
             kind: row.kind,
             text: row.text.clone(),
             height_delta: row.height_delta,
+            use_markdown: row.kind == RowKind::CodeBlock,
+            markdown_initialized: false,
+            markdown_init_count: 0,
         }
     }
 }
@@ -32,7 +38,7 @@ impl RowState {
 /// Retained `Entity`-per-item store keyed by item id. Order is separate from
 /// identity so virtualization recycle never remounts row state.
 pub struct RowStore {
-    order: Vec<RowId>,
+    pub(crate) order: Vec<RowId>,
     entities: HashMap<RowId, Entity<RowState>>,
 }
 

@@ -156,3 +156,48 @@ framework API — record as PARTIAL if we go that route.
 4. **Stick-to-bottom semantics differ materially** — native `list()` has a
    first-class `ListAlignment::Bottom` with `logical_scroll_top == None` meaning
    "at bottom"; gpui-component only has imperative `scroll_to_bottom()`.
+
+---
+
+## Phase 1 — Backend A + probes (2026-07-07)
+
+### Build / run
+
+```bash
+cargo build -p transcript-virtual
+cargo run -p transcript-virtual          # default N=200
+cargo run -p transcript-virtual -- --n 2000
+```
+
+### Keybindings (focus the window first)
+
+| Key | Probe |
+|-----|-------|
+| `shift-2` | Reload N=200 |
+| `shift-3` | Reload N=2000 |
+| `1` | Windowing (press at each N; second press compares frame-cost ratio) |
+| `2` | Variable heights |
+| `3` | Anchor 1a — append to last row (must be pinned to bottom) |
+| `4` | Anchor 1b setup — scroll to mid, record anchor |
+| `5` | Anchor 1b mutate — bump off-screen-above row height |
+| `6` | Identity — reveal markdown row, record, scroll off |
+| `shift-6` | Identity — scroll back, assert Entity retained |
+| `7` | UX — append while paused |
+| `8` | UX — evaluate follow transitions |
+| scroll wheel | UX — scroll up to pause, scroll to bottom to resume |
+
+### Identity / selection note
+
+`TextView` selection is mouse-driven only (no public `set_selection` API).
+Identity probe asserts **Entity id** + **markdown_init_count** (TextView
+keyed-state not re-created on re-scroll), not selection survival. Manual
+selection eyeball: drag in a CodeBlock row after shift-6.
+
+### API adaptations vs spec sketch
+
+- `ListState::new(count, ListAlignment::Bottom, overdraw)` — no render fn in
+  `new`; render closure is the second arg to `list()`.
+- Height changes require `list_state.splice(ix..ix+1, 1)` to invalidate cached
+  heights (gpui list contract).
+- Probe counters sample **one frame after keypress** (list closure runs post-
+  `render()` return).
