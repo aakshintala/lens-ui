@@ -121,12 +121,15 @@ false-FAIL the prior two spikes each caught — the guard remains worth its cost
 ## Machine-verified vs eyeball
 
 - **Machine (headless assertions):** probes 1–6 above.
-- **Eyeball (human, non-headless `cargo run -p elicitation-form`):** the form
-  *renders* legibly at composer-dock width (`max_w 420px`, probe 7); radio/checkbox
-  **interactivity** (`on_click`→selection) — these widgets are stateless (the app
-  holds selection), so probe 5 machine-covers the assembly + custom-row Entity but
-  **not** the `on_click` path; the eyeball confirms clicking drives selection and
-  the submit gate. <!-- EYEBALL: pending user confirmation -->
+- **Eyeball (human, non-headless `cargo run -p elicitation-form`) — CONFIRMED
+  2026-07-08:** the form *renders* legibly at composer-dock width (`max_w 420px`,
+  probe 7 — barebones, styling out of spike scope); radio/checkbox **interactivity**
+  (`on_click`→selection) works — these widgets are stateless (the app holds
+  selection), so probe 5 machine-covers only the assembly + custom-row Entity, and
+  the eyeball closes the gap: clicking radios/checkboxes drives selection (single-
+  select switches, multi-select toggles), the "type something" row works, and Submit
+  gates on all-answered. **Full "Both" verdict (machine 6/6 + human eyeball), matching
+  the prior two framework spikes.**
 
 ## gpui-component 0.5.1 API facts (from NOTES.md)
 
