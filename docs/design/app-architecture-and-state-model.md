@@ -195,6 +195,9 @@ pub struct Item {
     pub seq: Option<u64>,    // SSE sequence_number when seen live; None for items loaded
                              //   from GET /items. Live-overlap dedup only — never a storage key.
     pub ctx: BlockContext,   // attribution, stamped by the reducer (§4)
+    pub created_at: i64,     // epoch millis, stamped by the reducer from an INJECTED clock at
+                             //   reduce time (deterministic replay); maps 1:1 to items.created_at.
+                             //   The durable "when" — replaces the old BlockContext.timestamp (§2.4).
     pub kind: ItemKind,
 }
 
@@ -236,12 +239,20 @@ pub struct BlockContext {
     pub agent: Option<String>,  // "coder" | "coder.researcher"; None = root
     pub depth: u32,             // 0 = root, 1 = sub-agent, …
     pub turn: u32,              // turn within the response
-    pub timestamp: f64,         // monotonic, when reduced
 }
 ```
 
 This answers the typed client's open question: attribution is a **field on the
 canonical item**, set at reduce time — not a separate stream wrapper.
+
+> **Revised 2026-07-08 (grilling).** Dropped the original `timestamp: f64
+> // monotonic, when reduced` field. It had **no downstream consumer** (every
+> reader of `BlockContext` uses `.agent`/`.depth` only — §13.2), duplicated the
+> `items.created_at` epoch that *does* round-trip, and a monotonic value is
+> meaningless across a process restart so it could not survive disk. The durable
+> "when" now lives as `Item.created_at: i64` (epoch millis) on the item envelope
+> (§2.3), stamped from an **injected clock** so `reduce()` stays pure and replay
+> stays deterministic (§4.1). `BlockContext` is now pure attribution.
 
 ### 2.5 `Usage`, `Cost`, `ErrorInfo`, `PresenceViewer`
 
@@ -560,12 +571,49 @@ no client history cache. This layer owns it. Buys instant startup (paint cards
 from disk before the network is up), offline history, restart survival, and
 bounds RAM to ≈ the Active set.
 
+> **Revised 2026-07-08 (grilling).** Storage is **two-tier**, split by *access
+> plane* rather than a single monolithic file:
+>
+> 1. **Control plane — one `lens.db`** (`connections`, `sessions`,
+>    `cost_samples`, `meta`, later the Bridge tables). Small, bounded by session
+>    count, cross-cut and **aggregate-queried** (startup card paint, global cost
+>    windowing, board rollup, cross-session badges), and **precious — not
+>    re-derivable** (it is the index of what sessions exist). Served by a single
+>    serialized writer (write volume is low: session-field folds + cost samples).
+> 2. **Transcript plane — one SQLite file per session**, keyed
+>    `(ConnectionId, SessionId)` (path e.g. `transcripts/<connection_id>/<conv_id>.db`;
+>    both ids are filesystem-safe — `SessionId` is `conv_*`, `ConnectionId` is
+>    Lens-minted). Holds only that session's `items`. Owned by that session's
+>    `ActiveSession` actor while Active (its own WAL write connection → **zero
+>    cross-actor write contention**), opened on wake / for on-demand transcript
+>    reads, closed on Sleep.
+>
+> Why the split: the transcript is the **only** unbounded, append-heavy,
+> read-one-session-at-a-time data, and it is **re-fetchable from the server via
+> `GET /items`** — so isolating it from the small, precious, aggregate control
+> plane (a) makes each actor's writes contention-free by construction, (b) makes
+> retention/pruning and tombstoning a **file op** (drop/truncate one file, keep
+> the summary row), and (c) shrinks corruption blast-radius to one recoverable
+> session. Costs are benign: cross-session transcript **search** (§15, deferred)
+> is served by a rebuildable FTS index in `lens.db`, not by a monolithic `items`
+> table; there is no cross-file FK or atomic "finalize item + bump summary"
+> transaction, which is fine because the summary is eventually-consistent and
+> reconcile-on-wake repairs any lag (§6.3, already tolerated). `/clear` does
+> **not** rotate the key — it rotates the runner-internal `external_session_id`,
+> not `conv_id` (verified in omnigent source).
+
 ### 6.1 Engine & portability
 
-- **SQLite for v1** — single local file, transactional, low setup.
-- Access goes through an abstract **`SessionPersistence`** trait; SQLite is the
-  v1 impl. A later move to a remote backing store (per-connection or shared) is
-  a backing swap behind the same trait, not a rewrite.
+- **SQLite for v1** — the two-tier layout above: one control-plane `lens.db` +
+  one transcript file per session. Transactional, low setup. **`rusqlite`**
+  (blocking/synchronous — matches the no-tokio core data path, §8); WAL mode so
+  readers (poll, disk-paint) never block writers.
+- Access goes through an abstract **`SessionPersistence`** trait, factored into
+  two roles: an app-level **`ControlStore`** (`lens.db`) and a per-session
+  **`TranscriptStore`** (opened/closed on the Active lifecycle alongside the
+  actor). SQLite is the v1 impl of both. A later move to a remote backing store
+  (per-connection or shared) is a backing swap behind the same trait, not a
+  rewrite.
 - The schema is kept **portable**: standard SQL types, JSON payloads in a
   column that maps cleanly to Postgres `jsonb`, text ids, epoch timestamps,
   no SQLite-only features on the critical path.
@@ -576,7 +624,14 @@ bounds RAM to ≈ the Active set.
 
 ### 6.2 Schema sketch
 
+Two files (§6.1). `connections`/`sessions`/`cost_samples`/`meta` live in the
+control-plane **`lens.db`**; `items` lives in the **per-session transcript
+file** (one per `(connection_id, session_id)`), whose own `meta` records its
+`schema_version` + the `(connection_id, session_id)` it belongs to so the file
+is self-describing for Bridge.
+
 ```sql
+-- ══ lens.db — control plane (one file) ══════════════════════════════════════
 CREATE TABLE connections (
   id          TEXT PRIMARY KEY,        -- Lens-local ConnectionId
   base_url    TEXT NOT NULL,
@@ -629,26 +684,29 @@ CREATE TABLE sessions (
   PRIMARY KEY (connection_id, id)
 );
 
+-- ══ transcript file — one per session (path transcripts/<conn>/<conv>.db) ════
+-- The file IS the session, so (connection_id, session_id) are recorded once in
+-- this file's own `meta`, not on every row. `items` is the only content table.
 CREATE TABLE items (
-  connection_id TEXT NOT NULL,
-  session_id   TEXT NOT NULL,
   item_id      TEXT NOT NULL,
   live_seq     INTEGER,                    -- SSE-only overlap hint; NULL for GET /items
   ordinal      INTEGER NOT NULL,           -- local canonical order within the session
   kind         TEXT NOT NULL,           -- message|function_call|function_call_output|
                                         -- reasoning|native_tool|compaction|
-                                        -- slash_command|terminal_command|resource_event|
-                                        -- agent_changed
+                                        -- slash_command|terminal_command|error|
+                                        -- resource_event|agent_changed
   payload      TEXT NOT NULL,           -- json, jsonb-mappable
-  agent        TEXT,
-  depth        INTEGER NOT NULL DEFAULT 0,
-  turn         INTEGER NOT NULL DEFAULT 0,
-  created_at   INTEGER NOT NULL,
-  PRIMARY KEY (connection_id, session_id, item_id),
-  UNIQUE (connection_id, session_id, ordinal),
-  FOREIGN KEY (connection_id, session_id) REFERENCES sessions(connection_id, id)
+  agent        TEXT,                    -- BlockContext.agent (§2.4)
+  depth        INTEGER NOT NULL DEFAULT 0,   -- BlockContext.depth
+  turn         INTEGER NOT NULL DEFAULT 0,   -- BlockContext.turn
+  created_at   INTEGER NOT NULL,        -- Item.created_at, epoch millis (§2.3; injected clock)
+  PRIMARY KEY (item_id),
+  UNIQUE (ordinal)
 );
+-- transcript file also carries: CREATE TABLE meta (key, value) with
+--   schema_version, connection_id, session_id  (self-describing for Bridge).
 
+-- ══ back to lens.db ═════════════════════════════════════════════════════════
 -- Cost time-series for the time-windowed global readout (decision I). Lens
 -- samples each session's cumulative server total_cost_usd on usage events
 -- (Active) and on the list poll (Slept), and differences per window
@@ -674,10 +732,13 @@ CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);   -- schema_version, …
 ### 6.3 Write-through & reconcile
 
 - **Write-through while Active:** as `ActiveSession` finalizes each canonical
-  item, upsert it into `items` by `(connection_id, session_id, item_id)`; fold
-  session-field updates into `sessions`.
-  In-progress accumulators are RAM-only (§4.2) — a crash mid-stream loses only
-  unpersisted deltas, which the server still has.
+  item, upsert it by `item_id` into **its own transcript file** (the actor owns
+  that file's WAL write connection — no cross-actor contention, §6.1); fold
+  session-field updates into `sessions` in `lens.db` (via the shared serialized
+  control-plane writer). The two writes are not one transaction and need not be:
+  the `sessions` summary is eventually-consistent and reconcile-on-wake repairs
+  any lag (below). In-progress accumulators are RAM-only (§4.2) — a crash
+  mid-stream loses only unpersisted deltas, which the server still has.
 - **On sleep:** flush actor-local canonical state and persistence, send
   best-effort `stop_session`, then stop the actor and drop heavy RAM state.
 - **On wake:** load the disk snapshot into the foreground replica and paint

@@ -285,6 +285,32 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Recent
 
+- **2026-07-08** — **state-model engine spec GRILLED → implementation-ready.** After
+  the gpt-5.5 cross-family review (6 Important + 3 Minor, commit `05329a8`), a
+  focused grilling pass over the implementation-risk seams the review didn't reach.
+  Four branches, all resolved (no blocker; no second pass warranted):
+  1. **Storage is now two-tier** (design §6 revised, LOCKED-with-marker) — one
+     control-plane `lens.db` (connections/sessions/cost_samples/meta) + **one
+     SQLite file per session** for `items`, actor-owned WAL connection. Makes each
+     actor's writes contention-free by construction, retention/tombstone a file op,
+     corruption blast-radius one (re-fetchable) session. `rusqlite`, WAL, single
+     serialized writer for the control plane only.
+  2. **Transcript key = `(ConnectionId, conv_id)` — safe** (verified in omnigent
+     source): `/clear` rotates the runner-internal `external_session_id`, **not**
+     `conv_id`; `/clear` is a non-destructive `SlashCommandData` item on the same
+     conversation.
+  3. **`BlockContext.timestamp` dropped** (design §2.3/§2.4) — vestigial (no
+     consumer, never reviewed, can't round-trip as monotonic `f64`); durable "when"
+     is now `Item.created_at: i64` epoch on the item envelope, injected-clock-sourced.
+  4. **Optimistic-send × reconnect reconcile** (spec P3b note) — the one collision
+     §7's FIFO left open (a gap-dropped `consumed` event dup/orphans the optimistic
+     bubble); resolved by a reconnect-aware, session-type-asymmetric rule using the
+     snapshot's `pending_inputs` (native) / replayed `GET /items` (non-native). One
+     P3 live-verify item logged (does `POST /events` return `pending_id`).
+  Bonus: the §6.2 `items.kind` comment now lists `error` (resolves the P0
+  doc-correction). Edits in `app-architecture-and-state-model.md` (§2.3/§2.4/§6) +
+  the spec (D4/P0/P1/P2/P3b). Memory `state-model-grilling-revisions`.
+  **Next: implementation in a fresh session (P0 → P3).**
 - **2026-07-08** — **§4.3 JSON-Schema elicitation form spike EXECUTED → GO on native
   gpui + `gpui-component` inputs (6/6 probes)** (throwaway harness
   `spikes/elicitation-form/`, subagent-driven: composer-2.5 build + headless probe

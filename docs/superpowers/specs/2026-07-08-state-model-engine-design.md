@@ -61,8 +61,14 @@ the engine contract is proven against real bytes.
   read-only foreground replica: it applies self-contained `StreamUpdate`s and
   notifies, never reduces, never originates state. Not re-litigated here (memory
   `state-model-single-writer-decision`).
-- **D4 — Persistence.** `SessionPersistence` trait, SQLite v1 impl, portable
-  (jsonb-mappable) schema per LOCKED §6.2. Backing-store swap is behind the trait.
+- **D4 — Persistence, two-tier (grilling revision).** `SessionPersistence` trait
+  splits into a **`ControlStore`** (one `lens.db`: connections/sessions/
+  cost_samples/meta) + a per-session **`TranscriptStore`** (one SQLite file per
+  `(connection, session)`, actor-owned WAL connection — items only). `rusqlite`,
+  portable (jsonb-mappable) schema per LOCKED §6.1/§6.2. The split makes actor
+  writes contention-free by construction and retention/tombstone a file op;
+  transcripts are re-fetchable via `GET /items` so isolating them is safe.
+  Backing-store swap is behind the trait.
 - **D5 — Blocking OS thread, no tokio** on the core data path — matches
   `lens-client` D2 (the typed client's `EventStream` is a blocking reader).
 - **D6 — `StreamUpdate` drafted at P1, ratified at the P3 skeleton.** The
@@ -94,7 +100,8 @@ crates/
     src/
       domain/      # §2: SessionState, Item/ItemKind, BlockContext, ids, Usage/Cost, StreamScratch
       reduce/      # §4: reduce(), scratch accumulation, folds, transforms (§4.3)
-      persist/     # §6: SessionPersistence trait + SQLite impl + schema
+      persist/     # §6: SessionPersistence trait → ControlStore (lens.db) +
+                   #     per-session TranscriptStore (rusqlite/WAL) + schema
       actor/       # §8/§7: ActiveSession, SessionCommand, command semantics
       lib.rs       # StreamUpdate / SessionCommand seam types re-exported
   lens-store/      # NEW — gpui; depends on gpui + lens-core
@@ -120,17 +127,21 @@ persistence, so persistence precedes the actor).
 Branded ids, `SessionState`, `Item` + `ItemKind` enum — the full LOCKED **§2.3**
 union: message | function_call | function_call_output | reasoning | native_tool |
 compaction | slash_command | terminal_command | **error** | resource_event |
-agent_changed. `BlockContext { agent, depth, turn, timestamp }` (timestamp is
-`f64` monotonic, stamped at reduce time — §2.4), `Usage`/`Cost`/`ErrorInfo`/
-`PresenceViewer`, `StreamScratch` (§4.2). Pure data + serde (payloads
-jsonb-mappable per §6.2). No logic. **`presence` is RAM-only — never a persisted
-column** (§2.5/§6.2); carry it on `SessionState` but exclude it from the P2
-schema. **Gate:** serde round-trips; fmt · clippy · tests.
+agent_changed. `BlockContext { agent, depth, turn }` — **pure attribution**; the
+durable "when" is `Item.created_at: i64` (epoch millis) on the item **envelope**,
+stamped from an injected clock at reduce time (§2.3/§2.4, grilling revision — the
+old `BlockContext.timestamp: f64` monotonic field is **dropped**: no consumer,
+non-round-trippable). `Usage`/`Cost`/`ErrorInfo`/`PresenceViewer`, `StreamScratch`
+(§4.2). Pure data + serde (payloads jsonb-mappable per §6.2). No logic.
+**`presence` is RAM-only — never a persisted column** (§2.5/§6.2); carry it on
+`SessionState` but exclude it from the P2 schema. **Gate:** serde round-trips;
+`Item` round-trips through `created_at` (no monotonic value); fmt · clippy · tests.
 
-> **Doc correction (found in review):** the LOCKED §2.3 `ItemKind` includes
-> `Error { source, code, message }` ("persisted error banner"), but the §6.2
-> schema `kind`-column comment omits `error`. The P2 schema **must** include
-> `error` in the `item_kind` enum. File this correction against §6.2 when P2 lands.
+> **Doc correction (resolved 2026-07-08):** the LOCKED §2.3 `ItemKind` includes
+> `Error { source, code, message }` ("persisted error banner") but the §6.2
+> schema `kind`-column comment originally omitted `error`. **Now fixed in the
+> design §6.2** (the `items.kind` comment lists `error`); the P2 `item_kind`
+> enum must include it.
 
 ### P1 — Pure reducer + render transforms (`lens-core/reduce`, §4) — *contract-proving*
 `reduce(&mut SessionState, &ServerStreamEvent) -> SmallVec<[StreamUpdate; 2]>`:
@@ -154,9 +165,10 @@ restore only, no transcript side-effects**). Plus §4.3 render transforms
 are normalized here into `SessionState`'s canonical fields.
 
 No threads, no gpui, no SQLite. `reduce()` stays **pure** (§4.1 "does no I/O"), so
-the reduce-time `BlockContext.timestamp` (§2.4) comes from an **injected clock**
-(a `Clock` seam / passed-in instant), never a direct wall-clock read — otherwise
-replay is non-deterministic.
+the reduce-time `Item.created_at` epoch (§2.3, grilling revision — replaces the
+dropped `BlockContext.timestamp`) comes from an **injected clock** (a `Clock`
+seam / passed-in instant), never a direct wall-clock read — otherwise replay is
+non-deterministic.
 
 **TDD against the golden SSE corpus** (`docs/spikes/captures/2026-06-26-sse/` +
 `…-live-recapture/`) for the wire-event arms. The **reconnect/bootstrap arms are
@@ -170,18 +182,32 @@ fixed clock (replay twice → identical `SessionState`); fmt · clippy · tests.
 **The reducer-emitted `StreamUpdate` semantic deltas are drafted at this phase's
 exit (D6); ratified at the P3 skeleton.**
 
-### P2 — Persistence (`lens-core/persist`, §6)
-`SessionPersistence` trait + SQLite v1 impl over the §6.2 schema
-(connections/sessions/items/cost_samples/meta), with `error` in the `item_kind`
-enum (P0 doc correction). Write-through upsert by
-`(connection_id, session_id, item_id)`; session-field fold into `sessions`;
-`meta.schema_version` migration gate (unknown future version →
-read-only-degraded, never corrupted). In-progress `StreamScratch` and `presence`
-are RAM-only, never persisted (§2.5/§4.2). P2 exposes **load / upsert / reconcile
-primitives** (reconcile keyed by item `id`, since disk may lag the server); the
-**wake wiring that calls them is P3** (a lifecycle/actor concern, §6.3). **Gate:**
-temp-db write-through + reconcile-primitive tests; schema_version gating test;
-fmt · clippy.
+### P2 — Persistence (`lens-core/persist`, §6) — *two-tier (grilling revision)*
+`SessionPersistence` trait, **factored into two roles** over the §6.2 two-file
+schema (§6.1):
+
+- **`ControlStore`** (one `lens.db`): `connections`/`sessions`/`cost_samples`/
+  `meta`. Session-field folds write here through a **single serialized
+  control-plane writer** (low volume). `error` is in the `sessions.status` /
+  transcript `item_kind` vocabularies as applicable (P0 doc correction, now fixed
+  in §6.2).
+- **`TranscriptStore`** (one SQLite file per `(connection_id, session_id)`,
+  path `transcripts/<connection_id>/<conv_id>.db`): only that session's `items`.
+  Write-through upsert **by `item_id`** into the file the **actor owns** (its own
+  WAL write connection → zero cross-actor contention). The file's own `meta`
+  carries `schema_version` + `(connection_id, session_id)` (self-describing).
+
+**Impl:** `rusqlite` (blocking, matches D5) + WAL both tiers. `meta.schema_version`
+migration gate in **each** file (unknown future version → read-only-degraded,
+never corrupted). In-progress `StreamScratch` and `presence` are RAM-only, never
+persisted (§2.5/§4.2). P2 exposes **load / upsert / reconcile primitives** on
+`TranscriptStore` (reconcile keyed by item `id`, since disk may lag the server)
+plus control-plane load/upsert; the **wake wiring that calls them is P3** (a
+lifecycle/actor concern, §6.3). Retention/pruning/tombstone become **file ops**
+on the transcript file (§15 open q; still deferred). **Gate:** temp-db
+write-through + reconcile-primitive tests **on both stores**; per-file
+schema_version gating test; open/close transcript file across the Active
+lifecycle; fmt · clippy.
 
 ### P3 — Actor + store + commands (`lens-core/actor` + `lens-store`, §8/§7/§13.1)
 **Task 1 = walking skeleton (D7):** one fake event → `reduce` → `StreamUpdate`
@@ -207,6 +233,38 @@ on POST failure), interrupt, compact, approve, stop_session, fork, switch_agent;
 bootstrap + reconnect wiring (the actor consumes the crate-synthetic
 `Reconnecting`/`Reconnected`/`SnapshotRestored`/`Disconnected` lifecycle from
 `lens-client` §7); §13.1 `ClientError`→app-state mapping.
+
+> **Optimistic-send × reconnect reconcile (found in review — the one collision
+> §7's FIFO leaves open).** §7's FIFO reconcile assumes client posts and
+> `session.input.consumed` events stay ordered — but a reconnect **gap** can drop
+> the `consumed` event, which otherwise duplicates the optimistic bubble (the
+> replayed `GET /items` re-adds the message while the un-reconciled `pending_user`
+> entry still shows) or orphans it. Rules:
+> 1. **Do not clear `pending_user` on `Reconnected { gap != Some(0) }`** — unlike
+>    `StreamScratch` (§4.2). It is user intent; resolve it against the reconnect
+>    replay, never by dropping it.
+> 2. **Reconcile `pending_user` against the reconnect replay, not only the live
+>    `consumed` stream, and split by session type:**
+>    - **Native-terminal** (claude-native / codex-native): the message is *not*
+>      persisted at POST time, so trust the `SnapshotRestored` snapshot's
+>      `pending_inputs` (`{pending_id, content}[]`) — present ⇒ still pending
+>      (keep/re-hydrate); absent from both `pending_inputs` and the replayed items
+>      ⇒ lost (re-send or drop-with-marker). Live clears use the consumed event's
+>      `cleared_pending_id` **by id**.
+>    - **Non-native**: the message *is* persisted at POST time, so match ordered
+>      un-reconciled `pending_user` (role=user, `created_by == me`) against the
+>      ordered trailing user-message items in the replay not already canonical;
+>      content validates. Drop the optimistic bubble on match (kills the dup).
+> 3. **No client-supplied correlation id exists on the message input** (only the
+>    elicitation path has one) — do not design assuming one. Reconcile-repopulating
+>    `pending_user` from `pending_inputs` is **not** a §4.1 transcript side-effect
+>    (it pushes no canonical `Item`), but call it out so the `SnapshotRestored`
+>    "scalar-only" wording isn't read as forbidding it.
+>
+> **P3 verification item (not spec-blocking):** confirm against a live native
+> session whether `POST /events` **returns** the `pending_id`, letting Lens stamp
+> the optimistic bubble at POST time for fully by-id native reconcile. Add to the
+> P3 gate.
 
 **(c) Session lifecycle mechanics (§3).** The engine owns the *mechanics*: an
 `is_quiesced` predicate (strict — no open scratch / pending tools / pending user /
