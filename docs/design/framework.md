@@ -170,8 +170,9 @@ trigger; re-evaluate at the spike.
 
 ## 4. Residual spike items
 
-The recon retired the terminal/diff/board risk; **two** open items remain
-load-bearing — markdown (§4.1) and the JSON-Schema form renderer (§4.3):
+The recon retired the terminal/diff/board risk. Markdown (§4.1) — including its
+§4.1c/d variable-height virtualization sub-item — is now **spiked and resolved**;
+**one** open item remains load-bearing — the JSON-Schema form renderer (§4.3):
 
 ### 4.1 Markdown rendering (the lock-gating spike item)
 
@@ -206,7 +207,8 @@ updates with stable element identity** (no remount on append)? — **SPIKED
 2026-07-07 → PARTIAL; see the verdict block below**; (b) the link/image
 **sanitization boundary** (§2.5),
 still Lens-owned (reimplement from Paneflow's *spec*); (c) **variable-height
-virtualization** (§4.1d) — evaluate `gpui-component`'s virtualized `List`.
+virtualization** (§4.1d) — **SPIKED 2026-07-08 → GO on native gpui `list()`; see
+the §4.1c/d verdict block below**.
 **Caveat:** `gpui-component` is a large, young (0.5.x) dep that pins its own gpui
 version — check compat with the §3 gpui pin, and prefer **vendoring just the
 markdown module** (Apache-2.0 permits it) over taking the whole 60-component
@@ -226,6 +228,26 @@ top on every render** (violates transcript §5). All three are single-spot fixes
 in the vendorable module → this **confirms the "vendor just the markdown module"
 path** over the raw dep or a from-scratch renderer. Safe-prefix/mdstitch deferred
 (needs Rust 1.95; lower priority given the debounce hides intermediate states).
+
+**§4.1c/d virtualization verdict (2026-07-08) — GO on native gpui `list()`.**
+Full findings:
+[`docs/spikes/2026-07-07-transcript-virtualization.md`](../spikes/2026-07-07-transcript-virtualization.md).
+The residual "the variable-height transcript needs a *custom* virtualizer"
+(transcript §19 note 3) is **retired**: gpui's native **`list()` / `ListState`**
+is a measure-and-cache variable-height virtualizer purpose-built for chat logs
+(`ListAlignment::Bottom`), and it **satisfies all four transcript §16 contracts**
+on the head-to-head harness — windowing (`renders ≪ N`), variable heights,
+**off-screen-above anchoring** (`logical_scroll_top()` held under a height
+mutation above the viewport — the true go/no-go), jump-to-bottom, plus stable
+identity across recycle and markdown-component nesting (`.scrollable(false)` rows)
+and the stick-don't-yank UX demo. **7/7.** `uniform_list` was simply the wrong
+primitive (uniform-height); `list()` is the right one — **no custom virtualizer,
+no fork, no extra dep.** gpui-component's virtualized `v_virtual_list` was tested
+side-by-side and **does not fit** the transcript: it windows fine and preserves
+identity, but structurally lacks bottom-anchoring and a logical-anchor readout
+(1b anchor drifted, opens at top, stick-to-bottom unreliable). Net: **native
+`list()` for the transcript scroll surface; gpui-component reserved for markdown
+(§4.1) + the §4.3 form inputs.**
 
 GPUI has no first-class markdown renderer *in the framework itself*. Paneflow
 **forked gpui** for a markdown-append fix **and** built its own `pulldown-cmark`
@@ -295,7 +317,7 @@ Each spec has a "framework divergence" section. What each one owns vs. here:
 | typed client | (no framework impact) | Blocking reader threads + `std::sync::mpsc`; no tokio requirement |
 | state model §14 | State primitive (gpui `Entity::observe` vs alternative store); the channel→UI crossing (`cx.spawn` + entity update) | gpui's per-entity notify + `cx.spawn` is the foreground replica implementation |
 | application shell §17 | The board (ordinal-slot responsive reflow vs a free-form canvas) | §2.4 of this doc — confirmed ordinal board is *simpler*, not harder, in gpui |
-| transcript §19 | Progressive re-render (stable-identity in-place diff); markdown library; virtualization | §4.1 markdown spike; `uniform_list` is gpui-native **but uniform-height only** — the variable-height transcript needs a custom virtualizer (spike, §4.1d) |
+| transcript §19 | Progressive re-render (stable-identity in-place diff); markdown library; virtualization | §4.1 markdown spike; **virtualization SPIKED 2026-07-08 → native gpui `list()`** (variable-height, `ListAlignment::Bottom`) satisfies all four §16 contracts — `uniform_list` was the wrong primitive, `list()` is the right one (§4.1c/d verdict) |
 | workspace §9 | Terminal widget | §2.2 — `alacritty_terminal` + `portable-pty`, Arbor template (MIT) |
 | workspace §4 | Diff widget | §2.3 — `imara-diff` + `syntect` cached, Arbor template (MIT) |
 | permissions | (no special widgets — form renderer uses gpui inputs; JSON-schema form renderer is a one-off build) | — |

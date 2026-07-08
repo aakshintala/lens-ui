@@ -602,14 +602,19 @@ renderer.
    *strategy* is neutral; the library is not. The framework document's GPUI
    recon notes markdown is the roughest edge — budget a hand-rolled
    `pulldown-cmark`→element renderer + a link/image sanitization boundary.
-3. **Virtualization** (§16) — gpui `uniform_list` assumes **uniform row
-   heights**, but the transcript is variable-height (expanded tool spans, code,
-   images, work sections). `uniform_list` therefore does **not** satisfy §16
-   contract 3 as-is; a variable-height virtualizer (measure-and-cache, or a
-   `list`/custom element) is needed. **This is an unproven spike** — flag it
-   (along with incremental markdown re-render, note 2) for a verification spike
-   before committing to `uniform_list`. The contract is fixed; the mechanism is
-   not yet proven on gpui.
+3. **Virtualization** (§16) — **SPIKED 2026-07-08 → resolved.** gpui
+   `uniform_list` assumes uniform row heights and does not fit the
+   variable-height transcript — but gpui's native **`list()` / `ListState`** is a
+   measure-and-cache variable-height virtualizer purpose-built for chat logs
+   (`ListAlignment::Bottom`), and it **satisfies all four §16 contracts**:
+   windowing (`renders ≪ N`), variable heights, off-screen-above **anchoring**
+   (`logical_scroll_top()` held under a height mutation above the viewport),
+   and jump-to-bottom — plus stable identity across recycle and full-height
+   markdown-row nesting. No custom virtualizer or fork needed; `list()` (not
+   `uniform_list`) is the primitive. gpui-component's virtualized list was tested
+   side-by-side and does **not** fit (no bottom-anchoring, no logical-anchor
+   readout). Findings:
+   [`docs/spikes/2026-07-07-transcript-virtualization.md`](../spikes/2026-07-07-transcript-virtualization.md).
 
 ---
 
