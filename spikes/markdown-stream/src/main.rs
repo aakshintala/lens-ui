@@ -1,4 +1,5 @@
 mod replay;
+mod sanitize;
 
 // Task 1 — dependency-feasibility probe + static markdown render.
 // Goal: confirm gpui-component 0.5.1 builds and opens a window rendering
