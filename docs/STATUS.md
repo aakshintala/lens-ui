@@ -248,8 +248,14 @@ and roll older "Recent" pointers off this page as they age.
     (`runner_failed_to_start`); daemon/runner lifecycle confirms
     server-lifecycle §3.1/§6. Not separately driven: server-crash reconnect
     (P7), RSS under sustained load. Throwaway harness discarded.
-  - **Markdown renderer** — the one real build risk (hand-rolled
-    `pulldown-cmark`→gpui + sanitization; framework §4.1).
+  - **Markdown renderer — SPIKED 2026-07-07 → PARTIAL (lock holds).** Architecture
+    passes (retained id-keyed state, no remount, flat ~25µs/frame across 17KB), but
+    3 hardcoded module behaviors break naive streaming (200ms trailing debounce;
+    `clear_selection` on reparse; `list_state.reset`→scroll-to-top) → confirms
+    **vendor-just-the-markdown-module**. **Follow-up** = the vendor-and-patch (3
+    localized fixes) + variable-height virtualization (§4.1d, still un-spiked) +
+    mdstitch safe-prefix (deferred, needs Rust 1.95). Findings:
+    [`docs/spikes/2026-07-07-markdown-streaming.md`](./spikes/2026-07-07-markdown-streaming.md).
 - **Tunables for the verification pass:** auto-sleep threshold (~10m), poll cadence
   (~10s), ring-buffer size (10 MB), transcript truncation tiers, `cost_samples` cadence.
 - **Small undecided UX:** terminal-`transfer` UX, managed-provider selection,
@@ -259,6 +265,63 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Recent
 
+- **2026-07-07** — **§4.1 markdown-streaming spike EXECUTED → PARTIAL; gpui lock
+  holds** (throwaway harness `spikes/markdown-stream/`, subagent-driven: Task 1 +
+  render controller-built, Tasks 2–3 composer-2.5, verdict = probe-facts + user
+  eyeball). gpui-component 0.5.1 builds on gpui 0.2.2 (= §3 pin). **Stable-identity
+  architecture PASS** (retained `Entity` keyed by `ElementId`, no remount; async
+  debounced parse off the render path — probe measured **flat ~25µs/frame across a
+  17KB doc**, correlation −0.39 ⇒ no O(n) reparse). **But 3 hardcoded, vendorable
+  module behaviors break naive streaming:** 200ms *trailing* debounce that resets
+  on each update (`text_view.rs:628`) → fast streams show nothing until a pause;
+  `clear_selection()` on reparse (`:610`); `list_state.reset()` on content change
+  (`node.rs:1123`) → **scroll-to-top on every render** (violates transcript §5).
+  **Verdict confirms framework §4.1's "vendor just the markdown module"** (3
+  localized patches) over raw-dep or from-scratch. `sanitize`/`replay` unit-tested
+  (5 tests); `mdstitch` safe-prefix deferred (needs Rust 1.95, lower priority given
+  the debounce). Merged to main (spike commits `420a91d..ae4b307`). Findings:
+  [`docs/spikes/2026-07-07-markdown-streaming.md`](./spikes/2026-07-07-markdown-streaming.md).
+  **Open follow-ups:** vendor-and-patch the module; §4.1d variable-height
+  virtualization (still un-spiked); §4.3 JSON-Schema form spike.
+- **2026-07-07** — **gpui lock re-pressure-tested + markdown-ecosystem survey
+  (sets up the spikes)** (memory `gpui-markdown-ecosystem-2026-07`). Following the
+  web-app re-read, the live framework question narrowed to greenfield
+  **all-gpui vs Tauri+React** (fork is structurally dead). Turned on one axis —
+  the React alt's liftable widgets — which a verified crate survey then largely
+  neutralized *gpui-side*: `pulldown-cmark` 0.13.4 + **`mdstitch`** 0.1 (Apache,
+  streaming safe-prefix) + **`gpui-component`** 0.5.1 (Apache → LIFTABLE: native
+  markdown w/ tree-sitter, virtualized `List`/`Table`, form inputs) are all
+  liftable → gpui gets widget acceleration without the IPC/type-loss seam.
+  **Lock holds, better-supported.** `framework.md` reworked (§1 four pillars
+  ordered by load; §4.1/§4.3 survey folded in). **The markdown spike shrank** from
+  "hand-roll a renderer" to "integrate + verify **one thing**: does
+  `gpui-component`'s markdown accept incremental updates with **stable element
+  identity** (no remount on append)?" — plus the Lens-owned sanitization boundary
+  (§2.5) and gpui-version-pin compat (prefer vendoring just the markdown module).
+  Also: `gpui-form` 0.5.1 is struct-derive (not runtime JSON-Schema), so §4.3's
+  residual = runtime schema→inputs mapping over `gpui-component` inputs.
+- **2026-07-06** — **Re-read omnigent's shipped desktop app; corrected our stale
+  framing** (cursor-delegate read of `../omnigent` @ `62b4254a`, `v0.4.0.dev0-104`;
+  memory `omnigent-web-app-state-2026-07`). Prior read was ~6wk stale. Findings:
+  `ap-web/` was renamed `web/` (PR #1333); the app is **not** a "half-baked web
+  wrapper" — it's a *polished, actively developed* React/Vite SPA (Electron =
+  thin shell over the server-served bundle; also iOS/Android/embed targets) with
+  Monaco diff+comments, xterm terminals, sub-agent tree, a cross-session approval
+  inbox, ~209 tests. **But** the wedge survives, precisely located: it's
+  **single-server, single-warm-stream, chat-shaped** — `switchTo` aborts the
+  prior session's SSE stream (`chatStore.ts:1411-1417/:2786-2792`, one-warm-stream-
+  at-a-time), one server origin per SPA (`host.ts:6-8`; multi-server only via
+  separate Electron windows), sidebar+single-`ChatPage` shell, no list
+  virtualization. **Corrected wedge (now in docs):** Lens = multi-server,
+  **N-warm-streams** (every session live off-thread → zero switch latency, cards
+  always live), board-shaped — the differentiator is concurrent *warm state*, not
+  concurrent *display*. A fork buys a mature widget toolkit but forces a rewrite
+  of connection model + live-state fan-out + navigation, and re-crosses the type
+  boundary + inherits the untested hand-ported SSE parser (`sse.ts:6-9`). Edited
+  `docs/design/README.md` (wedge) + `capability-map §0.9 / client row`; historical
+  `ap-web` refs in review-findings/plans/ADR left as records. **Open follow-up:**
+  decide whether the narrowed-but-real wedge justifies the ground-up widget-toolkit
+  rebuild vs a thin fork-and-reshape (no numbers on the fork side yet).
 - **2026-07-05** — **0.4.0 client surface modeled: read-state + background_task_count**
   (commit `22857d0`; composer-2.5 authored, cross-family review codex/gpt-5.5 + Opus,
   both LGTM). `background_task_count` (nullable i64) now on `SessionSnapshot` + the SSE

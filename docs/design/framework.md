@@ -4,31 +4,60 @@ The client framework choice: gpui (locked) vs. React/TS over Tauri (rejected).
 Owns the rationale, the reconnaissance summary, the residual spike items, and
 the framework-specific seams the other specs reference.
 
-**Status:** Draft, 2026-06-23. Locked at gpui per capability map decision D.
+**Status:** Draft, 2026-06-23; lock **re-pressure-tested 2026-07-07**. Locked at
+gpui per capability map decision D.
 **Depends on:** the capability map's decision D (resolved: gpui).
 **Feeds:** every other spec — they cite "framework divergent points" and rely
 on the gpui substrate decisions pinned here.
 
 ---
 
-## 1. Decision: gpui (LOCKED)
+## 1. Decision: gpui (LOCKED — re-pressure-tested 2026-07-07)
 
-**Resolved: Lens is built on gpui.** Three inputs drove the lock:
+**Resolved: Lens is built on gpui.** Originally locked 2026-06-23; the lock was
+re-pressure-tested 2026-07-07 against a fresh read of omnigent's shipped `web/`
+client (capability map §0.9; memory `omnigent-web-app-state-2026-07`). That read
+established the **fork path is dead** — the `web/` client is single-server,
+single-warm-stream, chat-shaped, structurally incompatible with a fleet
+supervisor — so the live question is purely **greenfield all-gpui vs
+React/TS-on-Tauri**. Four inputs, ordered by load:
 
-1. **Greenfield removes migration cost.** No existing app to port.
-2. **The all-Rust win is unopposed.** The typed client's typed Rust enums flow
-   straight into the UI — no IPC boundary, no JSON serialization at the seam.
-   This is the single largest architectural advantage of Lens over a
-   React/TS-on-Tauri alternative, where every `ServerStreamEvent` crosses the
-   JS boundary and loses the type.
-3. **The reconnaissance retired the *terminal/diff/board* widget risk** — but
-   **not all** of it. The GPUI recon (§2), sourced from three reference GPUI apps
-   — Arbor / Paneflow / gpui-flow — proved the terminal, diff, and board widgets
-   are buildable with working templates. **Two renderers remain un-spiked and
-   load-bearing: incremental/streaming markdown (§4.1) and the JSON-Schema
-   elicitation form renderer (§4.3).** Treat these as hypotheses pending a spike,
-   not retired risk. (The recon was a read of the three apps, summarized in §2;
-   there is no separate "recon artifact" file — §2 *is* the record.)
+1. **N-warm-streams at fleet scale — the load-bearing pillar.** Lens's thesis is
+   every session kept *warm* off-thread (zero switch latency, cards always live —
+   not coarse badges). In gpui that's N `ActiveSession` actors + bounded channels
+   + a foreground `SessionStore` replica: cheap, native paint, no DOM. In a Tauri
+   webview it's N live React subtrees / Monaco / xterm-webgl contexts resident at
+   once — a Chromium-memory ceiling, and precisely the limitation the `web/`
+   client already documents (no list virtualization, one-warm-stream-at-a-time by
+   construction). Picking Tauri means adopting the exact ceiling Lens exists to
+   beat.
+2. **The all-Rust, no-IPC win.** `lens-client`'s typed Rust enums flow straight
+   into the UI — no IPC boundary, no JSON re-serialization at the seam. Under
+   Tauri every `ServerStreamEvent` (or reduced `StreamUpdate`) crosses to the
+   webview as JSON and must be **re-typed in TS** — two type systems, and the
+   `web/` client's own hand-ported, server-parity-*untested* SSE parser
+   (`web/src/lib/sse.ts:6-9`) is what you'd inherit. `lens-client` is already
+   feature-complete (~137 tests); its value is realized fully only all-Rust.
+3. **Greenfield removes migration cost.** No existing app to port (fork is off
+   the table regardless).
+4. **Widget risk — where the fresh read cuts *against* gpui, and why the markdown
+   spike is now the gate.** The recon (§2) retired terminal/diff/board risk. But
+   the fresh read shows the `web/` client ships mature, tested React components
+   for the two *un-spiked* gpui residuals — streaming markdown (Streamdown, §4.1)
+   and JSON-Schema elicitation forms (§4.3) — plus Monaco diff+comments and xterm.
+   A Tauri path could **lift these as components**, collapsing gpui's residual
+   build risk toward zero. This is the one honest advantage of the React
+   alternative. It does **not** outweigh pillars 1–2, but it means the gpui lock
+   is only as safe as the **markdown-renderer spike (§4.1)**: if that comes in
+   cheap, the React case largely collapses; if it's genuinely hard, the trade
+   re-opens. **De-risk §4.1 before treating this lock as truly closed.** (The
+   recon itself was a read of the three apps, summarized in §2; §2 *is* the
+   record.)
+
+**Also weighed (and outweighed, not dismissed):** iteration velocity + ecosystem
+favor React/TS (vast ecosystem, hot-reload, mature devtools) — material for a
+solo builder, and the strongest *non-widget* argument for Tauri. Judged
+outweighed by pillars 1–2.
 
 **Bridge-webview risk is gone** — the Bridge (capability map §0.6) is rebuilt
 native, no webview.
@@ -144,11 +173,64 @@ trigger; re-evaluate at the spike.
 The recon retired the terminal/diff/board risk; **two** open items remain
 load-bearing — markdown (§4.1) and the JSON-Schema form renderer (§4.3):
 
-### 4.1 Markdown rendering (the one spike item)
+### 4.1 Markdown rendering (the lock-gating spike item)
 
-GPUI has no first-class markdown renderer. Paneflow **forked gpui** for a
-markdown-append fix **and** built its own `pulldown-cmark` → element view.
-Two implications for Lens:
+Per §1 pillar 4, this is the spike that actually closes (or re-opens) the gpui
+lock — the fresh `web/` read means the React alternative already has a solved
+streaming-markdown component, so gpui only holds if this residual is cheap.
+
+**Ecosystem survey DONE (2026-07-07, verified vs crates.io) — the residual
+shrank, and it strengthens the gpui lock (§1.4).** Liftable Apache-2.0,
+gpui-native building blocks now exist:
+
+- **Parser: `pulldown-cmark` 0.13.4 (MIT)** — event stream → gpui elements,
+  confirmed the right base (not comrak's AST/HTML-emitter path). Alternates
+  `comrak` 0.53, `markdown`/markdown-rs 1.0 reduce no UI risk.
+- **Streaming safe-prefix: `mdstitch` 0.1 (Apache-2.0, framework-agnostic)** —
+  closes unterminated tokens (`**bold`→`**bold**`) *before* pulldown on each
+  accumulated chunk. This is the §5 safe-prefix well-formedness problem as a
+  **liftable dep, not app code**. (Used by `tahoe-gpui` for streaming markdown —
+  another gpui reference alongside Paneflow.)
+- **Rendering + highlight: `gpui-component` 0.5.1 (Apache-2.0 → LIFTABLE)** —
+  ships a native Markdown component with **tree-sitter** syntax highlighting,
+  plus virtualized `List`/`Table` (relevant to §4.1d virtualization) and form
+  inputs (relevant to §4.3). This is the input that most changes the picture:
+  the widget-risk axis where the React alternative was genuinely ahead (§1.4) is
+  now largely matched *on the gpui side*, permissively licensed, no IPC cost.
+- **Reference-only (GPL): Zed `crates/markdown`, Paneflow** — architecture
+  references, not liftable.
+
+**Net residual is integration + the Lens-specific parts, not a from-scratch
+renderer:** (a) does `gpui-component`'s markdown component accept **incremental
+updates with stable element identity** (no remount on append)? — **SPIKED
+2026-07-07 → PARTIAL; see the verdict block below**; (b) the link/image
+**sanitization boundary** (§2.5),
+still Lens-owned (reimplement from Paneflow's *spec*); (c) **variable-height
+virtualization** (§4.1d) — evaluate `gpui-component`'s virtualized `List`.
+**Caveat:** `gpui-component` is a large, young (0.5.x) dep that pins its own gpui
+version — check compat with the §3 gpui pin, and prefer **vendoring just the
+markdown module** (Apache-2.0 permits it) over taking the whole 60-component
+library.
+
+**Spike verdict (2026-07-07) — PARTIAL; the lock HOLDS.** Full findings:
+[`docs/spikes/2026-07-07-markdown-streaming.md`](../spikes/2026-07-07-markdown-streaming.md).
+gpui-component 0.5.1 builds on **gpui 0.2.2 (= the §3 pin — no reconciliation)**;
+the *architecture* passes — state is a retained `Entity` keyed by `ElementId`
+(no remount), re-parse is async/debounced off the render path (probe: flat
+**~25µs/frame across a 17KB doc**, no O(n) reparse). **But three hardcoded module
+behaviors break naive streaming:** (1) a 200ms *trailing* debounce that resets on
+every update (`text_view.rs:628`) → fast streams render nothing until a pause;
+(2) `clear_selection()` on reparse (`:610`) → selection lost mid-stream;
+(3) `list_state.reset()` on content change (`node.rs:1123`) → **scroll jumps to
+top on every render** (violates transcript §5). All three are single-spot fixes
+in the vendorable module → this **confirms the "vendor just the markdown module"
+path** over the raw dep or a from-scratch renderer. Safe-prefix/mdstitch deferred
+(needs Rust 1.95; lower priority given the debounce hides intermediate states).
+
+GPUI has no first-class markdown renderer *in the framework itself*. Paneflow
+**forked gpui** for a markdown-append fix **and** built its own `pulldown-cmark`
+→ element view. Two implications for Lens (the fallback if `gpui-component`'s
+component can't stream with stable identity):
 
 - **Budget a hand-rolled `pulldown-cmark` → gpui element renderer.** A
   naive dep on a "gpui markdown" crate will not give stream-append support;
@@ -174,7 +256,13 @@ live, swap to formatted markdown on item finalize) — uglier but unblocks ship.
 The permissions form-mode elicitation (permissions §3) renders an arbitrary
 `requested_schema` JSON Schema as a gpui input form. gpui has no JSON-Schema
 form primitive, so this is a hand-rolled renderer (string/number/enum/boolean/
-nested-object fields → gpui inputs, with validation). **Un-spiked.** Spike:
+nested-object fields → gpui inputs, with validation). **Un-spiked** — but the
+2026-07-07 survey shrinks it: `gpui-component` 0.5.1 (Apache-2.0) already
+provides the field inputs (Input/Select/Checkbox/NumberInput/Switch/DatePicker),
+so the residual is the **runtime schema→inputs mapping**, not building inputs.
+(`gpui-form` 0.5.1 MIT/Apache derives forms from Rust *structs* at compile time —
+wrong shape for a runtime-arbitrary schema, but confirms the input primitives.)
+Spike:
 render the common omnigent elicitation schemas and confirm submit produces a
 valid `ElicitationResult.content`. Fallback if a schema is too complex to render
 natively: fall back to the url-mode approval page (permissions §3) or a raw
@@ -221,10 +309,12 @@ Each spec has a "framework divergence" section. What each one owns vs. here:
 - Not the gpui *API tutorial* — that's the gpui docs.
 - Not the build system — cargo workspace is implementation detail, spec'd
   in the typed client's §1 (where it's load-bearing for the seam).
-- Not a React/TS-over-Tauri comparison. The decision is locked; the rejected
-  alternative is documented here only where it sharpens why gpui won (the
-  IPC seam is the headline — every `ServerStreamEvent` loses its type at a
-  JS boundary).
+- Not an exhaustive React/TS-over-Tauri comparison. The decision is locked
+  (re-pressure-tested 2026-07-07, §1); the rejected alternative is documented
+  only where it sharpens why gpui won — the two headlines are the fleet-scale
+  N-warm-streams ceiling of a webview (§1.1) and the IPC/type-loss seam (§1.2).
+  The one axis where the alternative is genuinely stronger (liftable widgets) is
+  recorded in §1.4 and gated on the §4.1 spike, not buried.
 - Not a performance budget. Benchmarks are a verification-pass concern
   (capability map §0.8).
 

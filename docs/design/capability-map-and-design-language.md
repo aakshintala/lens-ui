@@ -87,7 +87,7 @@ omnigent separates three roles (verified in 0.2.0 code structure:
 |---|---|---|
 | **Server** | agents, conversations, files, REST/SSE API, task lifecycle. Zero execution state. | runs locally on the Mac (Lens spawns it); on a dedicated remote host (Lens supervises it); on a managed sandbox (Lens connects to it, the server provisions it); or on a **remote omnigent server Lens did not spawn and only connects to as a client** (e.g. an internal dev workspace) |
 | **Runner** | harness subprocesses, OS env, filesystem, terminals (tmux PTYs), MCP, sub-agents, tool resolution. Outbound WS tunnel to the server. | runs wherever the server does (in local mode the server **embeds a runner** — verified `omnigent/cli.py:2382`); on remote hosts the runner is brought online via `omnigent host` |
-| **Client** | REST + SSE + WS only — CLI, `ap-web`, Slack, Lens are all just clients | **Lens** — and Lens is a **multi-connection client**: one open Lens instance talks to N servers at once (a local one it spawned + one or more remote ones it only connects to). A session belongs to exactly one connection. |
+| **Client** | REST + SSE + WS only — CLI, `web` (Electron/browser/mobile SPA, formerly `ap-web`), Slack, Lens are all just clients | **Lens** — and Lens is a **multi-connection client**: one open Lens instance talks to N servers at once (a local one it spawned + one or more remote ones it only connects to). A session belongs to exactly one connection. |
 
 Resolved lifecycle facts (grounded in 0.2.0):
 
@@ -638,8 +638,14 @@ mechanism; the application shell owns the visual handoff.
 ## 0.9 What this spec is NOT
 
 - Not an MVP plan. Sequencing is separate.
-- Not a port of `ap-web`. The official web client is a reference/contrast; Lens
-  is a deliberate native alternative.
+- Not a port of omnigent's `web` client (formerly `ap-web`). That client is a
+  polished, actively-developed but **single-server, single-warm-stream,
+  chat-shaped** SPA (re-read 2026-07-06, omnigent `62b4254a`): one live SSE
+  stream at a time, one server origin per window, sidebar+single-chat shell.
+  It's a reference/contrast — a mature widget toolkit (Monaco diff+comments,
+  xterm, SSE taxonomy parser), **not a base to fork**. Lens is a deliberate
+  native alternative on the axis that client can't reach: multi-server,
+  N-warm-streams, board-shaped.
 - Not seam-driven. There is no `Backend` trait — omnigent is the backend; the
   typed client is the pin layer that could later become a trait if a Rust
   sidecar or another orchestrator emerges. The design keeps that door open

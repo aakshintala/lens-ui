@@ -216,7 +216,7 @@ map §0.3, the highest-value control-room surface).
 prefix IS required.** The router declares the bare `/sessions/.../attach` path
 (`terminal_attach.py:103-130`), but `create_app` mounts that router with
 `prefix="/v1"` (`app.py:1635-1642`), so the external WS URL carries `/v1` (the
-runner proxy + ap-web both use the prefixed URL). The typed client's WS client
+runner proxy + the `web` client both use the prefixed URL). The typed client's WS client
 (typed client §5) owns the connection; this document owns the Lens-side ring
 buffer + the lifecycle.
 

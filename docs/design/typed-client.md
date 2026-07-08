@@ -121,7 +121,7 @@ endpoints are now environment-scoped):
 `ws://{host}/v1/sessions/{session_id}/resources/terminals/{terminal_id}/attach`.
 The router defines the bare `/sessions/.../attach` path (`terminal_attach.py:103-130`)
 but `create_app` mounts that router with `prefix="/v1"` (`app.py:1635-1642`), so the
-external URL carries `/v1`. Runner proxy + ap-web both use the `/v1`-prefixed URL.
+external URL carries `/v1`. Runner proxy + the `web` client both use the `/v1`-prefixed URL.
 Section 5 covers it.
 
 ### Sub-agents & comments

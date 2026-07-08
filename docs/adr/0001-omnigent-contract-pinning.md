@@ -43,6 +43,11 @@ churn by `openapi.json` line count badly overstates real contract churn, and
 proves `openapi.json` was **never the whole client contract**. Hence the commit,
 not the spec file, is canonical.
 
+> **Naming note (2026-07-06):** the first-party client dir was renamed
+> `ap-web/` → `web/` upstream (PR #1333). References to `ap-web` below (and the
+> "does `ap-web` call it?" heuristic) now mean `web/`; paths like
+> `sessionsApi.ts` moved accordingly.
+
 `include_in_schema=False` is not a single signal — it splits by caller:
 
 - `/hooks/{permission,codex,antigravity,cursor,native}-*-request` are
