@@ -103,6 +103,50 @@ Application::new().run(|cx| {
   incomplete-markdown rendering, and take the deliberate 1.95 bump ONLY if
   observation proves safe-prefix necessary. Keeps the workspace 1.91-clean.
 
+## Task 5/6 — runtime observation (2026-07-07) — VERDICT: PARTIAL
+
+Quantitative (probe) + visual (user eyeball) — the "Both" verdict method.
+
+### Stable identity — PASS (architecture)
+- `--stream` (2KB): 284 ticks, build/tick mean 51µs, corr +0.18.
+- `--big` (17KB framework.md): 4370 ticks, build/tick mean **25µs**, build-time↔
+  bytes correlation **−0.39**. Across 8× the bytes, per-frame build cost is FLAT
+  (even lower) with negative correlation → the parse is definitively OFF the
+  render path (async+debounced). Same `ElementId` every frame ⇒ no remount by
+  construction. Finalize swap (full text, same id) = no-op.
+
+### But three HARDCODED module behaviors break naive streaming (all vendorable)
+1. **200ms trailing debounce, hardcoded** (`text_view.rs:628`
+   `Duration::from_millis(200)`, no builder). It RESETS on every `Update::Text`
+   (`text_view.rs:168` `timer.set_after(delay)`). Updates faster than 200ms
+   perpetually reset it → **nothing renders until the stream pauses**, then the
+   whole accumulated doc appears at once. Confirmed by user ("takes a lot longer
+   than 200ms, whole sections appear at once") and proven by re-running at 220ms
+   cadence (> debounce) → progressive render returns.
+2. **`clear_selection()` on every reparse** (`text_view.rs:610`) → a text
+   selection does NOT survive a streamed update.
+3. **`list_state.reset(children.len())` on every content change**
+   (`node.rs:1123`). gpui `ListState::reset()` re-inits scroll to the top
+   alignment → **scroll jumps to the top on each render**. Confirmed by user
+   ("scrolls to top each time new content rendered"). This directly violates
+   transcript §5 ("in-place diff with stable identity… a remount is what causes
+   a flash or scroll-jump").
+
+### Conclusion → framework §4.1 "vendor just the markdown module" is the right path
+- NOT the unmodified dep (the 3 behaviors above are streaming-hostile).
+- NOT a from-scratch renderer (parser + tree-sitter highlight + element view all
+  work and are liftable).
+- Vendor the markdown module (Apache-2.0) and patch three localized spots:
+  debounce policy (leading/throttle or configurable), drop `clear_selection` on
+  reparse, replace `list_state.reset` with a scroll-preserving splice/anchor.
+- Interim (no vendoring): coalesce our own `Update::Text` sends to ≥200ms
+  (accumulate deltas underneath, push a snapshot ~4–5×/s) — restores progressive
+  render but NOT scroll/selection preservation.
+- gpui pin: gpui-component 0.5.1 → gpui 0.2.2 (= §3 pin). No reconciliation.
+- mdstitch/safe-prefix: still deferred; the debounce means intermediate mid-
+  construct states rarely render anyway, so safe-prefix is LOWER priority than
+  the scroll/selection fixes.
+
 ### Confirmed deps (build clean on 1.91.1)
 - `pulldown-cmark = "0.13"` (0.13.4) — parser.
 - `pulldown-cmark-to-cmark = "22.0.0"` — reserializer. `cmark` signature (v22):

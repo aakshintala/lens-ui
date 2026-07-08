@@ -22,10 +22,15 @@ const ADVERSARIAL: &str = include_str!("../fixtures/adversarial.md");
 /// while streaming). ~15KB of headings/tables/lists/fences/links.
 const BIG: &str = include_str!("../../../docs/design/framework.md");
 
-/// Delta size in characters; small enough that ticks land mid-construct often.
-const CHUNK_CHARS: usize = 6;
-/// Frame-tick cadence — slow enough to watch stream in.
-const TICK_MS: u64 = 30;
+/// Delta size in characters. Larger so each (throttled) update adds a visible
+/// chunk rather than a few glacial characters.
+const CHUNK_CHARS: usize = 40;
+/// Frame-tick cadence. IMPORTANT FINDING: gpui-component's markdown re-parse is
+/// a TRAILING debounce (200ms, hardcoded, text_view.rs:628) that RESETS on every
+/// `Update::Text`. Updates faster than 200ms perpetually reset it → nothing
+/// renders until the stream pauses. So to see progressive render we must space
+/// updates ABOVE the debounce window. 220ms proves the mechanism.
+const TICK_MS: u64 = 220;
 /// Delay before streaming starts, so the window is visible first.
 const START_DELAY_MS: u64 = 800;
 /// Pause at end of each loop before restarting, so the finalized doc is visible.
