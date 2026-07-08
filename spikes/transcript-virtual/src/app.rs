@@ -5,8 +5,8 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use gpui::{
-    actions, div, list, prelude::*, px, App, Context, Entity, KeyBinding, ListScrollEvent, Styled,
-    Window,
+    actions, div, list, prelude::*, px, App, Context, FocusHandle, Focusable, KeyBinding,
+    ListScrollEvent, Styled, Window,
 };
 use gpui_component::{ActiveTheme as _, v_virtual_list};
 
@@ -32,6 +32,7 @@ actions!(
 );
 
 pub struct HarnessView {
+    focus_handle: FocusHandle,
     pub backend: Backend,
     probes: ProbeHarness,
     render_calls: Rc<RefCell<u32>>,
@@ -46,7 +47,14 @@ pub struct HarnessView {
 }
 
 impl HarnessView {
-    pub fn new(choice: BackendChoice, n: usize, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        choice: BackendChoice,
+        n: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
         let identity_ix = {
             let f = crate::fixture::Fixture::synthetic(n);
             f.rows
@@ -54,8 +62,8 @@ impl HarnessView {
                 .position(|r| r.kind == crate::fixture::RowKind::CodeBlock)
                 .unwrap_or(n / 4)
         };
-        let _ = cx;
         Self {
+            focus_handle,
             probes: ProbeHarness::new(identity_ix),
             backend: Backend::new(choice, n, cx),
             render_calls: Rc::new(RefCell::new(0)),
@@ -449,6 +457,7 @@ impl Render for HarnessView {
             .child(self.render_readout())
             .child(div().flex_grow().overflow_hidden().child(list_el))
             .key_context("Harness")
+            .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::on_probe_windowing))
             .on_action(cx.listener(Self::on_probe_variable_heights))
             .on_action(cx.listener(Self::on_probe_anchor_1a))
@@ -460,6 +469,12 @@ impl Render for HarnessView {
             .on_action(cx.listener(Self::on_ux_evaluate))
             .on_action(cx.listener(Self::on_reload_200))
             .on_action(cx.listener(Self::on_reload_2000))
+    }
+}
+
+impl Focusable for HarnessView {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
     }
 }
 

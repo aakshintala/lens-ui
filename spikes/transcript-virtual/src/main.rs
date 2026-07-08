@@ -35,7 +35,7 @@ fn main() {
         gpui_component::init(cx);
         register_keybindings(cx);
         cx.open_window(WindowOptions::default(), move |window, cx| {
-            let view = cx.new(|cx| HarnessView::new(backend, n, cx));
+            let view = cx.new(|cx| HarnessView::new(backend, n, window, cx));
             let any: gpui::AnyView = view.into();
             cx.new(|cx| Root::new(any, window, cx))
         })
