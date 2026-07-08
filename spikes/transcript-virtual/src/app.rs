@@ -265,7 +265,7 @@ impl HarnessView {
             self.identity_scrolled_off = true;
             self.identity_arm_record = false;
             self.probes.identity_detail =
-                format!("recorded row ix={ix} — shift-6 to scroll back + assert");
+                format!("recorded row ix={ix} — press b to scroll back + assert");
         }
         if self.identity_arm_assert && renders > 0 {
             let before = self.probes.identity_entity_before;
@@ -358,8 +358,8 @@ impl HarnessView {
             .child(
                 div().text_xs().text_color(gpui::rgb(0x888888)).child(
                     "Keys: 1=windowing 2=var-heights 3=anchor-1a 4=1b-setup 5=1b-mutate \
-                     6=identity-off shift-6=identity-back 7=ux-append 8=ux-eval \
-                     | shift-2=N200 shift-3=N2000",
+                     6=identity-off b=identity-back 7=ux-append 8=ux-eval \
+                     | 9=N200 0=N2000",
                 ),
             )
     }
@@ -486,10 +486,10 @@ pub fn register_keybindings(cx: &mut App) {
         KeyBinding::new("4", ProbeAnchor1bSetup, Some("Harness")),
         KeyBinding::new("5", ProbeAnchor1bMutate, Some("Harness")),
         KeyBinding::new("6", ProbeIdentityScrollOff, Some("Harness")),
-        KeyBinding::new("shift-6", ProbeIdentityScrollBack, Some("Harness")),
+        KeyBinding::new("b", ProbeIdentityScrollBack, Some("Harness")),
         KeyBinding::new("7", ProbeUxAppend, Some("Harness")),
         KeyBinding::new("8", ProbeUxEvaluate, Some("Harness")),
-        KeyBinding::new("shift-2", Reload200, Some("Harness")),
-        KeyBinding::new("shift-3", Reload2000, Some("Harness")),
+        KeyBinding::new("9", Reload200, Some("Harness")),
+        KeyBinding::new("0", Reload2000, Some("Harness")),
     ]);
 }
