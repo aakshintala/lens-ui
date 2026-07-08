@@ -1,0 +1,12 @@
+[package]
+name = "transcript-virtual"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Deliberately NO `[lints] workspace = true` — spikes live outside the
+# production lint wall (see root Cargo.toml).
+
+[dependencies]
+gpui = "0.2.2"
+gpui-component = "0.5.1"

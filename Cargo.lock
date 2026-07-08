@@ -6316,6 +6316,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "transcript-virtual"
+version = "0.0.0"
+dependencies = [
+ "gpui",
+ "gpui-component",
+]
+
+[[package]]
 name = "tree-sitter"
 version = "0.25.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
