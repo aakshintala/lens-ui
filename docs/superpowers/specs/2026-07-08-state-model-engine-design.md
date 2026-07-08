@@ -65,11 +65,17 @@ the engine contract is proven against real bytes.
   (jsonb-mappable) schema per LOCKED §6.2. Backing-store swap is behind the trait.
 - **D5 — Blocking OS thread, no tokio** on the core data path — matches
   `lens-client` D2 (the typed client's `EventStream` is a blocking reader).
-- **D6 — `StreamUpdate` frozen at P1 exit.** The `StreamUpdate` enum (the
-  reducer's output, the seam the upper layers hang on) is defined *empirically*
-  by the P1 reducer against the golden SSE corpus and frozen when P1 lands green.
-  Upper-layer plans (P2/P3) are written against the frozen contract, not a guess
-  — this is the phasing-risk mitigation the whole cut is built around.
+- **D6 — `StreamUpdate` drafted at P1, ratified at the P3 skeleton.** The
+  `StreamUpdate` enum (the reducer's output per LOCKED §4.1 —
+  `reduce() -> SmallVec<[StreamUpdate; 2]>`) is *drafted* empirically by the P1
+  reducer against the golden SSE corpus: P1 freezes the **semantic deltas** (which
+  events produce which state changes). Its **apply-side representation** may still
+  refine when the P3 walking skeleton exercises `StreamUpdate::apply` on the gpui
+  replica (and P2 write-through) — so the contract is *ratified* at the P3
+  skeleton, not P1 exit. The de-risking still holds: P0/P1 land without waiting on
+  P3, and P2/P3 plans are written against the P1 draft and reconciled at the
+  skeleton. (Reviewer note, gpt-5.5: an early hard freeze would hide the apply/
+  write-through coupling — hence draft-then-ratify, not freeze-at-P1.)
 - **D7 — Walking skeleton = P3 task 1.** The off-thread→foreground handoff
   (blocking OS thread → channel → gpui `Entity` → `cx.notify`) is proven by a
   minimal end-to-end slice before the real reducer volume lands in P3 — no
@@ -111,12 +117,20 @@ Strict dependency order **P0 → P1 → P2 → P3** (the actor write-throughs to
 persistence, so persistence precedes the actor).
 
 ### P0 — Domain types (`lens-core/domain`, §2)
-Branded ids, `SessionState`, `Item` + `ItemKind` enum (the §6.2 `kind` set:
-message | function_call | function_call_output | reasoning | native_tool |
-compaction | slash_command | terminal_command | resource_event | agent_changed),
-`BlockContext { agent, depth, turn }`, `Usage`/`Cost`/`ErrorInfo`,
-`StreamScratch` (§4.2). Pure data + serde (payloads jsonb-mappable per §6.2).
-No logic. **Gate:** serde round-trips; fmt · clippy · tests.
+Branded ids, `SessionState`, `Item` + `ItemKind` enum — the full LOCKED **§2.3**
+union: message | function_call | function_call_output | reasoning | native_tool |
+compaction | slash_command | terminal_command | **error** | resource_event |
+agent_changed. `BlockContext { agent, depth, turn, timestamp }` (timestamp is
+`f64` monotonic, stamped at reduce time — §2.4), `Usage`/`Cost`/`ErrorInfo`/
+`PresenceViewer`, `StreamScratch` (§4.2). Pure data + serde (payloads
+jsonb-mappable per §6.2). No logic. **`presence` is RAM-only — never a persisted
+column** (§2.5/§6.2); carry it on `SessionState` but exclude it from the P2
+schema. **Gate:** serde round-trips; fmt · clippy · tests.
+
+> **Doc correction (found in review):** the LOCKED §2.3 `ItemKind` includes
+> `Error { source, code, message }` ("persisted error banner"), but the §6.2
+> schema `kind`-column comment omits `error`. The P2 schema **must** include
+> `error` in the `item_kind` enum. File this correction against §6.2 when P2 lands.
 
 ### P1 — Pure reducer + render transforms (`lens-core/reduce`, §4) — *contract-proving*
 `reduce(&mut SessionState, &ServerStreamEvent) -> SmallVec<[StreamUpdate; 2]>`:
@@ -139,19 +153,35 @@ restore only, no transcript side-effects**). Plus §4.3 render transforms
 6-val live vs `SessionStatus` 3-val snapshot) and the two usage representations
 are normalized here into `SessionState`'s canonical fields.
 
-No threads, no gpui, no SQLite. **TDD against the golden SSE corpus**
-(`docs/spikes/captures/2026-06-26-sse/` + `…-live-recapture/`). **Gate:** reducer
-is deterministic/replayable (same event sequence → same state); fmt · clippy ·
-tests. **`StreamUpdate` is frozen when this phase lands (D6).**
+No threads, no gpui, no SQLite. `reduce()` stays **pure** (§4.1 "does no I/O"), so
+the reduce-time `BlockContext.timestamp` (§2.4) comes from an **injected clock**
+(a `Clock` seam / passed-in instant), never a direct wall-clock read — otherwise
+replay is non-deterministic.
+
+**TDD against the golden SSE corpus** (`docs/spikes/captures/2026-06-26-sse/` +
+`…-live-recapture/`) for the wire-event arms. The **reconnect/bootstrap arms are
+crate-synthetic** (`Reconnecting`/`Reconnected{gap}`/`SnapshotRestored` are
+lens-client §7 synthetics, NOT in the wire corpus) → tested with **hand-authored
+synthetic-event fixtures**. Required cases: gap-cleared `StreamScratch` on
+`Reconnected{gap != Some(0)}` (§4.2); `SnapshotRestored` scalar-only fold with
+**no transcript side-effects** (§4.1); replayed `GET /items` dedup; duplicate-`id`
+dedup against hydrated items. **Gate:** reducer deterministic/replayable under the
+fixed clock (replay twice → identical `SessionState`); fmt · clippy · tests.
+**The reducer-emitted `StreamUpdate` semantic deltas are drafted at this phase's
+exit (D6); ratified at the P3 skeleton.**
 
 ### P2 — Persistence (`lens-core/persist`, §6)
 `SessionPersistence` trait + SQLite v1 impl over the §6.2 schema
-(connections/sessions/items/cost_samples/meta). Write-through upsert by
+(connections/sessions/items/cost_samples/meta), with `error` in the `item_kind`
+enum (P0 doc correction). Write-through upsert by
 `(connection_id, session_id, item_id)`; session-field fold into `sessions`;
-reconcile-by-`id` on wake (disk may lag the server); `meta.schema_version`
-migration gate (unknown future version → read-only-degraded, never corrupted).
-In-progress `StreamScratch` is RAM-only, never persisted. **Gate:** temp-db
-write-through + reconcile tests; schema_version gating test; fmt · clippy.
+`meta.schema_version` migration gate (unknown future version →
+read-only-degraded, never corrupted). In-progress `StreamScratch` and `presence`
+are RAM-only, never persisted (§2.5/§4.2). P2 exposes **load / upsert / reconcile
+primitives** (reconcile keyed by item `id`, since disk may lag the server); the
+**wake wiring that calls them is P3** (a lifecycle/actor concern, §6.3). **Gate:**
+temp-db write-through + reconcile-primitive tests; schema_version gating test;
+fmt · clippy.
 
 ### P3 — Actor + store + commands (`lens-core/actor` + `lens-store`, §8/§7/§13.1)
 **Task 1 = walking skeleton (D7):** one fake event → `reduce` → `StreamUpdate`
@@ -159,22 +189,41 @@ over a bounded channel → `SessionStore` replica applies → `cx.notify` → ob
 on the foreground. Proves the blocking-thread↔`cx.spawn` handoff + backpressure
 shape end-to-end.
 
-Then: `ActiveSession` OS-thread actor driving `lens-client`'s `EventStream`
-(reduce → persist write-through → emit `StreamUpdate`); `SessionStore` replica
-(`StreamUpdate::apply` = cheap assignment/insert only, no parse/reduce/IO on the
-foreground) + `cx.observe` granularity; `SessionCommand` inbound channel with the
-§7 command semantics — **send** (optimistic actor-owned `pending_user`, FIFO
-reconcile on `session.input.consumed`, rollback on POST failure), interrupt,
-compact, approve, stop_session, fork, switch_agent; bootstrap + reconnect wiring
-(the actor consumes the crate-synthetic `Reconnecting`/`Reconnected`/
-`SnapshotRestored`/`Disconnected` lifecycle from `lens-client` §7); §13.1
-`ClientError`→app-state mapping; bounded-channel backpressure + delta coalescing
-(drain all pending `StreamUpdate`s before one `cx.notify`).
+Then, in three parts:
+
+**(a) Actor run-loop.** `ActiveSession` on its OS thread **multiplexes two
+inputs** — the `EventStream` receiver (the mpsc from `lens-client`'s reader
+thread) and the `SessionCommand` receiver — via non-blocking select/`try_recv`,
+so commands are serviced even while a turn streams (D5 is a blocking *thread*, not
+a blocking *read* on one channel). Per event: reduce → persist write-through →
+emit `StreamUpdate`. `SessionStore` replica applies (`StreamUpdate::apply` = cheap
+assignment/insert only — no parse/reduce/IO on the foreground) with `cx.observe`
+granularity; bounded-channel backpressure + delta coalescing (drain all pending
+`StreamUpdate`s before one `cx.notify`).
+
+**(b) Command semantics (§7).** `SessionCommand` inbound — **send** (optimistic
+actor-owned `pending_user`, FIFO reconcile on `session.input.consumed`, rollback
+on POST failure), interrupt, compact, approve, stop_session, fork, switch_agent;
+bootstrap + reconnect wiring (the actor consumes the crate-synthetic
+`Reconnecting`/`Reconnected`/`SnapshotRestored`/`Disconnected` lifecycle from
+`lens-client` §7); §13.1 `ClientError`→app-state mapping.
+
+**(c) Session lifecycle mechanics (§3).** The engine owns the *mechanics*: an
+`is_quiesced` predicate (strict — no open scratch / pending tools / pending user /
+unreconciled reconnect / non-`idle` status / live terminal, §3.2), **sleep**
+(flush persistence → best-effort `stop_session` → stop actor → drop heavy RAM,
+§3.4/§6.3), **wake** (disk-paint input + fresh stream bootstrap → reconcile-by-id,
+calling the P2 primitives), and `SessionLifecycle = Active | Slept | Deleted` +
+tombstone state (§3.1). The **trigger/scheduler** that *fires* auto-sleep (the
+~10min timer, the active-set) is the **§9 seam**, deferred — the engine exposes
+`is_quiesced()` + `sleep()`/`wake()` for that scheduler to call.
 
 **Gate:** scripted-mock actor tests (reuse the `lens-client` `Reopen`-style seam
 for deterministic reconnect/bootstrap without a server) + the walking-skeleton
-integration; **no foreground blocking** (all I/O off-thread — AGENTS.md
-MANDATORY); fmt · clippy · tests.
+integration; a **command-interleaving matrix** — send/interrupt/stop exercised
+while the stream is idle, running, and reconnecting; sleep/wake round-trip
+(quiesce → sleep → flush asserted → wake → reconcile); **no foreground blocking**
+(all I/O off-thread — AGENTS.md MANDATORY); fmt · clippy · tests.
 
 ---
 
@@ -208,9 +257,15 @@ MANDATORY); fmt · clippy · tests.
   synthetic lifecycle) and issues `SessionEventInput` commands + the REST
   fork/switch-agent endpoints.
 - **To the future §9 registry (named, not specced):** a `SessionHandle`-shaped
-  handle `{ SessionStore replica, Option<ActiveSessionHandle> }` and a
-  coarse-summary apply path the list-poll can fold into a Slept session's store
-  without an actor. This is the only forward hook this spec commits to.
+  handle `{ SessionStore replica, Option<ActiveSessionHandle> }`, plus a
+  **`SummaryUpdate`** — a type *distinct* from `StreamUpdate`, applied to a Slept
+  session's store by the §10 list-poll **without an actor and without touching the
+  reducer** (not a backdoor reduce path). Its invariant is committed here even
+  though its allowed-field set is defined by the §9/§10 spec: it carries **only
+  coarse card-summary fields** (status/title/last_total_tokens/host_id/
+  needs-attention) and an Active session **ignores** it for any field its live
+  stream owns (§10 — the stream is authoritative). This is the only forward hook
+  this spec commits to.
 
 ---
 
@@ -235,8 +290,10 @@ MANDATORY); fmt · clippy · tests.
 ## 8. Reversibility
 
 - The two-crate split is cheap to collapse or re-cut — `lens-store` is thin.
-- `StreamUpdate`/`SessionCommand` are the only cross-layer contracts; frozen at
-  P1/P3 exits respectively, versionable if they must change.
+- `StreamUpdate`/`SessionCommand` are the only cross-layer contracts *this spec
+  owns* (`SummaryUpdate` belongs to the §9/§10 spec): `StreamUpdate` drafted at P1
+  / ratified at the P3 skeleton (D6), `SessionCommand` at P3 — versionable if they
+  must change.
 - SQLite is behind `SessionPersistence` — a backing-store swap is a trait impl,
   not a rewrite (D4).
 - Every phase lands green and independently, so a phase can be revised without
