@@ -11,7 +11,7 @@ mod sanitize;
 use gpui::{div, prelude::*, App, Application, Context, Window, WindowOptions};
 use gpui_component::{text::TextView, Root};
 
-use render::StreamView;
+use render::{Source, StreamView};
 
 const SAMPLE: &str = "# Hello\n\nSome **bold** and a list:\n\n- one\n- two\n\n```rust\nfn main() {}\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n[a link](https://example.com)\n";
 
@@ -27,14 +27,22 @@ impl Render for MdView {
 }
 
 fn main() {
-    let stream = std::env::args().any(|a| a == "--stream");
+    let args: Vec<String> = std::env::args().collect();
+    let source = if args.iter().any(|a| a == "--adversarial") {
+        Some(Source::Adversarial)
+    } else if args.iter().any(|a| a == "--big") {
+        Some(Source::Big)
+    } else if args.iter().any(|a| a == "--stream") {
+        Some(Source::Stress)
+    } else {
+        None
+    };
     Application::new().run(move |cx: &mut App| {
         gpui_component::init(cx);
         cx.open_window(WindowOptions::default(), move |window, cx| {
-            let any: gpui::AnyView = if stream {
-                cx.new(StreamView::new).into()
-            } else {
-                cx.new(|_| MdView).into()
+            let any: gpui::AnyView = match source {
+                Some(src) => cx.new(move |cx| StreamView::new(src, cx)).into(),
+                None => cx.new(|_| MdView).into(),
             };
             cx.new(|cx| Root::new(any, window, cx))
         })
