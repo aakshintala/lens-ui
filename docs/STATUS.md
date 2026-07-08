@@ -253,9 +253,19 @@ and roll older "Recent" pointers off this page as they age.
     3 hardcoded module behaviors break naive streaming (200ms trailing debounce;
     `clear_selection` on reparse; `list_state.reset`→scroll-to-top) → confirms
     **vendor-just-the-markdown-module**. **Follow-up** = the vendor-and-patch (3
-    localized fixes) + variable-height virtualization (§4.1d, still un-spiked) +
-    mdstitch safe-prefix (deferred, needs Rust 1.95). Findings:
+    localized fixes) + mdstitch safe-prefix (deferred, needs Rust 1.95). Findings:
     [`docs/spikes/2026-07-07-markdown-streaming.md`](./spikes/2026-07-07-markdown-streaming.md).
+  - **Variable-height virtualization (§4.1c/d) — SPIKED 2026-07-08 → GO on native
+    gpui `list()`.** Head-to-head (native `list()` vs gpui-component `v_virtual_list`)
+    behind one `RowSource` seam: native `list()`/`ListState`/`ListAlignment::Bottom`
+    passes **all four transcript §16 contracts (7/7)** incl. the 1b off-screen-above
+    anchor holding; gpui-component fails the whole bottom-anchoring family. Retires
+    the "needs a custom virtualizer" residual. Divides the dep story: **native
+    `list()` for the transcript scroll surface, gpui-component for markdown + §4.3
+    forms.** Findings:
+    [`docs/spikes/2026-07-07-transcript-virtualization.md`](./spikes/2026-07-07-transcript-virtualization.md);
+    memory `transcript-virtualization-spike-2026-07`. **Only §4.3 (JSON-Schema form
+    renderer) remains as a load-bearing un-spiked framework residual.**
 - **Tunables for the verification pass:** auto-sleep threshold (~10m), poll cadence
   (~10s), ring-buffer size (10 MB), transcript truncation tiers, `cost_samples` cadence.
 - **Small undecided UX:** terminal-`transfer` UX, managed-provider selection,
@@ -265,6 +275,25 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Recent
 
+- **2026-07-08** — **§4.1c/d transcript-virtualization spike EXECUTED → GO on native
+  gpui `list()`** (throwaway harness `spikes/transcript-virtual/`, subagent-driven:
+  composer-2.5 Phase 0–2 build + Opus probe design/interpretation; spec-only, no
+  plan/TDD per the throwaway-spike calibration). A+B head-to-head behind one
+  `RowSource` seam. **Backend A (native `list()`): 7/7** — windowing (`renders ≪ N`),
+  variable heights, stick-to-bottom, **1b off-screen-above anchor held**
+  (`logical_scroll_top()` unchanged under above-viewport height mutation — the true
+  go/no-go), jump-to-bottom, identity-across-recycle, markdown nesting, UX demo.
+  **Backend B (gpui-component `v_virtual_list`):** windowing + identity pass, whole
+  bottom-anchoring family fails (no `ListAlignment::Bottom`, pixel-offset only, 1b
+  drift, opens at top). Retires the "needs a custom virtualizer" fear (§4.1c/d /
+  transcript §19 note 3): `uniform_list` was the wrong primitive, `list()` is the
+  right one — no fork, no extra dep. The probe-validity guard earned its keep (2
+  probe bugs caught + fixed before they poisoned the verdict: dead keybinds until a
+  focused `FocusHandle`; a false identity FAIL from a pre-first-paint baseline).
+  Framework §4.1c/d + §5 seam table + transcript §19 note 3 updated. Merged to main
+  (`825d462..9a5af61`). Findings:
+  [`docs/spikes/2026-07-07-transcript-virtualization.md`](./spikes/2026-07-07-transcript-virtualization.md);
+  memory `transcript-virtualization-spike-2026-07`.
 - **2026-07-07** — **§4.1 markdown-streaming spike EXECUTED → PARTIAL; gpui lock
   holds** (throwaway harness `spikes/markdown-stream/`, subagent-driven: Task 1 +
   render controller-built, Tasks 2–3 composer-2.5, verdict = probe-facts + user
