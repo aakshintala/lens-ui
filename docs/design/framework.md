@@ -171,8 +171,10 @@ trigger; re-evaluate at the spike.
 ## 4. Residual spike items
 
 The recon retired the terminal/diff/board risk. Markdown (§4.1) — including its
-§4.1c/d variable-height virtualization sub-item — is now **spiked and resolved**;
-**one** open item remains load-bearing — the JSON-Schema form renderer (§4.3):
+§4.1c/d variable-height virtualization sub-item — the transcript virtualization
+(§4.1c/d), and the JSON-Schema form renderer (§4.3) are **all now spiked and
+resolved**. **No load-bearing framework residual remains.** (Historical spike
+detail retained in the subsections below.)
 
 ### 4.1 Markdown rendering (the lock-gating spike item)
 
@@ -273,22 +275,44 @@ git-pin a Lens fork with the markdown-append fix (Paneflow's path, §3); (3)
 last resort, degrade to non-streaming finalize-only markdown (render plain text
 live, swap to formatted markdown on item finalize) — uglier but unblocks ship.
 
-### 4.3 JSON-Schema elicitation form renderer (second spike)
+### 4.3 JSON-Schema elicitation form renderer — SPIKED 2026-07-08 → GO
 
-The permissions form-mode elicitation (permissions §3) renders an arbitrary
-`requested_schema` JSON Schema as a gpui input form. gpui has no JSON-Schema
-form primitive, so this is a hand-rolled renderer (string/number/enum/boolean/
-nested-object fields → gpui inputs, with validation). **Un-spiked** — but the
-2026-07-07 survey shrinks it: `gpui-component` 0.5.1 (Apache-2.0) already
-provides the field inputs (Input/Select/Checkbox/NumberInput/Switch/DatePicker),
-so the residual is the **runtime schema→inputs mapping**, not building inputs.
-(`gpui-form` 0.5.1 MIT/Apache derives forms from Rust *structs* at compile time —
-wrong shape for a runtime-arbitrary schema, but confirms the input primitives.)
-Spike:
-render the common omnigent elicitation schemas and confirm submit produces a
-valid `ElicitationResult.content`. Fallback if a schema is too complex to render
-natively: fall back to the url-mode approval page (permissions §3) or a raw
-key/value editor.
+**Verdict: GO on native gpui + `gpui-component` inputs. 6/6 probes.** Full findings:
+[`docs/spikes/2026-07-08-elicitation-form.md`](../spikes/2026-07-08-elicitation-form.md).
+This was **the last load-bearing un-spiked framework residual**; the framework
+spike series closes.
+
+**Ground-truth reframe (the prior framing was wrong in both directions).** The
+permissions elicitation surface is **not** an arbitrary/nested JSON-Schema form:
+
+- **"Arbitrary/nested" is not real.** MCP elicitation is a **flat object of
+  primitive properties** (`string | number | integer | boolean`, `enum`,
+  `oneOf:[{const}]`, optional `default`); `content` values ∈
+  `str | int | float | bool | list[str] | null`. omnigent's own auto-fill helper
+  (`tools/_elicitation_schema.py`) never recurses. No nesting, no arrays-of-objects.
+- **The real surface is a discriminated set,** not one form: omnigent's own client
+  (`web/.../ApprovalCard.tsx`) has **no general JSON-Schema renderer** — it resolves
+  URL / ExitPlanMode / AskUserQuestion / Codex-command / (dormant) enum-options /
+  binary. The genuine runtime-schema case fires only for **third-party MCP servers**
+  (omnigent forwards their `requestedSchema`).
+
+So the build is a **bounded flat-primitive schema→inputs mapper** over
+`gpui-component` 0.5.1 inputs (`Input/NumberInput/Switch/Select/Radio/Checkbox`) +
+a handful of structured-payload cards — **not** a hand-rolled arbitrary renderer.
+(`gpui-form` 0.5.1 is compile-time struct-derive — wrong shape for a runtime
+schema; it only confirms the input primitives exist.) The spike proved the load-
+bearing unknown — a **runtime**, heterogeneous, runtime-sized collection of
+`gpui-component` input Entities builds from a parsed schema, reads back into a
+valid flat `ElicitationResult.content`, with `required` gating, `default` prefill,
+`enum`/`oneOf`, and no panic — plus that it composes with the discriminated surface
+(AskUserQuestion carousel; binary/url/plan cards; nested schema → raw key/value
+fallback). ⚠ Fixtures were source-derived, **not byte-verified** from a live
+form-mode capture (both live captures were url-mode) — byte-verify one real
+`requestedSchema` at consumer-build time.
+
+**Fallback ladder (unchanged, now the exception not the rule):** a schema with a
+non-flat-primitive property degrades to a **raw key/value editor**; url-mode routes
+to the approval page (permissions §3).
 
 ### 4.2 Other GPUI gaps (carried, smaller)
 
@@ -320,7 +344,7 @@ Each spec has a "framework divergence" section. What each one owns vs. here:
 | transcript §19 | Progressive re-render (stable-identity in-place diff); markdown library; virtualization | §4.1 markdown spike; **virtualization SPIKED 2026-07-08 → native gpui `list()`** (variable-height, `ListAlignment::Bottom`) satisfies all four §16 contracts — `uniform_list` was the wrong primitive, `list()` is the right one (§4.1c/d verdict) |
 | workspace §9 | Terminal widget | §2.2 — `alacritty_terminal` + `portable-pty`, Arbor template (MIT) |
 | workspace §4 | Diff widget | §2.3 — `imara-diff` + `syntect` cached, Arbor template (MIT) |
-| permissions | (no special widgets — form renderer uses gpui inputs; JSON-schema form renderer is a one-off build) | — |
+| permissions | (form renderer uses gpui-component inputs; a bounded flat-primitive schema→inputs mapper + structured-payload cards) | §4.3 form spike **SPIKED 2026-07-08 → GO** (6/6) — runtime schema→`gpui-component` inputs → valid flat `ElicitationResult.content`; discriminated surface, not an arbitrary renderer |
 | sub-agent topology | (no special widgets — rail/tree uses gpui list primitives) | — |
 | server lifecycle | (no widgets — backend) | — |
 

@@ -101,13 +101,39 @@ while the count drives badges.
 
 ## 3. The elicitation widget
 
-Docked at the **composer** (always on-screen, never above the fold):
+Docked at the **composer** (always on-screen, never above the fold). The widget is
+a **discriminator over a known set of shapes**, not a single arbitrary-schema form
+(framework §4.3, SPIKED 2026-07-08 → GO; ground-truthed against omnigent 0.4.0's own
+`web/.../ApprovalCard.tsx`). Resolved in priority order:
 
 - **Binary (no `requested_schema` or `{approve: boolean}`):** `Allow | Deny |
-  Cancel` over `content_preview`.
-- **Form (`mode=form` with `requested_schema`):** a panel above the composer
-  rendering the JSON Schema as a form. Submit returns the form values in
-  `ElicitationResult.content`.
+  Cancel` over `content_preview`. For Claude-native prompts this grows a contextual
+  third action: **"Allow all edits"** (`content.allow_all_edits` → server switches
+  the session to `acceptEdits`/`auto`) on edit-tool / ExitPlanMode prompts, or
+  **"Don't ask again"** (`content.remember` → session-scoped allow rule) on
+  non-edit tools. Absent for every other elicitation.
+- **ExitPlanMode plan review** (structured `exit_plan_mode.plan`): the plan
+  rendered as markdown + `Approve | Approve (auto mode) | Reject-with-feedback`
+  (`content.feedback` rides the decline back to the agent).
+- **AskUserQuestion** (structured `ask_user_question.questions[]`): the one genuine
+  multi-field form — a **carousel** (one question at a time, Prev/Next/Submit) of
+  radio (single-select) / checkbox (multi-select) options, each with an optional
+  `header` badge + option `description`/`preview`, plus a "type something" custom
+  row; submit gated on every question answered; returns a **flat**
+  `{questionKey: scalar | list[str]}` (`questionKey` = `id` if present else the
+  question text). ⚠ **Caveat:** for the *native Claude* path these answers are
+  **cosmetic + an approval surface — they do not propagate to the agent** (the
+  PermissionRequest hook returns only allow/deny; the real answer flows through
+  Claude's own picker). Only a *genuine MCP elicitation*'s `content` propagates.
+- **Generic MCP form (`mode=form` with a flat-primitive `requested_schema`):** the
+  runtime schema→inputs mapper (framework §4.3) — `string→Input`,
+  `number/integer→NumberInput`, `boolean→Switch`, `enum`/`oneOf:[{const}]→Select` —
+  with `required` gating + `default` prefill. Fires for **third-party MCP servers**
+  attached to a session; MCP bounds it to a **flat object of primitive properties**
+  (no nesting). Submit returns the values in `ElicitationResult.content` (flat
+  `str | int | float | bool | list[str]`). A schema carrying a non-flat property
+  degrades to a **raw key/value editor**. (Codex command approval + the dormant
+  enum-option-buttons shape ride the same discriminator; no live producer today.)
 - **URL (`mode=url`):** an "Authorize ↗" button. **Today the current omnigent
   producer sets a RELATIVE same-origin approval page** (`/approve/{session_id}/
   {elicitation_id}`, `approval.py:209`), NOT an arbitrary external OAuth URL —

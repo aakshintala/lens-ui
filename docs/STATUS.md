@@ -264,8 +264,18 @@ and roll older "Recent" pointers off this page as they age.
     `list()` for the transcript scroll surface, gpui-component for markdown + §4.3
     forms.** Findings:
     [`docs/spikes/2026-07-07-transcript-virtualization.md`](./spikes/2026-07-07-transcript-virtualization.md);
-    memory `transcript-virtualization-spike-2026-07`. **Only §4.3 (JSON-Schema form
-    renderer) remains as a load-bearing un-spiked framework residual.**
+    memory `transcript-virtualization-spike-2026-07`.
+  - **JSON-Schema elicitation form (§4.3) — SPIKED 2026-07-08 → GO** on native gpui
+    + `gpui-component` inputs (**6/6** probes). The doc's "arbitrary/nested JSON-Schema
+    form" framing was wrong: MCP elicitation is a **flat object of primitives**, and
+    the real surface is a **discriminated set** (url/binary/AskUserQuestion/plan/codex),
+    not a general renderer. Proved the runtime flat-schema→`gpui-component`-inputs mapper
+    reads back into valid flat `ElicitationResult.content` (required-gate, default, enum,
+    oneOf, never panic) + composes with the discriminated cards + raw key/value fallback.
+    ⚠ fixtures source-derived (not byte-verified; live captures were url-mode). Findings:
+    [`docs/spikes/2026-07-08-elicitation-form.md`](./spikes/2026-07-08-elicitation-form.md);
+    memory `elicitation-form-spike-2026-07`. **No load-bearing framework residual
+    remains — the framework spike series is closed.**
 - **Tunables for the verification pass:** auto-sleep threshold (~10m), poll cadence
   (~10s), ring-buffer size (10 MB), transcript truncation tiers, `cost_samples` cadence.
 - **Small undecided UX:** terminal-`transfer` UX, managed-provider selection,
@@ -275,6 +285,28 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Recent
 
+- **2026-07-08** — **§4.3 JSON-Schema elicitation form spike EXECUTED → GO on native
+  gpui + `gpui-component` inputs (6/6 probes)** (throwaway harness
+  `spikes/elicitation-form/`, subagent-driven: composer-2.5 build + headless probe
+  auto-run + Opus reframe/probe-validity/interpretation; spec-only, no plan/TDD per the
+  throwaway-spike calibration). **The pivotal finding was a ground-truth reframe** (read
+  from omnigent 0.4.0 source, not the doc): §4.3 is **not** an arbitrary/nested
+  JSON-Schema form — MCP elicitation is a **flat object of primitives**, and omnigent's
+  own client renders a **discriminated set** (url/binary/AskUserQuestion/ExitPlanMode/
+  codex), with the genuine runtime-schema case firing only for third-party MCP servers.
+  So the build is a bounded flat-primitive schema→inputs mapper + structured-payload
+  cards, not a hand-rolled renderer. Headless auto-run = **6/6**: runtime dynamic form
+  (crux — heterogeneous runtime `InputState`/`SelectState` Entities read back into valid
+  flat content, defaults/enum/oneOf, no panic), type coverage, constraints, content
+  round-trip (independent oracle; default-flow proven un-seeded), AskUserQuestion carousel,
+  composition + raw key/value fallback. Probe-validity guard caught 1 false-FAIL (multi-select
+  array order — form sorts, oracle used insertion order; answers are an unordered `list[str]`
+  set → order-insensitive compare). ⚠ fixtures source-derived, not byte-verified (both live
+  captures were url-mode); opportunistic live capture not run. Reconciled framework §4.3/§4/§5
+  + permissions §3 (added the discriminated modes + the AskUserQuestion "cosmetic-for-native-
+  Claude" caveat). **Closes the framework spike series — no load-bearing residual remains.**
+  Findings: [`docs/spikes/2026-07-08-elicitation-form.md`](./spikes/2026-07-08-elicitation-form.md);
+  memory `elicitation-form-spike-2026-07`.
 - **2026-07-08** — **§4.1c/d transcript-virtualization spike EXECUTED → GO on native
   gpui `list()`** (throwaway harness `spikes/transcript-virtual/`, subagent-driven:
   composer-2.5 Phase 0–2 build + Opus probe design/interpretation; spec-only, no
