@@ -11,6 +11,9 @@ target
 # Mutation testing (cargo mutants)
 **/mutants.out*/
 
+# Transient lens-capture run output (curated corpus is committed deliberately)
+/docs/spikes/captures/live/
+
 # Local tooling state
 /.opencode/
 /.superpowers/
