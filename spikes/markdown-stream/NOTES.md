@@ -87,3 +87,26 @@ Application::new().run(|cx| {
   We can't easily instrument inside the dep without vendoring; alternative =
   measure frame time + observe that re-parse is debounced (indirect). Revisit
   probe design at Task 5 given this.
+
+## Task 2/3 prep — dep resolution + a real toolchain finding (2026-07-07)
+
+### ⚠ mdstitch requires Rust 1.95 — DEFERRED (toolchain-floor finding)
+- `mdstitch 0.1.0` hard-requires **rustc ≥ 1.95.0** (cargo refuses to compile
+  it on older). This repo pins **1.91.1** via `rust-toolchain.toml`, deliberately
+  ("Bump deliberately, not incidentally").
+- **This is itself a §4.1 finding:** adopting mdstitch (a liftable dep the survey
+  counts on for safe-prefix) forces a toolchain-floor bump for the whole repo.
+- **Decision (spike sequencing):** defer mdstitch. gpui-component already runs the
+  accumulated text through pulldown-cmark (auto-closes unterminated constructs at
+  EOF) behind the 200ms debounce, so whether a safe-prefix layer is even *needed*
+  is a runtime observation (Task 5/6). Build replay+sanitize first, observe raw
+  incomplete-markdown rendering, and take the deliberate 1.95 bump ONLY if
+  observation proves safe-prefix necessary. Keeps the workspace 1.91-clean.
+
+### Confirmed deps (build clean on 1.91.1)
+- `pulldown-cmark = "0.13"` (0.13.4) — parser.
+- `pulldown-cmark-to-cmark = "22.0.0"` — reserializer. `cmark` signature (v22):
+  `cmark<'a, I, E, F>(events: I, formatter: F) -> Result<State, Error>` where
+  `F: fmt::Write`, `E: Borrow<Event<'a>>`. So `cmark(events.into_iter(), &mut out)`
+  with `out: String` is correct — matches the plan's Task 3 code.
+- gpui `0.2.2`, gpui-component `0.5.1` (Task 1).

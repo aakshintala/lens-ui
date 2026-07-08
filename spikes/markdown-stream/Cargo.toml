@@ -10,3 +10,5 @@ publish = false
 [dependencies]
 gpui = "0.2.2"
 gpui-component = "0.5.1"
+pulldown-cmark = "0.13"
+pulldown-cmark-to-cmark = "22.0.0"
