@@ -1,6 +1,6 @@
 //! Foreground gpui replica for one session — pure copy-assignment via `apply`.
 
-use gpui::{App, AppContext, Entity};
+use gpui::{App, AppContext, Entity, Task};
 use lens_core::domain::SessionState;
 use lens_core::reduce::StreamUpdate;
 
@@ -85,6 +85,34 @@ impl SessionStore {
     }
 }
 
+/// Foreground drain: event-driven wakeup (`recv().await`) + greedy `try_recv`
+/// coalescing so a burst of deltas costs ONE `cx.notify()`/frame. Ends when the
+/// actor drops its sender (channel closed). Detach the returned Task to run it.
+pub fn spawn_apply_bridge(
+    store: SessionStore,
+    rx: async_channel::Receiver<StreamUpdate>,
+    cx: &mut App,
+) -> Task<()> {
+    cx.spawn(async move |cx| {
+        while let Ok(first) = rx.recv().await {
+            let mut batch = smallvec::SmallVec::<[StreamUpdate; 8]>::new();
+            batch.push(first);
+            while let Ok(more) = rx.try_recv() {
+                batch.push(more);
+            }
+            let applied = store.entity().update(cx, |state, cx| {
+                for u in batch.drain(..) {
+                    apply(state, u);
+                }
+                cx.notify();
+            });
+            if applied.is_err() {
+                break; // replica entity released — nothing to update
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::SessionStore;
@@ -164,5 +192,70 @@ mod tests {
         });
         let status = cx.read(|cx| store.read(cx).status);
         assert_eq!(status, SessionStatusValue::Running);
+    }
+
+    #[gpui::test]
+    async fn skeleton_off_thread_event_reaches_foreground(cx: &mut gpui::TestAppContext) {
+        let (tx, rx) = async_channel::bounded::<StreamUpdate>(1024);
+
+        let store = cx.update(|cx| SessionStore::new(cx, state()));
+        let entity = store.entity().clone();
+        let _bridge = cx.update(|cx| super::spawn_apply_bridge(store, rx, cx));
+
+        // A plain OS thread stands in for the actor: emit a Rebased baseline, then a delta.
+        let sender = std::thread::spawn(move || {
+            let mut s = state();
+            s.title = Some("baseline".into());
+            tx.send_blocking(StreamUpdate::Rebased(Box::new(s)))
+                .unwrap();
+            tx.send_blocking(StreamUpdate::StatusChanged(SessionStatusValue::Running))
+                .unwrap();
+            // drop(tx) closes the channel and ends the bridge loop.
+        });
+
+        sender.join().expect("sender thread");
+        cx.run_until_parked();
+        let (title, status) = cx.read(|cx| {
+            let s = entity.read(cx);
+            (s.title.clone(), s.status)
+        });
+        assert_eq!(
+            title.as_deref(),
+            Some("baseline"),
+            "Rebased baseline applied"
+        );
+        assert_eq!(
+            status,
+            SessionStatusValue::Running,
+            "delta applied after baseline"
+        );
+    }
+
+    #[gpui::test]
+    async fn skeleton_coalesces_a_burst_into_few_notifies(cx: &mut gpui::TestAppContext) {
+        let (tx, rx) = async_channel::bounded::<StreamUpdate>(1024);
+        let store = cx.update(|cx| SessionStore::new(cx, state()));
+        let entity = store.entity().clone();
+        // Observe notify count.
+        let notifies = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let n2 = notifies.clone();
+        let _sub = cx.update(|cx| cx.observe(&entity, move |_, _| n2.set(n2.get() + 1)));
+        let _bridge = cx.update(|cx| super::spawn_apply_bridge(store, rx, cx));
+
+        let sender = std::thread::spawn(move || {
+            for i in 0..500u64 {
+                tx.send_blocking(StreamUpdate::LastTokensChanged(Some(i)))
+                    .unwrap();
+            }
+        });
+        sender.join().expect("sender thread");
+        cx.run_until_parked();
+        let last = cx.read(|cx| entity.read(cx).last_total_tokens);
+        assert_eq!(last, Some(499));
+        let notify_count = notifies.get();
+        assert!(
+            notify_count < 500,
+            "500 deltas coalesced into {notify_count} notifies"
+        );
     }
 }

@@ -3361,6 +3361,7 @@ dependencies = [
  "async-channel 2.5.0",
  "gpui",
  "lens-core",
+ "smallvec",
 ]
 
 [[package]]
