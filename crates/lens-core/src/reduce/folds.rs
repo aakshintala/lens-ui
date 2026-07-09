@@ -27,6 +27,25 @@ fn map_todo_status(w: TodoItemStatus) -> TodoStatus {
     }
 }
 
+/// Live `session.usage` → canonical scalars (D-P1-9).
+pub(crate) fn fold_usage(
+    state: &mut SessionState,
+    context_tokens: Option<i64>,
+    context_window: Option<i64>,
+    total_cost_usd: Option<f64>,
+) -> Updates {
+    if let Some(ct) = context_tokens {
+        state.last_total_tokens = Some(ct.max(0) as u64);
+    }
+    if let Some(cw) = context_window {
+        state.context_window = Some(cw.max(0) as u64);
+    }
+    if let Some(cost) = total_cost_usd {
+        state.cumulative_cost.total_cost_usd = Some(cost);
+    }
+    smallvec![StreamUpdate::UsageChanged]
+}
+
 /// The non-item, non-usage, non-presence, non-child session-field arms. Returns
 /// `None` for arms handled elsewhere so `reduce` can route them.
 pub(crate) fn fold_session_field(state: &mut SessionState, ev: &SessionEvent) -> Option<Updates> {
@@ -83,9 +102,13 @@ pub(crate) fn fold_session_field(state: &mut SessionState, ev: &SessionEvent) ->
             smallvec![StreamUpdate::ResourcesChanged] // D-P1-4
         }
         SessionEvent::Heartbeat { .. } => return Some(smallvec![]),
+        SessionEvent::Usage {
+            context_tokens,
+            context_window,
+            total_cost_usd,
+        } => fold_usage(state, *context_tokens, *context_window, *total_cost_usd),
         // Handled elsewhere:
-        SessionEvent::Usage { .. }
-        | SessionEvent::Presence { .. }
+        SessionEvent::Presence { .. }
         | SessionEvent::ChildSessionUpdated { .. }
         | SessionEvent::AgentChanged { .. } => return None,
     })
@@ -174,5 +197,38 @@ mod tests {
             &clock(),
         );
         assert!(s.terminal_pending);
+    }
+
+    #[test]
+    fn usage_folds_into_canonical_cost() {
+        let mut s = st();
+        let u = reduce(
+            &mut s,
+            &ServerStreamEvent::Session(SessionEvent::Usage {
+                context_tokens: Some(1200),
+                context_window: Some(200_000),
+                total_cost_usd: Some(0.42),
+            }),
+            &clock(),
+        );
+        assert_eq!(s.last_total_tokens, Some(1200));
+        assert_eq!(s.context_window, Some(200_000));
+        assert_eq!(s.cumulative_cost.total_cost_usd, Some(0.42));
+        assert_eq!(&u[..], &[StreamUpdate::UsageChanged]);
+    }
+
+    #[test]
+    fn usage_negative_wire_ints_never_panic() {
+        let mut s = st();
+        reduce(
+            &mut s,
+            &ServerStreamEvent::Session(SessionEvent::Usage {
+                context_tokens: Some(-5),
+                context_window: None,
+                total_cost_usd: None,
+            }),
+            &clock(),
+        );
+        assert_eq!(s.last_total_tokens, Some(0)); // clamped, total
     }
 }
