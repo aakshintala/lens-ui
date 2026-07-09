@@ -129,4 +129,72 @@ mod tests {
         let out = reduce(&mut s, &ev, &clock);
         assert_eq!(&out[..], &[StreamUpdate::Reconnecting { attempt: 1 }]);
     }
+
+    mod corpus {
+        use super::*;
+        use crate::domain::ItemKind;
+        use crate::reduce::testutil::{CORPUS_FILES, decode_corpus, fresh_state};
+
+        #[test]
+        fn corpus_replay_is_deterministic() {
+            for path in CORPUS_FILES {
+                let events = decode_corpus(path);
+                let mut a = fresh_state();
+                let mut b = fresh_state();
+                let clock = ManualClock::new(1_700_000_000_000);
+                for ev in &events {
+                    reduce(&mut a, ev, &clock);
+                }
+                for ev in &events {
+                    reduce(&mut b, ev, &clock);
+                }
+                assert_eq!(a, b, "non-deterministic replay for {path}");
+            }
+        }
+
+        #[test]
+        fn happy_path_produces_expected_transcript_shape() {
+            let events = decode_corpus("docs/spikes/captures/2026-06-26-sse/happy_path.stream.sse");
+            let mut s = fresh_state();
+            let clock = ManualClock::new(1_700_000_000_000);
+            for ev in &events {
+                reduce(&mut s, ev, &clock);
+            }
+            assert!(
+                s.items
+                    .iter()
+                    .any(|i| matches!(i.kind, ItemKind::FunctionCall { .. }))
+            );
+            assert!(
+                s.items
+                    .iter()
+                    .any(|i| matches!(i.kind, ItemKind::FunctionCallOutput { .. }))
+            );
+            assert!(
+                s.items
+                    .iter()
+                    .any(|i| matches!(i.kind, ItemKind::Message { .. }))
+            );
+            let mut ids: Vec<_> = s.items.iter().map(|i| i.id.as_str().to_string()).collect();
+            let n = ids.len();
+            ids.sort();
+            ids.dedup();
+            assert_eq!(ids.len(), n, "duplicate item ids leaked");
+        }
+
+        #[test]
+        fn deferred_wire_type_is_a_noop() {
+            let mut s = fresh_state();
+            let clock = ManualClock::new(1_700_000_000_000);
+            let u = reduce(
+                &mut s,
+                &ServerStreamEvent::Unknown {
+                    event_type: "session.collaboration_mode".into(),
+                },
+                &clock,
+            );
+            assert!(u.is_empty());
+            assert_eq!(s.collaboration_mode, None);
+        }
+    }
 }
