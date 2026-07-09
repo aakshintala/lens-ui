@@ -10,6 +10,8 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+async-channel = "2"
+crossbeam-channel = "0.5"
 lens-client = { path = "../lens-client" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive", "rc"] }

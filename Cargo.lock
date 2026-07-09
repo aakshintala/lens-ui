@@ -3344,7 +3344,9 @@ dependencies = [
 name = "lens-core"
 version = "0.1.0"
 dependencies = [
+ "async-channel 2.5.0",
  "criterion",
+ "crossbeam-channel",
  "lens-client",
  "rusqlite",
  "serde",
