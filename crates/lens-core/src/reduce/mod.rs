@@ -21,8 +21,13 @@ use smallvec::SmallVec;
 /// Fold one event into `state`; return which parts changed (§4.1). Total over
 /// every event arm — never panics on external data (AGENTS.md).
 pub fn reduce(state: &mut SessionState, event: &ServerStreamEvent, clock: &dyn Clock) -> Updates {
-    // Arms are filled in Tasks 2–9; unhandled events are a no-op for now.
-    let _ = (state, event, clock);
+    if let ServerStreamEvent::Session(ev) = event
+        && let Some(updates) = folds::fold_session_field(state, ev)
+    {
+        return updates;
+    }
+    // Arms are filled in Tasks 3–9; unhandled events are a no-op for now.
+    let _ = clock;
     SmallVec::new()
 }
 
