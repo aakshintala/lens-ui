@@ -15,7 +15,7 @@ pub use update::{StreamUpdate, Updates};
 
 use crate::clock::Clock;
 use crate::domain::SessionState;
-use lens_client::stream::ServerStreamEvent;
+use lens_client::stream::{ResponseEvent, ServerStreamEvent};
 use smallvec::SmallVec;
 
 /// Fold one event into `state`; return which parts changed (§4.1). Total over
@@ -26,7 +26,16 @@ pub fn reduce(state: &mut SessionState, event: &ServerStreamEvent, clock: &dyn C
     {
         return updates;
     }
-    // Arms are filled in Tasks 3–9; unhandled events are a no-op for now.
+    if let ServerStreamEvent::Response(ResponseEvent::OutputTextDelta {
+        delta,
+        message_id,
+        index,
+        ..
+    }) = event
+    {
+        return scratch::accumulate_text(&mut state.stream, delta, message_id.as_deref(), *index);
+    }
+    // Arms are filled in Tasks 6–9; unhandled events are a no-op for now.
     let _ = clock;
     SmallVec::new()
 }
