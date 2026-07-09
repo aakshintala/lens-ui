@@ -285,6 +285,29 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Recent
 
+- **2026-07-09** — **state-model P3 sliced + Task 0 spike DONE + P3-1 plan written.**
+  P3 (actor + store + commands) is too big for one plan → sliced into **P3-1 actor
+  foundation** (channel swap + skeleton + run-loop + dual-mode, D7/D8/D9/D10/D13),
+  **P3-2 command semantics** (D16 optimistic-send/reconcile, D18 §13.1 map), **P3-3
+  lifecycle** (D17 quiesce/sleep/wake) — plus the **Task 0 spike** as a throwaway
+  (not a plan). **Task 0 (D12) large-transcript latency spike — DONE** (`cb56f38`,
+  background subagent; findings `docs/spikes/2026-07-09-large-transcript-latency.md`;
+  harness `spikes/large-transcript/`, 516 MiB `.db` gitignored; memory
+  `large-transcript-latency-spike-2026-07`): 100k-item/500 MiB corpus →
+  windowed page-load sub-ms, byte-budgeted cold-hydrate tail 4.88ms, **reconcile
+  full-history 1062ms vs tail-bounded ≤2.85ms (370–3100×)**. **LOCKED P3-3 contract:
+  reconcile bounded-tail, never full history**; blocking dep = lift `GET /items` tail
+  pagination (deferred from 3b-2b) in P3-3. D11 byte-window premise held. Paged-load
+  SQL shapes captured. **P3-1 plan written** (`28b73ab`,
+  `docs/superpowers/plans/2026-07-09-state-model-p3-1-actor-foundation.md`, 7 TDD
+  tasks; grounded in real gpui-0.2.2 bridge API + reader.rs + P1/P2 surfaces; scratch
+  representation decided `ScratchChanged(Arc<StreamScratch>)`+coalesce). Tasks 1 & 5
+  are the MANDATORY cross-family-review seams (lens-client channel swap; run-loop).
+  **Bench-validity audit done + PARKED** (memory `benchmark-validity-audit-2026-07`):
+  sse bench good; reduce bench hides the per-item linear dedup scan (needs a
+  window-scale variant); persist bench conflates DB-open with writes + is non-bimodal
+  (fix both) + wire an `xtask gate` (`cargo bench --no-run`, no full criterion in-gate).
+  **NEXT (two fresh sessions):** (1) bench-hardening + `xtask gate`; (2) execute P3-1.
 - **2026-07-09** — **state-model P3 GRILLING — CLOSED (session 2).** The 4 open
   branches resolved as **D15–D18** in new
   [`spec §2.2`](./superpowers/specs/2026-07-08-state-model-engine-design.md)
