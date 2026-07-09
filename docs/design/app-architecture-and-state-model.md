@@ -750,6 +750,29 @@ CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);   -- schema_version, …
 - **Schema versioning:** `meta.schema_version` gates migrations; an unrecognized
   future version is read-only-degraded, never silently corrupted.
 
+> **Amendment (2026-07-09, P3 grilling D11/D12/D17 — spec §2.2).**
+> - **Byte-windowed resident tail (D11).** The actor's in-RAM `items` is a
+>   **byte-budgeted tail** (~8 MB target, count backstop), **not** the full
+>   history. Real sessions reach ~600 MiB / 10k–100k items and items are bimodal
+>   (100 B markers vs 200 KB dumps), so the window is sized by **bytes, not count**.
+>   Full history lives in the per-session `TranscriptStore` file; older items
+>   **lazy-load on scroll-back** (indexed by `ordinal`, paged, off-thread, prefetch
+>   one page ahead) and the resident tail evicts. This promotes transcript
+>   retention from a deferred §15 tunable to a **designed seam** (thresholds still
+>   tunable); keeps fleet RAM flat (~240 MB @ 30 warm × ~8 MB) regardless of age.
+> - **Reconcile scope (D12).** Naïve reconcile-by-id over 100k rows is
+>   O(transcript); on-wake/reconnect reconcile must **bound to the tail** (since
+>   `last_seen_seq`), which entangles the server `GET /items` pagination contract.
+>   A P3 **Task 0 latency spike** (synthetic ~500 MiB / ~100k items) fixes the
+>   reconcile contract before the wake wiring is built.
+> - **Sleep ordering (D17), made precise.** `sleep()` = **re-check `is_quiesced()`
+>   and abort-if-false** (closes the scheduler→sleep TOCTOU) → **flush durable**
+>   (final transcript upsert + control `lifecycle=Slept`/`last_seen_seq`/
+>   `last_focused_at`) → **best-effort `stop_session` fire-and-forget** (timeout-
+>   bounded, outcome→ring, never blocks the flush) → stop actor → drop RAM.
+>   Flush-first is safe because the quiescence predicate already guaranteed
+>   terminal state.
+
 ---
 
 ## 7. Command flow — ④ (decided)
@@ -869,6 +892,31 @@ The foreground hand-off is isolated to one seam with two message directions:
 `StreamUpdate` out of the actor, `SessionCommand` into it. See §14 for the
 framework divergence there.
 
+> **Amendment (2026-07-09, P3 grilling D8/D9/D14 — spec §2.1).**
+> - **Why two copies (D14).** The actor+replica split exists to **decouple the N
+>   warm *background* streams from the gpui foreground executor** — N mostly-idle
+>   Active sessions must advance and persist without waking the UI thread per
+>   event, and gpui entities are foreground-mutation-only, so canonical state
+>   cannot itself be the entity. It is **not** because "reduce is expensive":
+>   `reduce` is **1.36µs/turn** (P1 bench). A future reader who notices reduce is
+>   trivial must not conclude the actor layer is pointless.
+> - **Replica contract, made precise (D8).** `StreamUpdate` is **value-carrying**:
+>   each variant carries its just-reduced value (`ItemAppended(Arc<Item>)`,
+>   `ItemUpdated { index, item: Arc<Item> }`, `StatusChanged(..)`, …) and
+>   `StreamUpdate::apply` is **pure copy-assignment** — deposit the value into the
+>   named field, never re-derive, never run `reduce` on the foreground; O(1)/delta.
+>   `items` is **`Vec<Arc<Item>>`** so item bodies are *shared* actor↔replica — the
+>   replica's "copy" is a pointer spine + small scalars, not a second copy of
+>   transcript bytes. (Rejected: a whole-state snapshot swap — a plain-`Vec` deep
+>   clone is O(n²) over a streaming turn.)
+> - **One-shot baseline at attach (D9).** The reducer only **appends or
+>   updates-in-place** (never removes/clears), so steady-state needs only those two
+>   item deltas. At actor attach/promote the replica is seeded **once** with
+>   `Rebased(Box<SessionState>)` (disk-painted baseline: identity + scalars +
+>   resident item window); `*state = baseline`, then all subsequent deltas are
+>   incremental. This keeps index-based `ItemUpdated` sound. Distinct from the
+>   scalar-only `SnapshotRestored` (mid-session reconnect chrome).
+
 ---
 
 ## 9. App structure & navigation — ③
@@ -925,6 +973,20 @@ pub struct ActiveSessionHandle {
   the same registry.
 - **Multi-window** is a capability-map decision G — `AppState` is
   framework-shared; per-window `WindowState` lives in the application shell.
+
+> **Amendment (2026-07-09, P3 grilling D10 — spec §2.1/§2.2).** The line "the
+> background actor … emits `StreamUpdate`s into the replica" is **render-scoping,
+> not memory-scoping**: a **full** replica (with items, fed full `StreamUpdate`s)
+> exists **only for focused sessions (≤ ~10)**, not for every Active session.
+> Background-**warm** Active sessions get only a coarse **`SummaryUpdate`** feed
+> emitted **by the actor** (status/title/tokens/needs-attention/sub-agent-active,
+> ms–s cadence) — not the per-token full delta stream. The actor is therefore
+> **dual-mode (`Detailed | Summary`)**: **promote** on focus emits a `Rebased`
+> baseline then `Detailed` deltas; **demote** on blur drops the full items and
+> reverts to `Summary`. **Full-fidelity duplication is bounded by the *focus*
+> count, not the *warm* count.** The trigger *policy* (focus set, active-set LRU)
+> that drives promote/demote lives in this §9 registry; the per-session engine
+> exposes only the capability + the `Rebased` promote primitive.
 
 ---
 
@@ -1127,19 +1189,53 @@ Concierge per Lens, never per-connection.
 
 ### 13.1 Error & lifecycle mapping
 
-`ClientError` (the typed client's §11) maps to app state:
+Failures arrive on **two distinct paths** with different actor behavior, so the
+mapping is **two tables**, not one (amended 2026-07-09, P3 grilling D18 — spec
+§2.2). The **stream path** delivers terminal failures folded into
+`ServerStreamEvent::Disconnected { reason: DisconnectReason }` (a 5-variant enum
+in the typed client); the **command/REST path** returns `ClientError` from
+`send_event`/fork/switch. The same underlying condition (a 401, a 404) means
+different things depending on which path hit it — on the stream it is terminal,
+on a command it is one failed call that need not tear down the session.
 
-| `ClientError` / signal | App-state effect |
+**Non-terminal stream lifecycle** (health transitions, not errors):
+
+| signal | effect |
 |---|---|
-| `ServerStreamEvent::Reconnecting { attempt }` (typed client §7) | Active → health `Reconnecting`; raise the amber `↻` immediately; record `since`/`attempts`. |
-| `ServerStreamEvent::Disconnected` (retry phase expired, typed client §7) | Active → "hard disconnected" UI; offer user-retry (reopens via `Sessions::stream`). Session stays in registry. (A stream signal, not a `ClientError` variant — see typed client §11.) |
-| `ServerStreamEvent::Reconnected { gap }` (typed client §7) | `gap == Some(0)`: keep state. Else: clear `StreamScratch` (§4.2), show `↻` break, reconcile. |
-| `Auth { 401 }` | Prompt re-auth (permissions + server-lifecycle docs); do not drop sessions. |
-| `Auth { 403 }` | Lost access → remove session from registry + UI. |
-| `NotFound` (404) | Session deleted server-side → remove from registry; any disk rows remain as a read-only local tombstone (history viewable, never re-streamed). |
-| snapshot `status == Failed` | Surface `last_task_error`; no retry. |
-| `ContractMismatch` | Connection goes to "wrong version" state; the user is prompted to upgrade Lens or downgrade omnigent. **Never silently continue.** |
-| `Network` / `Parse` / `Ws` | Log; surface a non-fatal transcript error marker. Unknown event types are already dropped by the typed client. |
+| `ServerStreamEvent::Reconnecting { attempt }` | Active → health `Reconnecting`; raise the amber `↻` immediately; record `since`/`attempts`. Actor sets `reconcile_in_flight` (§3.2 quiescence, D17). |
+| `ServerStreamEvent::Reconnected { gap }` | `gap == Some(0)`: keep state. Else: clear `StreamScratch` (§4.2, keep `pending_user`), show `↻` break, reconcile; clear `reconcile_in_flight` when reconcile completes. |
+
+**Table A — terminal `Disconnected { reason }` (stream path) → actor lifecycle:**
+
+| `DisconnectReason` | actor action | UI |
+|---|---|---|
+| `Unauthorized` (401) | **park** — close stream, keep actor + state resident | prompt re-auth; do not drop session |
+| `SessionFailed` (snapshot `status == Failed`) | **park** — surface `last_task_error`, no auto-retry | failed banner; user may inspect/fork |
+| `RetriesExhausted` (retry window elapsed) | **park** — offer user-retry (reopens via `Sessions::stream`) | "hard disconnected"; stays in registry |
+| `Forbidden` (403) | **stop** — stop actor, remove from registry | lost access → remove from UI |
+| `NotFound` (404) | **stop** — stop actor; disk rows kept as read-only tombstone | deleted server-side → history viewable, never re-streamed |
+
+A **parked** session is **not quiesced** (`transport != Connected`, D17) so it
+will not auto-sleep — it holds RAM until the user acts (re-auth / retry). Any
+force-reclaim of piled-up parked sessions is **§9 policy**, not the per-session
+engine.
+
+**Table B — `ClientError` on command/REST → command outcome** (does *not* tear
+down the stream):
+
+| `ClientError` | command outcome |
+|---|---|
+| `Network` | transient; surface a non-fatal marker; on `send`, roll back the optimistic `pending_user` bubble (D16). |
+| `Auth { 401 }` | prompt re-auth; keep the session; fail/hold the command. |
+| `Auth { 403 }` | lost access → escalate to registry removal. |
+| `NotFound { 404 }` | session gone → tombstone. |
+| `Server { status, body }` | **5xx** = server-side transient (log, marker, retry-eligible); **other 4xx** = denied/client bug (surface, no retry). |
+| `ContractMismatch` | connection → "wrong version" state; prompt upgrade/downgrade. **Never silently continue.** |
+| `Parse` | decode drift; non-fatal marker + log. Unknown event types are already dropped by the typed client. |
+| `ThreadSpawn` | **fatal at stream-open** — the actor never starts; the session cannot go Active; surface a hard error. |
+
+(There is no `Ws` `ClientError` variant — the WS terminal path is deferred and
+`lens-client` has no `terminal.rs` yet; add its mapping when that path lands.)
 
 ### 13.2 Downstream contracts (the seams)
 
@@ -1227,6 +1323,9 @@ framework-independent (Rust + SQLite + typed-client).
   dropped — §3.3.)
 - **Disk retention policy** — how long Slept/server-archived sessions keep their `items`
   rows before pruning to a summary tombstone; whether the user controls it.
+  (Amended 2026-07-09, D11 — the *in-RAM* resident window is now a **designed
+  byte-windowed seam** with paged `TranscriptStore` load, §6.3; the open question
+  here is narrowed to on-*disk* pruning thresholds, which stay tunable.)
   The schema (§6.2) supports either.
 - **Bridge integration depth** — §6.1 keeps the schema readable; whether Bridge
   reads the SQLite file directly vs. a small export API is a Bridge-side
