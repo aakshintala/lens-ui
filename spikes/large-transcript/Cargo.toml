@@ -1,0 +1,21 @@
+[package]
+name = "large-transcript"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Deliberately NO `[lints] workspace = true` — spikes live outside the
+# production lint wall (see root Cargo.toml). Throwaway P3 Task 0 (D12).
+
+[dependencies]
+# Reuse the SHIPPED domain + persistence so the measurements exercise the real
+# `Item`/`ItemKind` serde path, the real `SqliteTranscriptStore::{load_items,
+# reconcile}`, and the real `row_to_item` decode. The windowed/paged primitives
+# do not exist yet, so we prototype them over a raw `rusqlite::Connection`.
+lens-core = { path = "../../crates/lens-core" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde_json = "1"
+
+[[bin]]
+name = "large-transcript"
+path = "src/main.rs"
