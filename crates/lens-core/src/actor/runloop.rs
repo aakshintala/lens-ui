@@ -105,13 +105,21 @@ fn run(
 /// Write the deltas of this batch to disk. Items → `TranscriptStore` by ordinal;
 /// a scalar/collection change → one control upsert of the whole session row.
 fn persist_write_through(stores: &ActorStores, state: &SessionState, batch: &Updates, now_ms: i64) {
+    // Appended items occupy the last `appends` slots of state.items, in batch order.
+    let appends = batch
+        .iter()
+        .filter(|u| matches!(u, StreamUpdate::ItemAppended(_)))
+        .count();
+    let base = state.items.len().saturating_sub(appends);
+    let mut append_i = 0usize;
     let mut touched_scalar = false;
     for u in batch {
         match u {
             StreamUpdate::ItemAppended(item) => {
-                // TODO(P3-3): replace items.len() with the owned ordinal cursor once byte-window eviction lands (D11).
-                let ordinal = (state.items.len() as i64) - 1;
+                // TODO(P3-3): replace this positional ordinal with the owned ordinal cursor once byte-window eviction lands (D11).
+                let ordinal = (base + append_i) as i64;
                 let _ = stores.transcript.upsert_item(ordinal, item.as_ref());
+                append_i += 1;
             }
             StreamUpdate::ItemUpdated { index, item } => {
                 let _ = stores.transcript.upsert_item(*index as i64, item.as_ref());
@@ -161,12 +169,17 @@ fn coalesce(batch: Updates) -> Updates {
 mod tests {
     use super::*;
     use crate::clock::ManualClock;
+    use crate::domain::ids::ItemId;
     use crate::domain::ids::{ConnectionId, SessionId};
+    use crate::domain::item::{BlockContext, ContentBlock, Item, ItemKind};
+    use crate::domain::scalars::Role;
     use crate::persist::{
         ConnectionRecord, SqliteControlStore, SqliteTranscriptStore, TranscriptStore,
     };
     use crate::reduce::testutil::{fresh_state, parse_response};
+    use smallvec::smallvec;
     use std::path::Path;
+    use std::sync::Arc;
 
     fn test_clock() -> Box<dyn Clock + Send> {
         Box::new(ManualClock::new(1_700_000_000_000))
@@ -227,6 +240,48 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reopened.load_items().unwrap().rows.len(), 1);
+    }
+
+    fn test_item(id: &str, text: &str) -> Item {
+        Item {
+            id: ItemId::new(id),
+            seq: None,
+            ctx: BlockContext {
+                agent: None,
+                depth: 0,
+                turn: 0,
+            },
+            created_at: 0,
+            kind: ItemKind::Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock {
+                    kind: "text".into(),
+                    text: Some(text.into()),
+                    data: serde_json::Value::Null,
+                }],
+            },
+        }
+    }
+
+    #[test]
+    fn batched_appends_persist_at_distinct_ordinals() {
+        let _dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(_dir.path());
+        seed_connection(&stores);
+        let mut state = fresh_state();
+        let a = Arc::new(test_item("fc_1", "a"));
+        let b = Arc::new(test_item("fc_2", "b"));
+        state.items.push(Arc::clone(&a));
+        state.items.push(Arc::clone(&b));
+        let batch: Updates = smallvec![
+            StreamUpdate::ItemAppended(Arc::clone(&a)),
+            StreamUpdate::ItemAppended(Arc::clone(&b)),
+        ];
+        persist_write_through(&stores, &state, &batch, 1_700_000_000_000);
+        let rows = stores.transcript.load_items().unwrap().rows;
+        assert_eq!(rows.len(), 2, "both batched appends must persist");
+        assert_eq!(rows[0].id.as_str(), "fc_1");
+        assert_eq!(rows[1].id.as_str(), "fc_2");
     }
 
     #[test]
