@@ -27,3 +27,7 @@ lens-client = { path = "../lens-client", features = ["test-util"] }
 [[bench]]
 name = "reduce_throughput"
 harness = false
+
+[[bench]]
+name = "persist_throughput"
+harness = false
