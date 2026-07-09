@@ -285,6 +285,29 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Recent
 
+- **2026-07-08** — **state-model engine P0 (lens-core domain types) EXECUTED & MERGED
+  to main** (`ff554d7..2069e88`, ff-merge + push; plan-first → composer-2.5 build →
+  Opus review, per CLAUDE.md). New gpui-free crate `crates/lens-core` with the full
+  LOCKED §2 domain model — pure data + serde, no logic. **Reuse boundary (the
+  architectural call):** reuse `lens-client`'s 9 branded ids + `generated::SessionResourceObject`;
+  **domain-own every other value/aggregate type** — because `lens-client`'s read
+  wrappers (`TodoItem`/`PresenceViewer`/`SessionStatusValue`/…) are deserialize-only
+  with private fields, unusable as a mutable, persistable view-model. `branded_id!`
+  is not exported → local macro for the 4 new ids (`ItemId`/`CallId`/`ResponseId`/`AgentId`).
+  Modules: ids · scalars · usage · controls · item · session. **23 tests, clippy
+  clean, fmt clean, full-workspace gate green, `generated.rs` untouched.** Plan
+  cross-family reviewed **before build** (free codex/gpt-5.5, 2 Important applied):
+  enriched `ModelUsage` to the wire-faithful shape (cache buckets + per-model
+  `total_cost_usd`, all optional — was dropping spend/cache data), and flagged a
+  **P1 blocker** (below). Plan:
+  [`docs/superpowers/plans/2026-07-08-state-model-p0-domain-types.md`](./superpowers/plans/2026-07-08-state-model-p0-domain-types.md).
+  **P1 handoff notes (in the plan):** (1) `lens_client::stream::PresenceViewer`
+  wrapper exposes only `user_id` — drops `joined_at`/`idle` the generated contract
+  carries, so P1 can't fill the domain `PresenceViewer` from `ServerStreamEvent::Presence`
+  until lens-client's stream wrapper is widened (or P1 reads the generated type);
+  (2) `ModelUsage` is now wire-1:1 for P1's usage normalization. **Next: P1 — pure
+  reducer + render transforms (`lens-core/reduce`, §4), the contract-proving phase;
+  TDD against the golden SSE corpus. Fresh session (per cost/context policy).**
 - **2026-07-08** — **state-model engine spec GRILLED → implementation-ready.** After
   the gpt-5.5 cross-family review (6 Important + 3 Minor, commit `05329a8`), a
   focused grilling pass over the implementation-risk seams the review didn't reach.
@@ -310,7 +333,7 @@ and roll older "Recent" pointers off this page as they age.
   Bonus: the §6.2 `items.kind` comment now lists `error` (resolves the P0
   doc-correction). Edits in `app-architecture-and-state-model.md` (§2.3/§2.4/§6) +
   the spec (D4/P0/P1/P2/P3b). Memory `state-model-grilling-revisions`.
-  **Next: implementation in a fresh session (P0 → P3).**
+  **Implementation started: P0 DONE (see 2026-07-08 P0 entry above); next = P1.**
 - **2026-07-08** — **§4.3 JSON-Schema elicitation form spike EXECUTED → GO on native
   gpui + `gpui-component` inputs (6/6 probes)** (throwaway harness
   `spikes/elicitation-form/`, subagent-driven: composer-2.5 build + headless probe
