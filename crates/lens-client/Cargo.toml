@@ -19,6 +19,7 @@ url = { version = "2", features = ["serde"] }
 # `regress`-backed regex checks — typify's runtime companion, pulled in by the
 # 0.3.0 mcp-servers schemas. Pinned to typify's own regress major.
 regress = "0.10"
+crossbeam-channel = "0.5"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

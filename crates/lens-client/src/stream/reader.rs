@@ -1,12 +1,14 @@
 //! The SSE reader thread: holds the blocking reqwest body, feeds the pure
-//! parser, deserializes typed events, and pushes them down an mpsc channel.
+//! parser, deserializes typed events, and pushes them down a bounded crossbeam
+//! channel.
 //! One thread per active session (typed-client.md §4); the gpui poller drains
 //! via `try_recv` off `cx.background_spawn`. Never blocks the foreground thread.
 
 use std::io::Read;
-use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::Duration;
+
+use crossbeam_channel::{Receiver, Sender, bounded};
 
 use crate::error::ClientError;
 use crate::reconnect::{BACKOFF_MS, Reopen, items_to_replay};
@@ -22,7 +24,7 @@ use super::sse::SseParser;
 pub(crate) const EVENT_CHANNEL_BOUND: usize = 1024;
 
 pub struct EventStream {
-    rx: mpsc::Receiver<ServerStreamEvent>,
+    rx: Receiver<ServerStreamEvent>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     _handle: JoinHandle<()>,
 }
@@ -33,7 +35,7 @@ impl EventStream {
         resp: reqwest::blocking::Response,
         reopener: Re,
     ) -> crate::error::Result<Self> {
-        let (tx, rx) = mpsc::sync_channel(EVENT_CHANNEL_BOUND);
+        let (tx, rx) = bounded(EVENT_CHANNEL_BOUND);
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let thread_stop = std::sync::Arc::clone(&stop);
         let handle = std::thread::Builder::new()
@@ -67,6 +69,12 @@ impl EventStream {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// The raw event receiver, for a consumer that multiplexes it with other
+    /// channels (the lens-core actor `Select`s over this + its command channel).
+    pub fn receiver(&self) -> &Receiver<ServerStreamEvent> {
+        &self.rx
+    }
+
     /// Block until the next event, or `None` when the stream closes.
     pub fn recv(&self) -> Option<ServerStreamEvent> {
         self.rx.recv().ok()
@@ -97,7 +105,7 @@ fn stop_reason(e: &ClientError) -> Option<DisconnectReason> {
 /// Retryable fetch failure degrades to live-tail-only (no regression vs pre-Plan-4).
 fn bootstrap<Re: Reopen>(
     reopener: &Re,
-    tx: &mpsc::SyncSender<ServerStreamEvent>,
+    tx: &Sender<ServerStreamEvent>,
     stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> bool {
     match reopener
@@ -133,7 +141,7 @@ fn bootstrap<Re: Reopen>(
 
 fn run<Re: Reopen>(
     body: Box<dyn Read + Send>,
-    tx: mpsc::SyncSender<ServerStreamEvent>,
+    tx: Sender<ServerStreamEvent>,
     reopener: Re,
     sleep: impl Fn(Duration),
     stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -149,7 +157,7 @@ fn run<Re: Reopen>(
 
 fn read_loop<Re: Reopen>(
     mut body: Box<dyn Read + Send>,
-    tx: mpsc::SyncSender<ServerStreamEvent>,
+    tx: Sender<ServerStreamEvent>,
     reopener: Re,
     sleep: impl Fn(Duration),
     stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -226,7 +234,7 @@ fn read_loop<Re: Reopen>(
 fn reconnect<Re: Reopen>(
     reopener: &Re,
     sleep: &impl Fn(Duration),
-    tx: &mpsc::SyncSender<ServerStreamEvent>,
+    tx: &Sender<ServerStreamEvent>,
     normalizer: &mut Normalizer,
     stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Option<Box<dyn Read + Send>> {
@@ -384,11 +392,115 @@ mod tests {
         assert_eq!(EVENT_CHANNEL_BOUND, 1024);
     }
 
+    /// `EventStream::receiver()` exposes the same `rx` that `recv()` drains; we
+    /// cannot construct `EventStream` without a live `reqwest` body, so this
+    /// drives `run` over a crossbeam bounded channel and reads via `rx.recv`.
+    #[test]
+    fn crossbeam_receiver_delivers_events_from_run() {
+        use std::io::Cursor;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        use crate::reconnect::Reopen;
+        use crate::sessions::{ItemList, SessionSnapshot};
+        use crate::stream::event::ResponseEvent;
+
+        struct MockReopen {
+            snapshot: SessionSnapshot,
+            items: std::sync::Mutex<Option<ItemList>>,
+        }
+
+        impl Reopen for MockReopen {
+            fn open_stream(&self) -> crate::error::Result<Box<dyn Read + Send>> {
+                Err(crate::error::ClientError::Server {
+                    status: 503,
+                    body: serde_json::json!({}),
+                })
+            }
+
+            fn snapshot(&self) -> crate::error::Result<SessionSnapshot> {
+                Ok(self.snapshot.clone())
+            }
+
+            fn items(&self) -> crate::error::Result<ItemList> {
+                match self.items.lock().unwrap().take() {
+                    Some(list) => Ok(list),
+                    None => Err(crate::error::ClientError::Server {
+                        status: 503,
+                        body: serde_json::json!({}),
+                    }),
+                }
+            }
+        }
+
+        let reopener = MockReopen {
+            snapshot: happy_idle_snapshot(),
+            items: std::sync::Mutex::new(Some({
+                let raw = include_str!(
+                    "../../../../docs/spikes/captures/2026-06-26-sse/happy_path.items.json"
+                );
+                serde_json::from_str(raw).expect("parse happy items")
+            })),
+        };
+        let (tx, rx) = bounded(EVENT_CHANNEL_BOUND);
+        let body: Box<dyn Read + Send> = Box::new(Cursor::new(Vec::<u8>::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        run(body, tx, reopener, |_d| {}, &stop);
+
+        let first = rx.recv().expect("snapshot via crossbeam receiver");
+        assert!(matches!(first, ServerStreamEvent::SnapshotRestored(_)));
+        let second = rx.recv().expect("replayed item via crossbeam receiver");
+        assert!(matches!(
+            second,
+            ServerStreamEvent::Response(ResponseEvent::OutputItemDone { .. })
+        ));
+    }
+
+    /// Crossbeam bounded `Sender::send` unblocks when all receivers drop — the
+    /// primitive `stop()`'s doc relies on for a reader parked on a full channel.
+    #[test]
+    fn dropping_receiver_unblocks_a_parked_sender() {
+        use std::time::Instant;
+
+        const CAP: usize = 2;
+        let (tx, rx) = bounded(CAP);
+        let filler = || ServerStreamEvent::Reconnecting { attempt: 1 };
+        assert!(tx.send(filler()).is_ok());
+        assert!(tx.send(filler()).is_ok());
+
+        let producer = std::thread::spawn(move || {
+            loop {
+                if tx.send(filler()).is_err() {
+                    return;
+                }
+            }
+        });
+
+        std::thread::sleep(Duration::from_millis(50));
+        drop(rx);
+
+        let (done_tx, done_rx) = bounded(1);
+        let watchdog = std::thread::spawn(move || {
+            let _ = producer.join();
+            let _ = done_tx.send(());
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while done_rx.try_recv().is_err() {
+            assert!(
+                Instant::now() < deadline,
+                "producer failed to exit on receiver drop"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        watchdog.join().expect("watchdog join");
+    }
+
     #[test]
     fn run_returns_immediately_when_stop_is_set_at_entry() {
         use std::sync::Arc;
         use std::sync::atomic::AtomicBool;
-        let (tx, rx) = mpsc::sync_channel(EVENT_CHANNEL_BOUND);
+        let (tx, rx) = bounded(EVENT_CHANNEL_BOUND);
         // A body that would block/emit if read; the entry stop check must short-circuit.
         let body: Box<dyn Read + Send> = Box::new(StepRead {
             steps: vec![Ok(b"event: session.heartbeat\ndata: {}\n\n")],
@@ -414,7 +526,7 @@ mod tests {
             ],
             next: 0,
         };
-        let (tx, rx) = mpsc::sync_channel(EVENT_CHANNEL_BOUND);
+        let (tx, rx) = bounded(EVENT_CHANNEL_BOUND);
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         run(
             Box::new(reader) as Box<dyn Read + Send>,
@@ -448,7 +560,7 @@ mod tests {
             steps: vec![Ok(reasoning_started_frame())],
             next: 0,
         };
-        let (tx, rx) = mpsc::sync_channel(EVENT_CHANNEL_BOUND);
+        let (tx, rx) = bounded(EVENT_CHANNEL_BOUND);
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         run(
             Box::new(reader) as Box<dyn Read + Send>,
@@ -635,7 +747,7 @@ mod reconnect_tests {
             bodies: Mutex::new(vec![body2]),
             open_stream_always_503: false,
         };
-        let (tx, rx) = mpsc::sync_channel(EVENT_CHANNEL_BOUND);
+        let (tx, rx) = bounded(EVENT_CHANNEL_BOUND);
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         read_loop(
             Box::new(Cursor::new(body1)) as Box<dyn Read + Send>,
@@ -669,7 +781,7 @@ mod reconnect_tests {
             bodies: Mutex::new(vec![]),
             open_stream_always_503: false,
         };
-        let (tx, rx) = mpsc::sync_channel(EVENT_CHANNEL_BOUND);
+        let (tx, rx) = bounded(EVENT_CHANNEL_BOUND);
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         read_loop(
             Box::new(Cursor::new(Vec::<u8>::new())) as Box<dyn Read + Send>,
@@ -709,7 +821,7 @@ mod reconnect_tests {
             bodies: Mutex::new(vec![]),
             open_stream_always_503: false,
         };
-        let (tx, rx) = mpsc::sync_channel(EVENT_CHANNEL_BOUND);
+        let (tx, rx) = bounded(EVENT_CHANNEL_BOUND);
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         read_loop(
             Box::new(Cursor::new(Vec::<u8>::new())) as Box<dyn Read + Send>,
@@ -759,7 +871,7 @@ mod reconnect_tests {
             bodies: Mutex::new(vec![reopen_body]),
             open_stream_always_503: false,
         };
-        let (tx, rx) = mpsc::sync_channel(EVENT_CHANNEL_BOUND);
+        let (tx, rx) = bounded(EVENT_CHANNEL_BOUND);
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         read_loop(
             Box::new(Cursor::new(Vec::<u8>::new())) as Box<dyn Read + Send>,
@@ -803,7 +915,7 @@ mod reconnect_tests {
             bodies: Mutex::new(vec![]),
             open_stream_always_503: true,
         };
-        let (tx, rx) = mpsc::sync_channel(EVENT_CHANNEL_BOUND);
+        let (tx, rx) = bounded(EVENT_CHANNEL_BOUND);
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         read_loop(
             Box::new(Cursor::new(Vec::<u8>::new())) as Box<dyn Read + Send>,
@@ -846,7 +958,7 @@ mod reconnect_tests {
             bodies: Mutex::new(vec![]),
             open_stream_always_503: true,
         };
-        let (tx, rx) = mpsc::sync_channel(EVENT_CHANNEL_BOUND);
+        let (tx, rx) = bounded(EVENT_CHANNEL_BOUND);
         let body: Box<dyn Read + Send> = Box::new(Cursor::new(Vec::<u8>::new()));
         let stop = Arc::new(AtomicBool::new(false));
         run(body, tx, reopener, |_d| {}, &stop);
