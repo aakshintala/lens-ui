@@ -1,0 +1,15 @@
+[package]
+name = "lens-store"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT"
+authors = ["Amogh Akshintala"]
+
+[dependencies]
+gpui = { version = "0.2.2", features = ["test-support"] }
+lens-core = { path = "../lens-core" }
+async-channel = "2"
+
+[lints]
+workspace = true
