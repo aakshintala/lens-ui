@@ -95,8 +95,16 @@ pub fn reduce(state: &mut SessionState, event: &ServerStreamEvent, clock: &dyn C
             _ => SmallVec::new(),
         };
     }
-    // Arms are filled in Tasks 8–9; unhandled events are a no-op for now.
-    SmallVec::new()
+    match event {
+        ServerStreamEvent::Reconnecting { attempt } => {
+            smallvec![StreamUpdate::Reconnecting { attempt: *attempt }]
+        }
+        ServerStreamEvent::Reconnected { gap } => snapshot::on_reconnected(state, *gap),
+        ServerStreamEvent::SnapshotRestored(snap) => snapshot::fold_snapshot(state, snap),
+        ServerStreamEvent::Disconnected { .. } => smallvec![StreamUpdate::Disconnected],
+        ServerStreamEvent::Unknown { .. } => smallvec![],
+        _ => SmallVec::new(),
+    }
 }
 
 #[cfg(test)]
@@ -114,11 +122,11 @@ mod tests {
     }
 
     #[test]
-    fn reduce_stub_is_a_noop() {
+    fn reconnecting_emits_lifecycle_marker() {
         let mut s = empty_state();
         let clock = ManualClock::new(1_700_000_000_000);
         let ev = ServerStreamEvent::Reconnecting { attempt: 1 };
         let out = reduce(&mut s, &ev, &clock);
-        assert!(out.is_empty());
+        assert_eq!(&out[..], &[StreamUpdate::Reconnecting { attempt: 1 }]);
     }
 }
