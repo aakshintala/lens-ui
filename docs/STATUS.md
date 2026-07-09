@@ -285,6 +285,35 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Recent
 
+- **2026-07-08** — **state-model engine P1 (lens-core pure reducer) EXECUTED & MERGED
+  to main** (`7959391..8a9a456`, 13 commits, ff-merge + push; subagent-driven:
+  composer-2.5 per-task TDD + gate + Opus/gpt-5.5 dual end-review, per CLAUDE.md). The
+  §4 contract-proving phase: `reduce(&mut SessionState, &ServerStreamEvent, &dyn Clock)
+  -> SmallVec<[StreamUpdate;2]>` — pure, deterministic (injected `Clock`; **8 real SSE
+  corpus files replay twice → identical state**), total (never panics on decodable data).
+  Folds every modeled event: text/reasoning accumulation → finalized items; tool items by
+  `call_id`; session-field folds (status/usage/todos/model/effort/sandbox/terminal_pending/
+  presence/elicitation/agent-changed/child); `SnapshotRestored` **scalar-only** bootstrap/
+  reconnect; `AgentChanged` transcript marker (synthesized `from`); §4.3 render transforms.
+  **`StreamUpdate` drafted** (D6 — ratified at the P3 skeleton). **64 tests, clippy/fmt
+  clean, `generated.rs` untouched; bench ~1.36µs/full-turn.** Plan:
+  [`docs/superpowers/plans/2026-07-08-state-model-p1-reducer.md`](./superpowers/plans/2026-07-08-state-model-p1-reducer.md).
+  **Reviews:** plan cross-family-reviewed BEFORE build (codex/gpt-5.5, 12 findings incl.
+  2 Critical — turn-bump order, clock-based synthetic-id collision — applied); consolidated
+  end-of-branch **Opus + gpt-5.5 dual read** → 1 fix wave (7 items: collision-probing
+  synthetic ids, `ScratchChanged`-on-preview-clear, `last_task_error` clear, saturating
+  turn, terminal-activity marker, merge agent-gate). **The one lens-client touch:** a
+  `test-util`-gated `stream::decode_all(&[u8])` byte-decode seam (private `parse_event` was
+  unreachable from lens-core tests). **P1 contract-proving findings (lens-client wrapper-
+  widening backlog, all degraded-not-dropped + flagged):** `stream::Item` models 5 concrete
+  + `Other` while domain `ItemKind` has 11 → native_tool/slash_command/terminal_command
+  payloads degrade to a `NativeTool` catch-all; `ItemKind::ResourceEvent` un-materializable
+  (no `SessionResourceObject` on the wire) → marker-only; `PresenceViewer` fills `user_id`
+  only (joined_at/idle dropped); `session.collaboration_mode` is a *deferred* wire type →
+  domain field stays `None`; `depth` fixed at 0 (sub-agent topology = §9). Memory
+  `state-model-p1-reducer`. **Next: P2 — persistence (`lens-core/persist`, §6): two-tier
+  `ControlStore` (`lens.db`) + per-session `TranscriptStore` (rusqlite/WAL), spec §4 "P2".
+  Fresh session (cost/context policy).**
 - **2026-07-08** — **state-model engine P0 (lens-core domain types) EXECUTED & MERGED
   to main** (`ff554d7..2069e88`, ff-merge + push; plan-first → composer-2.5 build →
   Opus review, per CLAUDE.md). New gpui-free crate `crates/lens-core` with the full
