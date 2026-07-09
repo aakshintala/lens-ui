@@ -2,11 +2,16 @@
 //! `items.kind` vocabulary. Serialization of our OWN enums cannot fail on a
 //! string-serializing type — the `expect` invariants below are never external data.
 
-use crate::domain::item::ItemKind;
+use crate::domain::ids::{AgentId, ConnectionId, HostId, ItemId, RunnerId, SessionId};
+use crate::domain::item::{BlockContext, Item, ItemKind};
+use crate::domain::scalars::{ErrorInfo, HostType, SessionLifecycle, SessionStatusValue};
+use crate::domain::session::SessionState;
+use crate::domain::usage::Cost;
 use crate::persist::{PersistError, Result};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 /// A string-serializing enum → its bare token (`"waiting"`), for a Bridge column.
 pub fn enum_token<T: Serialize>(v: &T) -> Result<String> {
@@ -51,6 +56,105 @@ pub fn item_kind_token(k: &ItemKind) -> &'static str {
         ItemKind::ResourceEvent { .. } => "resource_event",
         ItemKind::AgentChanged { .. } => "agent_changed",
     }
+}
+
+/// The `sessions` SELECT column list — shared by `load_session` + `list_sessions`
+/// so both feed one `row_to_session`. Order MUST match `row_to_session`'s `get(n)`.
+pub const SESSION_COLUMNS: &str = "connection_id, id, agent_id, agent_name, runner_id, \
+    parent_session_id, status, last_task_error, llm_model, model_override, reasoning_effort, \
+    collaboration_mode, context_window, last_total_tokens, cost_json, workspace, git_branch, \
+    host_type, host_id, title, labels, permission_level, owner, todos, skills, terminal_pending, \
+    created_at, archived, lifecycle, last_focused_at, last_seen_seq";
+
+/// Reconstruct a disk-snapshot `SessionState` (items empty; RAM-only fields
+/// defaulted — D-P2-6). Total over decodable rows (never panics on disk data).
+pub fn row_to_session(r: &rusqlite::Row) -> rusqlite::Result<SessionState> {
+    // Lift a decode error out of a rusqlite row closure. NOTE (REVIEW#8): a
+    // serde_json/enum decode failure is surfaced as `rusqlite::Error::
+    // FromSqlConversionFailure`, which `?` then converts to `PersistError::Sqlite`
+    // — NOT `PersistError::Json`. Totality is preserved (never a panic); callers
+    // must not rely on the `Json` variant to distinguish a decode failure here.
+    fn to_sql_err<E: std::error::Error + Send + Sync + 'static>(e: E) -> rusqlite::Error {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    }
+
+    let connection_id = ConnectionId::new(r.get::<_, String>(0)?);
+    let id = SessionId::new(r.get::<_, String>(1)?);
+    let agent_id = AgentId::new(r.get::<_, String>(2)?);
+    let mut st = SessionState::new(connection_id, id, agent_id);
+
+    st.agent_name = r.get(3)?;
+    st.runner_id = r.get::<_, Option<String>>(4)?.map(RunnerId::new);
+    st.parent_session_id = r.get::<_, Option<String>>(5)?.map(SessionId::new);
+    st.status = from_token::<SessionStatusValue>(r.get::<_, String>(6)?).map_err(to_sql_err)?;
+    st.last_task_error = match r.get::<_, Option<String>>(7)? {
+        Some(j) => Some(from_json::<ErrorInfo>(&j).map_err(to_sql_err)?),
+        None => None,
+    };
+    st.llm_model = r.get(8)?;
+    st.model_override = r.get(9)?;
+    st.reasoning_effort = r.get(10)?;
+    st.collaboration_mode = r.get(11)?;
+    // REVIEW#6: read unsigned columns through i64 uniformly (like last_seen_seq /
+    // permission_level) so a high-bit value loads (rusqlite's u64 FromSql errors
+    // on > i64::MAX) — keeps loads total.
+    st.context_window = r.get::<_, Option<i64>>(12)?.map(|v| v as u64);
+    st.last_total_tokens = r.get::<_, Option<i64>>(13)?.map(|v| v as u64);
+    st.cumulative_cost = match r.get::<_, Option<String>>(14)? {
+        Some(j) => from_json::<Cost>(&j).map_err(to_sql_err)?,
+        None => Cost::default(),
+    };
+    st.workspace = r.get(15)?;
+    st.git_branch = r.get(16)?;
+    st.host_type = from_token::<HostType>(r.get::<_, String>(17)?).map_err(to_sql_err)?;
+    st.host_id = r.get::<_, Option<String>>(18)?.map(HostId::new);
+    st.title = r.get(19)?;
+    st.labels = match r.get::<_, Option<String>>(20)? {
+        Some(j) => from_json::<BTreeMap<String, String>>(&j).map_err(to_sql_err)?,
+        None => BTreeMap::new(),
+    };
+    st.permission_level = r.get::<_, Option<i64>>(21)?.map(|v| v as u8);
+    st.owner = r.get(22)?;
+    st.todos = match r.get::<_, Option<String>>(23)? {
+        Some(j) => from_json(&j).map_err(to_sql_err)?,
+        None => Vec::new(),
+    };
+    st.skills = match r.get::<_, Option<String>>(24)? {
+        Some(j) => from_json(&j).map_err(to_sql_err)?,
+        None => Vec::new(),
+    };
+    st.terminal_pending = r.get::<_, i64>(25)? != 0;
+    st.created_at = r.get(26)?;
+    st.archived = r.get::<_, i64>(27)? != 0;
+    st.lifecycle = from_token::<SessionLifecycle>(r.get::<_, String>(28)?).map_err(to_sql_err)?;
+    st.last_focused_at = r.get(29)?;
+    st.last_seen_seq = r.get::<_, Option<i64>>(30)?.map(|v| v as u64);
+    // items, presence, stream, pending_user, model_options, sandbox_status,
+    // pending_elicitations: NOT persisted (D-P2-5/D-P2-6) — left at `new()` defaults.
+    Ok(st)
+}
+
+/// Reconstruct an `Item` from a transcript row. `payload` alone carries the full
+/// tagged `ItemKind` (D-P2-9); `ordinal`/`kind` columns are read-contract only.
+/// Total over decodable rows. Column order: item_id, live_seq, kind, payload,
+/// agent, depth, turn, created_at.
+pub fn row_to_item(r: &rusqlite::Row) -> rusqlite::Result<Item> {
+    fn to_sql_err<E: std::error::Error + Send + Sync + 'static>(e: E) -> rusqlite::Error {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    }
+    let payload: String = r.get(3)?;
+    let kind: ItemKind = from_json(&payload).map_err(to_sql_err)?;
+    Ok(Item {
+        id: ItemId::new(r.get::<_, String>(0)?),
+        seq: r.get::<_, Option<i64>>(1)?.map(|v| v as u64),
+        ctx: BlockContext {
+            agent: r.get(4)?,
+            depth: r.get::<_, i64>(5)? as u32,
+            turn: r.get::<_, i64>(6)? as u32,
+        },
+        created_at: r.get(7)?,
+        kind,
+    })
 }
 
 #[cfg(test)]

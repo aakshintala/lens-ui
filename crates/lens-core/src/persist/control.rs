@@ -74,16 +74,115 @@ impl ControlStore for SqliteControlStore {
             .map_err(Into::into)
     }
 
-    // sessions + cost_samples: Tasks 4–5.
-    fn upsert_session(&self, _s: &SessionState, _now_ms: i64) -> Result<()> {
-        unimplemented!("Task 4")
+    // sessions + cost_samples: Task 5 for cost.
+    fn upsert_session(&self, s: &SessionState, now_ms: i64) -> Result<()> {
+        use crate::persist::map::{enum_token, json_string};
+        self.guard_write()?;
+
+        let status = enum_token(&s.status)?;
+        let host_type = enum_token(&s.host_type)?;
+        let lifecycle = enum_token(&s.lifecycle)?;
+        let last_task_error = s.last_task_error.as_ref().map(json_string).transpose()?;
+        let cost_json = json_string(&s.cumulative_cost)?;
+        let usage_by_model = json_string(&s.cumulative_cost.cumulative_usage.usage_by_model)?;
+        let labels = json_string(&s.labels)?;
+        let todos = json_string(&s.todos)?;
+        let skills = json_string(&s.skills)?;
+
+        // INSERT sets store-managed columns to their defaults; ON CONFLICT UPDATE
+        // OMITS pinned/last_status/tombstoned_at so a P3/§9 write survives (D-P2-4).
+        // updated_at is store-managed and always written.
+        self.conn.execute(
+            "INSERT INTO sessions (
+               connection_id, id, agent_id, agent_name, runner_id, parent_session_id,
+               status, last_task_error, llm_model, model_override, reasoning_effort,
+               collaboration_mode, context_window, last_total_tokens, cumulative_cost,
+               usage_by_model, cost_json, workspace, git_branch, host_type, host_id,
+               title, labels, permission_level, owner, todos, skills, terminal_pending,
+               created_at, archived, lifecycle, last_focused_at, last_seen_seq, updated_at
+             ) VALUES (
+               ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+               ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34
+             )
+             ON CONFLICT(connection_id, id) DO UPDATE SET
+               agent_id=excluded.agent_id, agent_name=excluded.agent_name,
+               runner_id=excluded.runner_id, parent_session_id=excluded.parent_session_id,
+               status=excluded.status, last_task_error=excluded.last_task_error,
+               llm_model=excluded.llm_model, model_override=excluded.model_override,
+               reasoning_effort=excluded.reasoning_effort, collaboration_mode=excluded.collaboration_mode,
+               context_window=excluded.context_window, last_total_tokens=excluded.last_total_tokens,
+               cumulative_cost=excluded.cumulative_cost, usage_by_model=excluded.usage_by_model,
+               cost_json=excluded.cost_json, workspace=excluded.workspace, git_branch=excluded.git_branch,
+               host_type=excluded.host_type, host_id=excluded.host_id, title=excluded.title,
+               labels=excluded.labels, permission_level=excluded.permission_level, owner=excluded.owner,
+               todos=excluded.todos, skills=excluded.skills, terminal_pending=excluded.terminal_pending,
+               created_at=excluded.created_at, archived=excluded.archived, lifecycle=excluded.lifecycle,
+               last_focused_at=excluded.last_focused_at, last_seen_seq=excluded.last_seen_seq,
+               updated_at=excluded.updated_at",
+            rusqlite::params![
+                s.connection_id.as_str(),
+                s.id.as_str(),
+                s.agent_id.as_str(),
+                s.agent_name,
+                s.runner_id.as_ref().map(|v| v.as_str()),
+                s.parent_session_id.as_ref().map(|v| v.as_str()),
+                status,
+                last_task_error,
+                s.llm_model,
+                s.model_override,
+                s.reasoning_effort,
+                s.collaboration_mode,
+                s.context_window.map(|v| v as i64),
+                s.last_total_tokens.map(|v| v as i64),
+                s.cumulative_cost.total_cost_usd,
+                usage_by_model,
+                cost_json,
+                s.workspace,
+                s.git_branch,
+                host_type,
+                s.host_id.as_ref().map(|v| v.as_str()),
+                s.title,
+                labels,
+                s.permission_level,
+                s.owner,
+                todos,
+                skills,
+                s.terminal_pending as i64,
+                s.created_at,
+                s.archived as i64,
+                lifecycle,
+                s.last_focused_at,
+                s.last_seen_seq.map(|v| v as i64),
+                now_ms,
+            ],
+        )?;
+        Ok(())
     }
-    fn load_session(&self, _conn: &ConnectionId, _id: &SessionId) -> Result<Option<SessionState>> {
-        unimplemented!("Task 4")
+
+    fn load_session(&self, conn: &ConnectionId, id: &SessionId) -> Result<Option<SessionState>> {
+        use crate::persist::map::{SESSION_COLUMNS, row_to_session};
+        let sql =
+            format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE connection_id = ?1 AND id = ?2");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(rusqlite::params![conn.as_str(), id.as_str()])?;
+        match rows.next()? {
+            Some(r) => Ok(Some(row_to_session(r)?)),
+            None => Ok(None),
+        }
     }
-    fn list_sessions(&self, _conn: &ConnectionId) -> Result<Vec<SessionState>> {
-        unimplemented!("Task 4")
+
+    fn list_sessions(&self, conn: &ConnectionId) -> Result<Vec<SessionState>> {
+        use crate::persist::map::{SESSION_COLUMNS, row_to_session};
+        let sql = format!(
+            "SELECT {SESSION_COLUMNS} FROM sessions WHERE connection_id = ?1 \
+             ORDER BY last_focused_at DESC, id"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params![conn.as_str()], row_to_session)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
+
     fn insert_cost_sample(
         &self,
         _conn: &ConnectionId,
@@ -137,5 +236,210 @@ mod tests {
         s.upsert_connection(&c2).unwrap();
         let loaded = s.load_connections().unwrap();
         assert_eq!(loaded, vec![c2]);
+    }
+
+    #[test]
+    fn session_upsert_then_load_roundtrips_persisted_fields() {
+        use crate::domain::ids::{AgentId, ConnectionId, SessionId};
+        use crate::domain::item::{BlockContext, ContentBlock, Item, ItemKind};
+        use crate::domain::scalars::{Role, SessionStatusValue};
+        use crate::domain::usage::{Cost, ModelUsage, Usage};
+        use std::collections::BTreeMap;
+
+        let (_d, s) = store();
+        // A connection row must exist (FK).
+        s.upsert_connection(&ConnectionRecord {
+            id: ConnectionId::new("conn_1"),
+            base_url: "u".into(),
+            auth_kind: "none".into(),
+            label: None,
+            server_info: None,
+            created_at: 1,
+        })
+        .unwrap();
+
+        let mut st = SessionState::new(
+            ConnectionId::new("conn_1"),
+            SessionId::new("conv_1"),
+            AgentId::new("agent_1"),
+        );
+        st.status = SessionStatusValue::Running;
+        st.title = Some("t".into());
+        st.labels.insert("env".into(), "prod".into());
+        st.terminal_pending = true;
+        st.last_total_tokens = Some(1234);
+        st.context_window = Some(200_000);
+        let mut by_model = BTreeMap::new();
+        by_model.insert(
+            "opus".to_string(),
+            ModelUsage {
+                input_tokens: Some(3),
+                ..Default::default()
+            },
+        );
+        st.cumulative_cost = Cost {
+            cumulative_usage: Usage {
+                input_tokens: 3,
+                output_tokens: 4,
+                total_tokens: 7,
+                usage_by_model: by_model,
+                ..Default::default()
+            },
+            total_cost_usd: Some(0.5),
+        };
+        // items are NOT persisted here (they live in the transcript file, D-P2-6).
+        st.items.push(Item {
+            id: crate::domain::ids::ItemId::new("item_1"),
+            seq: None,
+            ctx: BlockContext {
+                agent: None,
+                depth: 0,
+                turn: 0,
+            },
+            created_at: 1,
+            kind: ItemKind::Message {
+                role: Role::User,
+                content: vec![ContentBlock {
+                    kind: "text".into(),
+                    text: Some("x".into()),
+                    data: serde_json::Value::Null,
+                }],
+            },
+        });
+
+        s.upsert_session(&st, 1_700_000_000_000).unwrap();
+        let loaded = s
+            .load_session(&ConnectionId::new("conn_1"), &SessionId::new("conv_1"))
+            .unwrap()
+            .expect("row present");
+
+        // Persisted fields survive; items are empty on load (D-P2-6).
+        assert_eq!(loaded.status, SessionStatusValue::Running);
+        assert_eq!(loaded.title.as_deref(), Some("t"));
+        assert_eq!(loaded.labels.get("env").map(String::as_str), Some("prod"));
+        assert!(loaded.terminal_pending);
+        assert_eq!(loaded.last_total_tokens, Some(1234));
+        // Cost is lossless via cost_json (D-P2-2).
+        assert_eq!(loaded.cumulative_cost, st.cumulative_cost);
+        assert!(loaded.items.is_empty());
+        // RAM-only fields are defaulted on load.
+        assert!(loaded.presence.is_empty());
+        assert!(loaded.pending_user.is_empty());
+    }
+
+    #[test]
+    fn upsert_preserves_store_managed_columns() {
+        use crate::domain::ids::{AgentId, ConnectionId, SessionId};
+
+        let (_d, s) = store();
+        s.upsert_connection(&ConnectionRecord {
+            id: ConnectionId::new("conn_1"),
+            base_url: "u".into(),
+            auth_kind: "none".into(),
+            label: None,
+            server_info: None,
+            created_at: 1,
+        })
+        .unwrap();
+        let st = SessionState::new(
+            ConnectionId::new("conn_1"),
+            SessionId::new("conv_1"),
+            AgentId::new("a"),
+        );
+        s.upsert_session(&st, 10).unwrap();
+        // Simulate P3/§9 writes to ALL THREE store-managed columns (D-P2-4).
+        s.conn
+            .execute(
+                "UPDATE sessions SET pinned = 1, last_status = 'waiting', tombstoned_at = 999 WHERE id = 'conv_1'",
+                [],
+            )
+            .unwrap();
+        // A later reducer fold re-upserts the session — must NOT clobber them.
+        s.upsert_session(&st, 20).unwrap();
+        let pinned: i64 = s
+            .conn
+            .query_row("SELECT pinned FROM sessions WHERE id='conv_1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let last_status: Option<String> = s
+            .conn
+            .query_row(
+                "SELECT last_status FROM sessions WHERE id='conv_1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let tombstoned_at: Option<i64> = s
+            .conn
+            .query_row(
+                "SELECT tombstoned_at FROM sessions WHERE id='conv_1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let updated_at: i64 = s
+            .conn
+            .query_row(
+                "SELECT updated_at FROM sessions WHERE id='conv_1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pinned, 1);
+        assert_eq!(last_status.as_deref(), Some("waiting"));
+        assert_eq!(tombstoned_at, Some(999));
+        assert_eq!(updated_at, 20); // store-managed, always written
+    }
+
+    #[test]
+    fn enum_columns_store_bare_unquoted_tokens_for_bridge() {
+        // D-P2-8/D-P2-9: Bridge reads `status`/`host_type`/`lifecycle`/`items.kind`
+        // as bare tokens, NOT json-quoted. Pin the raw cell (roundtrip tests alone
+        // would pass even if a stray-quoted token were stored).
+        use crate::domain::ids::{AgentId, ConnectionId, SessionId};
+        use crate::domain::scalars::SessionStatusValue;
+        let (_d, s) = store();
+        s.upsert_connection(&ConnectionRecord {
+            id: ConnectionId::new("conn_1"),
+            base_url: "u".into(),
+            auth_kind: "none".into(),
+            label: None,
+            server_info: None,
+            created_at: 1,
+        })
+        .unwrap();
+        let mut st = SessionState::new(
+            ConnectionId::new("conn_1"),
+            SessionId::new("conv_1"),
+            AgentId::new("a"),
+        );
+        st.status = SessionStatusValue::Waiting;
+        s.upsert_session(&st, 1).unwrap();
+        let status: String = s
+            .conn
+            .query_row("SELECT status FROM sessions WHERE id='conv_1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let host_type: String = s
+            .conn
+            .query_row(
+                "SELECT host_type FROM sessions WHERE id='conv_1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let lifecycle: String = s
+            .conn
+            .query_row(
+                "SELECT lifecycle FROM sessions WHERE id='conv_1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "waiting"); // not "\"waiting\""
+        assert_eq!(host_type, "external");
+        assert_eq!(lifecycle, "active");
     }
 }
