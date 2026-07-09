@@ -285,6 +285,42 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Recent
 
+- **2026-07-09** — **state-model P3 GRILLING — CLOSED (session 2).** The 4 open
+  branches resolved as **D15–D18** in new
+  [`spec §2.2`](./superpowers/specs/2026-07-08-state-model-engine-design.md)
+  (+§7.1 §13.1-amendment row + §4 P3 batched live-verify gate); memory
+  `state-model-p3-grilling`. **Spec still UNCOMMITTED (working tree only).**
+  **D15** `created_at` = first-non-zero-wins upsert guard **+** a found P1 defect
+  (`fold_snapshot` never sets `state.created_at` → add the fold). **D16**
+  optimistic-send reconcile keyed by server ack ids (`SendEventAck` *already*
+  carries `pending_id`/`item_id`; `PendingUserMessage` gains
+  `server_pending_id`/`store_item_id`; precedence native-id → item-id → content
+  fallback). **D17** `is_quiesced` = pure `transient_work_outstanding()` ∧
+  actor-owned `transport==Connected` ∧ `!reconcile_in_flight`; pinned=§9 gate not
+  predicate; sleep = re-check-abort → flush-durable → best-effort `stop_session`
+  fire-and-forget → stop actor → drop RAM. **D18** §13.1 splits into two
+  path-keyed tables — stream `Disconnected{reason}` (park Unauthorized/Failed/
+  RetriesExhausted, stop Forbidden/NotFound) vs `ClientError` command-outcome (fill
+  `Server`/`ThreadSpawn` gaps, drop phantom `Ws`). **Two live-verify riders
+  batched** into one gated 0.4.0 P3 run (ack id population; post-`stop_session`
+  wake-refetchability) — not spec-blocking. **NEXT:** commit spec → do the §7.1
+  LOCKED design-doc amendments (§8/§9/§13.1) → `writing-plans` for P3.
+  — — — (session 1, D8–D14, still current:) **Decided:** value-carrying `StreamUpdate`
+  (option A) + `items: Vec<Arc<Item>>` (share bodies actor↔replica; rejected
+  whole-state snapshot swap = O(n²)/turn); one-shot `Rebased(Box<State>)` baseline
+  at attach (reducer only appends/updates-in-place → no remove variant);
+  **focus-scoped fidelity** — full replica only for focused (≤~10), background-warm
+  gets a coarse actor-emitted `SummaryUpdate` (dual-mode `Detailed|Summary`,
+  promote/demote; policy is §9); **byte-windowed** in-RAM transcript (~8 MB tail,
+  older paged from `TranscriptStore`; user confirmed real sessions hit ~600 MiB /
+  10k–100k items); a **large-transcript latency spike as P3 Task 0** (page-load /
+  cold-hydrate / **`reconcile`-scope** — the real unknown, likely tail-bounded);
+  **crossbeam `Select`** ingest (swap lens-client reader channel + `receiver()`;
+  the one hardened-lens-client touch → cross-family review); and the §8 rationale
+  correction (two copies decouple N warm background streams from the gpui
+  foreground executor, NOT "reduce is expensive" — it's 1.36µs). Built an
+  architecture **Artifact** (threads/ownership/memory map) as the shared mental
+  model. **(These 4 branches are now CLOSED as D15–D18 above.)**
 - **2026-07-08** — **state-model engine P2 (lens-core persistence) EXECUTED & MERGED
   to main** (`25e4e09..978fb85`, 9 commits, ff-merge + push; composer-2.5 full-plan
   build + **Opus-only reviews** — Codex/gpt-5.5 + non-Composer Cursor out of credits,

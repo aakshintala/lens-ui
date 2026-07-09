@@ -89,6 +89,198 @@ the engine contract is proven against real bytes.
   our specific blocking-thread↔executor shape + backpressure, which the skeleton
   exercises).
 
+### 2.1 P3 grilling refinements (2026-07-09) — D8–D14
+
+Resolved in a focused grilling pass over the actor↔replica seam before writing
+the P3 plan. These are authoritative for P3; where one amends a LOCKED design
+section it is flagged **→ design-doc amendment** and listed in §7.1.
+
+- **D8 — `StreamUpdate` ratified as value-carrying deltas (option A), `items:
+  Vec<Arc<Item>>`.** Ratifies D6. Each variant carries its just-reduced value
+  (`ItemAppended(Arc<Item>)`, `ItemUpdated { index, item: Arc<Item> }`,
+  `StatusChanged(SessionStatusValue)`, …); `SessionStore::apply` is **pure
+  copy-assignment** — it deposits the already-reduced value into the named field,
+  never re-derives, never runs `reduce` on the foreground — O(1)/delta. `items`
+  becomes `Vec<Arc<Item>>` so item **bodies are shared** between the actor's
+  canonical state and the replica: the replica's "copy" is a pointer spine +
+  small scalars, *not* a second copy of transcript bytes. **Rejected B**
+  (whole-state snapshot swap): a plain-`Vec` deep clone is O(n²) over a streaming
+  turn and would force an `im::Vector`/`Arc<Vec>` restructure to be viable.
+  Supersedes the P1 marker-only draft in `reduce/update.rs`.
+- **D9 — `Rebased(Box<SessionState>)` bulk variant at actor attach; no
+  remove/clear variant.** The reducer only ever **appends or updates-in-place**
+  (verified `reduce/items.rs:183` — id-hit → `ItemUpdated { index }`, id-miss →
+  push → `ItemAppended`); it never removes/clears/truncates items. So steady-state
+  `StreamUpdate` needs only those two item variants. The one exception is the
+  **baseline at attach**: when an actor attaches/promotes to a full replica it
+  emits `Rebased(Box<SessionState>)` **once** (disk-painted baseline: identity +
+  scalars + resident item window); the replica does `*state = baseline`, then all
+  subsequent deltas are incremental A. This keeps **index-based `ItemUpdated`
+  sound** (the replica is a faithful mirror *from the rebase forward*) and is the
+  one place a whole-state swap is correct **and** cheap (once/attach, not per
+  event). Distinct from `SnapshotRestored` (scalar-only mid-session reconnect
+  chrome).
+- **D10 — Fidelity is focus-scoped; the actor is dual-mode.** A **full** replica
+  (with items) fed by full `StreamUpdate`s exists **only for focused sessions
+  (≤ ~10)**. Background-warm Active sessions get only a coarse **`SummaryUpdate`**
+  feed (status/title/tokens/needs-attention/sub-agent-active), emitted **by the
+  actor** at within-turn **ms–s** cadence — not the per-token full delta stream.
+  (Same `SummaryUpdate` *type* as the §10 poll uses for Slept sessions, but here
+  the actor is the producer — two producers, one type.) The actor supports two
+  output modes (`Detailed | Summary`); **promote** (on focus) emits a `Rebased`
+  baseline then `Detailed` deltas; **demote** (on blur) drops the full items and
+  reverts to `Summary`. **This spec builds the actor's dual-mode capability + the
+  promote/demote primitive; the trigger *policy* (focus set, active-set LRU) is
+  §9 (seam only).** → **design-doc amendment §9:** the current wording ("every
+  Active session's actor emits `StreamUpdate`s into [a full] replica") is
+  render-scoping, not memory-scoping; full-fidelity duplication must be bounded by
+  the **focus** count, not the **warm** count.
+- **D11 — Byte-windowed in-RAM transcript (retention).** Canonical `items` in the
+  actor is a **byte-budgeted tail** (target ~8 MB, count backstop), not the full
+  history. Real sessions reach **~600 MiB / 10k–100k items** (multi-day,
+  auto-compacted); items are **bimodal** (100 B markers vs 200 KB dumps), so the
+  window is sized by **bytes, not item count**. Full history lives in the
+  per-session `TranscriptStore` file; older items **lazy-load on scroll-back**
+  (indexed by `ordinal`, paged, off-thread, prefetch one page ahead) and the
+  resident tail evicts. `TranscriptStore` grows a **windowed/paged load +
+  hydrate-older** primitive. Keeps fleet RAM flat (~240 MB @ 30 warm × ~8 MB)
+  regardless of session age. → **design-doc amendment §6/§15:** promotes "disk
+  retention" from a deferred tunable to a **designed P3 seam** (thresholds still
+  tunable).
+- **D12 — Large-transcript latency spike (new P3 task, sequenced FIRST).**
+  Throwaway harness against a synthetic **~500 MiB / ~100k-item** transcript,
+  measuring: (1) windowed page-load (scroll-back) — expect ~1–10 ms/page;
+  (2) cold hydrate (Slept→focus) — expect ~5–20 ms; (3) **`reconcile` at scale +
+  its correct scope** — the real unknown: naïve reconcile-by-id over 100k rows is
+  O(transcript), so it likely must bound to the reconnect **tail** (since
+  `last_seen_seq`), which entangles the server `GET /items` **pagination** contract
+  deferred from plan 3b-2b. Sequenced **before** the sleep/wake wiring because it
+  sets the `reconcile` contract wake/reconnect depend on. Same throwaway-spike
+  calibration as the framework spikes.
+- **D13 — Actor ingest = crossbeam `Select` over two typed channels.** The actor
+  must block-wait on **both** the `EventStream` receiver and the `SessionCommand`
+  receiver (commands serviced promptly even during heartbeat-only idle).
+  `std::mpsc` can't select; a busy-poll (rejected) wastes a wakeup on every idle
+  warm session; a forwarder thread adds a per-event context-switch tax (~1–5µs) +
+  2-stage backpressure. **Chosen:** swap lens-client's reader channel
+  `std::sync::mpsc::sync_channel → crossbeam_channel::bounded`, expose a
+  `receiver()` accessor, and the actor `Select`s over `(events, commands)` — zero
+  busy-poll, zero extra thread, and lens-client stays a **pristine typed event
+  source** (no consumer-type leakage; complexity lives in the new lens-core code).
+  It is `tokio::select!` for the blocking world — recovers the one ergonomic tokio
+  would have given without reintroducing an async runtime beside gpui or
+  re-async-ifying hardened `reqwest::blocking` lens-client. **Cost:** a localized
+  edit to feature-complete/hardened lens-client under the backpressure +
+  `stop()`/drop-unblock semantics → re-verify those + **MANDATORY cross-family
+  review** of the diff (temporal/stateful, `[[composer-delegation-profile]]`).
+  Adds `crossbeam-channel` as a workspace dep. Perf: 1-hop, parks when idle;
+  equivalent to the merged-mailbox alternative on the hot path (select bookkeeping
+  ~100–300 ns/event ≪ 1.36µs reduce); **none of this touches the 120fps foreground
+  apply path** (a separate channel).
+- **D14 — Design-memo rationale correction (§8).** The two-copy (actor + replica)
+  justification must read **"off-thread to decouple N warm *background* streams
+  from the gpui foreground executor"** — NOT "off-thread because reduce is
+  expensive." `reduce` is **1.36µs/turn** (P1 bench); the load-bearing reason is
+  that N mostly-idle warm sessions must advance + persist without waking the UI
+  thread per event, and gpui entities are foreground-mutation-only, so canonical
+  state cannot itself be the entity. → **design-doc amendment §8** + memory
+  `state-model-single-writer-decision`: without this a future reader correctly
+  notices reduce is trivial and concludes the whole actor layer is pointless.
+
+### 2.2 P3 grilling refinements (2026-07-09, session 2) — D15–D18
+
+Closes the four branches left open after D8–D14 (the `/grilling` resume). Each is
+spec-decidable now; where one rests on a live-server observation it is flagged as
+a **live-verify rider** (not spec-blocking) and batched into the single P3 live
+run (§4 P3 gate).
+
+- **D15 — `created_at` is an immutable first-non-zero stamp; also fold it from the
+  snapshot.** Closes the P2-deferred clobber (memory `state-model-p2-persistence`).
+  Two complementary fixes: **(1, P2 SQL)** the `sessions` upsert stops doing
+  `created_at=excluded.created_at` unconditionally and becomes first-non-zero-wins:
+  `created_at = CASE WHEN sessions.created_at != 0 THEN sessions.created_at ELSE
+  excluded.created_at END` — an immutable creation stamp is never overwritten once
+  set, and an actor writing fresh state (`created_at = 0`, pre-bootstrap) can never
+  clobber a good value the §10 list-poll wrote. **(2, P1 reduce — a genuine defect
+  found this session)** `fold_snapshot` (`reduce/snapshot.rs:18`) folds ~25 fields
+  but **never sets `state.created_at`**, so within this engine the actor's
+  `created_at` is *always 0*; add `state.created_at = snap.created_at();` (accessor
+  exists, epoch **seconds** per §2 `session.rs:27`). The guard makes disk *safe*;
+  the fold makes the actor-written value *correct*. Guard belongs to P2, fold to P1.
+- **D16 — Optimistic-send reconcile is keyed by server ack ids, with content-match
+  as the defensive floor.** Ratifies the §4 P3(b) collision. **Finding:**
+  `SendEventAck` (`lens-client sessions.rs:697`) **already models `pending_id`
+  (native bypass) and `item_id` (persisted store id, non-native)**, and
+  `send_event` returns the full ack — so a server-authoritative correlation id is
+  plumbed *today*. Restructure `PendingUserMessage` (`domain/controls.rs:71`) to
+  separate Lens-local from server ids: keep `pending_id: String` (Lens-local,
+  addresses the bubble for rollback/UI) and add `server_pending_id: Option<String>`
+  (native, ← `SendEventAck.pending_id`) + `store_item_id: Option<String>`
+  (non-native, ← `SendEventAck.item_id`), both stamped at POST-return. **Reconcile
+  precedence (identical for the live `consumed` stream and the reconnect replay):**
+  (1) `server_pending_id` present → native by-id (live `cleared_pending_id` /
+  snapshot `pending_inputs[].pending_id`); (2) `store_item_id` present → non-native
+  by-id (replayed `GET /items` item whose `id ==` it → drop bubble); (3) ack empty
+  → the §4 P3(b) content/ordinal match. Sits inside D12's tail-bounded reconcile
+  scope (bubbles are always at the tail). **Supersedes** the §4 P3(b) rule-3 framing
+  ("no correlation id exists, do not design assuming one"): a *client-supplied* id
+  still doesn't exist, but the *server-returned* ack id does — carry the slot.
+  **Live-verify rider:** confirm the ack populates `pending_id`/`item_id` at runtime
+  (`#[serde(default)]` masks an empty body as `None`, and no POST-ack body is in the
+  corpus). If confirmed, (1)/(2) are the common path and (3) is defensive-only; if
+  not, (3) carries it and nothing is lost.
+- **D17 — `is_quiesced` = a pure-core predicate ∧ an actor transport conjunct;
+  sleep is flush-first with a re-check guard.** **Predicate split:** the six
+  content clauses are a pure `SessionState::transient_work_outstanding()` in
+  lens-core (unit-testable, no actor) — quiesced needs `status ==
+  SessionStatusValue::Idle` ∧ `stream.open_message/open_reasoning` both `None` ∧
+  `stream.unpaired_calls.is_empty()` ∧ `pending_user.is_empty()` ∧
+  `pending_elicitations.is_empty()` ∧ `!terminal_pending`. The §3.2 **"unreconciled
+  reconnect"** condition has **no field** (verified: reducer records no
+  reconnect phase — it is transport, not content), so the actor's `is_quiesced()` =
+  that pure predicate ∧ `transport == Connected` ∧ `!reconcile_in_flight`, where
+  `reconcile_in_flight` is an **actor-owned, never-persisted** flag (true from
+  `Disconnected`/`Reconnecting` until the post-reconnect reconcile completes).
+  **"Pinned" is NOT in the predicate** — it is held-by-intent, a §9 scheduler gate
+  ("don't *call* `sleep()`"), not a transient-work condition. **"Recent terminal
+  activity" is subsumed by the scheduler's ~10-min idle timer** — no separate
+  cooldown timestamp (recent terminal activity ⇒ not idle recently ⇒ timer hasn't
+  elapsed). **Sleep ordering** (`sleep()` on the actor): (1) **re-check
+  `is_quiesced()` atomically, abort-and-stay-Active if false** — the actor is
+  single-threaded, so this closes the scheduler-check→`sleep()` TOCTOU; (2) **flush
+  durable** — final transcript upsert committed + control write `lifecycle=Slept`,
+  `last_seen_seq`, `last_focused_at`; (3) **best-effort `stop_session`** —
+  fire-and-forget, timeout-bounded, outcome → introspection ring, **never blocks the
+  flush**; (4) stop actor + close stream; (5) drop heavy RAM. Flush-first (not
+  stop-then-flush) is safe because the predicate already guaranteed terminal state,
+  so `stop_session` yields no meaningful transcript deltas. **Live-verify rider:**
+  confirm post-`stop_session` server effects are durably re-fetchable on wake
+  (`GET /items`/snapshot) — the design breaks only if some effect is live-stream-only
+  and never persisted; that is the one thing the bytes must rule out.
+- **D18 — §13.1 splits into two path-keyed tables; recoverable disconnects park,
+  terminal ones stop.** **Finding:** `Disconnected { reason: DisconnectReason }`
+  (`lens-client stream/event.rs`) already carries a 5-variant reason
+  (`Unauthorized|Forbidden|NotFound|SessionFailed|RetriesExhausted`), each
+  pre-annotated with intent — so auth/notfound/failed on the **stream path** arrive
+  *folded into the terminal event*, distinct from the same conditions on the
+  **command/REST path** (which return `ClientError`). The design §13.1 table
+  conflates both paths in one flat list; split it. **Table A — terminal
+  `Disconnected{reason}` → actor lifecycle:** `Unauthorized` / `SessionFailed` /
+  `RetriesExhausted` → **park** (close stream, keep actor + state resident, await
+  re-auth/user-retry via `Sessions::stream`); `Forbidden` → **stop** + remove from
+  registry; `NotFound` → **stop** + local read-only tombstone. A parked session is
+  **not** quiesced (`transport != Connected`) so it will not auto-sleep — it holds
+  RAM until the user acts; any force-reclaim of piled-up parked sessions is **§9
+  policy**, not this engine. **Table B — `ClientError` on command/REST → command
+  outcome** (fills three gaps in the design table): `Server { status, body }`
+  (**absent** from the design table) → 5xx = transient (log/marker/retry-eligible),
+  other-4xx = denied/bug (surface, no retry); `ThreadSpawn` (**absent**) → fatal at
+  stream-open, actor never starts, session can't go Active; `Ws` in the design table
+  → **no such `ClientError` variant** (WS terminal deferred, no `terminal.rs`) — drop
+  or mark forward-looking; `Network`/`Parse`/`Auth`/`NotFound`/`ContractMismatch`
+  scope to command outcome (e.g. `Network` on `send` → roll back the optimistic
+  bubble per D16), **not** stream teardown. → **design-doc amendment §13.1** (§7.1).
+
 ---
 
 ## 3. Workspace layout
@@ -210,22 +402,33 @@ schema_version gating test; open/close transcript file across the Active
 lifecycle; fmt · clippy.
 
 ### P3 — Actor + store + commands (`lens-core/actor` + `lens-store`, §8/§7/§13.1)
-**Task 1 = walking skeleton (D7):** one fake event → `reduce` → `StreamUpdate`
-over a bounded channel → `SessionStore` replica applies → `cx.notify` → observed
-on the foreground. Proves the blocking-thread↔`cx.spawn` handoff + backpressure
-shape end-to-end.
+**Task 0 = large-transcript latency spike (D12), sequenced FIRST.** Throwaway
+harness vs a synthetic ~500 MiB / ~100k-item transcript file: page-load, cold
+hydrate, and `reconcile`-at-scale + scope. Runs before the wake wiring because it
+fixes the `reconcile` contract (bounded tail vs full history) that (c) depends on.
+
+**Task 1 = walking skeleton (D7), ratifies D8/D9.** One fake event → `reduce` →
+value-carrying `StreamUpdate` (D8) over a bounded channel → `SessionStore` replica
+applies (`apply` = pure copy-assignment) → `cx.notify` → observed on the
+foreground; plus a `Rebased` baseline (D9) at attach. Proves the
+blocking-thread↔`cx.spawn` handoff + backpressure shape and ratifies the
+value-carrying-delta + `Arc<Item>` representation end-to-end.
 
 Then, in three parts:
 
-**(a) Actor run-loop.** `ActiveSession` on its OS thread **multiplexes two
-inputs** — the `EventStream` receiver (the mpsc from `lens-client`'s reader
-thread) and the `SessionCommand` receiver — via non-blocking select/`try_recv`,
-so commands are serviced even while a turn streams (D5 is a blocking *thread*, not
-a blocking *read* on one channel). Per event: reduce → persist write-through →
-emit `StreamUpdate`. `SessionStore` replica applies (`StreamUpdate::apply` = cheap
-assignment/insert only — no parse/reduce/IO on the foreground) with `cx.observe`
-granularity; bounded-channel backpressure + delta coalescing (drain all pending
-`StreamUpdate`s before one `cx.notify`).
+**(a) Actor run-loop.** `ActiveSession` on its OS thread **waits on two inputs via
+crossbeam `Select` (D13)** — the `EventStream` receiver (now
+`crossbeam_channel::Receiver<ServerStreamEvent>`, exposed by `lens-client`) and
+the `SessionCommand` receiver — block-until-either-ready, so commands are serviced
+even during heartbeat-only idle, with no busy-poll and no forwarder thread. Per
+event: reduce → persist write-through (byte-windowed `items` tail, D11) → emit
+`StreamUpdate` (`Detailed` mode, focused) **or** `SummaryUpdate` (`Summary` mode,
+background — D10). `SessionStore` replica applies (`StreamUpdate::apply` = pure
+copy-assignment, D8 — no parse/reduce/IO on the foreground) with `cx.observe`
+granularity; bounded-channel backpressure + delta coalescing (greedy `try_recv`
+drain of all pending updates before one `cx.notify`). **Promote/demote** (D10):
+on focus emit `Rebased` + switch to `Detailed`; on blur drop items + revert to
+`Summary`. The trigger *policy* (focus, active-set) is §9.
 
 **(b) Command semantics (§7).** `SessionCommand` inbound — **send** (optimistic
 actor-owned `pending_user`, FIFO reconcile on `session.input.consumed`, rollback
@@ -270,8 +473,10 @@ bootstrap + reconnect wiring (the actor consumes the crate-synthetic
 `is_quiesced` predicate (strict — no open scratch / pending tools / pending user /
 unreconciled reconnect / non-`idle` status / live terminal, §3.2), **sleep**
 (flush persistence → best-effort `stop_session` → stop actor → drop heavy RAM,
-§3.4/§6.3), **wake** (disk-paint input + fresh stream bootstrap → reconcile-by-id,
-calling the P2 primitives), and `SessionLifecycle = Active | Slept | Deleted` +
+§3.4/§6.3), **wake** (disk-paint the **byte-windowed** tail, D11 → fresh stream
+bootstrap → **tail-scoped** reconcile-by-id per the D12 spike's `reconcile`
+contract, not a full-history diff, calling the P2 primitives), and
+`SessionLifecycle = Active | Slept | Deleted` +
 tombstone state (§3.1). The **trigger/scheduler** that *fires* auto-sleep (the
 ~10min timer, the active-set) is the **§9 seam**, deferred — the engine exposes
 `is_quiesced()` + `sleep()`/`wake()` for that scheduler to call.
@@ -282,6 +487,17 @@ integration; a **command-interleaving matrix** — send/interrupt/stop exercised
 while the stream is idle, running, and reconnecting; sleep/wake round-trip
 (quiesce → sleep → flush asserted → wake → reconcile); **no foreground blocking**
 (all I/O off-thread — AGENTS.md MANDATORY); fmt · clippy · tests.
+
+**Batched live-verify run (D16/D17, not spec-blocking).** One gated live session
+against a pinned 0.4.0 server (`installing-omnigent-from-source`) confirms the
+three riders together — cheaper than scattering them, same real session:
+1. **D16:** `POST /events` populates `SendEventAck.pending_id` (native `message`)
+   and `.item_id` (non-native `message`) at runtime → picks the primary reconcile
+   path (id-match vs content-match fallback).
+2. **D17:** post-`stop_session` server effects on an already-idle session are
+   durably re-fetchable on wake (`GET /items`/snapshot) → validates flush-first.
+3. The pre-existing §4 P3(b) check (does native `POST /events` return `pending_id`
+   for at-POST-time by-id native reconcile) — same observation as (1).
 
 ---
 
@@ -314,16 +530,22 @@ while the stream is idle, running, and reconnecting; sleep/wake round-trip
 - **Down to `lens-client`:** the actor consumes `ServerStreamEvent` (incl. the
   synthetic lifecycle) and issues `SessionEventInput` commands + the REST
   fork/switch-agent endpoints.
+- **Up to the UI, coarse (D10):** a **`SummaryUpdate`** — a type *distinct* from
+  `StreamUpdate`, carrying **only coarse card-summary fields** (status/title/
+  last_total_tokens/host_id/needs-attention/sub-agent-active). **Two producers:**
+  (i) the **actor** emits it for a background-warm Active session in `Summary` mode
+  (within-turn ms–s cadence, D10) instead of the full delta stream; (ii) the §10
+  list-poll applies it to a **Slept** session's store **without an actor and
+  without touching the reducer** (not a backdoor reduce path). `apply` is
+  copy-assignment of coarse scalars only. A **focused** Active session is fed
+  `Detailed` `StreamUpdate`s, not `SummaryUpdate`, and its live stream is
+  authoritative for any field (§10). The allowed-field set is finalized by the
+  §9/§10 spec; the type + invariant are committed here.
 - **To the future §9 registry (named, not specced):** a `SessionHandle`-shaped
-  handle `{ SessionStore replica, Option<ActiveSessionHandle> }`, plus a
-  **`SummaryUpdate`** — a type *distinct* from `StreamUpdate`, applied to a Slept
-  session's store by the §10 list-poll **without an actor and without touching the
-  reducer** (not a backdoor reduce path). Its invariant is committed here even
-  though its allowed-field set is defined by the §9/§10 spec: it carries **only
-  coarse card-summary fields** (status/title/last_total_tokens/host_id/
-  needs-attention) and an Active session **ignores** it for any field its live
-  stream owns (§10 — the stream is authoritative). This is the only forward hook
-  this spec commits to.
+  handle `{ SessionStore replica, Option<ActiveSessionHandle> }`. The registry
+  owns the **focus/active-set policy** that drives the actor's promote/demote
+  (D10) and the `Detailed`↔`Summary` mode switch; this spec exposes the actor
+  capability + the `Rebased` promote primitive, not the trigger.
 
 ---
 
@@ -342,6 +564,39 @@ while the stream is idle, running, and reconnecting; sleep/wake round-trip
 - **`lens-client` residuals the reducer will eventually want** (memory
   `plan4-pre-consumer-hardening`): `last_task_error` type-ambiguity, minimal
   wrappers to grow with golden captures — resolve as the reducer consumes them.
+
+### 7.1 Design-doc amendments required (from D8–D14)
+
+These edit LOCKED sections of `app-architecture-and-state-model.md`; do them
+deliberately when the P3 plan is written so the design source stays the truth.
+
+- **§8 (D14):** rewrite the two-copy rationale — "off-thread to decouple N warm
+  *background* streams from the gpui foreground executor," not "reduce is
+  expensive" (reduce = 1.36µs). Also mirror in memory
+  `state-model-single-writer-decision`.
+- **§9 (D10):** the replica is full-fidelity **only when focused**; background-warm
+  Active sessions get a coarse `SummaryUpdate` feed from the actor, not a full
+  `StreamUpdate` replica. Duplication bounded by focus count, not warm count. Add
+  the actor `Detailed | Summary` dual-mode + promote/demote.
+- **§8 replica contract (D8/D9):** `StreamUpdate` is **value-carrying**;
+  `apply` = pure copy-assignment; add the one-shot `Rebased(Box<SessionState>)`
+  baseline at attach; `items: Vec<Arc<Item>>`.
+- **§6/§15 (D11):** transcript retention is a **byte-windowed** resident tail +
+  paged `TranscriptStore` load, a designed seam — not solely a deferred tunable.
+- **§13.1 (D18):** restructure the single error/lifecycle table into **two
+  path-keyed tables** — Table A (stream terminal `Disconnected{reason}` → actor
+  park/stop lifecycle) and Table B (`ClientError` on command/REST → command
+  outcome). Add the missing `Server{status,body}` (4xx/5xx split) and `ThreadSpawn`
+  (fatal stream-open) rows; drop or mark-forward-looking the phantom `Ws` row.
+
+### 7.2 New dependencies / cross-crate touches (from D13)
+
+- **`crossbeam-channel`** — new workspace dependency (actor `Select`).
+- **`lens-client` reader channel swap** (`std::sync::mpsc::sync_channel →
+  crossbeam_channel::bounded`) + a `receiver()` accessor on `EventStream`. First
+  P3 modification of hardened/feature-complete `lens-client`: re-verify `stop()` +
+  drop-unblocks-blocked-sender under crossbeam; **MANDATORY cross-family review**
+  of the diff (temporal/stateful).
 
 ---
 
