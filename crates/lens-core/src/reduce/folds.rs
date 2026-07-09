@@ -51,6 +51,7 @@ pub(crate) fn fold_usage(
     smallvec![
         StreamUpdate::UsageChanged(state.cumulative_cost.clone()),
         StreamUpdate::LastTokensChanged(state.last_total_tokens),
+        StreamUpdate::ContextWindowChanged(state.context_window),
     ]
 }
 
@@ -334,7 +335,8 @@ mod tests {
             &u[..],
             [
                 StreamUpdate::UsageChanged(cost),
-                StreamUpdate::LastTokensChanged(Some(1200))
+                StreamUpdate::LastTokensChanged(Some(1200)),
+                StreamUpdate::ContextWindowChanged(Some(200_000)),
             ] if cost.total_cost_usd == Some(0.42)
         ));
     }
