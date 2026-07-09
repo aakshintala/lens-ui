@@ -54,12 +54,39 @@ pub fn reduce(state: &mut SessionState, event: &ServerStreamEvent, clock: &dyn C
                 scratch::ReasoningKind::Summary,
                 delta,
             ),
-            // Item-producing / finalizing arms land in Tasks 7/8.
+            ResponseEvent::OutputItemDone { item } => match items::map_item(item) {
+                // D-P1-4 / REVIEW#3: resource items produce no transcript item.
+                None => smallvec![StreamUpdate::ResourcesChanged],
+                Some((id, kind)) => {
+                    // REVIEW#7 / D-P1-14: a completed FunctionCall's sanitized agent_name becomes the
+                    // current attribution agent for this and subsequent items.
+                    if let crate::domain::ItemKind::FunctionCall {
+                        agent_name: Some(a),
+                        ..
+                    } = &kind
+                    {
+                        state.stream.current_agent = Some(a.clone());
+                    }
+                    // REVIEW#5 / D-P1-12: the canonical Message supersedes the streaming preview ONLY
+                    // when it is the SAME message — match by message_id (None ⇒ untracked single
+                    // preview for this turn, safe to clear). An unrelated keyed preview is preserved.
+                    if let crate::domain::ItemKind::Message { .. } = &kind {
+                        let clears = state.stream.open_message.as_ref().is_some_and(|acc| {
+                            acc.message_id.is_none()
+                                || acc.message_id.as_deref() == Some(id.as_str())
+                        });
+                        if clears {
+                            state.stream.open_message = None;
+                        }
+                    }
+                    items::push_item(state, id, kind, None, clock)
+                }
+            },
+            // Finalizing arms land in Task 8.
             _ => SmallVec::new(),
         };
     }
-    // Arms are filled in Tasks 7–9; unhandled events are a no-op for now.
-    let _ = clock;
+    // Arms are filled in Tasks 8–9; unhandled events are a no-op for now.
     SmallVec::new()
 }
 
