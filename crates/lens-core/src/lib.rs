@@ -4,8 +4,10 @@
 
 pub mod clock;
 pub mod domain;
+pub mod persist;
 pub mod reduce;
 
 pub use clock::{Clock, ManualClock};
 pub use domain::*;
+pub use persist::{ControlStore, PersistError, StoreMode, TranscriptStore};
 pub use reduce::{StreamUpdate, Updates, reduce};
