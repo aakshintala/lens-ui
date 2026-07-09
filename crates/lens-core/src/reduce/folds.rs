@@ -46,8 +46,7 @@ pub(crate) fn fold_usage(
     smallvec![StreamUpdate::UsageChanged]
 }
 
-/// The non-item, non-usage, non-presence, non-child session-field arms. Returns
-/// `None` for arms handled elsewhere so `reduce` can route them.
+/// Session-field scalar/collection folds. Returns `None` only for arms routed elsewhere.
 pub(crate) fn fold_session_field(state: &mut SessionState, ev: &SessionEvent) -> Option<Updates> {
     Some(match ev {
         SessionEvent::Status { status, .. } => {
@@ -107,10 +106,30 @@ pub(crate) fn fold_session_field(state: &mut SessionState, ev: &SessionEvent) ->
             context_window,
             total_cost_usd,
         } => fold_usage(state, *context_tokens, *context_window, *total_cost_usd),
-        // Handled elsewhere:
-        SessionEvent::Presence { .. }
-        | SessionEvent::ChildSessionUpdated { .. }
-        | SessionEvent::AgentChanged { .. } => return None,
+        SessionEvent::Presence { viewers } => {
+            state.presence = viewers
+                .iter()
+                .filter_map(|v| {
+                    v.user_id().map(|uid| crate::domain::PresenceViewer {
+                        user_id: uid.to_string(),
+                        joined_at: String::new(), // P1-DECISION D-P1-5: wrapper drops these
+                        idle: false,
+                    })
+                })
+                .collect();
+            smallvec![StreamUpdate::PresenceChanged]
+        }
+        SessionEvent::AgentChanged {
+            agent_id,
+            agent_name,
+        } => {
+            state.agent_id = crate::domain::AgentId::new(agent_id.clone());
+            state.agent_name = Some(agent_name.clone());
+            state.stream.current_agent = Some(agent_name.clone());
+            // Transcript marker pushed in Task 8 (needs push_item); scalar fold here.
+            smallvec![StreamUpdate::AgentChanged]
+        }
+        SessionEvent::ChildSessionUpdated { .. } => smallvec![StreamUpdate::ChildSessionChanged],
     })
 }
 
@@ -230,5 +249,35 @@ mod tests {
             &clock(),
         );
         assert_eq!(s.last_total_tokens, Some(0)); // clamped, total
+    }
+
+    #[test]
+    fn presence_fills_user_id_only() {
+        let mut s = st();
+        // build via bytes so the private wrapper is populated
+        let ev = parse_session("session.presence", r#"{"viewers":[{"user_id":"u_1"}]}"#);
+        let u = reduce(&mut s, &ev, &clock());
+        assert_eq!(s.presence.len(), 1);
+        assert_eq!(s.presence[0].user_id, "u_1");
+        assert_eq!(s.presence[0].joined_at, ""); // P1-DECISION: wrapper drops joined_at/idle
+        assert!(!s.presence[0].idle);
+        assert_eq!(&u[..], &[StreamUpdate::PresenceChanged]);
+    }
+
+    #[test]
+    fn agent_changed_updates_scalars() {
+        let mut s = st();
+        let u = reduce(
+            &mut s,
+            &ServerStreamEvent::Session(SessionEvent::AgentChanged {
+                agent_id: "ag_2".into(),
+                agent_name: "debby".into(),
+            }),
+            &clock(),
+        );
+        assert_eq!(s.agent_id.as_str(), "ag_2");
+        assert_eq!(s.agent_name.as_deref(), Some("debby"));
+        assert_eq!(s.stream.current_agent.as_deref(), Some("debby"));
+        assert!(u.contains(&StreamUpdate::AgentChanged));
     }
 }
