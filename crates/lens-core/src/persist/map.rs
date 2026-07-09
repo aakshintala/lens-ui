@@ -7,11 +7,39 @@ use crate::domain::item::{BlockContext, Item, ItemKind};
 use crate::domain::scalars::{ErrorInfo, HostType, SessionLifecycle, SessionStatusValue};
 use crate::domain::session::SessionState;
 use crate::domain::usage::Cost;
-use crate::persist::{PersistError, Result};
+use crate::persist::{Loaded, PersistError, Result, SkippedRow};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::collections::BTreeMap;
+
+/// Drain `rows`, decoding each with `decode`. A per-row decode failure is recorded
+/// in `Loaded::skipped` (keyed by `id_col`) and the row is skipped — so one corrupt
+/// row never aborts the whole load (§6.3). A real cursor/IO error from `rows.next()`
+/// still fails the load (outer `Err`).
+pub fn collect_skipping<T>(
+    rows: &mut rusqlite::Rows<'_>,
+    id_col: usize,
+    decode: impl Fn(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+) -> Result<Loaded<T>> {
+    let mut out = Vec::new();
+    let mut skipped = Vec::new();
+    while let Some(row) = rows.next()? {
+        match decode(row) {
+            Ok(v) => out.push(v),
+            Err(e) => {
+                let id = row
+                    .get::<_, String>(id_col)
+                    .unwrap_or_else(|_| "<unreadable-id>".to_string());
+                skipped.push(SkippedRow {
+                    id,
+                    reason: e.to_string(),
+                });
+            }
+        }
+    }
+    Ok(Loaded { rows: out, skipped })
+}
 
 /// A string-serializing enum → its bare token (`"waiting"`), for a Bridge column.
 pub fn enum_token<T: Serialize>(v: &T) -> Result<String> {

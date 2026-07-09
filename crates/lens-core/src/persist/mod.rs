@@ -42,6 +42,37 @@ pub enum StoreMode {
     ReadOnlyDegraded,
 }
 
+/// A row that failed to decode during a multi-row load. Recorded (not swallowed,
+/// not propagated) so one corrupt row degrades to a skip instead of failing the
+/// whole load — and stays OBSERVABLE for the caller to surface / re-fetch (§6.3;
+/// AGENTS.md "no silent caps"). lens-core has no logger by design; the app layer
+/// decides what to do with these.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkippedRow {
+    /// The row's identity (`item_id` / session `id`), or `"<unreadable-id>"` if
+    /// even the id column could not be read.
+    pub id: String,
+    /// The decode failure, stringified.
+    pub reason: String,
+}
+
+/// The outcome of a multi-row load: the decodable rows plus any that were skipped.
+/// A genuinely-corrupt row (truncated json, unknown internally-tagged `kind`, …)
+/// lands in `skipped`; a real cursor/IO error still fails the whole load (outer
+/// `Err`). `skipped` empty ⇒ a fully clean load.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Loaded<T> {
+    pub rows: Vec<T>,
+    pub skipped: Vec<SkippedRow>,
+}
+
+impl<T> Loaded<T> {
+    /// True when every row decoded (no corruption).
+    pub fn is_clean(&self) -> bool {
+        self.skipped.is_empty()
+    }
+}
+
 /// A `connections` row (§6.2). No P0 domain owner yet (§9 registry scope), so the
 /// persist layer owns this record type for P2.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -66,7 +97,9 @@ pub trait ControlStore {
     fn upsert_session(&self, s: &SessionState, now_ms: i64) -> Result<()>;
     /// Disk snapshot: items empty, RAM-only fields defaulted (D-P2-6).
     fn load_session(&self, conn: &ConnectionId, id: &SessionId) -> Result<Option<SessionState>>;
-    fn list_sessions(&self, conn: &ConnectionId) -> Result<Vec<SessionState>>;
+    /// All sessions for `conn`, newest-focused first. A row that fails to decode is
+    /// skipped (recorded in `Loaded::skipped`), never aborting the whole list.
+    fn list_sessions(&self, conn: &ConnectionId) -> Result<Loaded<SessionState>>;
     fn insert_cost_sample(
         &self,
         conn: &ConnectionId,
@@ -91,8 +124,9 @@ pub trait TranscriptStore {
     fn identity(&self) -> Result<(ConnectionId, SessionId)>;
     /// Write-through one finalized item at its canonical `ordinal` (D-P2-7).
     fn upsert_item(&self, ordinal: i64, item: &Item) -> Result<()>;
-    /// All items ordered by `ordinal`.
-    fn load_items(&self) -> Result<Vec<Item>>;
+    /// All items ordered by `ordinal`. A row that fails to decode is skipped
+    /// (recorded in `Loaded::skipped`), never aborting the whole transcript load.
+    fn load_items(&self) -> Result<Loaded<Item>>;
     /// Make the file match server truth by `item_id`: upsert each at `ordinal =
     /// index`, delete rows whose id is absent (§6.3 reconcile-by-id).
     fn reconcile(&self, items: &[Item]) -> Result<()>;

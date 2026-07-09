@@ -6,9 +6,9 @@
 use crate::domain::ids::{ConnectionId, SessionId};
 use crate::domain::item::Item;
 use crate::persist::db::open_db;
-use crate::persist::map::{item_kind_token, json_string, row_to_item};
+use crate::persist::map::{collect_skipping, item_kind_token, json_string, row_to_item};
 use crate::persist::schema::{SCHEMA_VERSION, TRANSCRIPT_DDL};
-use crate::persist::{PersistError, Result, StoreMode, TranscriptStore};
+use crate::persist::{Loaded, PersistError, Result, StoreMode, TranscriptStore};
 use rusqlite::Connection;
 use std::path::Path;
 
@@ -97,14 +97,14 @@ impl TranscriptStore for SqliteTranscriptStore {
         self.upsert_item_stmt(ordinal, item)
     }
 
-    fn load_items(&self) -> Result<Vec<Item>> {
+    fn load_items(&self) -> Result<Loaded<Item>> {
         let mut stmt = self.conn.prepare(
             "SELECT item_id, live_seq, kind, payload, agent, depth, turn, created_at
              FROM items ORDER BY ordinal",
         )?;
-        let rows = stmt.query_map([], row_to_item)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+        let mut rows = stmt.query([])?;
+        // id_col = 0 (`item_id` is the 1st selected column).
+        collect_skipping(&mut rows, 0, row_to_item)
     }
 
     fn reconcile(&self, items: &[Item]) -> Result<()> {
@@ -186,7 +186,7 @@ mod tests {
         s.upsert_item(1, &item("item_b", 0, "b")).unwrap();
         // Re-upsert item_a at ordinal 0 with edited text — no dup, payload updated.
         s.upsert_item(0, &item("item_a", 0, "a-edited")).unwrap();
-        let items = s.load_items().unwrap();
+        let items = s.load_items().unwrap().rows;
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].id.as_str(), "item_a");
         assert_eq!(items[1].id.as_str(), "item_b");
@@ -218,7 +218,7 @@ mod tests {
             item("item_d", 1, "d"),
         ];
         s.reconcile(&truth).unwrap();
-        let items = s.load_items().unwrap();
+        let items = s.load_items().unwrap().rows;
         let ids: Vec<_> = items.iter().map(|i| i.id.as_str().to_string()).collect();
         assert_eq!(ids, vec!["item_a", "item_b", "item_d"]); // c gone, order = truth
         match &items[1].kind {
@@ -228,5 +228,33 @@ mod tests {
             _ => panic!(),
         }
         assert_eq!(items[1].ctx.turn, 1);
+    }
+
+    #[test]
+    fn corrupt_item_is_skipped_not_fatal_and_good_items_survive() {
+        // A row with an undecodable payload (or a future/unknown `kind`, which the
+        // internally-tagged ItemKind can't degrade) is skipped + reported, never
+        // aborting the whole transcript load (§6.3, deferred-#1 / covers deferred-#2).
+        let d = tempdir().unwrap();
+        let s = store(d.path());
+        s.upsert_item(0, &item("item_a", 0, "a")).unwrap();
+        s.upsert_item(1, &item("item_b", 0, "b")).unwrap();
+        s.upsert_item(2, &item("item_c", 0, "c")).unwrap();
+        // Simulate a future/foreign writer: an ItemKind tag this build doesn't know.
+        s.conn
+            .execute(
+                "UPDATE items SET payload = '{\"kind\":\"quantum_tool\",\"x\":1}' WHERE item_id = 'item_b'",
+                [],
+            )
+            .unwrap();
+        let loaded = s.load_items().unwrap(); // MUST NOT Err
+        let ids: Vec<_> = loaded
+            .rows
+            .iter()
+            .map(|i| i.id.as_str().to_string())
+            .collect();
+        assert_eq!(ids, vec!["item_a", "item_c"]); // unknown-kind row skipped
+        assert_eq!(loaded.skipped.len(), 1);
+        assert_eq!(loaded.skipped[0].id, "item_b");
     }
 }

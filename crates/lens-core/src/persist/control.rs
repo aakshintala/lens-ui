@@ -6,7 +6,7 @@ use crate::domain::ids::{ConnectionId, SessionId};
 use crate::domain::session::SessionState;
 use crate::persist::db::open_db;
 use crate::persist::schema::{CONTROL_DDL, SCHEMA_VERSION};
-use crate::persist::{ConnectionRecord, ControlStore, PersistError, Result, StoreMode};
+use crate::persist::{ConnectionRecord, ControlStore, Loaded, PersistError, Result, StoreMode};
 use rusqlite::Connection;
 use std::path::Path;
 
@@ -171,16 +171,16 @@ impl ControlStore for SqliteControlStore {
         }
     }
 
-    fn list_sessions(&self, conn: &ConnectionId) -> Result<Vec<SessionState>> {
-        use crate::persist::map::{SESSION_COLUMNS, row_to_session};
+    fn list_sessions(&self, conn: &ConnectionId) -> Result<Loaded<SessionState>> {
+        use crate::persist::map::{SESSION_COLUMNS, collect_skipping, row_to_session};
         let sql = format!(
             "SELECT {SESSION_COLUMNS} FROM sessions WHERE connection_id = ?1 \
              ORDER BY last_focused_at DESC, id"
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(rusqlite::params![conn.as_str()], row_to_session)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+        let mut rows = stmt.query(rusqlite::params![conn.as_str()])?;
+        // id_col = 1 (`id` is the 2nd column in SESSION_COLUMNS).
+        collect_skipping(&mut rows, 1, row_to_session)
     }
 
     fn insert_cost_sample(
@@ -503,9 +503,49 @@ mod tests {
                 [],
             )
             .unwrap();
-        let sessions = s.list_sessions(&conn).unwrap(); // MUST NOT Err
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].host_type, HostType::Unknown);
-        assert_eq!(sessions[0].lifecycle, SessionLifecycle::Unknown);
+        let loaded = s.list_sessions(&conn).unwrap(); // MUST NOT Err
+        // An unknown ENUM TOKEN decodes to `Unknown` — the row is clean, not skipped.
+        assert!(loaded.is_clean());
+        assert_eq!(loaded.rows.len(), 1);
+        assert_eq!(loaded.rows[0].host_type, HostType::Unknown);
+        assert_eq!(loaded.rows[0].lifecycle, SessionLifecycle::Unknown);
+    }
+
+    #[test]
+    fn corrupt_row_is_skipped_not_fatal_and_good_rows_survive() {
+        // A genuinely-undecodable row (malformed json in a NON-degrading column)
+        // is skipped + reported, never aborting the whole list (§6.3, deferred-#1).
+        use crate::domain::ids::{AgentId, ConnectionId, SessionId};
+        let (_d, s) = store();
+        let conn = ConnectionId::new("conn_1");
+        s.upsert_connection(&ConnectionRecord {
+            id: conn.clone(),
+            base_url: "u".into(),
+            auth_kind: "none".into(),
+            label: None,
+            server_info: None,
+            created_at: 1,
+        })
+        .unwrap();
+        for sid in ["conv_good_a", "conv_bad", "conv_good_b"] {
+            let st = SessionState::new(conn.clone(), SessionId::new(sid), AgentId::new("a"));
+            s.upsert_session(&st, 1).unwrap();
+        }
+        // Corrupt one row's `cost_json` (a required-to-parse json column) into garbage.
+        s.conn
+            .execute(
+                "UPDATE sessions SET cost_json = '{not valid json' WHERE id = 'conv_bad'",
+                [],
+            )
+            .unwrap();
+        let loaded = s.list_sessions(&conn).unwrap(); // MUST NOT Err
+        let ids: Vec<_> = loaded
+            .rows
+            .iter()
+            .map(|r| r.id.as_str().to_string())
+            .collect();
+        assert_eq!(ids, vec!["conv_good_a", "conv_good_b"]); // bad one skipped, good ones survive
+        assert_eq!(loaded.skipped.len(), 1);
+        assert_eq!(loaded.skipped[0].id, "conv_bad"); // reported BY ID (observable)
     }
 }

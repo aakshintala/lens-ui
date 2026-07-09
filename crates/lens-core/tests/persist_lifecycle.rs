@@ -45,7 +45,9 @@ fn transcript_survives_close_and_reopen() {
         // store dropped here — file closed.
     }
     let s = SqliteTranscriptStore::open(&path, &conn, &sid).unwrap();
-    let items = s.load_items().unwrap();
+    let loaded = s.load_items().unwrap();
+    assert!(loaded.is_clean());
+    let items = loaded.rows;
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].id.as_str(), "item_1");
     assert_eq!(s.identity().unwrap(), (conn, sid));
