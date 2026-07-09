@@ -309,12 +309,15 @@ and roll older "Recent" pointers off this page as they age.
   cols (`pinned`/`last_status`/`tombstoned_at`) preserved via ON-CONFLICT omission;
   live-stream chrome (`model_options`/`sandbox_status`/`pending_elicitations`) +
   `presence`/`stream`/`pending_user` RAM-only, re-derived on wake; `load_session` returns
-  a disk-snapshot (items empty). **Deferred hardening (non-blocking, noted for P3):**
-  list/load paths are all-or-nothing on a genuinely-corrupt row (no per-row
-  skip — lens-core has no logging seam); `ItemKind` can't `#[serde(other)]` (internally
-  tagged) so an unknown transcript `kind` fails that load; `created_at=excluded` re-upsert
-  could clobber with 0 if the actor upserts a fresh state pre-bootstrap (P3 upsert-timing
-  concern). **Next: P3 — actor + store + commands (`lens-core/actor` + `lens-store`,
+  a disk-snapshot (items empty). **Post-merge hardening DONE (`ff55e48`):** resilient
+  loads — `list_sessions`/`load_items` now return `Loaded<T> { rows, skipped:
+  Vec<SkippedRow{id,reason}> }` via a shared `collect_skipping` helper: a corrupt/unknown
+  row is skipped + reported BY ID (observable, not silent — lens-core stays logger-free,
+  app decides) instead of aborting the whole load; also covers the internally-tagged
+  `ItemKind` unknown-`kind` case (can't `#[serde(other)]`). **Still deferred to P3
+  (upsert-timing, can't decide until the actor's write cadence exists):**
+  `created_at=excluded` re-upsert could clobber a good creation time with 0 if the actor
+  upserts a fresh state pre-bootstrap → add a `COALESCE`/non-zero guard when wiring P3. **Next: P3 — actor + store + commands (`lens-core/actor` + `lens-store`,
   §8/§7/§13.1): walking skeleton first (fake event → reduce → StreamUpdate over bounded
   channel → SessionStore replica → cx.notify), then actor run-loop, command semantics
   (§7 optimistic-send × reconnect reconcile), bootstrap/reconnect wiring that CALLS the
