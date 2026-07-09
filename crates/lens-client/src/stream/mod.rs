@@ -63,3 +63,16 @@ pub use event::{
     SessionEvent, SessionStatusValue,
 };
 pub use reader::EventStream;
+
+/// Decode a complete SSE byte buffer into the typed event sequence — the same
+/// path the reader thread uses (`SseParser` + `parse_event`). Test/bench only.
+#[cfg(feature = "test-util")]
+pub fn decode_all(bytes: &[u8]) -> Vec<ServerStreamEvent> {
+    let mut p = crate::stream::sse::SseParser::default();
+    let mut frames = p.push(bytes);
+    frames.extend(p.finish());
+    frames
+        .iter()
+        .map(crate::stream::event::parse_event)
+        .collect()
+}

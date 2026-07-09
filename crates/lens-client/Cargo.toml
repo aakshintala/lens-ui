@@ -29,6 +29,7 @@ url = "2"
 # neither implies the other, so a live-tests build never pulls in the bench harness).
 bench = []
 live-tests = []
+test-util = [] # exposes byte-decode helpers for downstream reducer tests
 
 [[bench]]
 name = "sse_pipeline"

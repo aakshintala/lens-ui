@@ -113,6 +113,10 @@ pub struct StreamScratch {
     pub open_message: Option<MessageAcc>,
     pub open_reasoning: Option<ReasoningAcc>,
     pub unpaired_calls: HashMap<CallId, ItemId>,
+    /// Reduce-local (§4.1 attribution): current turn, bumped on `response.completed`.
+    pub turn: u32,
+    /// Reduce-local: current agent name for `BlockContext` stamping.
+    pub current_agent: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -253,6 +257,8 @@ mod tests {
         let s = StreamScratch::default();
         assert!(s.open_message.is_none());
         assert!(s.unpaired_calls.is_empty());
+        assert_eq!(s.turn, 0);
+        assert!(s.current_agent.is_none());
         let back: StreamScratch =
             serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back, s);

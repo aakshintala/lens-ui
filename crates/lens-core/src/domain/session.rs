@@ -43,6 +43,8 @@ pub struct SessionState {
     pub host_type: HostType,
     pub host_id: Option<HostId>,
     pub sandbox_status: Option<SandboxStatus>,
+    /// Live `session.terminal_pending` fold (§4.1). RAM+persisted scalar.
+    pub terminal_pending: bool,
 
     // ── Content ──
     pub items: Vec<Item>,
@@ -100,6 +102,7 @@ impl SessionState {
             host_type: HostType::External,
             host_id: None,
             sandbox_status: None,
+            terminal_pending: false,
             items: Vec::new(),
             todos: Vec::new(),
             skills: Vec::new(),
