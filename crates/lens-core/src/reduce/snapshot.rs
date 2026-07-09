@@ -4,6 +4,7 @@ use crate::domain::{AgentId, HostId, ModelUsage, RunnerId, SessionId, SessionSta
 use crate::reduce::{StreamUpdate, Updates};
 use lens_client::sessions::{SessionSnapshot, SessionStatus};
 use smallvec::smallvec;
+use std::sync::Arc;
 
 fn map_snapshot_status(s: SessionStatus) -> crate::domain::SessionStatusValue {
     use crate::domain::SessionStatusValue as V;
@@ -80,7 +81,7 @@ pub(crate) fn on_reconnected(state: &mut SessionState, gap: Option<u64>) -> Upda
         state.stream.open_reasoning = None;
         state.stream.unpaired_calls.clear();
         if had {
-            u.push(StreamUpdate::ScratchChanged);
+            u.push(StreamUpdate::ScratchChanged(Arc::new(state.stream.clone())));
         }
     }
     u

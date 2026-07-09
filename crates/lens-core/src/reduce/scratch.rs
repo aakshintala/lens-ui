@@ -3,6 +3,7 @@
 use crate::domain::item::{MessageAcc, StreamScratch};
 use crate::reduce::{StreamUpdate, Updates};
 use smallvec::smallvec;
+use std::sync::Arc;
 
 pub(crate) enum ReasoningKind {
     Full,
@@ -19,7 +20,7 @@ pub(crate) fn accumulate_reasoning(
         ReasoningKind::Full => acc.full_text.push_str(delta),
         ReasoningKind::Summary => acc.summary_text.push_str(delta),
     }
-    smallvec![StreamUpdate::ScratchChanged]
+    smallvec![StreamUpdate::ScratchChanged(Arc::new(scratch.clone()))]
 }
 
 pub(crate) fn accumulate_text(
@@ -37,7 +38,7 @@ pub(crate) fn accumulate_text(
     if let Some(i) = index {
         acc.block_index = i;
     }
-    smallvec![StreamUpdate::ScratchChanged]
+    smallvec![StreamUpdate::ScratchChanged(Arc::new(scratch.clone()))]
 }
 
 #[cfg(test)]
@@ -101,6 +102,6 @@ mod tests {
         let u = reduce(&mut s, &resp_text("lo", None, None), &clock());
         let acc = s.stream.open_message.as_ref().unwrap();
         assert_eq!(acc.text, "Hello");
-        assert_eq!(&u[..], &[StreamUpdate::ScratchChanged]);
+        assert!(matches!(&u[..], [StreamUpdate::ScratchChanged(_)]));
     }
 }

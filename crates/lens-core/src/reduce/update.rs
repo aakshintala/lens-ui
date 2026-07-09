@@ -1,41 +1,51 @@
+use crate::domain::controls::{Elicitation, ModelOption, SandboxStatus, SkillSummary, Todo};
+use crate::domain::ids::AgentId;
+use crate::domain::item::{Item, StreamScratch};
+use crate::domain::scalars::SessionStatusValue;
+use crate::domain::session::SessionState;
+use crate::domain::usage::{Cost, PresenceViewer};
 use smallvec::SmallVec;
+use std::sync::Arc;
 
 /// The reducer's output: which part of `SessionState` a `reduce()` call changed.
-/// DRAFT (spec D6): marker-style at P1 (no payload, no `apply()` — no replica exists
-/// yet). The P3 walking skeleton ratifies whether apply carries a payload or re-reads a
-/// shared snapshot. `SmallVec<[_; 2]>` because most events touch 0–2 groups.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Value-carrying (D8): each delta deposits its just-reduced value into the
+/// foreground replica via pure copy-assignment. `SmallVec<[_; 2]>` because most
+/// events touch 0–2 groups.
+#[derive(Clone, Debug, PartialEq)]
 pub enum StreamUpdate {
-    // ── transcript deltas ──
-    /// A new canonical item was appended at `index`.
-    ItemAppended {
-        index: usize,
-    },
-    /// An existing canonical item at `index` was updated in place (dedup-by-id hit).
+    // ── transcript deltas (value-carrying) ──
+    ItemAppended(Arc<Item>),
     ItemUpdated {
         index: usize,
+        item: Arc<Item>,
     },
-    /// `StreamScratch` (in-progress message/reasoning) changed — the live preview bubble.
-    ScratchChanged,
+    ScratchChanged(Arc<StreamScratch>),
 
-    // ── scalar / collection folds ──
-    StatusChanged,
-    UsageChanged,
-    ModelChanged,
-    ReasoningEffortChanged,
-    CollaborationModeChanged,
-    ModelOptionsChanged,
-    TodosChanged,
-    SkillsChanged,
-    SandboxChanged,
-    TerminalPendingChanged,
-    ElicitationsChanged,
+    // ── scalar / collection folds — carry the just-reduced value ──
+    StatusChanged(SessionStatusValue),
+    UsageChanged(Cost),
+    ModelChanged {
+        llm_model: Option<String>,
+        model_override: Option<String>,
+    },
+    ReasoningEffortChanged(Option<String>),
+    CollaborationModeChanged(Option<String>),
+    ModelOptionsChanged(Option<Vec<ModelOption>>),
+    TodosChanged(Vec<Todo>),
+    SkillsChanged(Vec<SkillSummary>),
+    SandboxChanged(Option<SandboxStatus>),
+    TerminalPendingChanged(bool),
+    ElicitationsChanged(Vec<Elicitation>),
     ChildSessionChanged,
-    PresenceChanged,
+    PresenceChanged(Vec<PresenceViewer>),
     ResourcesChanged,
-    /// `agent_id`/`agent_name` changed AND an `AgentChanged` transcript marker was pushed.
-    AgentChanged,
-    TitleChanged,
+    AgentChanged {
+        agent_id: AgentId,
+        agent_name: Option<String>,
+    },
+    TitleChanged(Option<String>),
+    LastTokensChanged(Option<u64>),
+    ContextWindowChanged(Option<u64>),
 
     // ── reconnect / bootstrap lifecycle (passthrough for the UI banner) ──
     Reconnecting {
@@ -43,8 +53,10 @@ pub enum StreamUpdate {
     },
     Reconnected,
     Disconnected,
-    /// Coarse: the snapshot chrome scalars were bulk-restored (bootstrap or reconnect).
     SnapshotRestored,
+
+    // D9: once-at-attach full baseline
+    Rebased(Box<SessionState>),
 }
 
 pub type Updates = SmallVec<[StreamUpdate; 2]>;
@@ -52,12 +64,32 @@ pub type Updates = SmallVec<[StreamUpdate; 2]>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::ids::ItemId;
+    use crate::domain::item::{BlockContext, ContentBlock, ItemKind};
+    use crate::domain::scalars::Role;
 
     #[test]
     fn updates_smallvec_stays_inline_for_two() {
         let mut u: Updates = SmallVec::new();
-        u.push(StreamUpdate::StatusChanged);
-        u.push(StreamUpdate::ItemAppended { index: 0 });
+        u.push(StreamUpdate::StatusChanged(SessionStatusValue::Idle));
+        u.push(StreamUpdate::ItemAppended(Arc::new(Item {
+            id: ItemId::new("item_0"),
+            seq: None,
+            ctx: BlockContext {
+                agent: None,
+                depth: 0,
+                turn: 0,
+            },
+            created_at: 0,
+            kind: ItemKind::Message {
+                role: Role::User,
+                content: vec![ContentBlock {
+                    kind: "text".into(),
+                    text: Some("x".into()),
+                    data: serde_json::Value::Null,
+                }],
+            },
+        })));
         assert_eq!(u.len(), 2);
         assert!(
             !u.spilled(),

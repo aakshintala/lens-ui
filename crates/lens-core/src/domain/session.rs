@@ -10,6 +10,7 @@ use crate::domain::scalars::{ErrorInfo, HostType, SessionLifecycle, SessionStatu
 use crate::domain::usage::{Cost, PresenceViewer};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SessionState {
@@ -47,7 +48,7 @@ pub struct SessionState {
     pub terminal_pending: bool,
 
     // ── Content ──
-    pub items: Vec<Item>,
+    pub items: Vec<Arc<Item>>,
     pub todos: Vec<Todo>,
     pub skills: Vec<SkillSummary>,
 
@@ -164,7 +165,7 @@ mod tests {
         s.status = SessionStatusValue::Running;
         s.title = Some("my session".into());
         s.labels.insert("env".into(), "prod".into());
-        s.items.push(Item {
+        s.items.push(Arc::new(Item {
             id: ItemId::new("item_1"),
             seq: Some(1),
             ctx: BlockContext {
@@ -181,7 +182,7 @@ mod tests {
                     data: serde_json::Value::Null,
                 }],
             },
-        });
+        }));
         let back: SessionState = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back, s);
     }

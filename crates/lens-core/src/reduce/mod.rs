@@ -17,6 +17,7 @@ use crate::clock::Clock;
 use crate::domain::SessionState;
 use lens_client::stream::{ResponseEvent, ServerStreamEvent};
 use smallvec::{SmallVec, smallvec};
+use std::sync::Arc;
 
 /// Bench-only seam (doc-hidden, not the public contract): append one synthetic
 /// assistant message through the same internal `push_item` path the reducer uses
@@ -72,7 +73,7 @@ pub fn reduce(state: &mut SessionState, event: &ServerStreamEvent, clock: &dyn C
                     .stream
                     .open_reasoning
                     .get_or_insert_with(Default::default);
-                smallvec![StreamUpdate::ScratchChanged]
+                smallvec![StreamUpdate::ScratchChanged(Arc::new(state.stream.clone()))]
             }
             ResponseEvent::ReasoningTextDelta { delta } => scratch::accumulate_reasoning(
                 &mut state.stream,
@@ -112,7 +113,7 @@ pub fn reduce(state: &mut SessionState, event: &ServerStreamEvent, clock: &dyn C
                     }
                     let mut u = items::push_item(state, id, kind, None, clock);
                     if cleared {
-                        u.push(StreamUpdate::ScratchChanged);
+                        u.push(StreamUpdate::ScratchChanged(Arc::new(state.stream.clone())));
                     }
                     u
                 }
@@ -125,16 +126,16 @@ pub fn reduce(state: &mut SessionState, event: &ServerStreamEvent, clock: &dyn C
                 u.append(&mut ru);
                 state.stream.turn = state.stream.turn.saturating_add(1);
                 if had_open_msg || had_open_reasoning {
-                    u.push(StreamUpdate::ScratchChanged);
+                    u.push(StreamUpdate::ScratchChanged(Arc::new(state.stream.clone())));
                 }
-                u.push(StreamUpdate::StatusChanged);
+                u.push(StreamUpdate::StatusChanged(state.status));
                 u
             }
             ResponseEvent::ReasoningClosed { .. } => {
                 let had = state.stream.open_reasoning.is_some();
                 let mut u = items::finalize_reasoning(state, clock);
                 if had {
-                    u.push(StreamUpdate::ScratchChanged);
+                    u.push(StreamUpdate::ScratchChanged(Arc::new(state.stream.clone())));
                 }
                 u
             }

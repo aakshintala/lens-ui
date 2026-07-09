@@ -8,6 +8,7 @@ use crate::reduce::{StreamUpdate, Updates};
 use lens_client::stream::Item as WireItem;
 use serde_json::Value;
 use smallvec::smallvec;
+use std::sync::Arc;
 
 pub(crate) fn current_ctx(scratch: &StreamScratch) -> BlockContext {
     BlockContext {
@@ -181,21 +182,23 @@ pub(crate) fn push_item(
 ) -> Updates {
     let ctx = current_ctx(&state.stream);
     if let Some(idx) = state.items.iter().position(|it| it.id == id) {
-        let existing = &mut state.items[idx];
+        let existing = Arc::make_mut(&mut state.items[idx]);
         existing.kind = kind;
         existing.seq = seq.or(existing.seq);
-        smallvec![StreamUpdate::ItemUpdated { index: idx }]
+        smallvec![StreamUpdate::ItemUpdated {
+            index: idx,
+            item: Arc::clone(&state.items[idx]),
+        }]
     } else {
-        state.items.push(Item {
+        let item = Arc::new(Item {
             id,
             seq,
             ctx,
             created_at: clock.now_millis(),
             kind,
         });
-        smallvec![StreamUpdate::ItemAppended {
-            index: state.items.len() - 1,
-        }]
+        state.items.push(Arc::clone(&item));
+        smallvec![StreamUpdate::ItemAppended(item)]
     }
 }
 
@@ -242,7 +245,7 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        assert_eq!(&u[..], &[StreamUpdate::ItemAppended { index: 0 }]);
+        assert!(matches!(&u[..], [StreamUpdate::ItemAppended(_)]));
         assert_eq!(s.items[0].created_at, 1_700_000_000_000); // clock-stamped
     }
 
@@ -274,7 +277,10 @@ mod tests {
         );
         let u = reduce(&mut s, &second, &clock());
         assert_eq!(s.items.len(), 1); // no double-insert (D-P1-13)
-        assert_eq!(&u[..], &[StreamUpdate::ItemUpdated { index: 0 }]);
+        assert!(matches!(
+            &u[..],
+            [StreamUpdate::ItemUpdated { index: 0, .. }]
+        ));
     }
 
     use lens_client::stream::{ResponseEvent, ServerStreamEvent};
@@ -426,7 +432,24 @@ mod tests {
             _ => None,
         });
         assert_eq!(marker, Some(("ag".into(), "ag_2".into())));
-        assert!(u.contains(&StreamUpdate::AgentChanged));
+        assert!(
+            u.iter()
+                .any(|update| matches!(update, StreamUpdate::AgentChanged { .. }))
+        );
+    }
+
+    #[test]
+    fn appended_delta_carries_the_same_arc_body_as_state() {
+        let mut s = st();
+        let ev = parse_response(
+            "response.output_item.done",
+            r#"{"item":{"id":"item_1","type":"function_call","status":"completed","name":"read","arguments":"{}","call_id":"c"}}"#,
+        );
+        let out = reduce(&mut s, &ev, &clock());
+        let StreamUpdate::ItemAppended(arc) = &out[0] else {
+            panic!("expected ItemAppended")
+        };
+        assert!(std::sync::Arc::ptr_eq(arc, s.items.last().unwrap()));
     }
 
     #[test]
@@ -480,7 +503,10 @@ mod tests {
             r#"{"item":{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"output_text","text":"hi"}]}}"#,
         );
         let u = reduce(&mut s, &done, &clock());
-        assert!(u.contains(&StreamUpdate::ScratchChanged));
+        assert!(
+            u.iter()
+                .any(|update| matches!(update, StreamUpdate::ScratchChanged(_)))
+        );
         assert!(s.stream.open_message.is_none());
     }
 
@@ -493,7 +519,10 @@ mod tests {
             &ServerStreamEvent::Response(ResponseEvent::Completed),
             &clock(),
         );
-        assert!(u.contains(&StreamUpdate::ScratchChanged));
+        assert!(
+            u.iter()
+                .any(|update| matches!(update, StreamUpdate::ScratchChanged(_)))
+        );
         assert!(s.stream.open_message.is_none());
     }
 
@@ -517,7 +546,10 @@ mod tests {
             summary_text: "".into(),
         });
         let u = reduce(&mut s, &closed, &clock());
-        assert!(u.contains(&StreamUpdate::ScratchChanged));
+        assert!(
+            u.iter()
+                .any(|update| matches!(update, StreamUpdate::ScratchChanged(_)))
+        );
     }
 
     #[test]

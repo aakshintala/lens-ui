@@ -48,7 +48,10 @@ pub(crate) fn fold_usage(
     if let Some(cost) = total_cost_usd {
         state.cumulative_cost.total_cost_usd = Some(cost);
     }
-    smallvec![StreamUpdate::UsageChanged]
+    smallvec![
+        StreamUpdate::UsageChanged(state.cumulative_cost.clone()),
+        StreamUpdate::LastTokensChanged(state.last_total_tokens),
+    ]
 }
 
 /// Session-field scalar/collection folds. Returns `None` only for arms routed elsewhere.
@@ -64,17 +67,24 @@ pub(crate) fn fold_session_field(
             if normalized != SessionStatusValue::Failed {
                 state.last_task_error = None;
             }
-            smallvec![StreamUpdate::StatusChanged]
+            smallvec![StreamUpdate::StatusChanged(normalized)]
         }
         SessionEvent::Model { model } => {
             state.llm_model = Some(model.clone());
-            smallvec![StreamUpdate::ModelChanged]
+            smallvec![StreamUpdate::ModelChanged {
+                llm_model: state.llm_model.clone(),
+                model_override: state.model_override.clone(),
+            }]
         }
         SessionEvent::ReasoningEffort { reasoning_effort } => {
             state.reasoning_effort = reasoning_effort.clone();
-            smallvec![StreamUpdate::ReasoningEffortChanged]
+            smallvec![StreamUpdate::ReasoningEffortChanged(
+                state.reasoning_effort.clone()
+            )]
         }
-        SessionEvent::ModelOptions => smallvec![StreamUpdate::ModelOptionsChanged],
+        SessionEvent::ModelOptions => smallvec![StreamUpdate::ModelOptionsChanged(
+            state.model_options.clone()
+        )],
         SessionEvent::Todos { todos } => {
             state.todos = todos
                 .iter()
@@ -84,23 +94,23 @@ pub(crate) fn fold_session_field(
                     active_form: t.active_form().to_string(),
                 })
                 .collect();
-            smallvec![StreamUpdate::TodosChanged]
+            smallvec![StreamUpdate::TodosChanged(state.todos.clone())]
         }
         SessionEvent::Skills => {
             // P1-DECISION: lens-client `session.skills` wrapper is a unit variant (payload
             // dropped) — no names available. Mark changed; leave `state.skills` untouched.
-            smallvec![StreamUpdate::SkillsChanged]
+            smallvec![StreamUpdate::SkillsChanged(state.skills.clone())]
         }
         SessionEvent::SandboxStatus { stage, error } => {
             state.sandbox_status = Some(SandboxStatus {
                 stage: stage.clone(),
                 detail: error.clone(),
             });
-            smallvec![StreamUpdate::SandboxChanged]
+            smallvec![StreamUpdate::SandboxChanged(state.sandbox_status.clone())]
         }
         SessionEvent::TerminalPending { pending } => {
             state.terminal_pending = *pending;
-            smallvec![StreamUpdate::TerminalPendingChanged]
+            smallvec![StreamUpdate::TerminalPendingChanged(state.terminal_pending)]
         }
         // Marker-only (D-P1-19): no P1 field home / liveness only.
         SessionEvent::TerminalActivity { .. }
@@ -130,7 +140,7 @@ pub(crate) fn fold_session_field(
                     })
                 })
                 .collect();
-            smallvec![StreamUpdate::PresenceChanged]
+            smallvec![StreamUpdate::PresenceChanged(state.presence.clone())]
         }
         SessionEvent::AgentChanged {
             agent_id,
@@ -142,7 +152,10 @@ pub(crate) fn fold_session_field(
             state.agent_name = Some(agent_name.clone());
             state.stream.current_agent = Some(agent_name.clone());
             let mut u = items::push_agent_changed(state, from, to, clock);
-            u.push(StreamUpdate::AgentChanged);
+            u.push(StreamUpdate::AgentChanged {
+                agent_id: state.agent_id.clone(),
+                agent_name: state.agent_name.clone(),
+            });
             u
         }
         SessionEvent::ChildSessionUpdated { .. } => smallvec![StreamUpdate::ChildSessionChanged],
@@ -156,7 +169,9 @@ pub(crate) fn fold_response_marker(
     ev: &ResponseEvent,
 ) -> Option<Updates> {
     Some(match ev {
-        ResponseEvent::InProgress => smallvec![StreamUpdate::StatusChanged], // P1-DECISION: liveness marker
+        ResponseEvent::InProgress => {
+            smallvec![StreamUpdate::StatusChanged(state.status)]
+        } // P1-DECISION: liveness marker
         ResponseEvent::Failed | ResponseEvent::Incomplete | ResponseEvent::Cancelled => {
             smallvec![]
         }
@@ -170,7 +185,7 @@ pub(crate) fn fold_response_marker(
                 code: code.clone(),
                 message: message.clone(),
             });
-            smallvec![StreamUpdate::StatusChanged]
+            smallvec![StreamUpdate::StatusChanged(state.status)]
         }
         ResponseEvent::ElicitationRequest {
             elicitation_id,
@@ -188,13 +203,17 @@ pub(crate) fn fold_response_marker(
                     content_preview: params.content_preview().map(str::to_string),
                 },
             });
-            smallvec![StreamUpdate::ElicitationsChanged]
+            smallvec![StreamUpdate::ElicitationsChanged(
+                state.pending_elicitations.clone()
+            )]
         }
         ResponseEvent::ElicitationResolved { elicitation_id } => {
             state
                 .pending_elicitations
                 .retain(|e| e.id.as_str() != elicitation_id);
-            smallvec![StreamUpdate::ElicitationsChanged]
+            smallvec![StreamUpdate::ElicitationsChanged(
+                state.pending_elicitations.clone()
+            )]
         }
         // item-producing / scratch-finalizing arms handled in Task 7/8:
         ResponseEvent::OutputItemDone { .. }
@@ -242,7 +261,10 @@ mod tests {
             &clock(),
         );
         assert_eq!(s.status, SessionStatusValue::Running);
-        assert_eq!(&u[..], &[StreamUpdate::StatusChanged]);
+        assert_eq!(
+            &u[..],
+            &[StreamUpdate::StatusChanged(SessionStatusValue::Running)]
+        );
     }
 
     #[test]
@@ -279,7 +301,7 @@ mod tests {
         assert_eq!(s.todos.len(), 1);
         assert_eq!(s.todos[0].content, "Fix bug");
         assert_eq!(s.todos[0].status, TodoStatus::InProgress);
-        assert_eq!(&u[..], &[StreamUpdate::TodosChanged]);
+        assert!(matches!(&u[..], [StreamUpdate::TodosChanged(todos)] if todos.len() == 1));
     }
 
     #[test]
@@ -308,7 +330,13 @@ mod tests {
         assert_eq!(s.last_total_tokens, Some(1200));
         assert_eq!(s.context_window, Some(200_000));
         assert_eq!(s.cumulative_cost.total_cost_usd, Some(0.42));
-        assert_eq!(&u[..], &[StreamUpdate::UsageChanged]);
+        assert!(matches!(
+            &u[..],
+            [
+                StreamUpdate::UsageChanged(cost),
+                StreamUpdate::LastTokensChanged(Some(1200))
+            ] if cost.total_cost_usd == Some(0.42)
+        ));
     }
 
     #[test]
@@ -336,7 +364,7 @@ mod tests {
         assert_eq!(s.presence[0].user_id, "u_1");
         assert_eq!(s.presence[0].joined_at, ""); // P1-DECISION: wrapper drops joined_at/idle
         assert!(!s.presence[0].idle);
-        assert_eq!(&u[..], &[StreamUpdate::PresenceChanged]);
+        assert!(matches!(&u[..], [StreamUpdate::PresenceChanged(v)] if v.len() == 1));
     }
 
     #[test]
@@ -357,7 +385,10 @@ mod tests {
         });
         let u = reduce(&mut s, &res, &clock());
         assert!(s.pending_elicitations.is_empty());
-        assert_eq!(&u[..], &[StreamUpdate::ElicitationsChanged]);
+        assert!(matches!(
+            &u[..],
+            [StreamUpdate::ElicitationsChanged(elicitations)] if elicitations.is_empty()
+        ));
     }
 
     #[test]
@@ -428,6 +459,9 @@ mod tests {
         assert_eq!(s.agent_id.as_str(), "ag_2");
         assert_eq!(s.agent_name.as_deref(), Some("debby"));
         assert_eq!(s.stream.current_agent.as_deref(), Some("debby"));
-        assert!(u.contains(&StreamUpdate::AgentChanged));
+        assert!(
+            u.iter()
+                .any(|update| matches!(update, StreamUpdate::AgentChanged { .. }))
+        );
     }
 }

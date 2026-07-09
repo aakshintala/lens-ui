@@ -264,6 +264,7 @@ mod tests {
         use crate::domain::scalars::{Role, SessionStatusValue};
         use crate::domain::usage::{Cost, ModelUsage, Usage};
         use std::collections::BTreeMap;
+        use std::sync::Arc;
 
         let (_d, s) = store();
         // A connection row must exist (FK).
@@ -307,7 +308,7 @@ mod tests {
             total_cost_usd: Some(0.5),
         };
         // items are NOT persisted here (they live in the transcript file, D-P2-6).
-        st.items.push(Item {
+        st.items.push(Arc::new(Item {
             id: crate::domain::ids::ItemId::new("item_1"),
             seq: None,
             ctx: BlockContext {
@@ -324,7 +325,7 @@ mod tests {
                     data: serde_json::Value::Null,
                 }],
             },
-        });
+        }));
 
         s.upsert_session(&st, 1_700_000_000_000).unwrap();
         let loaded = s
