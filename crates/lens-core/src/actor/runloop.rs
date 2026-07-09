@@ -1,6 +1,7 @@
 //! The actor run-loop: `crossbeam::Select` over events + commands, greedy drain,
 //! persist write-through, coalesce, emit to the foreground bridge.
 
+use crate::actor::summary::SummaryUpdate;
 use crate::clock::Clock;
 use crate::domain::SessionState;
 use crate::persist::{ControlStore, TranscriptStore};
@@ -11,10 +12,12 @@ use std::collections::HashSet;
 use std::mem::Discriminant;
 use std::thread::JoinHandle;
 
-/// Commands to the actor thread. Extended in P3-2.
+/// Commands to the actor thread.
 #[derive(Debug)]
 pub enum SessionCommand {
     Stop,
+    Promote,
+    Demote,
 }
 
 /// Persist role stores moved into the actor thread.
@@ -45,8 +48,15 @@ impl ActorHandle {
     }
 }
 
-/// Spawn the actor thread. `events` is the crossbeam receiver from lens-client;
-/// `updates` is the async-channel sender to the foreground bridge.
+/// Bridge senders + output granularity for the actor run-loop.
+struct ActorOutput {
+    updates: async_channel::Sender<StreamUpdate>,
+    summaries: async_channel::Sender<SummaryUpdate>,
+    mode: OutputMode,
+}
+
+/// Spawn the actor thread in `Detailed` mode (Task 5 API). Summary channel is
+/// created internally and dropped — never emitted to in Detailed mode.
 pub fn spawn_actor(
     state: SessionState,
     events: Receiver<ServerStreamEvent>,
@@ -54,10 +64,45 @@ pub fn spawn_actor(
     stores: ActorStores,
     clock: Box<dyn Clock + Send>,
 ) -> ActorHandle {
+    let (sum_tx, _sum_rx) = async_channel::bounded(1);
+    spawn_actor_dual(
+        state,
+        events,
+        updates,
+        sum_tx,
+        OutputMode::Detailed,
+        stores,
+        clock,
+    )
+}
+
+/// Spawn the actor thread with explicit output mode and both bridge senders.
+pub fn spawn_actor_dual(
+    state: SessionState,
+    events: Receiver<ServerStreamEvent>,
+    updates: async_channel::Sender<StreamUpdate>,
+    summaries: async_channel::Sender<SummaryUpdate>,
+    mode: OutputMode,
+    stores: ActorStores,
+    clock: Box<dyn Clock + Send>,
+) -> ActorHandle {
     let (cmd_tx, cmd_rx) = crossbeam_channel::bounded::<SessionCommand>(64);
     let join = std::thread::Builder::new()
         .name("lens-actor".into())
-        .spawn(move || run(state, events, cmd_rx, updates, stores, clock))
+        .spawn(move || {
+            run(
+                state,
+                events,
+                cmd_rx,
+                ActorOutput {
+                    updates,
+                    summaries,
+                    mode,
+                },
+                stores,
+                clock,
+            )
+        })
         .expect("actor thread");
     ActorHandle {
         commands: cmd_tx,
@@ -69,7 +114,7 @@ fn run(
     mut state: SessionState,
     events: Receiver<ServerStreamEvent>,
     commands: Receiver<SessionCommand>,
-    updates: async_channel::Sender<StreamUpdate>,
+    mut output: ActorOutput,
     stores: ActorStores,
     clock: Box<dyn Clock + Send>,
 ) {
@@ -81,6 +126,19 @@ fn run(
         match oper.index() {
             i if i == cmd_idx => match oper.recv(&commands) {
                 Ok(SessionCommand::Stop) | Err(_) => break,
+                Ok(SessionCommand::Promote) => {
+                    if output
+                        .updates
+                        .send_blocking(StreamUpdate::Rebased(Box::new(state.clone())))
+                        .is_err()
+                    {
+                        return;
+                    }
+                    output.mode = OutputMode::Detailed;
+                }
+                Ok(SessionCommand::Demote) => {
+                    output.mode = OutputMode::Summary;
+                }
             },
             i if i == ev_idx => match oper.recv(&events) {
                 Ok(event) => {
@@ -89,9 +147,22 @@ fn run(
                         batch.extend(reduce(&mut state, &next, clock.as_ref()));
                     }
                     persist_write_through(&stores, &state, &batch, clock.now_millis());
-                    for u in coalesce(batch) {
-                        if updates.send_blocking(u).is_err() {
-                            return;
+                    match output.mode {
+                        OutputMode::Detailed => {
+                            for u in coalesce(batch) {
+                                if output.updates.send_blocking(u).is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                        OutputMode::Summary => {
+                            if output
+                                .summaries
+                                .send_blocking(SummaryUpdate::from_state(&state))
+                                .is_err()
+                            {
+                                return;
+                            }
                         }
                     }
                 }
@@ -169,6 +240,8 @@ fn coalesce(batch: Updates) -> Updates {
 mod tests {
     use super::*;
     use crate::clock::ManualClock;
+    use crate::domain::controls::{Elicitation, ElicitationParams};
+    use crate::domain::ids::ElicitationId;
     use crate::domain::ids::ItemId;
     use crate::domain::ids::{ConnectionId, SessionId};
     use crate::domain::item::{BlockContext, ContentBlock, Item, ItemKind};
@@ -177,6 +250,7 @@ mod tests {
         ConnectionRecord, SqliteControlStore, SqliteTranscriptStore, TranscriptStore,
     };
     use crate::reduce::testutil::{fresh_state, parse_response};
+    use lens_client::stream::{ServerStreamEvent, SessionEvent, SessionStatusValue as WireStatus};
     use smallvec::smallvec;
     use std::path::Path;
     use std::sync::Arc;
@@ -215,6 +289,74 @@ mod tests {
             "response.output_item.done",
             r#"{"item":{"id":"fc_1","type":"function_call","status":"completed","name":"read","arguments":"{}","call_id":"toolu_1","agent":"coder"}}"#,
         )
+    }
+
+    fn sample_elicitation() -> Elicitation {
+        Elicitation {
+            id: ElicitationId::new("e1"),
+            target_session_id: SessionId::new("conv_1"),
+            params: ElicitationParams {
+                mode: "confirm".into(),
+                message: "approve?".into(),
+                url: None,
+                phase: None,
+                policy_name: None,
+                content_preview: None,
+            },
+        }
+    }
+
+    fn status_running_event() -> ServerStreamEvent {
+        ServerStreamEvent::Session(SessionEvent::Status {
+            status: WireStatus::Running,
+            response_id: None,
+            background_task_count: None,
+        })
+    }
+
+    #[test]
+    fn summary_flags_needs_attention_on_pending_elicitation() {
+        let mut s = fresh_state();
+        s.pending_elicitations.push(sample_elicitation());
+        let sum = SummaryUpdate::from_state(&s);
+        assert!(sum.needs_attention);
+    }
+
+    #[test]
+    fn summary_mode_emits_summary_not_detailed_then_promote_rebases() {
+        let _dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(_dir.path());
+        seed_connection(&stores);
+
+        let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, up_rx) = async_channel::bounded(64);
+        let (sum_tx, sum_rx) = async_channel::bounded(64);
+        let handle = spawn_actor_dual(
+            fresh_state(),
+            ev_rx,
+            up_tx,
+            sum_tx,
+            OutputMode::Summary,
+            stores,
+            test_clock(),
+        );
+
+        ev_tx.send(status_running_event()).unwrap();
+        assert!(matches!(
+            sum_rx.recv_blocking().unwrap(),
+            SummaryUpdate { .. }
+        ));
+        assert!(
+            up_rx.try_recv().is_err(),
+            "no Detailed deltas in Summary mode"
+        );
+
+        handle.commands.send(SessionCommand::Promote).unwrap();
+        assert!(matches!(
+            up_rx.recv_blocking().unwrap(),
+            StreamUpdate::Rebased(_)
+        ));
+        handle.stop_and_join();
     }
 
     #[test]
