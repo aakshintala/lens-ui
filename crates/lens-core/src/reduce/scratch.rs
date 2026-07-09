@@ -4,6 +4,24 @@ use crate::domain::item::{MessageAcc, StreamScratch};
 use crate::reduce::{StreamUpdate, Updates};
 use smallvec::smallvec;
 
+pub(crate) enum ReasoningKind {
+    Full,
+    Summary,
+}
+
+pub(crate) fn accumulate_reasoning(
+    scratch: &mut StreamScratch,
+    kind: ReasoningKind,
+    delta: &str,
+) -> Updates {
+    let acc = scratch.open_reasoning.get_or_insert_with(Default::default);
+    match kind {
+        ReasoningKind::Full => acc.full_text.push_str(delta),
+        ReasoningKind::Summary => acc.summary_text.push_str(delta),
+    }
+    smallvec![StreamUpdate::ScratchChanged]
+}
+
 pub(crate) fn accumulate_text(
     scratch: &mut StreamScratch,
     delta: &str,
@@ -48,6 +66,32 @@ mod tests {
             index,
             last: None,
         })
+    }
+
+    #[test]
+    fn reasoning_deltas_accumulate() {
+        let mut s = st();
+        reduce(
+            &mut s,
+            &ServerStreamEvent::Response(ResponseEvent::ReasoningStarted),
+            &clock(),
+        );
+        reduce(
+            &mut s,
+            &ServerStreamEvent::Response(ResponseEvent::ReasoningTextDelta { delta: "be".into() }),
+            &clock(),
+        );
+        reduce(
+            &mut s,
+            &ServerStreamEvent::Response(ResponseEvent::ReasoningTextDelta {
+                delta: "cause".into(),
+            }),
+            &clock(),
+        );
+        assert_eq!(
+            s.stream.open_reasoning.as_ref().unwrap().full_text,
+            "because"
+        );
     }
 
     #[test]

@@ -16,7 +16,7 @@ pub use update::{StreamUpdate, Updates};
 use crate::clock::Clock;
 use crate::domain::SessionState;
 use lens_client::stream::{ResponseEvent, ServerStreamEvent};
-use smallvec::SmallVec;
+use smallvec::{SmallVec, smallvec};
 
 /// Fold one event into `state`; return which parts changed (§4.1). Total over
 /// every event arm — never panics on external data (AGENTS.md).
@@ -26,16 +26,39 @@ pub fn reduce(state: &mut SessionState, event: &ServerStreamEvent, clock: &dyn C
     {
         return updates;
     }
-    if let ServerStreamEvent::Response(ResponseEvent::OutputTextDelta {
-        delta,
-        message_id,
-        index,
-        ..
-    }) = event
-    {
-        return scratch::accumulate_text(&mut state.stream, delta, message_id.as_deref(), *index);
+    if let ServerStreamEvent::Response(ev) = event {
+        if let Some(updates) = folds::fold_response_marker(state, ev) {
+            return updates;
+        }
+        return match ev {
+            ResponseEvent::OutputTextDelta {
+                delta,
+                message_id,
+                index,
+                ..
+            } => scratch::accumulate_text(&mut state.stream, delta, message_id.as_deref(), *index),
+            ResponseEvent::ReasoningStarted => {
+                state
+                    .stream
+                    .open_reasoning
+                    .get_or_insert_with(Default::default);
+                smallvec![StreamUpdate::ScratchChanged]
+            }
+            ResponseEvent::ReasoningTextDelta { delta } => scratch::accumulate_reasoning(
+                &mut state.stream,
+                scratch::ReasoningKind::Full,
+                delta,
+            ),
+            ResponseEvent::ReasoningSummaryTextDelta { delta } => scratch::accumulate_reasoning(
+                &mut state.stream,
+                scratch::ReasoningKind::Summary,
+                delta,
+            ),
+            // Item-producing / finalizing arms land in Tasks 7/8.
+            _ => SmallVec::new(),
+        };
     }
-    // Arms are filled in Tasks 6–9; unhandled events are a no-op for now.
+    // Arms are filled in Tasks 7–9; unhandled events are a no-op for now.
     let _ = clock;
     SmallVec::new()
 }

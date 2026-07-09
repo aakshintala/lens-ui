@@ -1,9 +1,12 @@
 //! Session-field scalar folds + status/usage normalization (§4.1).
 
-use crate::domain::{SandboxStatus, SessionState, SessionStatusValue, Todo, TodoStatus};
+use crate::domain::{
+    Elicitation, ElicitationId, ElicitationParams as DomainElicParams, SandboxStatus, SessionState,
+    SessionStatusValue, Todo, TodoStatus,
+};
 use crate::reduce::{StreamUpdate, Updates};
 use lens_client::stream::event::TodoItemStatus;
-use lens_client::stream::{SessionEvent, SessionStatusValue as WireStatus};
+use lens_client::stream::{ResponseEvent, SessionEvent, SessionStatusValue as WireStatus};
 use smallvec::smallvec;
 
 /// Map the 6-value wire status to the domain status (D-P1-8). Distinct types, same shape.
@@ -130,6 +133,65 @@ pub(crate) fn fold_session_field(state: &mut SessionState, ev: &SessionEvent) ->
             smallvec![StreamUpdate::AgentChanged]
         }
         SessionEvent::ChildSessionUpdated { .. } => smallvec![StreamUpdate::ChildSessionChanged],
+    })
+}
+
+/// Response lifecycle markers + elicitation folds. Returns `None` for item-producing /
+/// scratch-routing arms handled in `reduce` or later tasks.
+pub(crate) fn fold_response_marker(
+    state: &mut SessionState,
+    ev: &ResponseEvent,
+) -> Option<Updates> {
+    Some(match ev {
+        ResponseEvent::InProgress => smallvec![StreamUpdate::StatusChanged], // P1-DECISION: liveness marker
+        ResponseEvent::Failed | ResponseEvent::Incomplete | ResponseEvent::Cancelled => {
+            smallvec![]
+        }
+        ResponseEvent::CompactionInProgress | ResponseEvent::CompactionFailed => smallvec![],
+        // REVIEW#4: fold response.error into the `last_task_error` scalar banner (ErrorInfo,
+        // "present iff Failed"). NOT a transcript item — the byte-verified error-item path is
+        // `OutputItemDone(Error)`; pushing from both would double-insert. This preserves the
+        // external error data without that hazard.
+        ResponseEvent::Error { code, message, .. } => {
+            state.last_task_error = Some(crate::domain::ErrorInfo {
+                code: code.clone(),
+                message: message.clone(),
+            });
+            smallvec![StreamUpdate::StatusChanged]
+        }
+        ResponseEvent::ElicitationRequest {
+            elicitation_id,
+            params,
+        } => {
+            state.pending_elicitations.push(Elicitation {
+                id: ElicitationId::new(elicitation_id.clone()),
+                target_session_id: state.id.clone(),
+                params: DomainElicParams {
+                    mode: params.mode().to_string(),
+                    message: params.message().to_string(),
+                    url: params.url().map(str::to_string),
+                    phase: params.phase().map(str::to_string),
+                    policy_name: params.policy_name().map(str::to_string),
+                    content_preview: params.content_preview().map(str::to_string),
+                },
+            });
+            smallvec![StreamUpdate::ElicitationsChanged]
+        }
+        ResponseEvent::ElicitationResolved { elicitation_id } => {
+            state
+                .pending_elicitations
+                .retain(|e| e.id.as_str() != elicitation_id);
+            smallvec![StreamUpdate::ElicitationsChanged]
+        }
+        // item-producing / scratch-finalizing arms handled in Task 7/8:
+        ResponseEvent::OutputItemDone { .. }
+        | ResponseEvent::Completed
+        | ResponseEvent::ReasoningClosed { .. }
+        | ResponseEvent::CompactionCompleted { .. }
+        | ResponseEvent::OutputTextDelta { .. }
+        | ResponseEvent::ReasoningStarted
+        | ResponseEvent::ReasoningTextDelta { .. }
+        | ResponseEvent::ReasoningSummaryTextDelta { .. } => return None,
     })
 }
 
@@ -262,6 +324,27 @@ mod tests {
         assert_eq!(s.presence[0].joined_at, ""); // P1-DECISION: wrapper drops joined_at/idle
         assert!(!s.presence[0].idle);
         assert_eq!(&u[..], &[StreamUpdate::PresenceChanged]);
+    }
+
+    #[test]
+    fn elicitation_request_then_resolved() {
+        use crate::reduce::testutil::parse_response;
+        use lens_client::stream::ResponseEvent;
+
+        let mut s = st();
+        let req = parse_response(
+            "response.elicitation_request",
+            r#"{"elicitation_id":"e1","params":{"mode":"url","message":"ok?","url":"/a"}}"#,
+        );
+        reduce(&mut s, &req, &clock());
+        assert_eq!(s.pending_elicitations.len(), 1);
+        assert_eq!(s.pending_elicitations[0].id.as_str(), "e1");
+        let res = ServerStreamEvent::Response(ResponseEvent::ElicitationResolved {
+            elicitation_id: "e1".into(),
+        });
+        let u = reduce(&mut s, &res, &clock());
+        assert!(s.pending_elicitations.is_empty());
+        assert_eq!(&u[..], &[StreamUpdate::ElicitationsChanged]);
     }
 
     #[test]
