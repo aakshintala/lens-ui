@@ -3,13 +3,18 @@
 //! Two variants:
 //!   1. `reduce_happy_path_full_replay` — real corpus shape, small n. The
 //!      representative-shape tripwire.
-//!   2. `reduce_window_scale/build_1500_item_tail` — `push_item` (items.rs) does
-//!      a linear dedup scan over ALL items on every append, so building an
-//!      N-item tail is O(N²). happy_path keeps n tiny and HIDES this; at D11
-//!      window scale (~1500 live items) that per-append scan bounds the
-//!      reconcile tail, so this variant makes the cost visible.
+//!   2. `reduce_window_scale/build_{375,750,1500}_item_tail` — `push_item`
+//!      (items.rs) does a linear dedup scan over ALL items on every append, so
+//!      building an N-item tail is O(N²). happy_path keeps n tiny and HIDES this;
+//!      at D11 window scale (~1500 live items) that per-append scan bounds the
+//!      reconcile tail. This variant sweeps THREE sizes (each a 2× step) so the
+//!      time RATIO between them exposes the growth rate: O(N²) ⇒ ~4× per
+//!      doubling, O(N) ⇒ ~2×. A single size could only catch a constant-factor
+//!      regression; the sweep catches a complexity regression too.
 
-use criterion::{BatchSize, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{
+    BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
+};
 use lens_client::stream::decode_all;
 use lens_core::reduce::bench_push_message;
 use lens_core::{AgentId, ConnectionId, ItemId, ManualClock, SessionId, SessionState, reduce};
@@ -19,9 +24,10 @@ const HAPPY_PATH: &str = concat!(
     "/../../docs/spikes/captures/2026-06-26-sse/happy_path.stream.sse"
 );
 
-/// D11 live-window size — the ~1500-item tail the reconcile path must stay
-/// bounded against (large-transcript-latency spike).
-const WINDOW: u64 = 1500;
+/// D11 live-window sizes — a 2× sweep up to the ~1500-item tail the reconcile
+/// path must stay bounded against (large-transcript-latency spike). Three sizes
+/// so the inter-size time ratio, not just the absolute number, is the signal.
+const WINDOWS: [u64; 3] = [375, 750, 1500];
 
 fn fresh_state() -> SessionState {
     SessionState::new(
@@ -52,29 +58,35 @@ fn bench_full_replay(c: &mut Criterion) {
 
 fn bench_window_scale(c: &mut Criterion) {
     let clock = ManualClock::new(1_700_000_000_000);
-    // IDs built once, up front, so id *formatting* stays out of the timed body.
-    // The measured cost is the real per-append path at window scale — the O(n)
-    // dedup scan (String eq × n) plus item construction, exactly what `reduce`
-    // does per item. The scan is the term that dominates and regresses as the
-    // tail grows; construction is a per-append constant.
-    let ids: Vec<ItemId> = (0..WINDOW)
-        .map(|i| ItemId::new(format!("item_{i}")))
-        .collect();
-
     let mut g = c.benchmark_group("reduce_window_scale");
-    g.throughput(Throughput::Elements(WINDOW));
-    g.bench_function("build_1500_item_tail", |b| {
-        b.iter_batched(
-            fresh_state,
-            |mut s| {
-                for id in &ids {
-                    black_box(bench_push_message(&mut s, id.clone(), &clock));
-                }
-                s // return so the 1500-item state's Drop is untimed
+    for window in WINDOWS {
+        // IDs built once per size, up front, so id *formatting* stays out of the
+        // timed body. The measured cost is the real per-append path at window
+        // scale — the O(n) dedup scan (String eq × n) plus item construction,
+        // exactly what `reduce` does per item. The scan dominates and grows with
+        // the tail; construction is a per-append constant. Across sizes, the O(N²)
+        // total means each 2× step should take ~4× as long.
+        let ids: Vec<ItemId> = (0..window)
+            .map(|i| ItemId::new(format!("item_{i}")))
+            .collect();
+        g.throughput(Throughput::Elements(window));
+        g.bench_with_input(
+            BenchmarkId::new("build_item_tail", window),
+            &ids,
+            |b, ids| {
+                b.iter_batched(
+                    fresh_state,
+                    |mut s| {
+                        for id in ids {
+                            black_box(bench_push_message(&mut s, id.clone(), &clock));
+                        }
+                        s // return so the built state's Drop is untimed
+                    },
+                    BatchSize::SmallInput,
+                );
             },
-            BatchSize::SmallInput,
         );
-    });
+    }
     g.finish();
 }
 
