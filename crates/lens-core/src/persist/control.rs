@@ -185,21 +185,40 @@ impl ControlStore for SqliteControlStore {
 
     fn insert_cost_sample(
         &self,
-        _conn: &ConnectionId,
-        _id: &SessionId,
-        _sampled_at: i64,
-        _total_cost_usd: f64,
+        conn: &ConnectionId,
+        id: &SessionId,
+        sampled_at: i64,
+        total_cost_usd: f64,
     ) -> Result<()> {
-        unimplemented!("Task 5")
+        self.guard_write()?;
+        self.conn.execute(
+            "INSERT INTO cost_samples (connection_id, session_id, sampled_at, total_cost_usd)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(connection_id, session_id, sampled_at)
+               DO UPDATE SET total_cost_usd = excluded.total_cost_usd",
+            rusqlite::params![conn.as_str(), id.as_str(), sampled_at, total_cost_usd],
+        )?;
+        Ok(())
     }
+
     fn cost_samples_in(
         &self,
-        _conn: &ConnectionId,
-        _id: &SessionId,
-        _since: i64,
-        _until: i64,
+        conn: &ConnectionId,
+        id: &SessionId,
+        since: i64,
+        until: i64,
     ) -> Result<Vec<(i64, f64)>> {
-        unimplemented!("Task 5")
+        let mut stmt = self.conn.prepare(
+            "SELECT sampled_at, total_cost_usd FROM cost_samples
+             WHERE connection_id = ?1 AND session_id = ?2 AND sampled_at BETWEEN ?3 AND ?4
+             ORDER BY sampled_at",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![conn.as_str(), id.as_str(), since, until],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 }
 
@@ -441,5 +460,20 @@ mod tests {
         assert_eq!(status, "waiting"); // not "\"waiting\""
         assert_eq!(host_type, "external");
         assert_eq!(lifecycle, "active");
+    }
+
+    #[test]
+    fn cost_samples_insert_and_window_query() {
+        use crate::domain::ids::{ConnectionId, SessionId};
+        let (_d, s) = store();
+        let conn = ConnectionId::new("conn_1");
+        let sid = SessionId::new("conv_1");
+        s.insert_cost_sample(&conn, &sid, 100, 1.0).unwrap();
+        s.insert_cost_sample(&conn, &sid, 200, 2.5).unwrap();
+        s.insert_cost_sample(&conn, &sid, 300, 4.0).unwrap();
+        // Re-inserting the same sampled_at is idempotent (PK), value updated.
+        s.insert_cost_sample(&conn, &sid, 300, 4.2).unwrap();
+        let window = s.cost_samples_in(&conn, &sid, 150, 300).unwrap();
+        assert_eq!(window, vec![(200, 2.5), (300, 4.2)]);
     }
 }
