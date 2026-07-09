@@ -22,7 +22,7 @@ use smallvec::{SmallVec, smallvec};
 /// every event arm — never panics on external data (AGENTS.md).
 pub fn reduce(state: &mut SessionState, event: &ServerStreamEvent, clock: &dyn Clock) -> Updates {
     if let ServerStreamEvent::Session(ev) = event
-        && let Some(updates) = folds::fold_session_field(state, ev)
+        && let Some(updates) = folds::fold_session_field(state, ev, clock)
     {
         return updates;
     }
@@ -82,7 +82,16 @@ pub fn reduce(state: &mut SessionState, event: &ServerStreamEvent, clock: &dyn C
                     items::push_item(state, id, kind, None, clock)
                 }
             },
-            // Finalizing arms land in Task 8.
+            ResponseEvent::Completed => {
+                let mut u = items::finalize_message(state, clock);
+                state.stream.turn += 1;
+                u.push(StreamUpdate::StatusChanged);
+                u
+            }
+            ResponseEvent::ReasoningClosed { .. } => items::finalize_reasoning(state, clock),
+            ResponseEvent::CompactionCompleted { total_tokens } => {
+                items::push_compaction(state, *total_tokens, clock)
+            }
             _ => SmallVec::new(),
         };
     }

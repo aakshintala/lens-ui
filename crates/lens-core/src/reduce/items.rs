@@ -1,8 +1,9 @@
 //! Wire `stream::Item` → domain `ItemKind`; dedup-by-id; `BlockContext` stamping.
 
 use crate::clock::Clock;
+use crate::domain::item::ReasoningAcc;
 use crate::domain::item::{BlockContext, ContentBlock, Item, ItemKind, StreamScratch};
-use crate::domain::{CallId, ErrorSource, ItemId, Role, SessionState};
+use crate::domain::{AgentId, CallId, ErrorSource, ItemId, Role, SessionState};
 use crate::reduce::{StreamUpdate, Updates};
 use lens_client::stream::Item as WireItem;
 use serde_json::Value;
@@ -93,6 +94,74 @@ pub(crate) fn map_item(wire: &WireItem) -> Option<(ItemId, ItemKind)> {
 
 fn map_error_source(s: &str) -> ErrorSource {
     serde_json::from_value(Value::String(s.to_string())).unwrap_or(ErrorSource::Unknown)
+}
+
+/// Deterministic, collision-free local id for reducer-synthesized items (REVIEW#2).
+fn local_id(kind: &str, state: &SessionState) -> ItemId {
+    ItemId::new(format!("{kind}_local_{}", state.items.len()))
+}
+
+pub(crate) fn finalize_message(state: &mut SessionState, clock: &dyn Clock) -> Updates {
+    let Some(acc) = state.stream.open_message.take() else {
+        return smallvec![];
+    };
+    let id = acc
+        .message_id
+        .clone()
+        .map(ItemId::new)
+        .unwrap_or_else(|| local_id("msg", state));
+    let kind = ItemKind::Message {
+        role: Role::Assistant,
+        content: vec![ContentBlock {
+            kind: "output_text".into(),
+            text: Some(acc.text),
+            data: Value::Null,
+        }],
+    };
+    push_item(state, id, kind, None, clock)
+}
+
+pub(crate) fn finalize_reasoning(state: &mut SessionState, clock: &dyn Clock) -> Updates {
+    let Some(acc): Option<ReasoningAcc> = state.stream.open_reasoning.take() else {
+        return smallvec![];
+    };
+    let id = local_id("reasoning", state);
+    let kind = ItemKind::Reasoning {
+        full_text: acc.full_text,
+        summary_text: acc.summary_text,
+        encrypted: acc.encrypted,
+    };
+    push_item(state, id, kind, None, clock)
+}
+
+pub(crate) fn push_compaction(
+    state: &mut SessionState,
+    total_tokens: Option<i64>,
+    clock: &dyn Clock,
+) -> Updates {
+    let id = local_id("compaction", state);
+    let kind = ItemKind::Compaction {
+        summary: String::new(),
+        token_count: total_tokens.map(|t| t.max(0) as u64),
+    };
+    push_item(state, id, kind, None, clock)
+}
+
+pub(crate) fn push_agent_changed(
+    state: &mut SessionState,
+    from: AgentId,
+    to: AgentId,
+    clock: &dyn Clock,
+) -> Updates {
+    let at = clock.now_millis();
+    let id = local_id("agent_changed", state);
+    push_item(
+        state,
+        id,
+        ItemKind::AgentChanged { from, to, at },
+        None,
+        clock,
+    )
 }
 
 /// Dedup-by-id insert (D-P1-13). Present ⇒ update in place; absent ⇒ append.
@@ -199,6 +268,158 @@ mod tests {
         let u = reduce(&mut s, &second, &clock());
         assert_eq!(s.items.len(), 1); // no double-insert (D-P1-13)
         assert_eq!(&u[..], &[StreamUpdate::ItemUpdated { index: 0 }]);
+    }
+
+    use lens_client::stream::{ResponseEvent, ServerStreamEvent};
+
+    fn resp_text(delta: &str, message_id: Option<&str>, index: Option<usize>) -> ServerStreamEvent {
+        ServerStreamEvent::Response(ResponseEvent::OutputTextDelta {
+            delta: delta.into(),
+            message_id: message_id.map(str::to_string),
+            index,
+            last: None,
+        })
+    }
+
+    #[test]
+    fn completed_bumps_turn_and_finalizes_unpersisted_message() {
+        let mut s = st();
+        reduce(&mut s, &resp_text("hi", None, None), &clock());
+        reduce(
+            &mut s,
+            &ServerStreamEvent::Response(ResponseEvent::Completed),
+            &clock(),
+        );
+        assert_eq!(s.stream.turn, 1);
+        assert_eq!(s.items.len(), 1);
+        assert!(matches!(s.items[0].kind, ItemKind::Message { .. }));
+        assert_eq!(s.items[0].ctx.turn, 0); // REVIEW#1: stamped with the PRE-bump turn
+        assert!(s.stream.open_message.is_none());
+    }
+
+    #[test]
+    fn synthetic_ids_are_unique_across_same_clock_finalizes() {
+        let mut s = st();
+        let clk = clock();
+        reduce(&mut s, &resp_text("first", None, None), &clk);
+        reduce(
+            &mut s,
+            &ServerStreamEvent::Response(ResponseEvent::Completed),
+            &clk,
+        );
+        reduce(&mut s, &resp_text("second", None, None), &clk);
+        reduce(
+            &mut s,
+            &ServerStreamEvent::Response(ResponseEvent::Completed),
+            &clk,
+        );
+        assert_eq!(
+            s.items.len(),
+            2,
+            "same-clock synthetic ids collided → dedup ate one"
+        );
+        assert_ne!(s.items[0].id, s.items[1].id);
+    }
+
+    #[test]
+    fn output_item_done_unrelated_keyed_message_preserves_open_preview() {
+        let mut s = st();
+        reduce(
+            &mut s,
+            &resp_text("streaming…", Some("msg_A"), None),
+            &clock(),
+        );
+        let done_other = parse_response(
+            "response.output_item.done",
+            r#"{"item":{"id":"msg_B","type":"message","role":"assistant","content":[{"type":"output_text","text":"other"}]}}"#,
+        );
+        reduce(&mut s, &done_other, &clock());
+        assert!(
+            s.stream.open_message.is_some(),
+            "unrelated msg_B must not clear the msg_A preview"
+        );
+    }
+
+    #[test]
+    fn completed_does_not_double_insert_when_output_item_done_won() {
+        let mut s = st();
+        reduce(&mut s, &resp_text("hi", None, None), &clock());
+        let done = parse_response(
+            "response.output_item.done",
+            r#"{"item":{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"output_text","text":"hi"}]}}"#,
+        );
+        reduce(&mut s, &done, &clock());
+        reduce(
+            &mut s,
+            &ServerStreamEvent::Response(ResponseEvent::Completed),
+            &clock(),
+        );
+        assert_eq!(s.items.len(), 1);
+    }
+
+    #[test]
+    fn reasoning_closed_finalizes_item_from_scratch() {
+        let mut s = st();
+        reduce(
+            &mut s,
+            &ServerStreamEvent::Response(ResponseEvent::ReasoningStarted),
+            &clock(),
+        );
+        reduce(
+            &mut s,
+            &ServerStreamEvent::Response(ResponseEvent::ReasoningTextDelta {
+                delta: "why".into(),
+            }),
+            &clock(),
+        );
+        let closed = ServerStreamEvent::Response(ResponseEvent::ReasoningClosed {
+            full_text: "why".into(),
+            summary_text: "".into(),
+        });
+        reduce(&mut s, &closed, &clock());
+        assert!(s.stream.open_reasoning.is_none());
+        assert!(matches!(
+            &s.items[0].kind,
+            ItemKind::Reasoning { full_text, .. } if full_text == "why"
+        ));
+    }
+
+    #[test]
+    fn compaction_completed_pushes_item() {
+        let mut s = st();
+        let ev = ServerStreamEvent::Response(ResponseEvent::CompactionCompleted {
+            total_tokens: Some(8421),
+        });
+        reduce(&mut s, &ev, &clock());
+        assert!(matches!(
+            s.items[0].kind,
+            ItemKind::Compaction {
+                token_count: Some(8421),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn agent_changed_pushes_transcript_marker_with_synthesized_from() {
+        use lens_client::stream::SessionEvent;
+        let mut s = st();
+        let u = reduce(
+            &mut s,
+            &ServerStreamEvent::Session(SessionEvent::AgentChanged {
+                agent_id: "ag_2".into(),
+                agent_name: "debby".into(),
+            }),
+            &clock(),
+        );
+        let marker = s.items.iter().find_map(|it| match &it.kind {
+            ItemKind::AgentChanged { from, to, .. } => {
+                Some((from.as_str().to_string(), to.as_str().to_string()))
+            }
+            _ => None,
+        });
+        assert_eq!(marker, Some(("ag".into(), "ag_2".into())));
+        assert!(u.contains(&StreamUpdate::AgentChanged));
     }
 
     #[test]

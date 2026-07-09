@@ -1,9 +1,11 @@
 //! Session-field scalar folds + status/usage normalization (§4.1).
 
+use crate::clock::Clock;
 use crate::domain::{
     Elicitation, ElicitationId, ElicitationParams as DomainElicParams, SandboxStatus, SessionState,
     SessionStatusValue, Todo, TodoStatus,
 };
+use crate::reduce::items;
 use crate::reduce::{StreamUpdate, Updates};
 use lens_client::stream::event::TodoItemStatus;
 use lens_client::stream::{ResponseEvent, SessionEvent, SessionStatusValue as WireStatus};
@@ -50,7 +52,11 @@ pub(crate) fn fold_usage(
 }
 
 /// Session-field scalar/collection folds. Returns `None` only for arms routed elsewhere.
-pub(crate) fn fold_session_field(state: &mut SessionState, ev: &SessionEvent) -> Option<Updates> {
+pub(crate) fn fold_session_field(
+    state: &mut SessionState,
+    ev: &SessionEvent,
+    clock: &dyn Clock,
+) -> Option<Updates> {
     Some(match ev {
         SessionEvent::Status { status, .. } => {
             state.status = normalize_status(*status);
@@ -126,11 +132,14 @@ pub(crate) fn fold_session_field(state: &mut SessionState, ev: &SessionEvent) ->
             agent_id,
             agent_name,
         } => {
-            state.agent_id = crate::domain::AgentId::new(agent_id.clone());
+            let from = state.agent_id.clone();
+            let to = crate::domain::AgentId::new(agent_id.clone());
+            state.agent_id = to.clone();
             state.agent_name = Some(agent_name.clone());
             state.stream.current_agent = Some(agent_name.clone());
-            // Transcript marker pushed in Task 8 (needs push_item); scalar fold here.
-            smallvec![StreamUpdate::AgentChanged]
+            let mut u = items::push_agent_changed(state, from, to, clock);
+            u.push(StreamUpdate::AgentChanged);
+            u
         }
         SessionEvent::ChildSessionUpdated { .. } => smallvec![StreamUpdate::ChildSessionChanged],
     })
