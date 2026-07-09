@@ -71,6 +71,13 @@ impl EventStream {
 
     /// The raw event receiver, for a consumer that multiplexes it with other
     /// channels (the lens-core actor `Select`s over this + its command channel).
+    ///
+    /// Single-consumer invariant: this shares the one internal queue with
+    /// `recv()`/`try_recv()`. Exactly one consumer must drain it — the actor's
+    /// `Select` is the sole consumer once it attaches. Do not also poll via
+    /// `recv()`/`try_recv()` or clone the returned receiver concurrently;
+    /// crossbeam receivers split a stream across consumers rather than
+    /// broadcasting it.
     pub fn receiver(&self) -> &Receiver<ServerStreamEvent> {
         &self.rx
     }
@@ -462,38 +469,47 @@ mod tests {
     fn dropping_receiver_unblocks_a_parked_sender() {
         use std::time::Instant;
 
-        const CAP: usize = 2;
-        let (tx, rx) = bounded(CAP);
+        const CAP: usize = 1;
+        let (tx, rx) = bounded::<ServerStreamEvent>(CAP);
         let filler = || ServerStreamEvent::Reconnecting { attempt: 1 };
-        assert!(tx.send(filler()).is_ok());
-        assert!(tx.send(filler()).is_ok());
+        // Fill to capacity so the producer's next send MUST block.
+        tx.send(filler()).expect("prime the full channel");
 
+        // ready-signal proves the producer thread was scheduled and reached the
+        // blocking send before we drop rx (closes the "never scheduled" hole).
+        let (ready_tx, ready_rx) = bounded::<()>(1);
         let producer = std::thread::spawn(move || {
-            loop {
-                if tx.send(filler()).is_err() {
-                    return;
-                }
-            }
+            ready_tx.send(()).expect("signal about-to-block");
+            // Channel is full → this send parks until rx drops, then errors.
+            tx.send(filler()).is_err()
         });
 
-        std::thread::sleep(Duration::from_millis(50));
-        drop(rx);
+        ready_rx.recv().expect("producer reached the blocking send");
+        std::thread::sleep(Duration::from_millis(20)); // let it enter the parked send
+        drop(rx); // wake the parked sender → Err
 
-        let (done_tx, done_rx) = bounded(1);
-        let watchdog = std::thread::spawn(move || {
-            let _ = producer.join();
-            let _ = done_tx.send(());
+        // Watchdog: a regression must fail, not hang CI.
+        let (done_tx, done_rx) = bounded::<bool>(1);
+        let watch = std::thread::spawn(move || {
+            let errored = producer.join().expect("producer join");
+            let _ = done_tx.send(errored);
         });
-
         let deadline = Instant::now() + Duration::from_secs(2);
-        while done_rx.try_recv().is_err() {
+        let errored = loop {
+            if let Ok(v) = done_rx.try_recv() {
+                break v;
+            }
             assert!(
                 Instant::now() < deadline,
-                "producer failed to exit on receiver drop"
+                "parked sender was not unblocked by rx drop"
             );
             std::thread::sleep(Duration::from_millis(10));
-        }
-        watchdog.join().expect("watchdog join");
+        };
+        watch.join().expect("watchdog join");
+        assert!(
+            errored,
+            "the parked send must return Err after the receiver dropped"
+        );
     }
 
     #[test]
