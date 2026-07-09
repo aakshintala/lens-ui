@@ -27,13 +27,19 @@ struct Sample {
 
 impl Probe {
     pub fn new(stable_id: &'static str) -> Self {
-        Self { samples: Vec::new(), stable_id }
+        Self {
+            samples: Vec::new(),
+            stable_id,
+        }
     }
 
     /// Record one streaming tick: the accumulated byte length and how long the
     /// view build+notify took.
     pub fn note_tick(&mut self, bytes: usize, build: Duration) {
-        self.samples.push(Sample { bytes, build_us: build.as_micros() });
+        self.samples.push(Sample {
+            bytes,
+            build_us: build.as_micros(),
+        });
     }
 
     /// Correlation of per-tick build time vs. accumulated bytes. A value near 0

@@ -11,7 +11,7 @@ mod rowsource;
 use gpui::{App, AppContext, Application, WindowOptions};
 use gpui_component::Root;
 
-use app::{register_keybindings, HarnessView};
+use app::{HarnessView, register_keybindings};
 use backend::BackendChoice;
 
 fn parse_n() -> usize {

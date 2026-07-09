@@ -1,6 +1,6 @@
 //! Elicitation card discriminator (probe 6 composition).
 
-use gpui::{div, prelude::*, AppContext as _, Entity, IntoElement, ParentElement, Styled, Window};
+use gpui::{AppContext as _, Entity, IntoElement, ParentElement, Styled, Window, div, prelude::*};
 use gpui_component::{
     button::{Button, ButtonVariants as _},
     text::TextView,
@@ -42,7 +42,12 @@ impl ElicitationCard {
             };
         }
 
-        if fixture.structured.get("plan").and_then(|p| p.as_str()).is_some() {
+        if fixture
+            .structured
+            .get("plan")
+            .and_then(|p| p.as_str())
+            .is_some()
+        {
             return Self {
                 kind: CardKind::PlanReview,
                 schema_form: None,
@@ -79,10 +84,17 @@ impl ElicitationCard {
             .requested_schema
             .get("properties")
             .and_then(|p| p.as_object());
-        let is_binary_only = props.map(|p| {
-            p.len() <= 1 && p.contains_key("approve") && fixture.requested_schema.get("required").is_none()
-        }).unwrap_or(false)
-            || fixture.requested_schema.as_object().is_some_and(|o| o.is_empty());
+        let is_binary_only = props
+            .map(|p| {
+                p.len() <= 1
+                    && p.contains_key("approve")
+                    && fixture.requested_schema.get("required").is_none()
+            })
+            .unwrap_or(false)
+            || fixture
+                .requested_schema
+                .as_object()
+                .is_some_and(|o| o.is_empty());
 
         if is_binary_only && fixture.structured.is_null() {
             return Self {
@@ -104,11 +116,7 @@ impl ElicitationCard {
         }
     }
 
-    pub fn render(
-        &mut self,
-        window: &mut Window,
-        cx: &mut gpui::App,
-    ) -> gpui::AnyElement {
+    pub fn render(&mut self, window: &mut Window, cx: &mut gpui::App) -> gpui::AnyElement {
         match self.kind {
             CardKind::Url => div()
                 .flex()
@@ -121,11 +129,7 @@ impl ElicitationCard {
                         .text_color(gpui::rgb(0x60a5fa))
                         .child(self.fixture.url.clone().unwrap_or_default()),
                 )
-                .child(
-                    Button::new("open-url")
-                        .label("Open / Approve")
-                        .primary(),
-                )
+                .child(Button::new("open-url").label("Open / Approve").primary())
                 .into_any_element(),
             CardKind::PlanReview => {
                 let plan = self
@@ -154,7 +158,9 @@ impl ElicitationCard {
                 if let Some(form) = &self.ask_form {
                     form.update(cx, |f, cx| f.render(form, window, cx).into_any_element())
                 } else {
-                    div().child("AskUserQuestion parse failed").into_any_element()
+                    div()
+                        .child("AskUserQuestion parse failed")
+                        .into_any_element()
                 }
             }
             CardKind::Binary => div()
@@ -206,10 +212,13 @@ pub fn card_kind_for_fixture(fixture: &Fixture) -> CardKind {
         .requested_schema
         .get("properties")
         .and_then(|p| p.as_object());
-    let is_binary_only = props.map(|p| {
-        p.len() <= 1 && p.contains_key("approve")
-    }).unwrap_or(false)
-        || fixture.requested_schema.as_object().is_some_and(|o| o.is_empty());
+    let is_binary_only = props
+        .map(|p| p.len() <= 1 && p.contains_key("approve"))
+        .unwrap_or(false)
+        || fixture
+            .requested_schema
+            .as_object()
+            .is_some_and(|o| o.is_empty());
     if is_binary_only && fixture.structured.is_null() {
         CardKind::Binary
     } else {

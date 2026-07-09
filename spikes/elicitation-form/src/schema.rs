@@ -29,7 +29,9 @@ pub struct ParsedSchema {
 
 pub fn parse_requested_schema(schema: &Value) -> ParsedSchema {
     let obj = schema.as_object();
-    let properties = obj.and_then(|o| o.get("properties")).and_then(|p| p.as_object());
+    let properties = obj
+        .and_then(|o| o.get("properties"))
+        .and_then(|p| p.as_object());
     let required: Vec<String> = obj
         .and_then(|o| o.get("required"))
         .and_then(|r| r.as_array())
@@ -101,7 +103,8 @@ fn classify_property(prop: &Value) -> FieldKind {
 }
 
 fn extract_one_of_consts(one_of: &[Value]) -> Vec<String> {
-    one_of.iter()
+    one_of
+        .iter()
         .filter_map(|entry| {
             entry
                 .get("const")

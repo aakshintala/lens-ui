@@ -214,9 +214,7 @@ impl ProbeHarness {
         });
 
         let render_ok = renders < (n as u32 / 5).max(30);
-        let mut detail = format!(
-            "N={n} renders={renders} (≪{n}) mean_frame={mean_us}µs",
-        );
+        let mut detail = format!("N={n} renders={renders} (≪{n}) mean_frame={mean_us}µs",);
 
         if self.windowing_samples.len() >= 2 {
             let a = &self.windowing_samples[self.windowing_samples.len() - 2];
@@ -380,12 +378,14 @@ impl ProbeHarness {
 
     /// UX demo — follow transitions logged; N-new increments while paused.
     pub fn evaluate_ux(&mut self) {
-        let scrolled_up = self.follow_log.iter().any(|t| {
-            t.from == FollowMode::Following && t.to == FollowMode::Paused
-        });
-        let resumed = self.follow_log.iter().any(|t| {
-            t.from == FollowMode::Paused && t.to == FollowMode::Following
-        });
+        let scrolled_up = self
+            .follow_log
+            .iter()
+            .any(|t| t.from == FollowMode::Following && t.to == FollowMode::Paused);
+        let resumed = self
+            .follow_log
+            .iter()
+            .any(|t| t.from == FollowMode::Paused && t.to == FollowMode::Following);
         self.ux_demo_detail = format!(
             "follow_log={} transitions paused_appends={} (scroll up with wheel, press 7 to append, scroll to bottom to resume)",
             self.follow_log.len(),

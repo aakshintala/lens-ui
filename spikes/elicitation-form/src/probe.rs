@@ -2,7 +2,7 @@
 
 use serde_json::{Map, Value};
 
-use crate::elicitation_card::{card_kind_for_fixture, CardKind};
+use crate::elicitation_card::{CardKind, card_kind_for_fixture};
 use crate::fixtures::{self, FixtureId};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -124,7 +124,11 @@ impl ProbeHarness {
         };
     }
 
-    pub fn assert_ask_user_question(&mut self, got: &Map<String, Value>, expected: &Map<String, Value>) {
+    pub fn assert_ask_user_question(
+        &mut self,
+        got: &Map<String, Value>,
+        expected: &Map<String, Value>,
+    ) {
         // Multi-select answers are an unordered `list[str]` set (MCP content is
         // order-insignificant), so canonicalize array order before comparing —
         // otherwise the form's sorted output false-FAILs an insertion-ordered

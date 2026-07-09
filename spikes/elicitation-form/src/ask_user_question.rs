@@ -3,14 +3,14 @@
 use std::collections::HashSet;
 
 use gpui::{
-    div, prelude::*, App, AppContext as _, Entity, IntoElement, ParentElement, Styled, Window,
+    App, AppContext as _, Entity, IntoElement, ParentElement, Styled, Window, div, prelude::*,
 };
 use gpui_component::{
+    Disableable,
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
     input::{Input, InputState},
     radio::Radio,
-    Disableable,
 };
 use serde_json::{Map, Value};
 
@@ -53,11 +53,7 @@ pub struct AskUserQuestionForm {
 }
 
 impl AskUserQuestionForm {
-    pub fn new_entity(
-        payload: &Value,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> Option<Entity<Self>> {
+    pub fn new_entity(payload: &Value, window: &mut Window, cx: &mut App) -> Option<Entity<Self>> {
         let questions_raw = payload.get("questions")?.as_array()?;
         let mut questions = Vec::new();
         for entry in questions_raw {
@@ -76,10 +72,7 @@ impl AskUserQuestionForm {
                 continue;
             }
             questions.push(Question {
-                id: entry
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
+                id: entry.get("id").and_then(|v| v.as_str()).map(String::from),
                 question,
                 header: entry
                     .get("header")
@@ -97,9 +90,8 @@ impl AskUserQuestionForm {
             let states = questions
                 .iter()
                 .map(|q| {
-                    let custom_input = cx.new(|cx| {
-                        InputState::new(window, cx).placeholder("Type something")
-                    });
+                    let custom_input =
+                        cx.new(|cx| InputState::new(window, cx).placeholder("Type something"));
                     QuestionUiState {
                         key: question_key(q),
                         single_selection: None,
@@ -216,7 +208,12 @@ impl AskUserQuestionForm {
     }
 
     pub fn on_custom_input_changed(&mut self, ix: usize, cx: &gpui::App) {
-        let text = self.states[ix].custom_input.read(cx).value().trim().to_string();
+        let text = self.states[ix]
+            .custom_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
         if text.is_empty() {
             return;
         }
@@ -377,9 +374,7 @@ impl AskUserQuestionForm {
                             })
                             .into_any_element()
                     })
-                    .child(
-                        Input::new(&custom_input),
-                    ),
+                    .child(Input::new(&custom_input)),
             )
             .child(
                 div()

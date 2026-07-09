@@ -109,8 +109,8 @@ fn default_text(kind: RowKind, ix: usize) -> String {
         RowKind::OneLiner => format!("line {ix}: short transcript utterance"),
         RowKind::CodeBlock => format!("line {ix}: ```\nfn example() {{\n    // ...\n}}\n```"),
         RowKind::ImagePlaceholder => format!("line {ix}: [image attachment placeholder]"),
-        RowKind::ToolSpan => format!(
-            "line {ix}: tool span expanded — read_file(path=\"src/main.rs\") → 42 lines"
-        ),
+        RowKind::ToolSpan => {
+            format!("line {ix}: tool span expanded — read_file(path=\"src/main.rs\") → 42 lines")
+        }
     }
 }

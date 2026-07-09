@@ -1,6 +1,6 @@
 //! Shared row rendering for both backends.
 
-use gpui::{div, prelude::*, App, Pixels, SharedString, Window, px};
+use gpui::{App, Pixels, SharedString, Window, div, prelude::*, px};
 use gpui_component::text::TextView;
 
 use crate::fixture::RowKind;
@@ -50,7 +50,10 @@ pub fn render_row(state: &mut RowState, window: &mut Window, cx: &mut App) -> gp
             .w_full()
             .pb(pad)
             .p_2()
-            .child(format!("{}\n(extra tool output line)\n(more output)", state.text))
+            .child(format!(
+                "{}\n(extra tool output line)\n(more output)",
+                state.text
+            ))
             .into_any_element(),
         RowKind::OneLiner => div()
             .w_full()

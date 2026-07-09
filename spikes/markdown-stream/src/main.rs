@@ -8,8 +8,8 @@ mod sanitize;
 //   --stream      Task 5 streaming render + probe over the GFM stress fixture
 // See NOTES.md for the discovered API and findings.
 
-use gpui::{div, prelude::*, App, Application, Context, Window, WindowOptions};
-use gpui_component::{text::TextView, Root};
+use gpui::{App, Application, Context, Window, WindowOptions, div, prelude::*};
+use gpui_component::{Root, text::TextView};
 
 use render::{Source, StreamView};
 

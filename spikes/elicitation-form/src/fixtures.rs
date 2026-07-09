@@ -1,6 +1,6 @@
 //! Source-grounded fixture corpus (⚠ derived-not-byte-verified unless noted).
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FixtureId {

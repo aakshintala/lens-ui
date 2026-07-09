@@ -1,13 +1,11 @@
 //! Runtime schema → heterogeneous widget collection (the §4.3 crux).
 
-use gpui::{
-    div, prelude::*, Entity, IntoElement, ParentElement, SharedString, Styled, Window,
-};
+use gpui::{Entity, IntoElement, ParentElement, SharedString, Styled, Window, div, prelude::*};
 use gpui_component::{
+    IndexPath,
     input::{Input, InputState, NumberInput},
     select::{SearchableVec, Select, SelectState},
     switch::Switch,
-    IndexPath,
 };
 use serde_json::{Map, Value};
 
@@ -88,8 +86,10 @@ impl SchemaForm {
                     .unwrap_or(false),
             },
             FieldKind::Enum(variants) => {
-                let items: Vec<SharedString> =
-                    variants.iter().map(|s| SharedString::from(s.clone())).collect();
+                let items: Vec<SharedString> = variants
+                    .iter()
+                    .map(|s| SharedString::from(s.clone()))
+                    .collect();
                 let delegate = SearchableVec::new(items);
                 let mut initial: Option<IndexPath> = None;
                 if let Some(Value::String(s)) = &f.default_value {
@@ -187,17 +187,16 @@ impl SchemaForm {
 
     pub fn submit(&mut self, cx: &gpui::App) -> Result<Map<String, Value>, Vec<FieldError>> {
         if !self.validate(cx) {
-            return Err(
-                self.fields
-                    .iter()
-                    .filter_map(|f| {
-                        f.inline_error.as_ref().map(|msg| FieldError {
-                            key: f.key.clone(),
-                            message: msg.clone(),
-                        })
+            return Err(self
+                .fields
+                .iter()
+                .filter_map(|f| {
+                    f.inline_error.as_ref().map(|msg| FieldError {
+                        key: f.key.clone(),
+                        message: msg.clone(),
                     })
-                    .collect(),
-            );
+                })
+                .collect());
         }
 
         let mut map = Map::new();
@@ -231,19 +230,13 @@ impl SchemaForm {
             .gap_3()
             .children(self.fields.iter().enumerate().map(|(ix, field)| {
                 let key = field.key.clone();
-                let label = format!(
-                    "{}{}",
-                    field.key,
-                    if field.required { " *" } else { "" }
-                );
+                let label = format!("{}{}", field.key, if field.required { " *" } else { "" });
                 let error = field.inline_error.clone();
                 let kind_hint = kind_label(&field.kind);
 
                 let widget: gpui::AnyElement = match &field.widget {
                     FieldWidget::String { input } => Input::new(input).into_any_element(),
-                    FieldWidget::Number { input, .. } => {
-                        NumberInput::new(input).into_any_element()
-                    }
+                    FieldWidget::Number { input, .. } => NumberInput::new(input).into_any_element(),
                     FieldWidget::Bool { value } => {
                         let checked = *value;
                         let ent = entity.clone();
@@ -268,19 +261,10 @@ impl SchemaForm {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .child(
-                        div()
-                            .text_sm()
-                            .child(format!("{label} [{kind_hint}]")),
-                    )
+                    .child(div().text_sm().child(format!("{label} [{kind_hint}]")))
                     .child(widget)
                     .when_some(error, |this, err| {
-                        this.child(
-                            div()
-                                .text_xs()
-                                .text_color(gpui::rgb(0xef4444))
-                                .child(err),
-                        )
+                        this.child(div().text_xs().text_color(gpui::rgb(0xef4444)).child(err))
                     })
             }))
     }
@@ -343,9 +327,7 @@ fn read_field_value(field: &FieldState, cx: &gpui::App) -> Result<Option<Value>,
                     .map(|n| Some(Value::Number(n.into())))
                     .map_err(|_| "Invalid integer".into())
             } else {
-                let n = v
-                    .parse::<f64>()
-                    .map_err(|_| "Invalid number".to_string())?;
+                let n = v.parse::<f64>().map_err(|_| "Invalid number".to_string())?;
                 Ok(Some(
                     serde_json::Number::from_f64(n)
                         .map(Value::Number)

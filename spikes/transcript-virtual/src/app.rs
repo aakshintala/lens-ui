@@ -5,8 +5,8 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use gpui::{
-    actions, div, list, prelude::*, px, App, Context, FocusHandle, Focusable, KeyBinding,
-    ListScrollEvent, Styled, Window,
+    App, Context, FocusHandle, Focusable, KeyBinding, ListScrollEvent, Styled, Window, actions,
+    div, list, prelude::*, px,
 };
 use gpui_component::{ActiveTheme as _, v_virtual_list};
 
@@ -94,7 +94,12 @@ impl HarnessView {
         cx.notify();
     }
 
-    fn on_probe_anchor_1a(&mut self, _: &ProbeAnchor1a, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_probe_anchor_1a(
+        &mut self,
+        _: &ProbeAnchor1a,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.backend.is_at_bottom() {
             self.probes.anchor_1a = ProbeVerdict::Fail(
                 "not pinned to bottom — scroll to bottom before pressing 3".into(),
@@ -113,13 +118,19 @@ impl HarnessView {
                 }
             }
             BackendChoice::B => {
-                self.probes.assert_anchor_1a_bottom(self.backend.is_at_bottom());
+                self.probes
+                    .assert_anchor_1a_bottom(self.backend.is_at_bottom());
             }
         }
         cx.notify();
     }
 
-    fn on_anchor_1b_setup(&mut self, _: &ProbeAnchor1bSetup, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_anchor_1b_setup(
+        &mut self,
+        _: &ProbeAnchor1bSetup,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let k = self.backend.scroll_anchor_ix();
         let o = px(16.);
         self.backend.scroll_to_logical(k, o);
@@ -185,8 +196,7 @@ impl HarnessView {
         let ix = self.probes.identity_target_ix;
         self.backend.scroll_to_reveal(ix);
         self.identity_arm_assert = true;
-        self.probes.identity_detail =
-            format!("scrolling back to ix={ix} — asserting next frame");
+        self.probes.identity_detail = format!("scrolling back to ix={ix} — asserting next frame");
         cx.notify();
     }
 
@@ -270,10 +280,9 @@ impl HarnessView {
         if self.identity_arm_assert && renders > 0 {
             let before = self.probes.identity_entity_before;
             let md_before = self.probes.identity_markdown_inits_before;
-            if let (Some(before), Some(after)) = (
-                before,
-                self.backend.identity_target_entity_id(ix, cx),
-            ) {
+            if let (Some(before), Some(after)) =
+                (before, self.backend.identity_target_entity_id(ix, cx))
+            {
                 let md_after = self.backend.identity_markdown_inits(ix, cx);
                 self.probes
                     .assert_identity(before, after, md_before, md_after);
@@ -329,17 +338,15 @@ impl HarnessView {
             .p_2()
             .bg(gpui::rgb(0x111111))
             .text_color(gpui::rgb(0xeeeeee))
-            .child(
-                div().text_sm().child(format!(
-                    "{} | N={} | renders/frame={} | frame={}µs | follow={:?} | N-new={}",
-                    self.backend.label(),
-                    self.backend.item_count(),
-                    p.render_counter.this_frame,
-                    p.frame_timer.last_frame.as_micros(),
-                    p.follow_mode,
-                    p.new_while_paused
-                )),
-            )
+            .child(div().text_sm().child(format!(
+                "{} | N={} | renders/frame={} | frame={}µs | follow={:?} | N-new={}",
+                self.backend.label(),
+                self.backend.item_count(),
+                p.render_counter.this_frame,
+                p.frame_timer.last_frame.as_micros(),
+                p.follow_mode,
+                p.new_while_paused
+            )))
             .child(line("1 windowing", &p.windowing, &p.windowing_detail))
             .child(line(
                 "2 var-heights",
@@ -355,13 +362,11 @@ impl HarnessView {
             ))
             .child(line("6 identity", &p.identity, &p.identity_detail))
             .child(line("7 ux-demo", &p.ux_demo, &p.ux_demo_detail))
-            .child(
-                div().text_xs().text_color(gpui::rgb(0x888888)).child(
-                    "Keys: 1=windowing 2=var-heights 3=anchor-1a 4=1b-setup 5=1b-mutate \
+            .child(div().text_xs().text_color(gpui::rgb(0x888888)).child(
+                "Keys: 1=windowing 2=var-heights 3=anchor-1a 4=1b-setup 5=1b-mutate \
                      6=identity-off b=identity-back 7=ux-append 8=ux-eval \
                      | 9=N200 0=N2000",
-                ),
-            )
+            ))
     }
 }
 

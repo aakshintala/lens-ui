@@ -1,6 +1,6 @@
 //! Backend A — gpui native `list()` + `ListState` + `ListAlignment::Bottom`.
 
-use gpui::{div, prelude::*, App, Entity, EntityId, ListAlignment, ListState, Pixels, Window, px};
+use gpui::{App, Entity, EntityId, ListAlignment, ListState, Pixels, Window, div, prelude::*, px};
 
 use crate::fixture::Fixture;
 use crate::row_render::render_row;

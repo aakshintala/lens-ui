@@ -26,7 +26,12 @@ pub fn sanitize(md: &str) -> String {
             continue;
         }
         match ev {
-            Event::Start(Tag::Link { link_type, dest_url, title, id }) => {
+            Event::Start(Tag::Link {
+                link_type,
+                dest_url,
+                title,
+                id,
+            }) => {
                 let url = if scheme_allowed(&dest_url) {
                     dest_url
                 } else {

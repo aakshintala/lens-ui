@@ -10,7 +10,7 @@ mod schema_form;
 use gpui::{App, AppContext as _, Application, WindowOptions};
 use gpui_component::Root;
 
-use app::{register_keybindings, HarnessView};
+use app::{HarnessView, register_keybindings};
 
 fn main() {
     Application::new().run(|cx: &mut App| {

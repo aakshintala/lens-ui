@@ -1,7 +1,7 @@
 //! gpui window wiring, fixture picker, keybind-triggered probes.
 
 use gpui::{
-    actions, div, prelude::*, App, Context, FocusHandle, Focusable, KeyBinding, Styled, Window,
+    App, Context, FocusHandle, Focusable, KeyBinding, Styled, Window, actions, div, prelude::*,
 };
 use gpui_component::ActiveTheme as _;
 
@@ -9,7 +9,7 @@ use crate::ask_user_question::AskUserQuestionForm;
 use crate::elicitation_card::ElicitationCard;
 use crate::fixtures::{self, Fixture, FixtureId};
 use crate::probe::{ProbeHarness, ProbeVerdict};
-use crate::schema::{parse_requested_schema, FieldKind};
+use crate::schema::{FieldKind, parse_requested_schema};
 use crate::schema_form::SchemaForm;
 
 actions!(
@@ -93,7 +93,12 @@ impl HarnessView {
         });
     }
 
-    fn on_probe_runtime(&mut self, _: &ProbeRuntimeForm, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_probe_runtime(
+        &mut self,
+        _: &ProbeRuntimeForm,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.run_runtime_form(window, cx);
         cx.notify();
     }
@@ -109,7 +114,12 @@ impl HarnessView {
         });
     }
 
-    fn on_probe_type_coverage(&mut self, _: &ProbeTypeCoverage, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_probe_type_coverage(
+        &mut self,
+        _: &ProbeTypeCoverage,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.run_type_coverage(window, cx);
         cx.notify();
     }
@@ -137,7 +147,12 @@ impl HarnessView {
         });
     }
 
-    fn on_probe_constraints(&mut self, _: &ProbeConstraints, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_probe_constraints(
+        &mut self,
+        _: &ProbeConstraints,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.run_constraints(window, cx);
         cx.notify();
     }
@@ -157,7 +172,12 @@ impl HarnessView {
         });
     }
 
-    fn on_probe_round_trip(&mut self, _: &ProbeRoundTrip, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_probe_round_trip(
+        &mut self,
+        _: &ProbeRoundTrip,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.run_round_trip(window, cx);
         cx.notify();
     }
@@ -193,7 +213,12 @@ impl HarnessView {
         self.probes.assert_composition();
     }
 
-    fn on_probe_composition(&mut self, _: &ProbeComposition, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_probe_composition(
+        &mut self,
+        _: &ProbeComposition,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.run_composition(window, cx);
         cx.notify();
     }
@@ -286,18 +311,28 @@ impl HarnessView {
             .p_2()
             .bg(gpui::rgb(0x111111))
             .text_color(gpui::rgb(0xeeeeee))
-            .child(
-                div().text_sm().child(format!(
-                    "fixture={} card={:?} | [←/→] fixture 1–6 probes",
-                    self.fixture_id.label(),
-                    self.card.kind
-                )),
-            )
-            .child(line("1 runtime-form", &p.runtime_form, &p.runtime_form_detail))
-            .child(line("2 type-coverage", &p.type_coverage, &p.type_coverage_detail))
+            .child(div().text_sm().child(format!(
+                "fixture={} card={:?} | [←/→] fixture 1–6 probes",
+                self.fixture_id.label(),
+                self.card.kind
+            )))
+            .child(line(
+                "1 runtime-form",
+                &p.runtime_form,
+                &p.runtime_form_detail,
+            ))
+            .child(line(
+                "2 type-coverage",
+                &p.type_coverage,
+                &p.type_coverage_detail,
+            ))
             .child(line("3 constraints", &p.constraints, &p.constraints_detail))
             .child(line("4 round-trip", &p.round_trip, &p.round_trip_detail))
-            .child(line("5 ask-user", &p.ask_user_question, &p.ask_user_question_detail))
+            .child(line(
+                "5 ask-user",
+                &p.ask_user_question,
+                &p.ask_user_question_detail,
+            ))
             .child(line("6 composition", &p.composition, &p.composition_detail))
     }
 }

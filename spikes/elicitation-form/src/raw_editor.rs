@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use gpui::{div, prelude::*, Entity, IntoElement, ParentElement, Styled, Window};
+use gpui::{Entity, IntoElement, ParentElement, Styled, Window, div, prelude::*};
 use gpui_component::input::{Input, InputState};
 
 use crate::schema::ParsedSchema;
@@ -50,11 +50,7 @@ impl RawKeyValueEditor {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .child(
-                        div()
-                            .text_sm()
-                            .child(format!("{key} (raw)")),
-                    )
+                    .child(div().text_sm().child(format!("{key} (raw)")))
                     .child(Input::new(state))
             }))
             .child(

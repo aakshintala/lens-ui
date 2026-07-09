@@ -3,9 +3,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use gpui::{
-    div, prelude::*, App, Entity, EntityId, Pixels, Size, Window, point, px, size,
-};
+use gpui::{App, Entity, EntityId, Pixels, Size, Window, div, point, prelude::*, px, size};
 use gpui_component::VirtualListScrollHandle;
 
 use crate::anchor::{derive_anchor, scroll_y_for_anchor};
@@ -61,12 +59,7 @@ impl BackendB {
     }
 
     fn sizes_from_heights(heights: &[Pixels]) -> Rc<Vec<Size<Pixels>>> {
-        Rc::new(
-            heights
-                .iter()
-                .map(|&h| size(px(0.), h))
-                .collect::<Vec<_>>(),
-        )
+        Rc::new(heights.iter().map(|&h| size(px(0.), h)).collect::<Vec<_>>())
     }
 
     fn resync_heights(&mut self, cx: &mut App) {
@@ -84,10 +77,7 @@ impl BackendB {
     }
 
     pub fn derived_anchor(&self) -> AnchorSnapshot {
-        derive_anchor(
-            self.scroll_handle.offset().y,
-            &self.item_heights.borrow(),
-        )
+        derive_anchor(self.scroll_handle.offset().y, &self.item_heights.borrow())
     }
 
     pub fn is_at_bottom(&self) -> bool {
@@ -114,7 +104,8 @@ impl BackendB {
     }
 
     pub fn scroll_to_reveal(&mut self, ix: usize) {
-        self.scroll_handle.scroll_to_item(ix, gpui::ScrollStrategy::Top);
+        self.scroll_handle
+            .scroll_to_item(ix, gpui::ScrollStrategy::Top);
         self.follow_bottom = false;
     }
 
