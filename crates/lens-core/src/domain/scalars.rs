@@ -26,6 +26,11 @@ pub enum ErrorSource {
 pub enum HostType {
     External,
     Managed,
+    /// Any `host_type` literal this version does not know. Churn-safe so a
+    /// future/Bridge-written token degrades rather than failing a whole
+    /// `list_sessions` load (§6.3 / persist D-P2-8).
+    #[serde(other)]
+    Unknown,
 }
 
 /// Lens-local lifecycle (§2.2). Distinct from the server `archived` flag.
@@ -35,6 +40,10 @@ pub enum SessionLifecycle {
     Active,
     Slept,
     Deleted,
+    /// Any `lifecycle` literal this version does not know (churn-safe, §6.3 /
+    /// persist D-P2-8).
+    #[serde(other)]
+    Unknown,
 }
 
 /// Canonical fine-grained status (§2.2). The full 5-state set is only observable

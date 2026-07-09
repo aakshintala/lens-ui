@@ -476,4 +476,36 @@ mod tests {
         let window = s.cost_samples_in(&conn, &sid, 150, 300).unwrap();
         assert_eq!(window, vec![(200, 2.5), (300, 4.2)]);
     }
+
+    #[test]
+    fn unknown_host_type_and_lifecycle_tokens_degrade_not_fail_the_list() {
+        // Review#end-of-branch: a future/Bridge-written enum token must degrade to
+        // `Unknown`, never abort the whole `list_sessions` load (§6.3 / D-P2-8).
+        use crate::domain::ids::{AgentId, ConnectionId, SessionId};
+        use crate::domain::scalars::{HostType, SessionLifecycle};
+        let (_d, s) = store();
+        let conn = ConnectionId::new("conn_1");
+        s.upsert_connection(&ConnectionRecord {
+            id: conn.clone(),
+            base_url: "u".into(),
+            auth_kind: "none".into(),
+            label: None,
+            server_info: None,
+            created_at: 1,
+        })
+        .unwrap();
+        let st = SessionState::new(conn.clone(), SessionId::new("conv_1"), AgentId::new("a"));
+        s.upsert_session(&st, 1).unwrap();
+        // Simulate a newer writer / Bridge storing tokens this build doesn't know.
+        s.conn
+            .execute(
+                "UPDATE sessions SET host_type = 'sandboxed', lifecycle = 'snoozed' WHERE id = 'conv_1'",
+                [],
+            )
+            .unwrap();
+        let sessions = s.list_sessions(&conn).unwrap(); // MUST NOT Err
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].host_type, HostType::Unknown);
+        assert_eq!(sessions[0].lifecycle, SessionLifecycle::Unknown);
+    }
 }
