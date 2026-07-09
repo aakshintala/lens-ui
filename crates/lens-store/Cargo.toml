@@ -7,9 +7,12 @@ license = "MIT"
 authors = ["Amogh Akshintala"]
 
 [dependencies]
-gpui = { version = "0.2.2", features = ["test-support"] }
+gpui = "0.2.2"
 lens-core = { path = "../lens-core" }
 async-channel = "2"
+
+[dev-dependencies]
+gpui = { version = "0.2.2", features = ["test-support"] }
 
 [lints]
 workspace = true
