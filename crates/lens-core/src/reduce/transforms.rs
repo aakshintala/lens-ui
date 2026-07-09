@@ -43,6 +43,7 @@ pub fn merge_text_for_display(items: &[Item]) -> Vec<Item> {
                 content: pcontent,
             } = &mut prev.kind
             && prole == role
+            && prev.ctx.agent == it.ctx.agent
         {
             pcontent.extend(content.iter().cloned());
             continue;
@@ -143,6 +144,31 @@ mod tests {
         let out = only_agent(&items, "coder");
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].id.as_str(), "m1");
+    }
+
+    #[test]
+    fn merge_text_for_display_merges_same_agent_only() {
+        let mut a = msg_item("m1", "hello");
+        a.ctx.agent = Some("coder".into());
+        let mut b = msg_item("m2", " world");
+        b.ctx.agent = Some("coder".into());
+        let merged = merge_text_for_display(&[a, b]);
+        assert_eq!(merged.len(), 1);
+        match &merged[0].kind {
+            ItemKind::Message { content, .. } => {
+                assert_eq!(content.len(), 2);
+                assert_eq!(content[0].text.as_deref(), Some("hello"));
+                assert_eq!(content[1].text.as_deref(), Some(" world"));
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let mut x = msg_item("m3", "a");
+        x.ctx.agent = Some("coder".into());
+        let mut y = msg_item("m4", "b");
+        y.ctx.agent = Some("researcher".into());
+        let split = merge_text_for_display(&[x, y]);
+        assert_eq!(split.len(), 2);
     }
 
     #[test]

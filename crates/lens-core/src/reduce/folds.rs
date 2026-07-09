@@ -59,7 +59,11 @@ pub(crate) fn fold_session_field(
 ) -> Option<Updates> {
     Some(match ev {
         SessionEvent::Status { status, .. } => {
-            state.status = normalize_status(*status);
+            let normalized = normalize_status(*status);
+            state.status = normalized;
+            if normalized != SessionStatusValue::Failed {
+                state.last_task_error = None;
+            }
             smallvec![StreamUpdate::StatusChanged]
         }
         SessionEvent::Model { model } => {
@@ -99,8 +103,8 @@ pub(crate) fn fold_session_field(
             smallvec![StreamUpdate::TerminalPendingChanged]
         }
         // Marker-only (D-P1-19): no P1 field home / liveness only.
-        SessionEvent::TerminalActivity { .. } => smallvec![StreamUpdate::TerminalPendingChanged],
-        SessionEvent::ChangedFilesInvalidated { .. }
+        SessionEvent::TerminalActivity { .. }
+        | SessionEvent::ChangedFilesInvalidated { .. }
         | SessionEvent::Interrupted { .. }
         | SessionEvent::Superseded { .. }
         | SessionEvent::InputConsumed { .. } => return Some(smallvec![]),
@@ -354,6 +358,60 @@ mod tests {
         let u = reduce(&mut s, &res, &clock());
         assert!(s.pending_elicitations.is_empty());
         assert_eq!(&u[..], &[StreamUpdate::ElicitationsChanged]);
+    }
+
+    #[test]
+    fn non_failed_status_clears_last_task_error() {
+        let mut s = st();
+        s.last_task_error = Some(crate::domain::ErrorInfo {
+            code: "E1".into(),
+            message: "boom".into(),
+        });
+        reduce(
+            &mut s,
+            &ServerStreamEvent::Session(SessionEvent::Status {
+                status: WireStatus::Idle,
+                response_id: None,
+                background_task_count: None,
+            }),
+            &clock(),
+        );
+        assert_eq!(s.last_task_error, None);
+    }
+
+    #[test]
+    fn failed_status_preserves_last_task_error() {
+        let mut s = st();
+        let err = crate::domain::ErrorInfo {
+            code: "E1".into(),
+            message: "boom".into(),
+        };
+        s.last_task_error = Some(err.clone());
+        reduce(
+            &mut s,
+            &ServerStreamEvent::Session(SessionEvent::Status {
+                status: WireStatus::Failed,
+                response_id: None,
+                background_task_count: None,
+            }),
+            &clock(),
+        );
+        assert_eq!(s.last_task_error, Some(err));
+    }
+
+    #[test]
+    fn terminal_activity_is_marker_only_no_pending_change() {
+        let mut s = st();
+        assert!(!s.terminal_pending);
+        let u = reduce(
+            &mut s,
+            &ServerStreamEvent::Session(SessionEvent::TerminalActivity {
+                terminal_id: "term_1".into(),
+            }),
+            &clock(),
+        );
+        assert!(u.is_empty());
+        assert!(!s.terminal_pending);
     }
 
     #[test]

@@ -70,25 +70,44 @@ pub fn reduce(state: &mut SessionState, event: &ServerStreamEvent, clock: &dyn C
                     // REVIEW#5 / D-P1-12: the canonical Message supersedes the streaming preview ONLY
                     // when it is the SAME message — match by message_id (None ⇒ untracked single
                     // preview for this turn, safe to clear). An unrelated keyed preview is preserved.
+                    let mut cleared = false;
                     if let crate::domain::ItemKind::Message { .. } = &kind {
-                        let clears = state.stream.open_message.as_ref().is_some_and(|acc| {
+                        cleared = state.stream.open_message.as_ref().is_some_and(|acc| {
                             acc.message_id.is_none()
                                 || acc.message_id.as_deref() == Some(id.as_str())
                         });
-                        if clears {
+                        if cleared {
                             state.stream.open_message = None;
                         }
                     }
-                    items::push_item(state, id, kind, None, clock)
+                    let mut u = items::push_item(state, id, kind, None, clock);
+                    if cleared {
+                        u.push(StreamUpdate::ScratchChanged);
+                    }
+                    u
                 }
             },
             ResponseEvent::Completed => {
+                let had_open_msg = state.stream.open_message.is_some();
+                let had_open_reasoning = state.stream.open_reasoning.is_some();
                 let mut u = items::finalize_message(state, clock);
-                state.stream.turn += 1;
+                let mut ru = items::finalize_reasoning(state, clock);
+                u.append(&mut ru);
+                state.stream.turn = state.stream.turn.saturating_add(1);
+                if had_open_msg || had_open_reasoning {
+                    u.push(StreamUpdate::ScratchChanged);
+                }
                 u.push(StreamUpdate::StatusChanged);
                 u
             }
-            ResponseEvent::ReasoningClosed { .. } => items::finalize_reasoning(state, clock),
+            ResponseEvent::ReasoningClosed { .. } => {
+                let had = state.stream.open_reasoning.is_some();
+                let mut u = items::finalize_reasoning(state, clock);
+                if had {
+                    u.push(StreamUpdate::ScratchChanged);
+                }
+                u
+            }
             ResponseEvent::CompactionCompleted { total_tokens } => {
                 items::push_compaction(state, *total_tokens, clock)
             }

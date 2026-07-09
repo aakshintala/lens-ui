@@ -98,7 +98,14 @@ fn map_error_source(s: &str) -> ErrorSource {
 
 /// Deterministic, collision-free local id for reducer-synthesized items (REVIEW#2).
 fn local_id(kind: &str, state: &SessionState) -> ItemId {
-    ItemId::new(format!("{kind}_local_{}", state.items.len()))
+    let mut n = state.items.len();
+    loop {
+        let candidate = ItemId::new(format!("{kind}_local_{n}"));
+        if !state.items.iter().any(|it| it.id == candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
 }
 
 pub(crate) fn finalize_message(state: &mut SessionState, clock: &dyn Clock) -> Updates {
@@ -420,6 +427,97 @@ mod tests {
         });
         assert_eq!(marker, Some(("ag".into(), "ag_2".into())));
         assert!(u.contains(&StreamUpdate::AgentChanged));
+    }
+
+    #[test]
+    fn local_id_probes_past_existing_collision() {
+        let mut s = st();
+        let clk = clock();
+        // Seed a real item whose id would collide with the first synthesized reasoning id.
+        let seeded = parse_response(
+            "response.output_item.done",
+            r#"{"item":{"id":"reasoning_local_1","type":"message","role":"assistant","content":[{"type":"output_text","text":"real"}]}}"#,
+        );
+        reduce(&mut s, &seeded, &clk);
+        assert_eq!(s.items.len(), 1);
+        assert_eq!(s.items[0].id.as_str(), "reasoning_local_1");
+
+        reduce(
+            &mut s,
+            &ServerStreamEvent::Response(ResponseEvent::ReasoningStarted),
+            &clk,
+        );
+        reduce(
+            &mut s,
+            &ServerStreamEvent::Response(ResponseEvent::ReasoningTextDelta {
+                delta: "synth".into(),
+            }),
+            &clk,
+        );
+        reduce(
+            &mut s,
+            &ServerStreamEvent::Response(ResponseEvent::ReasoningClosed {
+                full_text: "synth".into(),
+                summary_text: "".into(),
+            }),
+            &clk,
+        );
+        assert_eq!(
+            s.items.len(),
+            2,
+            "synthesized reasoning must append, not overwrite"
+        );
+        assert_eq!(s.items[0].id.as_str(), "reasoning_local_1");
+        assert_eq!(s.items[1].id.as_str(), "reasoning_local_2");
+    }
+
+    #[test]
+    fn output_item_done_clears_preview_emits_scratch_changed() {
+        let mut s = st();
+        reduce(&mut s, &resp_text("hi", None, None), &clock());
+        let done = parse_response(
+            "response.output_item.done",
+            r#"{"item":{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"output_text","text":"hi"}]}}"#,
+        );
+        let u = reduce(&mut s, &done, &clock());
+        assert!(u.contains(&StreamUpdate::ScratchChanged));
+        assert!(s.stream.open_message.is_none());
+    }
+
+    #[test]
+    fn completed_clears_preview_emits_scratch_changed() {
+        let mut s = st();
+        reduce(&mut s, &resp_text("hi", None, None), &clock());
+        let u = reduce(
+            &mut s,
+            &ServerStreamEvent::Response(ResponseEvent::Completed),
+            &clock(),
+        );
+        assert!(u.contains(&StreamUpdate::ScratchChanged));
+        assert!(s.stream.open_message.is_none());
+    }
+
+    #[test]
+    fn reasoning_closed_emits_scratch_changed() {
+        let mut s = st();
+        reduce(
+            &mut s,
+            &ServerStreamEvent::Response(ResponseEvent::ReasoningStarted),
+            &clock(),
+        );
+        reduce(
+            &mut s,
+            &ServerStreamEvent::Response(ResponseEvent::ReasoningTextDelta {
+                delta: "why".into(),
+            }),
+            &clock(),
+        );
+        let closed = ServerStreamEvent::Response(ResponseEvent::ReasoningClosed {
+            full_text: "why".into(),
+            summary_text: "".into(),
+        });
+        let u = reduce(&mut s, &closed, &clock());
+        assert!(u.contains(&StreamUpdate::ScratchChanged));
     }
 
     #[test]
