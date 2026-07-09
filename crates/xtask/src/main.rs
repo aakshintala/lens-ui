@@ -105,7 +105,8 @@ fn main() -> Result<()> {
     match cmd.as_str() {
         "codegen" => codegen(),
         "drift" => drift(std::env::args().skip(2)),
-        other => bail!("unknown xtask command: {other:?} (expected: codegen | drift)"),
+        "gate" => gate(),
+        other => bail!("unknown xtask command: {other:?} (expected: codegen | drift | gate)"),
     }
 }
 
@@ -249,6 +250,117 @@ fn drift(mut args: impl Iterator<Item = String>) -> Result<()> {
         client_paths(&vendored).len(),
         against.display()
     );
+    Ok(())
+}
+
+/// Run one `cargo <args>` and fail loudly on a non-zero exit.
+fn run(args: &[&str]) -> Result<()> {
+    eprintln!("$ cargo {}", args.join(" "));
+    let status = std::process::Command::new("cargo")
+        .args(args)
+        .status()
+        .context("spawn cargo")?;
+    if !status.success() {
+        bail!(
+            "`cargo {}` failed (exit {:?})",
+            args.join(" "),
+            status.code()
+        );
+    }
+    Ok(())
+}
+
+/// The "CI = us running everything" wall (memory benchmark-validity-audit): fmt →
+/// clippy (feature matrix) → test → bench compile-only → drift. Scoped to the
+/// production crates; `spikes/*` opt out of the lint bar by design. Bench NUMBERS
+/// are not pass/fail (no CI history to regress against yet) — `--no-run` only
+/// guards the harness against bit-rot.
+fn gate() -> Result<()> {
+    run(&[
+        "fmt",
+        "-p",
+        "lens-core",
+        "-p",
+        "lens-client",
+        "-p",
+        "lens-capture",
+        "-p",
+        "xtask",
+        "--",
+        "--check",
+    ])?;
+
+    // Default features across every production crate.
+    run(&[
+        "clippy",
+        "-p",
+        "lens-core",
+        "-p",
+        "lens-client",
+        "-p",
+        "lens-capture",
+        "-p",
+        "xtask",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings",
+    ])?;
+    // lens-client's feature combos compile different target sets; the live-tests
+    // clippy pass catches lints the bench build misses (memory lens-client-benchmarks).
+    run(&[
+        "clippy",
+        "-p",
+        "lens-client",
+        "--all-targets",
+        "--features",
+        "bench",
+        "--",
+        "-D",
+        "warnings",
+    ])?;
+    run(&[
+        "clippy",
+        "-p",
+        "lens-client",
+        "--all-targets",
+        "--features",
+        "live-tests",
+        "--",
+        "-D",
+        "warnings",
+    ])?;
+
+    // Tests: default features only (live-tests need a running server).
+    run(&[
+        "test",
+        "-p",
+        "lens-core",
+        "-p",
+        "lens-client",
+        "-p",
+        "lens-capture",
+        "-p",
+        "xtask",
+    ])?;
+
+    // Bench harness must still COMPILE (bit-rot guard); criterion sampling is
+    // deliberately NOT run here (minutes of wall-clock).
+    run(&[
+        "bench",
+        "-p",
+        "lens-client",
+        "--features",
+        "bench",
+        "--no-run",
+    ])?;
+    run(&["bench", "-p", "lens-core", "--no-run"])?;
+
+    // Contract drift vs the sibling omnigent pin. A MISSING sibling is a setup
+    // bug, not a pass — drift() bails on an unreadable spec and we propagate that.
+    drift(std::iter::empty())?;
+
+    println!("gate: all checks passed");
     Ok(())
 }
 

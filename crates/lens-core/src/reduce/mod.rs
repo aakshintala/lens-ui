@@ -18,6 +18,36 @@ use crate::domain::SessionState;
 use lens_client::stream::{ResponseEvent, ServerStreamEvent};
 use smallvec::{SmallVec, smallvec};
 
+/// Bench-only seam (doc-hidden, not the public contract): append one synthetic
+/// assistant message through the same internal `push_item` path the reducer uses
+/// — including its linear dedup scan over `state.items` (items.rs). Window-scale
+/// benches use this to build a large item tail without synthesizing opaque wire
+/// events. Always compiled (trivial, no extra deps) so `cargo bench -p lens-core
+/// --no-run` needs no feature flag.
+#[doc(hidden)]
+pub fn bench_push_message(
+    state: &mut SessionState,
+    id: crate::domain::ItemId,
+    clock: &dyn Clock,
+) -> Updates {
+    use crate::domain::Role;
+    use crate::domain::item::{ContentBlock, ItemKind};
+    items::push_item(
+        state,
+        id,
+        ItemKind::Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock {
+                kind: "text".into(),
+                text: Some("bench".into()),
+                data: serde_json::Value::Null,
+            }],
+        },
+        None,
+        clock,
+    )
+}
+
 /// Fold one event into `state`; return which parts changed (§4.1). Total over
 /// every event arm — never panics on external data (AGENTS.md).
 pub fn reduce(state: &mut SessionState, event: &ServerStreamEvent, clock: &dyn Clock) -> Updates {

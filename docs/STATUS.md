@@ -303,11 +303,25 @@ and roll older "Recent" pointers off this page as they age.
   tasks; grounded in real gpui-0.2.2 bridge API + reader.rs + P1/P2 surfaces; scratch
   representation decided `ScratchChanged(Arc<StreamScratch>)`+coalesce). Tasks 1 & 5
   are the MANDATORY cross-family-review seams (lens-client channel swap; run-loop).
-  **Bench-validity audit done + PARKED** (memory `benchmark-validity-audit-2026-07`):
-  sse bench good; reduce bench hides the per-item linear dedup scan (needs a
-  window-scale variant); persist bench conflates DB-open with writes + is non-bimodal
-  (fix both) + wire an `xtask gate` (`cargo bench --no-run`, no full criterion in-gate).
-  **NEXT (two fresh sessions):** (1) bench-hardening + `xtask gate`; (2) execute P3-1.
+  **Bench-hardening + `xtask gate`: DONE** (2026-07-09, memory
+  `benchmark-validity-audit-2026-07`; inline-authored + free-codex cross-family
+  review → 2 catches applied). (1) `reduce_throughput.rs` — added
+  `reduce_window_scale/build_1500_item_tail` variant that makes `push_item`'s O(n)
+  linear dedup scan visible: **1.20ms** to build a 1500-item tail vs **1.20µs** for
+  the whole happy-path replay (the O(n²) tripwire, previously hidden); `fresh_state()`
+  moved to `iter_batched` setup. Seam = doc-hidden `reduce::bench_push_message`
+  (always-compiled, no feature). (2) `persist_throughput.rs` — DB-open (WAL+DDL) +
+  teardown (close/file-delete/dealloc) moved OUT of the timed body via `iter_batched`
+  setup + return-outputs; bimodal corpus (5×200KB blobs + 195×~130B markers, spike-
+  matched) → **~15ms** now measures a realistic 1MB write+reload, not open cost. (3)
+  New **`cargo run -p xtask -- gate`**: fmt → clippy (feature matrix: default +
+  lens-client `bench`/`live-tests`) → test → `cargo bench --no-run` (compile-only,
+  no criterion sampling) → `drift`. Scoped to production crates (`spikes/*` opt out);
+  a missing sibling omnigent spec **hard-fails** (via `read_json`), never silently
+  skips. Codex caught both benches charging teardown to the timed body (fixed) +
+  overstated reduce comment; the gate caught its own unformatted code + a dead import.
+  **NEXT (fresh session):** execute P3-1
+  (`docs/superpowers/plans/2026-07-09-state-model-p3-1-actor-foundation.md`).
 - **2026-07-09** — **state-model P3 GRILLING — CLOSED (session 2).** The 4 open
   branches resolved as **D15–D18** in new
   [`spec §2.2`](./superpowers/specs/2026-07-08-state-model-engine-design.md)
