@@ -285,6 +285,40 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Recent
 
+- **2026-07-08** — **state-model engine P2 (lens-core persistence) EXECUTED & MERGED
+  to main** (`25e4e09..978fb85`, 9 commits, ff-merge + push; composer-2.5 full-plan
+  build + **Opus-only reviews** — Codex/gpt-5.5 + non-Composer Cursor out of credits,
+  so cross-family diversity came from Opus-reviewing-composer). The §6 two-tier local
+  store in `crates/lens-core/src/persist/`: role traits `ControlStore` (`lens.db`:
+  connections/sessions/cost_samples/meta) + `TranscriptStore` (per-session file
+  `transcripts/<conn>/<conv>.db`: items + self-describing meta), SQLite impls over
+  `rusqlite` **bundled** + WAL + `foreign_keys=ON`. Exposes load/upsert/**reconcile-by-
+  item-id** primitives; per-file `schema_version` gate (unknown/corrupt future version →
+  **read-only-degraded**, never a hard open failure). **79 tests** (77 unit + 2
+  integration), clippy `-D warnings` + fmt clean, `generated.rs`/lens-client untouched;
+  `persist_throughput` bench ~13.7ms/(200 upserts+load), I/O-bound. Plan:
+  [`docs/superpowers/plans/2026-07-08-state-model-p2-persistence.md`](./superpowers/plans/2026-07-08-state-model-p2-persistence.md).
+  **Reviews:** plan Opus pre-build review (SHIP-WITH-FIXES → 9 findings `REVIEW#n`
+  applied incl. 2 §6.3-contract bugs: corrupt-version hard-Err on open; WAL/DDL mutating
+  a file before the version gate — column-mapping + reconcile SQL verified correct);
+  Opus end-of-branch review (SHIP-WITH-FIXES → 1 IMPORTANT: **`HostType`/`SessionLifecycle`
+  lacked `#[serde(other)]`** so an unknown host_type/lifecycle token aborted the whole
+  `list_sessions` — fixed + regression test). **Key decisions (D-P2-1..9, in the plan):**
+  two role traits (no god-trait); lossless `cost_json` companion + denormalized Bridge
+  projections; `terminal_pending` persisted (P1 contract vs §6.2 sketch); store-managed
+  cols (`pinned`/`last_status`/`tombstoned_at`) preserved via ON-CONFLICT omission;
+  live-stream chrome (`model_options`/`sandbox_status`/`pending_elicitations`) +
+  `presence`/`stream`/`pending_user` RAM-only, re-derived on wake; `load_session` returns
+  a disk-snapshot (items empty). **Deferred hardening (non-blocking, noted for P3):**
+  list/load paths are all-or-nothing on a genuinely-corrupt row (no per-row
+  skip — lens-core has no logging seam); `ItemKind` can't `#[serde(other)]` (internally
+  tagged) so an unknown transcript `kind` fails that load; `created_at=excluded` re-upsert
+  could clobber with 0 if the actor upserts a fresh state pre-bootstrap (P3 upsert-timing
+  concern). **Next: P3 — actor + store + commands (`lens-core/actor` + `lens-store`,
+  §8/§7/§13.1): walking skeleton first (fake event → reduce → StreamUpdate over bounded
+  channel → SessionStore replica → cx.notify), then actor run-loop, command semantics
+  (§7 optimistic-send × reconnect reconcile), bootstrap/reconnect wiring that CALLS the
+  P2 primitives. Fresh session (cost/context policy).**
 - **2026-07-08** — **state-model engine P1 (lens-core pure reducer) EXECUTED & MERGED
   to main** (`7959391..8a9a456`, 13 commits, ff-merge + push; subagent-driven:
   composer-2.5 per-task TDD + gate + Opus/gpt-5.5 dual end-review, per CLAUDE.md). The
