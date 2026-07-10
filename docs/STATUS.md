@@ -285,6 +285,28 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Recent
 
+- **2026-07-09** — **state-model P3-2 PLANNED + D16 live-verify rider RESOLVED.** Plan
+  `docs/superpowers/plans/2026-07-09-state-model-p3-2-command-semantics.md` (`bc3082d`,
+  10 TDD tasks). **Authored by grok-4.5-xhigh** (cursor-delegate, model-eval experiment),
+  **reviewed by Opus cross-family** with every claim verified against the tree — satisfies
+  the MANDATORY diversity rule (grok = non-Claude author). Grok independently found **two
+  verified prerequisites** the brief missed: `cleared_pending_id` dropped at
+  `event.rs:314` (`RawInputConsumedData` parses only `item_id`+`type`) and `pending_inputs`
+  unmodeled on `SessionSnapshot` — both on the wire, load-bearing for D16 reconcile
+  (Tasks 2–3). Opus revisions applied: split Task 7 live-`Consumed` precedence vs snapshot
+  keep/drop/lost table + decisive reducer-placement; **Risk 5a** (actor `Select` deaf to
+  `Stop` while blocked in `send_event` → require finite HTTP timeout + matrix case);
+  **Risk 8a** (`SessionApi` injection ripple across P3-1 spawn surface, `Box<dyn
+  SessionApi+Send>` per the Clock precedent); M1 marked optional (self-heals, hot reduce
+  arms); `SendLost` = actor-diffed not reducer-emitted. **D16 rider CLOSED:** live 0.4.0
+  (`31669e1b`) + route source (`sessions.py:19368`) — POST ack is a non-empty bare dict,
+  exactly ONE of `item_id` (non-native / native-terminal-down) or `pending_id` (healthy
+  native) per message POST; precedence (1)/(2) are common paths, (3) defensive-only.
+  **GOTCHA: native ⇏ pending_id.** Memory `state-model-p3-grilling` updated. **Env note:**
+  `../omnigent` checkout moved to the pinned `v0.4.0` (`31669e1b`); editable install +
+  daemon now serve 0.4.0. **NEXT: execute P3-2 in a fresh session** (subagent-driven,
+  composer-2.5 per task, cross-family review at the Task 6/7 send-reconcile + Task 8/9
+  lifecycle seams).
 - **2026-07-09** — **state-model P3-1 (actor foundation) EXECUTED & MERGED to main.**
   All 7 TDD tasks done via subagent-driven-development (composer-2.5 build per task +
   Opus per-task cross-family review + fixes; codex used for Task 1's mandatory seam
