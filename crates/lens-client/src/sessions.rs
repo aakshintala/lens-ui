@@ -1490,7 +1490,13 @@ impl<'a> Sessions<'a> {
         let url = conn.url(&format!("/v1/sessions/{id}/events"))?;
         let resp = conn
             .auth
-            .apply(self.client.http().post(url).json(&evt.to_json()))
+            .apply(
+                self.client
+                    .http()
+                    .post(url)
+                    .json(&evt.to_json())
+                    .timeout(crate::client::REST_TIMEOUT),
+            )
             .send()?;
         let status = resp.status().as_u16();
         let body = resp.text()?;

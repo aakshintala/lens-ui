@@ -49,6 +49,21 @@ impl ClientError {
     }
 }
 
+#[cfg(feature = "test-util")]
+impl ClientError {
+    /// Build a `Network` error WITHOUT any network I/O — for downstream tests
+    /// that need to exercise the transport-error branch. Uses a URL that fails
+    /// at request-build time (no socket opened).
+    pub fn network_for_test() -> Self {
+        // A relative/unparseable URL errors synchronously in the builder — no I/O.
+        let err = reqwest::blocking::Client::new()
+            .get("http://")
+            .build()
+            .unwrap_err();
+        ClientError::Network(err)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -137,7 +137,18 @@ fn run(
     clock: Box<dyn Clock + Send>,
     api: Box<dyn SessionApi + Send>,
 ) {
-    let mut send_seq: u64 = 0;
+    // Seed past any lens-local ids already resident (reconnect carries pending_user
+    // over — D16 KEEP path), so respawn cannot re-mint a colliding lens_pend_N.
+    let mut send_seq: u64 = state
+        .pending_user
+        .iter()
+        .filter_map(|p| {
+            p.pending_id
+                .strip_prefix("lens_pend_")
+                .and_then(|s| s.parse::<u64>().ok())
+        })
+        .max()
+        .unwrap_or(0);
     loop {
         let mut sel = Select::new();
         let ev_idx = sel.recv(&events);
@@ -193,15 +204,14 @@ fn run(
                             });
                         }
                         Ok(ack) => {
-                            if let Some(p) = state
+                            let p = state
                                 .pending_user
                                 .iter_mut()
                                 .find(|p| p.pending_id == lens_pending_id)
-                            {
-                                // Stamp whichever id is present — NEVER branch on harness/native.
-                                p.server_pending_id = ack.pending_id.clone();
-                                p.store_item_id = ack.item_id.clone();
-                            }
+                                .expect("optimistic bubble present for stamp");
+                            // Stamp whichever id is present — NEVER branch on harness/native.
+                            p.server_pending_id = ack.pending_id.clone();
+                            p.store_item_id = ack.item_id.clone();
                             if !emit_pending_user(&output, &state) {
                                 return;
                             }
@@ -286,6 +296,7 @@ fn emit_pending_user(output: &ActorOutput, state: &SessionState) -> bool {
             .send_blocking(StreamUpdate::PendingUserChanged(state.pending_user.clone()))
             .is_ok(),
         OutputMode::Summary => {
+            // Summary is not a pending_user replica; the optimistic bubble surfaces on Promote/Rebased.
             let _ = output
                 .summaries
                 .send_blocking(SummaryUpdate::from_state(state));
@@ -384,6 +395,7 @@ mod tests {
     use lens_client::sessions::{SendEventAck, SessionEventInput};
     use lens_client::stream::{ServerStreamEvent, SessionEvent, SessionStatusValue as WireStatus};
     use smallvec::smallvec;
+    use std::collections::VecDeque;
     use std::path::Path;
     use std::sync::{Arc, Mutex};
 
@@ -391,35 +403,45 @@ mod tests {
         Box::new(ManualClock::new(1_700_000_000_000))
     }
 
-    /// Scriptable mock — one scripted result per `send_event` call.
+    /// Scriptable mock — one scripted result per `send_event` call (FIFO).
     struct MockApi {
-        script: Mutex<Vec<Result<SendEventAck, ClientError>>>,
+        script: Mutex<VecDeque<Result<SendEventAck, ClientError>>>,
+        last_evt: Mutex<Option<SessionEventInput>>,
     }
 
     impl MockApi {
-        fn succeed_with_ack(ack: SendEventAck) -> Box<dyn SessionApi + Send> {
-            Box::new(Self {
-                script: Mutex::new(vec![Ok(ack)]),
-            })
+        fn succeed_with_ack(ack: SendEventAck) -> (Box<dyn SessionApi + Send>, Arc<MockApi>) {
+            let mock = Arc::new(Self {
+                script: Mutex::new(VecDeque::from([Ok(ack)])),
+                last_evt: Mutex::new(None),
+            });
+            (Box::new(Arc::clone(&mock)), mock)
         }
 
-        fn fail(err: ClientError) -> Box<dyn SessionApi + Send> {
-            Box::new(Self {
-                script: Mutex::new(vec![Err(err)]),
-            })
+        fn fail(err: ClientError) -> (Box<dyn SessionApi + Send>, Arc<MockApi>) {
+            let mock = Arc::new(Self {
+                script: Mutex::new(VecDeque::from([Err(err)])),
+                last_evt: Mutex::new(None),
+            });
+            (Box::new(Arc::clone(&mock)), mock)
+        }
+
+        fn last_evt(&self) -> Option<SessionEventInput> {
+            self.last_evt.lock().unwrap().clone()
         }
     }
 
-    impl SessionApi for MockApi {
+    impl SessionApi for Arc<MockApi> {
         fn send_event(
             &self,
             _id: &SessionId,
-            _evt: &SessionEventInput,
+            evt: &SessionEventInput,
         ) -> Result<SendEventAck, ClientError> {
+            *self.last_evt.lock().unwrap() = Some(evt.clone());
             self.script
                 .lock()
                 .unwrap()
-                .pop()
+                .pop_front()
                 .expect("mock send_event called more times than scripted")
         }
     }
@@ -438,15 +460,6 @@ mod tests {
 
     fn noop_api() -> Box<dyn SessionApi + Send> {
         Box::new(PanicApi)
-    }
-
-    fn mock_network_error() -> ClientError {
-        ClientError::Network(
-            reqwest::blocking::Client::new()
-                .get("http://127.0.0.1:1")
-                .send()
-                .unwrap_err(),
-        )
     }
 
     fn expect_pending_user_changed(
@@ -741,7 +754,7 @@ mod tests {
         let stores = test_stores(_dir.path());
         seed_connection(&stores);
 
-        let api = MockApi::succeed_with_ack(SendEventAck {
+        let (api, mock) = MockApi::succeed_with_ack(SendEventAck {
             queued: true,
             item_id: Some("msg_42".into()),
             pending_id: None,
@@ -755,7 +768,7 @@ mod tests {
             .commands
             .send(SessionCommand::Send {
                 text: "hello".into(),
-                model_override: None,
+                model_override: Some("gpt-x".into()),
             })
             .unwrap();
 
@@ -783,6 +796,71 @@ mod tests {
             other => panic!("expected SendAccepted, got {other:?}"),
         }
 
+        match mock.last_evt().expect("mock recorded POST") {
+            SessionEventInput::Message {
+                content,
+                model_override,
+                ..
+            } => {
+                assert_eq!(
+                    content,
+                    vec![serde_json::json!({"type":"input_text","text":"hello"})]
+                );
+                assert_eq!(model_override.as_deref(), Some("gpt-x"));
+            }
+            other => panic!("expected Message POST, got {other:?}"),
+        }
+
+        handle.stop_and_join();
+    }
+
+    #[test]
+    fn send_respawn_seeds_send_seq_past_carried_pending_user() {
+        let _dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(_dir.path());
+        seed_connection(&stores);
+
+        let (api, _mock) = MockApi::succeed_with_ack(SendEventAck {
+            queued: true,
+            item_id: Some("msg_99".into()),
+            pending_id: None,
+            ..Default::default()
+        });
+        let mut state = fresh_state();
+        state.pending_user.push(PendingUserMessage {
+            pending_id: "lens_pend_1".into(),
+            server_pending_id: None,
+            store_item_id: None,
+            content: "carried".into(),
+            created_at: 1_700_000_000_000,
+        });
+
+        let (_ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, up_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(state, ev_rx, up_tx, stores, test_clock(), api);
+
+        handle
+            .commands
+            .send(SessionCommand::Send {
+                text: "new".into(),
+                model_override: None,
+            })
+            .unwrap();
+
+        let optimistic = expect_pending_user_changed(&up_rx);
+        assert_eq!(optimistic.len(), 2);
+        assert_eq!(optimistic[0].pending_id, "lens_pend_1");
+        assert_eq!(optimistic[0].content, "carried");
+        assert_eq!(optimistic[1].pending_id, "lens_pend_2");
+        assert_eq!(optimistic[1].content, "new");
+
+        let stamped = expect_pending_user_changed(&up_rx);
+        assert_eq!(stamped.len(), 2);
+        assert_eq!(stamped[0].pending_id, "lens_pend_1");
+        assert_eq!(stamped[0].content, "carried");
+        assert_eq!(stamped[1].pending_id, "lens_pend_2");
+        assert_eq!(stamped[1].store_item_id.as_deref(), Some("msg_99"));
+
         handle.stop_and_join();
     }
 
@@ -792,7 +870,7 @@ mod tests {
         let stores = test_stores(_dir.path());
         seed_connection(&stores);
 
-        let api = MockApi::fail(mock_network_error());
+        let (api, _mock) = MockApi::fail(ClientError::network_for_test());
         let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
         let (up_tx, up_rx) = async_channel::bounded(64);
         let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
@@ -827,12 +905,50 @@ mod tests {
     }
 
     #[test]
+    fn send_non_network_error_leaves_optimistic_bubble() {
+        let _dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(_dir.path());
+        seed_connection(&stores);
+
+        let (api, _mock) = MockApi::fail(ClientError::Auth { status: 401 });
+        let (_ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, up_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+
+        handle
+            .commands
+            .send(SessionCommand::Send {
+                text: "hello".into(),
+                model_override: None,
+            })
+            .unwrap();
+
+        let optimistic = expect_pending_user_changed(&up_rx);
+        assert_eq!(optimistic.len(), 1);
+        assert_eq!(optimistic[0].pending_id, "lens_pend_1");
+
+        // No rollback emit — bubble stays resident.
+        assert!(up_rx.try_recv().is_err());
+
+        match handle.outcomes.recv_blocking().unwrap() {
+            CommandOutcome::SendFailed {
+                lens_pending_id, ..
+            } => {
+                assert_eq!(lens_pending_id, "lens_pend_1");
+            }
+            other => panic!("expected SendFailed, got {other:?}"),
+        }
+
+        handle.stop_and_join();
+    }
+
+    #[test]
     fn send_denied_ack_rolls_back_and_reports_reason() {
         let _dir = tempfile::tempdir().unwrap();
         let stores = test_stores(_dir.path());
         seed_connection(&stores);
 
-        let api = MockApi::succeed_with_ack(SendEventAck {
+        let (api, _mock) = MockApi::succeed_with_ack(SendEventAck {
             queued: false,
             denied: true,
             reason: Some("policy".into()),
@@ -876,7 +992,7 @@ mod tests {
 
         // Case A: pending_id only → server_pending_id set, store_item_id None.
         {
-            let api = MockApi::succeed_with_ack(SendEventAck {
+            let (api, _mock) = MockApi::succeed_with_ack(SendEventAck {
                 queued: true,
                 pending_id: Some("pending_a1b2".into()),
                 item_id: None,
@@ -900,7 +1016,14 @@ mod tests {
                 Some("pending_a1b2")
             );
             assert_eq!(stamped[0].store_item_id, None);
-            let _ = handle.outcomes.recv_blocking().unwrap();
+            match handle.outcomes.recv_blocking().unwrap() {
+                CommandOutcome::SendAccepted {
+                    lens_pending_id, ..
+                } => {
+                    assert_eq!(lens_pending_id, "lens_pend_1");
+                }
+                other => panic!("expected SendAccepted, got {other:?}"),
+            }
             handle.stop_and_join();
         }
 
@@ -908,7 +1031,7 @@ mod tests {
         {
             let stores_b = test_stores(_dir.path());
             seed_connection(&stores_b);
-            let api = MockApi::succeed_with_ack(SendEventAck {
+            let (api, _mock) = MockApi::succeed_with_ack(SendEventAck {
                 queued: true,
                 item_id: Some("msg_non_native".into()),
                 pending_id: None,
@@ -929,7 +1052,14 @@ mod tests {
             assert_eq!(stamped.len(), 1);
             assert_eq!(stamped[0].server_pending_id, None);
             assert_eq!(stamped[0].store_item_id.as_deref(), Some("msg_non_native"));
-            let _ = handle.outcomes.recv_blocking().unwrap();
+            match handle.outcomes.recv_blocking().unwrap() {
+                CommandOutcome::SendAccepted {
+                    lens_pending_id, ..
+                } => {
+                    assert_eq!(lens_pending_id, "lens_pend_1");
+                }
+                other => panic!("expected SendAccepted, got {other:?}"),
+            }
             handle.stop_and_join();
         }
     }
