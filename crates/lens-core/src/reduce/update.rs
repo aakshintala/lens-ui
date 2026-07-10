@@ -1,7 +1,7 @@
 use crate::domain::controls::{Elicitation, ModelOption, SandboxStatus, SkillSummary, Todo};
 use crate::domain::ids::AgentId;
 use crate::domain::item::{Item, StreamScratch};
-use crate::domain::scalars::SessionStatusValue;
+use crate::domain::scalars::{ErrorInfo, SessionStatusValue};
 use crate::domain::session::SessionState;
 use crate::domain::usage::{Cost, PresenceViewer};
 use smallvec::SmallVec;
@@ -23,6 +23,7 @@ pub enum StreamUpdate {
 
     // ── scalar / collection folds — carry the just-reduced value ──
     StatusChanged(SessionStatusValue),
+    LastTaskErrorChanged(Option<ErrorInfo>),
     UsageChanged(Cost),
     ModelChanged {
         llm_model: Option<String>,

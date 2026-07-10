@@ -18,6 +18,7 @@ pub fn apply(state: &mut SessionState, update: StreamUpdate) {
         }
         ScratchChanged(scratch) => state.stream = (*scratch).clone(),
         StatusChanged(v) => state.status = v,
+        LastTaskErrorChanged(v) => state.last_task_error = v,
         UsageChanged(c) => state.cumulative_cost = c,
         ModelChanged {
             llm_model,

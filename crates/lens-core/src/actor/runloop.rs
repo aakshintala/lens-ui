@@ -149,8 +149,23 @@ fn run(
                     persist_write_through(&stores, &state, &batch, clock.now_millis());
                     match output.mode {
                         OutputMode::Detailed => {
+                            let had_snapshot = batch
+                                .iter()
+                                .any(|u| matches!(u, StreamUpdate::SnapshotRestored));
                             for u in coalesce(batch) {
                                 if output.updates.send_blocking(u).is_err() {
+                                    return;
+                                }
+                            }
+                            if had_snapshot {
+                                // SnapshotRestored bulk-folds ~20 chrome scalars actor-side with no
+                                // per-field delta; a Detailed replica learns them only via a full
+                                // baseline. (review I1)
+                                if output
+                                    .updates
+                                    .send_blocking(StreamUpdate::Rebased(Box::new(state.clone())))
+                                    .is_err()
+                                {
                                     return;
                                 }
                             }
@@ -196,6 +211,8 @@ fn persist_write_through(stores: &ActorStores, state: &SessionState, batch: &Upd
                 let _ = stores.transcript.upsert_item(*index as i64, item.as_ref());
             }
             StreamUpdate::ScratchChanged(_)
+            | StreamUpdate::ChildSessionChanged
+            | StreamUpdate::ResourcesChanged
             | StreamUpdate::Reconnecting { .. }
             | StreamUpdate::Reconnected
             | StreamUpdate::Disconnected => {}
@@ -249,7 +266,7 @@ mod tests {
     use crate::persist::{
         ConnectionRecord, SqliteControlStore, SqliteTranscriptStore, TranscriptStore,
     };
-    use crate::reduce::testutil::{fresh_state, parse_response};
+    use crate::reduce::testutil::{fresh_state, parse_response, snapshot_fixture};
     use lens_client::stream::{ServerStreamEvent, SessionEvent, SessionStatusValue as WireStatus};
     use smallvec::smallvec;
     use std::path::Path;
@@ -424,6 +441,53 @@ mod tests {
         assert_eq!(rows.len(), 2, "both batched appends must persist");
         assert_eq!(rows[0].id.as_str(), "fc_1");
         assert_eq!(rows[1].id.as_str(), "fc_2");
+    }
+
+    #[test]
+    fn detailed_mode_emits_rebased_after_snapshot_restored() {
+        let _dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(_dir.path());
+        seed_connection(&stores);
+
+        let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, up_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock());
+
+        let snap = snapshot_fixture(serde_json::json!({
+            "id": "conv_1",
+            "status": "running",
+            "agent_id": "ag_9",
+            "created_at": 1_700_000_000,
+            "llm_model": "opus",
+            "title": "snapshot title",
+            "items": []
+        }));
+        ev_tx
+            .send(ServerStreamEvent::SnapshotRestored(Box::new(snap)))
+            .unwrap();
+
+        let mut saw_snapshot = false;
+        let mut saw_rebased = false;
+        while let Ok(u) = up_rx.recv_blocking() {
+            match &u {
+                StreamUpdate::SnapshotRestored => saw_snapshot = true,
+                StreamUpdate::Rebased(baseline) => {
+                    saw_rebased = true;
+                    assert_eq!(baseline.title.as_deref(), Some("snapshot title"));
+                    assert_eq!(baseline.llm_model.as_deref(), Some("opus"));
+                }
+                _ => {}
+            }
+            if saw_snapshot && saw_rebased {
+                break;
+            }
+        }
+        assert!(saw_snapshot, "expected SnapshotRestored delta");
+        assert!(
+            saw_rebased,
+            "Detailed replica must receive Rebased after snapshot fold"
+        );
+        handle.stop_and_join();
     }
 
     #[test]

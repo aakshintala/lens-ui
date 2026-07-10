@@ -65,10 +65,21 @@ pub(crate) fn fold_session_field(
         SessionEvent::Status { status, .. } => {
             let normalized = normalize_status(*status);
             state.status = normalized;
-            if normalized != SessionStatusValue::Failed {
+            let cleared_error = if normalized != SessionStatusValue::Failed {
+                let had_error = state.last_task_error.is_some();
                 state.last_task_error = None;
+                had_error
+            } else {
+                false
+            };
+            if cleared_error {
+                smallvec![
+                    StreamUpdate::StatusChanged(normalized),
+                    StreamUpdate::LastTaskErrorChanged(state.last_task_error.clone()),
+                ]
+            } else {
+                smallvec![StreamUpdate::StatusChanged(normalized)]
             }
-            smallvec![StreamUpdate::StatusChanged(normalized)]
         }
         SessionEvent::Model { model } => {
             state.llm_model = Some(model.clone());
@@ -186,7 +197,10 @@ pub(crate) fn fold_response_marker(
                 code: code.clone(),
                 message: message.clone(),
             });
-            smallvec![StreamUpdate::StatusChanged(state.status)]
+            smallvec![
+                StreamUpdate::StatusChanged(state.status),
+                StreamUpdate::LastTaskErrorChanged(state.last_task_error.clone()),
+            ]
         }
         ResponseEvent::ElicitationRequest {
             elicitation_id,
@@ -400,7 +414,7 @@ mod tests {
             code: "E1".into(),
             message: "boom".into(),
         });
-        reduce(
+        let u = reduce(
             &mut s,
             &ServerStreamEvent::Session(SessionEvent::Status {
                 status: WireStatus::Idle,
@@ -410,6 +424,40 @@ mod tests {
             &clock(),
         );
         assert_eq!(s.last_task_error, None);
+        assert!(matches!(
+            &u[..],
+            [
+                StreamUpdate::StatusChanged(SessionStatusValue::Idle),
+                StreamUpdate::LastTaskErrorChanged(None),
+            ]
+        ));
+    }
+
+    #[test]
+    fn response_error_emits_status_and_last_task_error_changed() {
+        use crate::reduce::testutil::parse_response;
+
+        let mut s = st();
+        s.status = SessionStatusValue::Failed;
+        let ev = parse_response(
+            "response.error",
+            r#"{"source":"llm","tool_name":null,"error":{"code":"timeout","message":"timed out"}}"#,
+        );
+        let u = reduce(&mut s, &ev, &clock());
+        assert_eq!(
+            s.last_task_error,
+            Some(crate::domain::ErrorInfo {
+                code: "timeout".into(),
+                message: "timed out".into(),
+            })
+        );
+        assert!(matches!(
+            &u[..],
+            [
+                StreamUpdate::StatusChanged(SessionStatusValue::Failed),
+                StreamUpdate::LastTaskErrorChanged(Some(err)),
+            ] if err.code == "timeout" && err.message == "timed out"
+        ));
     }
 
     #[test]
