@@ -161,6 +161,7 @@ fn run(
         .max()
         .unwrap_or(0);
     let mut transport = ActorTransport::Connected;
+    // set true on Reconnecting, cleared on Reconnected or park; NOT set on a terminal Disconnected (park is not mid-reconcile).
     let mut reconcile_in_flight = false;
     let mut parked = false;
     loop {
@@ -315,12 +316,14 @@ fn run(
                                 .send_blocking(SummaryUpdate::from_state(&state));
                         }
                     }
+                    // park is terminal for this stream: transport=Parked and reconcile_in_flight=false are the final word; same-batch reconnect deltas are suppressed.
                     if let Some(reason) = disconnect_reason {
                         match reason {
                             DisconnectReason::Unauthorized => {
                                 transport = ActorTransport::Parked {
                                     reason: ParkReason::Unauthorized,
                                 };
+                                reconcile_in_flight = false;
                                 let _ = output.outcomes.send_blocking(ActorOutcome::Parked {
                                     reason: ParkReason::Unauthorized,
                                 });
@@ -330,6 +333,7 @@ fn run(
                                 transport = ActorTransport::Parked {
                                     reason: ParkReason::SessionFailed,
                                 };
+                                reconcile_in_flight = false;
                                 let _ = output.outcomes.send_blocking(ActorOutcome::Parked {
                                     reason: ParkReason::SessionFailed,
                                 });
@@ -339,6 +343,7 @@ fn run(
                                 transport = ActorTransport::Parked {
                                     reason: ParkReason::RetriesExhausted,
                                 };
+                                reconcile_in_flight = false;
                                 let _ = output.outcomes.send_blocking(ActorOutcome::Parked {
                                     reason: ParkReason::RetriesExhausted,
                                 });
@@ -357,7 +362,7 @@ fn run(
                             }
                         }
                     }
-                    if saw_reconnecting {
+                    if disconnect_reason.is_none() && saw_reconnecting {
                         transport = ActorTransport::Reconnecting;
                         reconcile_in_flight = true;
                         let _ = output
@@ -367,7 +372,7 @@ fn run(
                                 reconcile_in_flight,
                             });
                     }
-                    if saw_reconnected {
+                    if disconnect_reason.is_none() && saw_reconnected {
                         transport = ActorTransport::Connected;
                         reconcile_in_flight = false;
                         let _ = output
@@ -1241,13 +1246,24 @@ mod tests {
             StreamUpdate::Disconnected(DisconnectReason::Unauthorized)
         ));
 
-        ev_tx.send(status_running_event()).unwrap();
-        assert!(
-            up_rx.try_recv().is_err(),
-            "parked actor must not process further events"
-        );
+        // Drain park disconnect delta — baseline before post-park event.
+        let mut updates_at_park = Vec::new();
+        while let Ok(u) = up_rx.try_recv() {
+            updates_at_park.push(u);
+        }
 
+        ev_tx.send(status_running_event()).unwrap();
         handle.stop_and_join();
+
+        // Post-park event must be dropped, not merely delayed.
+        let mut updates_after_park = Vec::new();
+        while let Ok(u) = up_rx.try_recv() {
+            updates_after_park.push(u);
+        }
+        assert!(
+            updates_after_park.is_empty(),
+            "parked actor must drop further events (got {updates_after_park:?})"
+        );
     }
 
     #[test]
@@ -1342,5 +1358,127 @@ mod tests {
         }
 
         handle.stop_and_join();
+    }
+
+    #[test]
+    fn reconnected_clears_reconcile_in_flight_and_connects() {
+        let _dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(_dir.path());
+        seed_connection(&stores);
+
+        let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, _up_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(
+            fresh_state(),
+            ev_rx,
+            up_tx,
+            stores,
+            test_clock(),
+            noop_api(),
+        );
+
+        ev_tx
+            .send(ServerStreamEvent::Reconnecting { attempt: 2 })
+            .unwrap();
+
+        match handle.outcomes.recv_blocking().unwrap() {
+            ActorOutcome::TransportChanged {
+                transport: ActorTransport::Reconnecting,
+                reconcile_in_flight: true,
+            } => {}
+            other => panic!("expected TransportChanged Reconnecting, got {other:?}"),
+        }
+
+        ev_tx
+            .send(ServerStreamEvent::Reconnected { gap: None })
+            .unwrap();
+
+        match handle.outcomes.recv_blocking().unwrap() {
+            ActorOutcome::TransportChanged {
+                transport: ActorTransport::Connected,
+                reconcile_in_flight: false,
+            } => {}
+            other => panic!("expected TransportChanged Connected, got {other:?}"),
+        }
+
+        handle.stop_and_join();
+    }
+
+    #[test]
+    fn park_suppresses_same_batch_reconnect() {
+        let _dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(_dir.path());
+        seed_connection(&stores);
+
+        let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, up_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(
+            fresh_state(),
+            ev_rx,
+            up_tx,
+            stores,
+            test_clock(),
+            noop_api(),
+        );
+
+        // Determinism: actor is idle in select; queue both events before it drains.
+        // Greedy try_recv folds Reconnecting + Disconnected into one batch.
+        ev_tx
+            .send(ServerStreamEvent::Reconnecting { attempt: 1 })
+            .unwrap();
+        ev_tx
+            .send(ServerStreamEvent::Disconnected {
+                reason: DisconnectReason::Unauthorized,
+            })
+            .unwrap();
+
+        let mut transport_outcomes = vec![handle.outcomes.recv_blocking().unwrap()];
+        while let Ok(more) = handle.outcomes.try_recv() {
+            transport_outcomes.push(more);
+        }
+
+        let last = transport_outcomes.last().expect("park outcome emitted");
+        match last {
+            ActorOutcome::Parked {
+                reason: ParkReason::Unauthorized,
+            } => {}
+            other => panic!(
+                "terminal park must win over same-batch reconnect (got {other:?}, all: {transport_outcomes:?})"
+            ),
+        }
+        assert!(
+            !transport_outcomes.iter().any(|o| matches!(
+                o,
+                ActorOutcome::TransportChanged {
+                    transport: ActorTransport::Reconnecting,
+                    ..
+                }
+            )),
+            "same-batch reconnect must not emit TransportChanged Reconnecting after park"
+        );
+
+        let mut stream_updates = Vec::new();
+        while let Ok(u) = up_rx.try_recv() {
+            stream_updates.push(u);
+        }
+        assert!(
+            stream_updates.iter().any(|u| matches!(
+                u,
+                StreamUpdate::Disconnected(DisconnectReason::Unauthorized)
+            )),
+            "batch must still emit Disconnected to foreground (got {stream_updates:?})"
+        );
+
+        ev_tx.send(status_running_event()).unwrap();
+        handle.stop_and_join();
+
+        let mut post_park = Vec::new();
+        while let Ok(u) = up_rx.try_recv() {
+            post_park.push(u);
+        }
+        assert!(
+            post_park.is_empty(),
+            "parked actor must drop post-park events (got {post_park:?})"
+        );
     }
 }
