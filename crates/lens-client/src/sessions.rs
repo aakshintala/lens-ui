@@ -260,39 +260,44 @@ impl SessionSnapshot {
 }
 
 /// Per-model token+cost usage from `usage_by_model` on the session snapshot.
+///
+/// Every field is nullable on the wire (`anyOf [integer, null]`, "`None` when not
+/// recorded"): a session whose per-model usage was never recorded sends explicit
+/// `null`, so these must be `Option` — `#[serde(default)]` alone coerces a *missing*
+/// key to 0 but rejects an explicit `null`. Cost is present iff the model was priced.
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]
 pub struct ModelUsage {
     #[serde(default)]
-    input_tokens: i64,
+    input_tokens: Option<i64>,
     #[serde(default)]
-    output_tokens: i64,
+    output_tokens: Option<i64>,
     #[serde(default)]
-    total_tokens: i64,
+    total_tokens: Option<i64>,
     #[serde(default)]
-    cache_read_input_tokens: i64,
+    cache_read_input_tokens: Option<i64>,
     #[serde(default)]
-    cache_creation_input_tokens: i64,
+    cache_creation_input_tokens: Option<i64>,
     #[serde(default)]
-    total_cost_usd: f64,
+    total_cost_usd: Option<f64>,
 }
 
 impl ModelUsage {
-    pub fn input_tokens(&self) -> i64 {
+    pub fn input_tokens(&self) -> Option<i64> {
         self.input_tokens
     }
-    pub fn output_tokens(&self) -> i64 {
+    pub fn output_tokens(&self) -> Option<i64> {
         self.output_tokens
     }
-    pub fn total_tokens(&self) -> i64 {
+    pub fn total_tokens(&self) -> Option<i64> {
         self.total_tokens
     }
-    pub fn cache_read_input_tokens(&self) -> i64 {
+    pub fn cache_read_input_tokens(&self) -> Option<i64> {
         self.cache_read_input_tokens
     }
-    pub fn cache_creation_input_tokens(&self) -> i64 {
+    pub fn cache_creation_input_tokens(&self) -> Option<i64> {
         self.cache_creation_input_tokens
     }
-    pub fn total_cost_usd(&self) -> f64 {
+    pub fn total_cost_usd(&self) -> Option<f64> {
         self.total_cost_usd
     }
 }
@@ -2313,7 +2318,7 @@ mod tests {
         // usage_by_model: one model with token+cost detail.
         let usage = s.usage_by_model();
         assert!(usage.contains_key("claude-opus-4-8"));
-        assert!(usage["claude-opus-4-8"].total_tokens() > 0);
+        assert!(usage["claude-opus-4-8"].total_tokens().unwrap() > 0);
         // skills: 20 attached, each with a name.
         assert_eq!(s.skills().len(), 20);
         assert!(s.skills().iter().all(|sk| !sk.name().is_empty()));

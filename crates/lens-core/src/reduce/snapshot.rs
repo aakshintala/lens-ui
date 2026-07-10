@@ -46,14 +46,16 @@ pub(crate) fn fold_snapshot(state: &mut SessionState, snap: &SessionSnapshot) ->
             (
                 k.clone(),
                 ModelUsage {
-                    input_tokens: Some(mu.input_tokens().max(0) as u64),
-                    output_tokens: Some(mu.output_tokens().max(0) as u64),
-                    total_tokens: Some(mu.total_tokens().max(0) as u64),
-                    cache_creation_input_tokens: Some(
-                        mu.cache_creation_input_tokens().max(0) as u64
-                    ),
-                    cache_read_input_tokens: Some(mu.cache_read_input_tokens().max(0) as u64),
-                    total_cost_usd: Some(mu.total_cost_usd()),
+                    // Nullable on the wire: a null bucket stays `None` (not recorded)
+                    // rather than collapsing to `Some(0)`.
+                    input_tokens: mu.input_tokens().map(|v| v.max(0) as u64),
+                    output_tokens: mu.output_tokens().map(|v| v.max(0) as u64),
+                    total_tokens: mu.total_tokens().map(|v| v.max(0) as u64),
+                    cache_creation_input_tokens: mu
+                        .cache_creation_input_tokens()
+                        .map(|v| v.max(0) as u64),
+                    cache_read_input_tokens: mu.cache_read_input_tokens().map(|v| v.max(0) as u64),
+                    total_cost_usd: mu.total_cost_usd(),
                 },
             )
         })

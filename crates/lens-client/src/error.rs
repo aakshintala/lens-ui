@@ -74,7 +74,7 @@ mod tests {
         assert!(!ClientError::NotFound { what: "x".into() }.is_decode());
         assert!(
             ClientError::ContractMismatch {
-                expected: "0.4.0",
+                expected: "0.5.1",
                 actual: "0.3.0".into(),
             }
             .is_decode()
@@ -85,11 +85,11 @@ mod tests {
     #[test]
     fn contract_mismatch_displays_expected_and_actual() {
         let e = ClientError::ContractMismatch {
-            expected: "0.4.0",
+            expected: "0.5.1",
             actual: "0.3.0".into(),
         };
         let s = e.to_string();
-        assert!(s.contains("0.4.0"), "got: {s}");
+        assert!(s.contains("0.5.1"), "got: {s}");
         assert!(s.contains("0.3.0"), "got: {s}");
     }
 }

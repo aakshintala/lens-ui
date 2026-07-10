@@ -128,6 +128,13 @@ pub enum SessionEvent {
         agent_id: Option<String>,
         parent_session_id: Option<String>,
     },
+    /// Per-MCP-server startup progress for a native harness session (0.5.0).
+    /// Transient (SSE + snapshot cache); a client connecting mid-startup seeds
+    /// from the snapshot's `mcp_startup` field and updates live off this event.
+    // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
+    McpStartup {
+        servers: Vec<McpServerStartup>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -220,6 +227,39 @@ impl TodoItem {
     pub fn active_form(&self) -> &str {
         &self.active_form
     }
+}
+
+/// One MCP server's startup state within a `session.mcp_startup` event (0.5.0).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpServerStartup {
+    name: String,
+    status: McpStartupStatus,
+    error: Option<String>,
+}
+impl McpServerStartup {
+    /// The configured server name (map key on the wire), e.g. `"safe"`.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn status(&self) -> McpStartupStatus {
+        self.status
+    }
+    /// Failure detail when `status == Failed`; `None` otherwise.
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpStartupStatus {
+    Starting,
+    Ready,
+    Failed,
+    Cancelled,
+    /// Any status this crate version does not know (dev0 churn safety).
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -502,6 +542,30 @@ struct RawSessionCreated {
     #[serde(rename = "conversation_id")]
     _conversation_id: String,
 }
+#[derive(Deserialize)]
+struct RawMcpStartup {
+    #[serde(rename = "conversation_id")]
+    _conversation_id: String,
+    // BTreeMap: deterministic ordering when flattened to the exposed Vec.
+    // `servers` is REQUIRED by the contract — NOT defaulted, so a frame missing it
+    // fails deser and degrades to `Unknown` rather than fabricating an empty event.
+    servers: std::collections::BTreeMap<String, RawMcpServerStartup>,
+}
+#[derive(Deserialize)]
+struct RawMcpServerStartup {
+    status: McpStartupStatus,
+    #[serde(default)]
+    error: Option<String>,
+}
+#[derive(Deserialize)]
+struct RawPolicyDenied {
+    #[serde(rename = "conversation_id")]
+    _conversation_id: String,
+    #[serde(default)]
+    phase: String,
+    #[serde(default)]
+    reason: String,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResponseEvent {
@@ -558,6 +622,15 @@ pub enum ResponseEvent {
     },
     ElicitationResolved {
         elicitation_id: String,
+    },
+    /// A policy DENY was enforced on a native harness turn (0.5.0). Fire-and-forget
+    /// and observational — it does not gate the turn (the vendor command-hook already
+    /// did) and carries no correlation id; it surfaces the decision so observers can
+    /// see a native DENY as a positive signal rather than infer it from an absence.
+    // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
+    PolicyDenied {
+        phase: String,
+        reason: String,
     },
 }
 
@@ -638,6 +711,7 @@ pub const MODELED_EVENT_TYPES: &[&str] = &[
     "response.incomplete",
     "response.output_item.done",
     "response.output_text.delta",
+    "response.policy_denied",
     "response.reasoning.started",
     "response.reasoning_summary_text.delta",
     "response.reasoning_text.delta",
@@ -648,6 +722,7 @@ pub const MODELED_EVENT_TYPES: &[&str] = &[
     "session.heartbeat",
     "session.input.consumed",
     "session.interrupted",
+    "session.mcp_startup",
     "session.model",
     "session.model_options",
     "session.presence",
@@ -858,6 +933,21 @@ impl SessionEvent {
                     parent_session_id: r.parent_session_id,
                 }
             }
+            // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
+            "session.mcp_startup" => {
+                let r: RawMcpStartup = serde_json::from_str(d).ok()?;
+                SessionEvent::McpStartup {
+                    servers: r
+                        .servers
+                        .into_iter()
+                        .map(|(name, s)| McpServerStartup {
+                            name,
+                            status: s.status,
+                            error: s.error,
+                        })
+                        .collect(),
+                }
+            }
             _ => return None,
         })
     }
@@ -935,6 +1025,14 @@ impl ResponseEvent {
                 let r: RawElicitationResolved = serde_json::from_str(d).ok()?;
                 ResponseEvent::ElicitationResolved {
                     elicitation_id: r.elicitation_id,
+                }
+            }
+            // SCHEMA-DERIVED (not byte-verified — re-capture at config-time)
+            "response.policy_denied" => {
+                let r: RawPolicyDenied = serde_json::from_str(d).ok()?;
+                ResponseEvent::PolicyDenied {
+                    phase: r.phase,
+                    reason: r.reason,
                 }
             }
             _ => return None,
@@ -1814,6 +1912,88 @@ mod tests {
                 child_session_id: "conv_child".into(),
                 agent_id: None,
                 parent_session_id: None,
+            })
+        );
+    }
+
+    #[test]
+    fn schema_mcp_startup_flattens_server_map() {
+        // SCHEMA-DERIVED (0.5.0): map<name, {status, error?}> → deterministic Vec.
+        let ev = parse_event(&frame(
+            "session.mcp_startup",
+            r#"{"conversation_id":"conv_abc","servers":{"safe":{"status":"starting","error":null},"git":{"status":"failed","error":"handshaking with MCP server failed"}}}"#,
+        ));
+        let ServerStreamEvent::Session(SessionEvent::McpStartup { servers }) = ev else {
+            panic!("expected McpStartup, got {ev:?}");
+        };
+        // BTreeMap ordering: "git" before "safe".
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers[0].name(), "git");
+        assert_eq!(servers[0].status(), McpStartupStatus::Failed);
+        assert_eq!(
+            servers[0].error(),
+            Some("handshaking with MCP server failed")
+        );
+        assert_eq!(servers[1].name(), "safe");
+        assert_eq!(servers[1].status(), McpStartupStatus::Starting);
+        assert_eq!(servers[1].error(), None);
+    }
+
+    #[test]
+    fn mcp_startup_unknown_status_degrades_not_panics() {
+        // dev0 churn safety: a novel status string maps to Unknown.
+        let ev = parse_event(&frame(
+            "session.mcp_startup",
+            r#"{"conversation_id":"c","servers":{"safe":{"status":"reticulating"}}}"#,
+        ));
+        let ServerStreamEvent::Session(SessionEvent::McpStartup { servers }) = ev else {
+            panic!("expected McpStartup");
+        };
+        assert_eq!(servers[0].status(), McpStartupStatus::Unknown);
+        assert_eq!(servers[0].error(), None);
+    }
+
+    #[test]
+    fn mcp_startup_missing_required_servers_degrades_to_unknown() {
+        // `servers` is contract-required; a frame lacking it must not fabricate an
+        // empty McpStartup — it degrades to Unknown (the crate-bump alarm).
+        let ev = parse_event(&frame("session.mcp_startup", r#"{"conversation_id":"c"}"#));
+        assert_eq!(
+            ev,
+            ServerStreamEvent::Unknown {
+                event_type: "session.mcp_startup".into()
+            }
+        );
+    }
+
+    #[test]
+    fn schema_policy_denied() {
+        // SCHEMA-DERIVED (0.5.0): a native DENY surfaced on the stream.
+        let ev = parse_event(&frame(
+            "response.policy_denied",
+            r#"{"conversation_id":"conv_abc","phase":"tool_call","reason":"Blocked by policy."}"#,
+        ));
+        assert_eq!(
+            ev,
+            ServerStreamEvent::Response(ResponseEvent::PolicyDenied {
+                phase: "tool_call".into(),
+                reason: "Blocked by policy.".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn policy_denied_optional_fields_default_empty() {
+        // phase/reason carry server-side "" defaults; omission must not drop to Unknown.
+        let ev = parse_event(&frame(
+            "response.policy_denied",
+            r#"{"conversation_id":"conv_abc"}"#,
+        ));
+        assert_eq!(
+            ev,
+            ServerStreamEvent::Response(ResponseEvent::PolicyDenied {
+                phase: String::new(),
+                reason: String::new(),
             })
         );
     }

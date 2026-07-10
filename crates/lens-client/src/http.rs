@@ -30,7 +30,7 @@ pub(crate) fn check_status(stage: &str, status: u16) -> Result<()> {
     }
 }
 
-/// Exact-match contract gate against the pinned package semver (e.g. `0.4.0`).
+/// Exact-match contract gate against the pinned package semver (e.g. `0.5.1`).
 /// Coarse by design: it catches a release-level mismatch but not intra-release
 /// drift (commits sharing a version string — see typed-client-implementation.md
 /// D4). Real shape-level drift detection is the startup taxonomy diff +
@@ -53,8 +53,8 @@ mod tests {
 
     #[test]
     fn decode_json_ok_on_2xx() {
-        let ver: VersionResponse = decode_json("version", 200, r#"{"version":"0.4.0"}"#).unwrap();
-        assert_eq!(ver.version, "0.4.0");
+        let ver: VersionResponse = decode_json("version", 200, r#"{"version":"0.5.1"}"#).unwrap();
+        assert_eq!(ver.version, "0.5.1");
     }
 
     #[test]
@@ -131,15 +131,15 @@ mod tests {
 
     #[test]
     fn contract_gate_accepts_exact_match() {
-        assert!(check_contract("0.4.0", "0.4.0").is_ok());
+        assert!(check_contract("0.5.1", "0.5.1").is_ok());
     }
 
     #[test]
     fn contract_gate_rejects_mismatch() {
-        let err = check_contract("0.4.0", "0.3.0").unwrap_err();
+        let err = check_contract("0.5.1", "0.3.0").unwrap_err();
         match err {
             crate::error::ClientError::ContractMismatch { expected, actual } => {
-                assert_eq!(expected, "0.4.0");
+                assert_eq!(expected, "0.5.1");
                 assert_eq!(actual, "0.3.0");
             }
             other => panic!("wrong error: {other:?}"),

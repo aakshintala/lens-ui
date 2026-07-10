@@ -285,6 +285,27 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Recent
 
+- **2026-07-10** — **omnigent pin bumped `v0.4.0` → `v0.5.1`** (`bumping-the-omnigent-pin`
+  runbook; tag `v0.5.1`, Source HEAD `08285468`; pinned the latest patch since it's
+  contract-identical to `v0.5.0` — only a web-shell UI fix on top). Contract delta: +3 routes
+  (`/v1/hosts/{id}/worktrees`, `/v1/sessions/{id}/resources/files:copy`, `/v1/sharing`) +
+  **2 new SSE event types** — `response.policy_denied` + `session.mcp_startup` — both modeled
+  SCHEMA-DERIVED in `stream/event.rs` (+ `MODELED_EVENT_TYPES` + unit tests); lens-core
+  `folds.rs` exhaustive matches rippled (both **marker-only** — no state-model field home
+  yet). Re-vendored `vendor/omnigent-0.5.1/`, re-codegen'd `generated.rs` (119 schemas),
+  bumped `PINNED_OMNIGENT_VERSION` + test literals, re-grounded docs. **Live-verify caught a
+  latent contract bug offline gates can't see:** `GET /v1/sessions/{id}` decode blew up
+  (`invalid type: null, expected i64`) — hand-authored `ModelUsage` in `sessions.rs` used
+  non-`Option` `i64` + `#[serde(default)]`, but the schema declares those token fields
+  `anyOf[integer,null]` and `#[serde(default)]` rejects an explicit `null` (only fills a
+  *missing* key). Latent since ≥0.4.0; fixed → `Option<i64>`/`Option<f64>`, accessors +
+  lens-core `snapshot.rs` map through (`null` bucket stays `None`). **Gate:** clippy(0 warn) ·
+  149 lens-client + 139 lens-core tests · `no drift: 60 client paths match` — green (one
+  pre-existing spike-file fmt diff, unrelated). Daemon reinstalled editable + restarted →
+  serves `0.5.1 (08285468)`; handshake + reachability live-verified. **Follow-ups:** the 3
+  new routes + 2 new SSE events are unmodeled/marker-only in lens-core — the state model may
+  want to surface mcp-startup + policy-denied; `live_taxonomy` not runnable here (no attached
+  runner). See memory [[omnigent-pin-bump-0-3-0]].
 - **2026-07-10** — **state-model P3-3a PLAN WRITTEN + 5 design decisions locked + D19
   source-verified against omnigent `31669e1b` (Opus, this session).** Ran `writing-plans`
   for P3-3a from spec §2.3 (D19–D23) → **8-task subagent-driven plan**

@@ -127,10 +127,13 @@ pub(crate) fn fold_session_field(
             smallvec![StreamUpdate::TerminalPendingChanged(state.terminal_pending)]
         }
         // Marker-only (D-P1-19): no P1 field home / liveness only.
+        // `McpStartup` is a 0.5.0 addition (per-MCP-server startup progress) with no
+        // state-model field home yet — marker-only until the store designs a surface.
         SessionEvent::TerminalActivity { .. }
         | SessionEvent::ChangedFilesInvalidated { .. }
         | SessionEvent::Interrupted { .. }
-        | SessionEvent::Superseded { .. } => return Some(smallvec![]),
+        | SessionEvent::Superseded { .. }
+        | SessionEvent::McpStartup { .. } => return Some(smallvec![]),
         SessionEvent::InputConsumed {
             item_id,
             item_type: _,
@@ -214,6 +217,9 @@ pub(crate) fn fold_response_marker(
             smallvec![]
         }
         ResponseEvent::CompactionInProgress | ResponseEvent::CompactionFailed => smallvec![],
+        // 0.5.0 addition: a native policy DENY was surfaced. Observational, no state-model
+        // field home yet — marker-only until the store designs a surface.
+        ResponseEvent::PolicyDenied { .. } => smallvec![],
         // REVIEW#4: fold response.error into the `last_task_error` scalar banner (ErrorInfo,
         // "present iff Failed"). NOT a transcript item — the byte-verified error-item path is
         // `OutputItemDone(Error)`; pushing from both would double-insert. This preserves the

@@ -43,7 +43,7 @@ skill. Two modes:
 code it *started with* in memory. After `uv tool install --editable` you must
 `omnigent server stop && omnigent server start`, or it keeps serving the old
 version (observed: a 0.2.0 daemon serving 57 paths after the package was already
-0.4.0). Verify the live contract matches the pin by path set, not
+0.5.1). Verify the live contract matches the pin by path set, not
 `info.version` (which is a stale `0.1.0`):
 
 ```bash
@@ -57,5 +57,5 @@ share it).
 
 ## Contract
 
-- Ground truth: `vendor/omnigent-0.4.0/openapi.json` (pin: `OMNIGENT_PIN`).
+- Ground truth: `vendor/omnigent-0.5.1/openapi.json` (pin: `OMNIGENT_PIN`).
 - `lens-client` codegens + contract-tests against the vendored openapi.
