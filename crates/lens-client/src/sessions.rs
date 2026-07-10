@@ -71,6 +71,17 @@ fn hoist_embedded_item_payload(v: Value) -> Value {
     }
 }
 
+/// One un-consumed native web-composer message from a snapshot's `pending_inputs`.
+/// Only `pending_id` is modeled: it is the sole field reconcile keys on (D16
+/// Signal B keeps a bubble iff its server_pending_id is in this list). The wire
+/// `content` field is `additionalProperties:true` (untyped; see generated.rs
+/// ~L8084) and has no consumer — serde ignores it. Add it (shape-tolerant) only
+/// when a consumer needs it.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct PendingInput {
+    pub pending_id: String,
+}
+
 /// A session snapshot (`GET /v1/sessions/{id}`). Mirrors the CORE fields of
 /// omnigent's `SessionResponse` (`schemas.py:1601-1642`); unmodeled fields are
 /// ignored. Fields are private — access is via the typed getters, so the wire
@@ -138,6 +149,8 @@ pub struct SessionSnapshot {
     skills: Vec<SkillRef>,
     #[serde(default, deserialize_with = "de_items")]
     items: Vec<crate::stream::Item>,
+    #[serde(default, deserialize_with = "de_null_default")]
+    pending_inputs: Vec<PendingInput>,
     // ⚠ DEFERRED (empty/null in the only capture — model when non-empty, Plan 3b-2b/
     //   config-time): todos (TodoItem is not Deserialize; wire key `activeForm`),
     //   pending_elicitations (likely objects, not id strings), model_options,
@@ -240,6 +253,9 @@ impl SessionSnapshot {
     /// `Sessions::items()`.
     pub fn items(&self) -> &[crate::stream::Item] {
         &self.items
+    }
+    pub fn pending_inputs(&self) -> &[PendingInput] {
+        &self.pending_inputs
     }
 }
 
@@ -2009,6 +2025,28 @@ mod tests {
         assert!(q.contains(&("include_archived", "true".to_string())));
         assert!(q.contains(&("search_query", "foo".to_string())));
         assert!(q.contains(&("limit", "50".to_string())));
+    }
+
+    #[test]
+    fn snapshot_parses_pending_inputs() {
+        let raw = r#"{
+      "id":"conv_1","status":"idle","agent_id":"ag",
+      "created_at":0,"harness":"claude-native",
+      "pending_inputs":[{"pending_id":"pending_a1","content":"hello"}]
+    }"#;
+        let s: SessionSnapshot = serde_json::from_str(raw).unwrap();
+        assert_eq!(s.pending_inputs().len(), 1);
+        assert_eq!(s.pending_inputs()[0].pending_id, "pending_a1");
+    }
+
+    #[test]
+    fn snapshot_pending_inputs_null_is_empty() {
+        let raw = r#"{
+      "id":"conv_1","status":"idle","agent_id":"ag",
+      "created_at":0,"harness":"x","pending_inputs":null
+    }"#;
+        let s: SessionSnapshot = serde_json::from_str(raw).unwrap();
+        assert!(s.pending_inputs().is_empty());
     }
 
     #[test]
