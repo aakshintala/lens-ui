@@ -73,6 +73,7 @@ pub enum SessionEvent {
     InputConsumed {
         item_id: String,
         item_type: String,
+        cleared_pending_id: Option<String>,
     },
     ChangedFilesInvalidated {
         environment_id: String,
@@ -315,6 +316,8 @@ struct RawInputConsumedData {
     item_id: String,
     #[serde(rename = "type")]
     item_type: String,
+    #[serde(default)]
+    cleared_pending_id: Option<String>,
 }
 #[derive(Deserialize)]
 struct RawInterrupted {
@@ -751,6 +754,7 @@ impl SessionEvent {
                 SessionEvent::InputConsumed {
                     item_id: r.data.item_id,
                     item_type: r.data.item_type,
+                    cleared_pending_id: r.data.cleared_pending_id,
                 }
             }
             "session.changed_files.invalidated" => {
@@ -1159,8 +1163,40 @@ mod tests {
             ServerStreamEvent::Session(SessionEvent::InputConsumed {
                 item_id: "msg_1".into(),
                 item_type: "message".into(),
+                cleared_pending_id: None,
             })
         );
+    }
+
+    #[test]
+    fn input_consumed_carries_cleared_pending_id_when_present() {
+        let ev = parse_event(&frame(
+            "session.input.consumed",
+            r#"{"data":{"item_id":"msg_1","type":"message","data":{},"cleared_pending_id":"pending_a1b2c3"}}"#,
+        ));
+        assert_eq!(
+            ev,
+            ServerStreamEvent::Session(SessionEvent::InputConsumed {
+                item_id: "msg_1".into(),
+                item_type: "message".into(),
+                cleared_pending_id: Some("pending_a1b2c3".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn input_consumed_cleared_pending_id_defaults_none() {
+        let ev = parse_event(&frame(
+            "session.input.consumed",
+            r#"{"data":{"item_id":"msg_1","type":"message","data":{}}}"#,
+        ));
+        let ServerStreamEvent::Session(SessionEvent::InputConsumed {
+            cleared_pending_id, ..
+        }) = ev
+        else {
+            panic!("expected InputConsumed");
+        };
+        assert_eq!(cleared_pending_id, None);
     }
 
     #[test]
