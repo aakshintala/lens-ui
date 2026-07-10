@@ -35,6 +35,7 @@ pub fn apply(state: &mut SessionState, update: StreamUpdate) {
         SandboxChanged(v) => state.sandbox_status = v,
         TerminalPendingChanged(v) => state.terminal_pending = v,
         ElicitationsChanged(v) => state.pending_elicitations = v,
+        PendingUserChanged(v) => state.pending_user = v,
         PresenceChanged(v) => state.presence = v,
         AgentChanged {
             agent_id,
@@ -152,6 +153,25 @@ mod tests {
                 }],
             },
         }
+    }
+
+    #[test]
+    fn apply_pending_user_changed_is_copy_assignment() {
+        use lens_core::domain::controls::PendingUserMessage;
+
+        let mut s = state();
+        let bubble = PendingUserMessage {
+            pending_id: "pend_1".into(),
+            server_pending_id: None,
+            store_item_id: None,
+            content: "hello".into(),
+            created_at: 1_700_000_000_000,
+        };
+        super::apply(
+            &mut s,
+            StreamUpdate::PendingUserChanged(vec![bubble.clone()]),
+        );
+        assert_eq!(s.pending_user, vec![bubble]);
     }
 
     #[test]

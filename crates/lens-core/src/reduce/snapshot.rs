@@ -119,6 +119,8 @@ mod tests {
     fn pending(id: &str, content: &str) -> PendingUserMessage {
         PendingUserMessage {
             pending_id: id.into(),
+            server_pending_id: None,
+            store_item_id: None,
             content: content.into(),
             created_at: 1_700_000_000_000,
         }

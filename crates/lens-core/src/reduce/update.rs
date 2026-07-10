@@ -1,4 +1,6 @@
-use crate::domain::controls::{Elicitation, ModelOption, SandboxStatus, SkillSummary, Todo};
+use crate::domain::controls::{
+    Elicitation, ModelOption, PendingUserMessage, SandboxStatus, SkillSummary, Todo,
+};
 use crate::domain::ids::AgentId;
 use crate::domain::item::{Item, StreamScratch};
 use crate::domain::scalars::{ErrorInfo, SessionStatusValue};
@@ -37,6 +39,7 @@ pub enum StreamUpdate {
     SandboxChanged(Option<SandboxStatus>),
     TerminalPendingChanged(bool),
     ElicitationsChanged(Vec<Elicitation>),
+    PendingUserChanged(Vec<PendingUserMessage>),
     ChildSessionChanged,
     PresenceChanged(Vec<PresenceViewer>),
     ResourcesChanged,

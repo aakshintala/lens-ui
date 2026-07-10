@@ -69,7 +69,12 @@ pub struct Elicitation {
 /// server returns one (P3 live-verify item).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingUserMessage {
+    /// Lens-local id — addresses the optimistic bubble for rollback/UI.
     pub pending_id: String,
+    /// ← `SendEventAck.pending_id`, stamped at POST-return (native healthy path).
+    pub server_pending_id: Option<String>,
+    /// ← `SendEventAck.item_id`, stamped at POST-return (non-native / native-down).
+    pub store_item_id: Option<String>,
     pub content: String,
     /// Epoch millis, injected-clock-stamped when the send is issued (P3).
     pub created_at: i64,
@@ -111,9 +116,25 @@ mod tests {
     }
 
     #[test]
+    fn pending_user_message_carries_server_ids() {
+        let p = PendingUserMessage {
+            pending_id: "lens_pend_1".into(),
+            server_pending_id: Some("pending_a1".into()),
+            store_item_id: None,
+            content: "hi".into(),
+            created_at: 1,
+        };
+        let back: PendingUserMessage =
+            serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        assert_eq!(back, p);
+    }
+
+    #[test]
     fn pending_user_message_roundtrips() {
         let p = PendingUserMessage {
             pending_id: "pend_1".into(),
+            server_pending_id: None,
+            store_item_id: None,
             content: "hello".into(),
             created_at: 1_700_000_000_000,
         };
