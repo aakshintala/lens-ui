@@ -2,17 +2,269 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::time::Instant;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use gpui::{
-    App, Context, FocusHandle, Focusable, KeyBinding, ListScrollEvent, Styled, Window, actions,
-    div, list, prelude::*, px,
+    App, AsyncWindowContext, Context, EntityId, FocusHandle, Focusable, KeyBinding, ListOffset,
+    ListScrollEvent, Styled, WeakEntity, Window, actions, div, list, prelude::*, px,
 };
 use gpui_component::{ActiveTheme as _, v_virtual_list};
 
 use crate::backend::{Backend, BackendChoice};
-use crate::probe::{AnchorSnapshot, FollowMode, ProbeHarness, ProbeVerdict};
-use crate::rowsource::RowId;
+use crate::probe::{FollowMode, ProbeHarness, ProbeVerdict};
+use crate::rowsource::{HandoffMode, RowId, RowSource};
+
+const HANDOFF_N: usize = 40;
+const HANDOFF_STREAM_CHUNKS: &[&str] = &[
+    "fn streamed() {\n",
+    "    println!(\"grow\");\n",
+    "    let xs = vec![1, 2, 3];\n",
+    "}\n",
+    "```\n",
+];
+
+#[derive(Clone, Copy, Debug)]
+struct HandoffSnapshot {
+    entity_id: EntityId,
+    markdown_init_count: u32,
+    scroll: ListOffset,
+    item_count: usize,
+}
+
+impl HandoffSnapshot {
+    fn bottom_pinned(&self) -> bool {
+        self.scroll.item_ix == self.item_count && self.scroll.offset_in_item == px(0.)
+    }
+}
+
+// ADAPT: gpui 0.2.2 has no `await next_frame()`; schedule `on_next_frame` + `window.refresh()`.
+async fn wait_n_frames(wcx: &mut AsyncWindowContext, n: usize) {
+    for _ in 0..n {
+        let (tx, rx) = mpsc::sync_channel(1);
+        wcx.on_next_frame(move |_, _| {
+            let _ = tx.send(());
+        });
+        let _ = wcx.update(|window, _| window.refresh());
+        loop {
+            if rx.try_recv().is_ok() {
+                break;
+            }
+            wcx.background_executor()
+                .timer(Duration::from_millis(1))
+                .await;
+        }
+    }
+}
+
+fn snapshot_backend_a(
+    backend: &crate::backend_a::BackendA,
+    row_id: RowId,
+    cx: &App,
+) -> Option<HandoffSnapshot> {
+    Some(HandoffSnapshot {
+        entity_id: backend.store.entity_id(row_id, cx)?,
+        markdown_init_count: backend.store.markdown_init_count(row_id, cx),
+        scroll: backend.list_state.logical_scroll_top(),
+        item_count: backend.item_count(),
+    })
+}
+
+async fn stream_scratch_row(weak: &WeakEntity<HarnessView>, wcx: &mut AsyncWindowContext) {
+    for chunk in HANDOFF_STREAM_CHUNKS {
+        let _ = weak.update_in(wcx, |view, window, cx| {
+            if let Backend::A(ref mut backend) = view.backend {
+                backend.append_to_last(chunk, window, cx);
+            }
+            cx.notify();
+        });
+        wait_n_frames(wcx, 2).await;
+    }
+}
+
+fn print_handoff_upsert(before: HandoffSnapshot, after: HandoffSnapshot) {
+    let entity_ok = before.entity_id == after.entity_id;
+    let md_ok = after.markdown_init_count <= before.markdown_init_count
+        && after.markdown_init_count <= 1;
+    let scroll_ok = after.bottom_pinned();
+    if entity_ok && md_ok && scroll_ok {
+        println!("HANDOFF_UPSERT: PASS");
+    } else {
+        let mut reasons = Vec::new();
+        if !entity_ok {
+            reasons.push("entity recreated");
+        }
+        if !md_ok {
+            reasons.push("markdown re-init");
+        }
+        if !scroll_ok {
+            reasons.push("scroll anchor shifted");
+        }
+        println!(
+            "HANDOFF_UPSERT: FAIL {} | before entity={:?} md={} scroll=({}, {:?}) count={} | after entity={:?} md={} scroll=({}, {:?}) count={}",
+            reasons.join(", "),
+            before.entity_id,
+            before.markdown_init_count,
+            before.scroll.item_ix,
+            before.scroll.offset_in_item,
+            before.item_count,
+            after.entity_id,
+            after.markdown_init_count,
+            after.scroll.item_ix,
+            after.scroll.offset_in_item,
+            after.item_count,
+        );
+    }
+}
+
+fn print_handoff_recreate(before: HandoffSnapshot, after: HandoffSnapshot) {
+    let recreated = before.entity_id != after.entity_id
+        || after.markdown_init_count > before.markdown_init_count;
+    if recreated {
+        println!(
+            "HANDOFF_RECREATE: FAIL(expected) recreated entity {:?}->{:?} md {}->{} scroll ({}, {:?})->({}, {:?})",
+            before.entity_id,
+            after.entity_id,
+            before.markdown_init_count,
+            after.markdown_init_count,
+            before.scroll.item_ix,
+            before.scroll.offset_in_item,
+            after.scroll.item_ix,
+            after.scroll.offset_in_item,
+        );
+    } else {
+        println!(
+            "HANDOFF_RECREATE: PASS(unexpected) entity {:?}->{:?} md {}->{} scroll ({}, {:?})->({}, {:?})",
+            before.entity_id,
+            after.entity_id,
+            before.markdown_init_count,
+            after.markdown_init_count,
+            before.scroll.item_ix,
+            before.scroll.offset_in_item,
+            after.scroll.item_ix,
+            after.scroll.offset_in_item,
+        );
+    }
+}
+
+async fn run_handoff_probe(weak: WeakEntity<HarnessView>, mut wcx: AsyncWindowContext) {
+    wait_n_frames(&mut wcx, 2).await;
+
+    let bottom_ok = weak
+        .update_in(&mut wcx, |view, _, _| {
+            if let Backend::A(ref backend) = view.backend {
+                let count = backend.item_count();
+                let offset = backend.list_state.logical_scroll_top();
+                offset.item_ix == count && offset.offset_in_item == px(0.)
+            } else {
+                false
+            }
+        })
+        .unwrap_or(false);
+    if !bottom_ok {
+        println!("HANDOFF_UPSERT: FAIL not bottom-pinned on open");
+        println!("HANDOFF_RECREATE: FAIL(expected) skipped — setup failed");
+        println!("HANDOFF_DONE");
+        let _ = wcx.update(|_, cx| cx.quit());
+        return;
+    }
+
+    stream_scratch_row(&weak, &mut wcx).await;
+    wait_n_frames(&mut wcx, 2).await;
+
+    let (before, finalized) = weak
+        .update_in(&mut wcx, |view, _, cx| {
+            let Backend::A(ref backend) = view.backend else {
+                return (None, RowId(0));
+            };
+            let finalized = *backend.store.order.last().unwrap();
+            (snapshot_backend_a(backend, finalized, cx), finalized)
+        })
+        .unwrap_or((None, RowId(0)));
+    let Some(before) = before else {
+        println!("HANDOFF_UPSERT: FAIL backend not A");
+        println!("HANDOFF_DONE");
+        let _ = wcx.update(|_, cx| cx.quit());
+        return;
+    };
+
+    let _ = weak.update_in(&mut wcx, |view, _, cx| {
+        if let Backend::A(ref mut backend) = view.backend {
+            let _ = backend.finalize_handoff(HandoffMode::UpsertById, cx);
+            cx.notify();
+        }
+    });
+    wait_n_frames(&mut wcx, 2).await;
+
+    let after = weak
+        .update_in(&mut wcx, |view, _, cx| {
+            let Backend::A(ref backend) = view.backend else {
+                return None;
+            };
+            snapshot_backend_a(backend, finalized, cx)
+        })
+        .ok()
+        .flatten();
+    if let Some(after) = after {
+        print_handoff_upsert(before, after);
+    } else {
+        println!("HANDOFF_UPSERT: FAIL could not read after snapshot");
+    }
+
+    let _ = weak.update_in(&mut wcx, |view, _, cx| {
+        if let Backend::A(ref mut backend) = view.backend {
+            backend.reload_handoff(HANDOFF_N, cx);
+            view.checked_initial_bottom = false;
+            cx.notify();
+        }
+    });
+    wait_n_frames(&mut wcx, 2).await;
+
+    stream_scratch_row(&weak, &mut wcx).await;
+    wait_n_frames(&mut wcx, 2).await;
+
+    let (before_recreate, finalized_recreate) = weak
+        .update_in(&mut wcx, |view, _, cx| {
+            let Backend::A(ref backend) = view.backend else {
+                return (None, RowId(0));
+            };
+            let finalized = *backend.store.order.last().unwrap();
+            (snapshot_backend_a(backend, finalized, cx), finalized)
+        })
+        .unwrap_or((None, RowId(0)));
+    let Some(before_recreate) = before_recreate else {
+        println!("HANDOFF_RECREATE: FAIL(expected) could not read before snapshot");
+        println!("HANDOFF_DONE");
+        let _ = wcx.update(|_, cx| cx.quit());
+        return;
+    };
+
+    let _ = weak.update_in(&mut wcx, |view, _, cx| {
+        if let Backend::A(ref mut backend) = view.backend {
+            let _ = backend.finalize_handoff(HandoffMode::ClearRecreate, cx);
+            cx.notify();
+        }
+    });
+    wait_n_frames(&mut wcx, 2).await;
+
+    let after_recreate = weak
+        .update_in(&mut wcx, |view, _, cx| {
+            let Backend::A(ref backend) = view.backend else {
+                return None;
+            };
+            snapshot_backend_a(backend, finalized_recreate, cx)
+        })
+        .ok()
+        .flatten();
+    if let Some(after_recreate) = after_recreate {
+        print_handoff_recreate(before_recreate, after_recreate);
+    } else {
+        println!("HANDOFF_RECREATE: FAIL(expected) could not read after snapshot");
+    }
+
+    println!("HANDOFF_DONE");
+    let _ = wcx.update(|_, cx| cx.quit());
+}
 
 actions!(
     harness,
@@ -44,28 +296,36 @@ pub struct HarnessView {
     identity_arm_assert: bool,
     identity_scrolled_off: bool,
     last_scroll_y: Option<gpui::Pixels>,
+    handoff: bool,
+    handoff_spawned: bool,
 }
 
 impl HarnessView {
     pub fn new(
         choice: BackendChoice,
         n: usize,
+        handoff: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
+        let fixture_n = if handoff { HANDOFF_N } else { n };
         let identity_ix = {
-            let f = crate::fixture::Fixture::synthetic(n);
+            let f = if handoff {
+                crate::fixture::Fixture::handoff_scripted(fixture_n)
+            } else {
+                crate::fixture::Fixture::synthetic(fixture_n)
+            };
             f.rows
                 .iter()
                 .position(|r| r.kind == crate::fixture::RowKind::CodeBlock)
-                .unwrap_or(n / 4)
+                .unwrap_or(fixture_n / 4)
         };
         Self {
             focus_handle,
             probes: ProbeHarness::new(identity_ix),
-            backend: Backend::new(choice, n, cx),
+            backend: Backend::new(choice, fixture_n, handoff, cx),
             render_calls: Rc::new(RefCell::new(0)),
             frame_started: None,
             checked_initial_bottom: false,
@@ -75,6 +335,8 @@ impl HarnessView {
             identity_arm_assert: false,
             identity_scrolled_off: false,
             last_scroll_y: None,
+            handoff,
+            handoff_spawned: false,
         }
     }
 
@@ -371,7 +633,18 @@ impl HarnessView {
 }
 
 impl Render for HarnessView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.handoff && !self.handoff_spawned {
+            self.handoff_spawned = true;
+            cx.spawn_in(window, |weak, wcx: &mut AsyncWindowContext| {
+                let wcx = wcx.clone();
+                async move {
+                    run_handoff_probe(weak, wcx).await;
+                }
+            })
+            .detach();
+        }
+
         let now = Instant::now();
         let frame_elapsed = self
             .frame_started

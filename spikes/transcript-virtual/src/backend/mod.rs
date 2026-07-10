@@ -48,10 +48,14 @@ pub enum Backend {
 }
 
 impl Backend {
-    pub fn new(choice: BackendChoice, n: usize, cx: &mut App) -> Self {
-        match choice {
-            BackendChoice::A => Self::A(BackendA::new(n, cx)),
-            BackendChoice::B => Self::B(BackendB::new(n, cx)),
+    pub fn new(choice: BackendChoice, n: usize, handoff: bool, cx: &mut App) -> Self {
+        if handoff {
+            Self::A(BackendA::new_handoff(n, cx))
+        } else {
+            match choice {
+                BackendChoice::A => Self::A(BackendA::new(n, cx)),
+                BackendChoice::B => Self::B(BackendB::new(n, cx)),
+            }
         }
     }
 

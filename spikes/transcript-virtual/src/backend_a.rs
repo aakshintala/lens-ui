@@ -1,10 +1,10 @@
 //! Backend A — gpui native `list()` + `ListState` + `ListAlignment::Bottom`.
 
-use gpui::{App, Entity, EntityId, ListAlignment, ListState, Pixels, Window, div, prelude::*, px};
+use gpui::{App, EntityId, ListAlignment, ListState, Pixels, Window, div, prelude::*, px};
 
 use crate::fixture::Fixture;
 use crate::row_render::render_row;
-use crate::rowsource::{RowId, RowSource, RowStore};
+use crate::rowsource::{HandoffMode, RowId, RowSource, RowStore};
 
 const OVERDRAW: Pixels = px(200.);
 
@@ -25,6 +25,30 @@ impl BackendA {
             store,
             list_state,
         }
+    }
+
+    pub fn new_handoff(n: usize, cx: &mut App) -> Self {
+        let fixture = Fixture::handoff_scripted(n);
+        let mut store = RowStore::new();
+        store.load_fixture(&fixture.rows, cx);
+        let list_state = ListState::new(n, ListAlignment::Bottom, OVERDRAW);
+        Self {
+            fixture,
+            store,
+            list_state,
+        }
+    }
+
+    pub fn reload_handoff(&mut self, n: usize, cx: &mut App) {
+        self.fixture = Fixture::handoff_scripted(n);
+        self.store.load_fixture(&self.fixture.rows, cx);
+        self.list_state.reset(n);
+    }
+
+    pub fn finalize_handoff(&mut self, mode: HandoffMode, cx: &mut App) -> RowId {
+        let finalized = self.store.finalize_handoff(mode, cx);
+        self.list_state.reset(self.store.len());
+        finalized
     }
 
     pub fn reload(&mut self, n: usize, cx: &mut App) {

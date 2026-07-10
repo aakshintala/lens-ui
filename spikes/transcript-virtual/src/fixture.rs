@@ -69,6 +69,17 @@ impl Fixture {
         }
     }
 
+    /// Build `n` synthetic rows for the finalize-handoff probe: same as
+    /// [`Self::synthetic`] but the last row is always a markdown `CodeBlock`.
+    pub fn handoff_scripted(n: usize) -> Self {
+        let mut fixture = Self::synthetic(n);
+        if let Some(last) = fixture.rows.last_mut() {
+            last.kind = RowKind::CodeBlock;
+            last.text = default_text(RowKind::CodeBlock, n.saturating_sub(1));
+        }
+        fixture
+    }
+
     /// Append text to the streaming last item (contract 1a).
     pub fn append_to_last(&mut self, chunk: &str) {
         if let Some(row) = self.rows.last_mut() {

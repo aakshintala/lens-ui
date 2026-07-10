@@ -272,3 +272,38 @@ spec §5.
 - Render closure signature differs: `Fn(&mut V, Range<usize>, …) -> Vec<_>` vs
   gpui `list()`'s per-index `AnyElement`.
 
+---
+
+## Phase 3 — finalize-handoff probe (2026-07-10)
+
+### Run
+
+```bash
+cargo build -p transcript-virtual
+cargo run -p transcript-virtual -- --handoff
+```
+
+`--handoff` forces Backend A, N=40, last row `CodeBlock` (markdown). The window
+opens, a `cx.spawn_in` scripted loop drives stream → finalize → verdict, then
+auto-quits. Read **stdout** (not the on-screen readout).
+
+### Verdict lines
+
+| Line | Meaning |
+|------|---------|
+| `HANDOFF_UPSERT: PASS` | Upsert-by-id kept entity id, no markdown re-init, bottom pin held |
+| `HANDOFF_UPSERT: FAIL …` | Flash-risk regression — prints before/after entity/md/scroll triples |
+| `HANDOFF_RECREATE: FAIL(expected) …` | **Desired** negative control — clear+recreate remounted entities |
+| `HANDOFF_RECREATE: PASS(unexpected) …` | Recreate path somehow retained identity (bad) |
+| `HANDOFF_DONE` | Probe finished; app called `cx.quit()` |
+
+### API surprises
+
+- No `await next_frame()` in gpui 0.2.2 — scripted runner uses
+  `window.on_next_frame` + `window.refresh()` polled via `mpsc::sync_channel`
+  (see `// ADAPT:` in `app.rs`).
+- `finalize_handoff` appends a fresh scratch row → `list_state.reset(new_count)`
+  (not splice) so bottom alignment re-anchors on the new tail.
+- `spawn_in` hands `&mut AsyncWindowContext`; the async task **clones** it to
+  hold state across await points (`AsyncWindowContext: Clone`).
+

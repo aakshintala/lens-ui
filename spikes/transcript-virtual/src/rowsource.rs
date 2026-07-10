@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use gpui::{App, AppContext, Entity, Pixels, Window};
+use gpui::{App, AppContext, Entity, EntityId, Pixels, Window};
 
 use crate::fixture::{FixtureRow, RowKind};
 
@@ -11,6 +11,7 @@ use crate::fixture::{FixtureRow, RowKind};
 pub struct RowId(pub u64);
 
 /// Per-row retained state. Backends render a handle into this store.
+#[derive(Clone)]
 pub struct RowState {
     pub id: RowId,
     pub kind: RowKind,
@@ -35,6 +36,15 @@ impl RowState {
             measured_height: None,
         }
     }
+}
+
+/// How a live scratch row is settled into the retained disk window.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HandoffMode {
+    /// Re-ingest by id, reusing existing `Entity<RowState>` handles.
+    UpsertById,
+    /// Clear+recreate entities for the same ids (negative control).
+    ClearRecreate,
 }
 
 /// Retained `Entity`-per-item store keyed by item id. Order is separate from
@@ -99,6 +109,77 @@ impl RowStore {
         if let Some(entity) = self.entities.get_mut(&id) {
             entity.update(cx, |state, _| state.height_delta += delta);
         }
+    }
+
+    pub fn entity_id(&self, id: RowId, _cx: &App) -> Option<EntityId> {
+        self.entities.get(&id).map(|entity| entity.entity_id())
+    }
+
+    pub fn markdown_init_count(&self, id: RowId, cx: &App) -> u32 {
+        self.entities
+            .get(&id)
+            .map(|entity| entity.read(cx).markdown_init_count)
+            .unwrap_or(0)
+    }
+
+    fn next_scratch_id(&self) -> RowId {
+        let max = self.order.iter().map(|id| id.0).max().unwrap_or(0);
+        RowId(max + 1)
+    }
+
+    fn append_scratch_row(&mut self, cx: &mut App) -> RowId {
+        let id = self.next_scratch_id();
+        let entity = cx.new(|_| RowState {
+            id,
+            kind: RowKind::OneLiner,
+            text: String::new(),
+            height_delta: gpui::px(0.),
+            use_markdown: false,
+            markdown_initialized: false,
+            markdown_init_count: 0,
+            measured_height: None,
+        });
+        self.order.push(id);
+        self.entities.insert(id, entity);
+        id
+    }
+
+    /// Settle the live scratch row into the disk window, then open a fresh scratch tail.
+    pub fn finalize_handoff(&mut self, mode: HandoffMode, cx: &mut App) -> RowId {
+        let finalized = *self
+            .order
+            .last()
+            .expect("finalize_handoff needs at least one row");
+
+        match mode {
+            HandoffMode::UpsertById => {
+                for &id in &self.order.clone() {
+                    if let Some(entity) = self.entities.get(&id) {
+                        let text = entity.read(cx).text.clone();
+                        entity.update(cx, |state, _| state.text = text);
+                    }
+                }
+            }
+            HandoffMode::ClearRecreate => {
+                let snapshots = self
+                    .order
+                    .iter()
+                    .filter_map(|&id| {
+                        self.entities
+                            .get(&id)
+                            .map(|entity| (id, entity.read(cx).clone()))
+                    })
+                    .collect::<Vec<_>>();
+                self.entities.clear();
+                for (id, state) in snapshots {
+                    let entity = cx.new(|_| state);
+                    self.entities.insert(id, entity);
+                }
+            }
+        }
+
+        self.append_scratch_row(cx);
+        finalized
     }
 }
 
