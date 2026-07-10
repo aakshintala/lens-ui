@@ -10,6 +10,7 @@ use crate::reduce::{StreamUpdate, Updates};
 use lens_client::stream::event::TodoItemStatus;
 use lens_client::stream::{ResponseEvent, SessionEvent, SessionStatusValue as WireStatus};
 use smallvec::smallvec;
+use std::sync::Arc;
 
 /// Map the 6-value wire status to the domain status (D-P1-8). Distinct types, same shape.
 pub fn normalize_status(w: WireStatus) -> SessionStatusValue {
@@ -158,6 +159,7 @@ pub(crate) fn fold_session_field(
             agent_id,
             agent_name,
         } => {
+            let prev_agent = state.stream.current_agent.clone();
             let from = state.agent_id.clone();
             let to = crate::domain::AgentId::new(agent_id.clone());
             state.agent_id = to.clone();
@@ -168,6 +170,9 @@ pub(crate) fn fold_session_field(
                 agent_id: state.agent_id.clone(),
                 agent_name: state.agent_name.clone(),
             });
+            if state.stream.current_agent != prev_agent {
+                u.push(StreamUpdate::ScratchChanged(Arc::new(state.stream.clone())));
+            }
             u
         }
         SessionEvent::ChildSessionUpdated { .. } => smallvec![StreamUpdate::ChildSessionChanged],
@@ -513,5 +518,25 @@ mod tests {
             u.iter()
                 .any(|update| matches!(update, StreamUpdate::AgentChanged { .. }))
         );
+    }
+
+    #[test]
+    fn agent_changed_emits_scratch_when_current_agent_updates() {
+        let mut s = st();
+        let u = reduce(
+            &mut s,
+            &ServerStreamEvent::Session(SessionEvent::AgentChanged {
+                agent_id: "ag_2".into(),
+                agent_name: "debby".into(),
+            }),
+            &clock(),
+        );
+        let scratch = u.iter().find_map(|update| match update {
+            StreamUpdate::ScratchChanged(scratch) => Some(std::sync::Arc::clone(scratch)),
+            _ => None,
+        });
+        let scratch =
+            scratch.expect("AgentChanged must emit ScratchChanged when current_agent updates");
+        assert_eq!(scratch.current_agent, s.stream.current_agent);
     }
 }

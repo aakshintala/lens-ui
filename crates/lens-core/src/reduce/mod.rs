@@ -89,6 +89,7 @@ pub fn reduce(state: &mut SessionState, event: &ServerStreamEvent, clock: &dyn C
                 // D-P1-4 / REVIEW#3: resource items produce no transcript item.
                 None => smallvec![StreamUpdate::ResourcesChanged],
                 Some((id, kind)) => {
+                    let prev_agent = state.stream.current_agent.clone();
                     // REVIEW#7 / D-P1-14: a completed FunctionCall's sanitized agent_name becomes the
                     // current attribution agent for this and subsequent items.
                     if let crate::domain::ItemKind::FunctionCall {
@@ -112,22 +113,18 @@ pub fn reduce(state: &mut SessionState, event: &ServerStreamEvent, clock: &dyn C
                         }
                     }
                     let mut u = items::push_item(state, id, kind, None, clock);
-                    if cleared {
+                    if cleared || state.stream.current_agent != prev_agent {
                         u.push(StreamUpdate::ScratchChanged(Arc::new(state.stream.clone())));
                     }
                     u
                 }
             },
             ResponseEvent::Completed => {
-                let had_open_msg = state.stream.open_message.is_some();
-                let had_open_reasoning = state.stream.open_reasoning.is_some();
                 let mut u = items::finalize_message(state, clock);
                 let mut ru = items::finalize_reasoning(state, clock);
                 u.append(&mut ru);
                 state.stream.turn = state.stream.turn.saturating_add(1);
-                if had_open_msg || had_open_reasoning {
-                    u.push(StreamUpdate::ScratchChanged(Arc::new(state.stream.clone())));
-                }
+                u.push(StreamUpdate::ScratchChanged(Arc::new(state.stream.clone())));
                 u.push(StreamUpdate::StatusChanged(state.status));
                 u
             }
@@ -178,6 +175,44 @@ mod tests {
         let ev = ServerStreamEvent::Reconnecting { attempt: 1 };
         let out = reduce(&mut s, &ev, &clock);
         assert_eq!(&out[..], &[StreamUpdate::Reconnecting { attempt: 1 }]);
+    }
+
+    #[test]
+    fn completed_always_emits_scratch_after_turn_bump() {
+        use lens_client::stream::ResponseEvent;
+        let mut s = empty_state();
+        let clock = ManualClock::new(1_700_000_000_000);
+        let u = reduce(
+            &mut s,
+            &ServerStreamEvent::Response(ResponseEvent::Completed),
+            &clock,
+        );
+        assert_eq!(s.stream.turn, 1);
+        let scratch = u.iter().find_map(|update| match update {
+            StreamUpdate::ScratchChanged(scratch) => Some(Arc::clone(scratch)),
+            _ => None,
+        });
+        let scratch = scratch.expect("Completed must emit ScratchChanged for turn bump");
+        assert_eq!(scratch.turn, s.stream.turn);
+    }
+
+    #[test]
+    fn function_call_attribution_emits_scratch_when_agent_changes() {
+        use crate::reduce::testutil::parse_response;
+        let mut s = empty_state();
+        let clock = ManualClock::new(1_700_000_000_000);
+        let ev = parse_response(
+            "response.output_item.done",
+            r#"{"item":{"id":"fc_1","type":"function_call","status":"completed","name":"read","arguments":"{}","call_id":"toolu_1","agent":"coder"}}"#,
+        );
+        let u = reduce(&mut s, &ev, &clock);
+        assert_eq!(s.stream.current_agent.as_deref(), Some("coder"));
+        let scratch = u.iter().find_map(|update| match update {
+            StreamUpdate::ScratchChanged(scratch) => Some(Arc::clone(scratch)),
+            _ => None,
+        });
+        let scratch = scratch.expect("FunctionCall agent attribution must emit ScratchChanged");
+        assert_eq!(scratch.current_agent, s.stream.current_agent);
     }
 
     mod corpus {

@@ -245,7 +245,13 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        assert!(matches!(&u[..], [StreamUpdate::ItemAppended(_)]));
+        assert!(matches!(
+            &u[..],
+            [
+                StreamUpdate::ItemAppended(_),
+                StreamUpdate::ScratchChanged(_)
+            ]
+        ));
         assert_eq!(s.items[0].created_at, 1_700_000_000_000); // clock-stamped
     }
 
