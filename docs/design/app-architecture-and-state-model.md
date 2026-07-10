@@ -1237,6 +1237,25 @@ down the stream):
 (There is no `Ws` `ClientError` variant — the WS terminal path is deferred and
 `lens-client` has no `terminal.rs` yet; add its mapping when that path lands.)
 
+**P3-2 as-built refinements (2026-07-09, whole-branch review):**
+
+- **`Send` while parked is rejected.** A `SessionCommand::Send` issued while the actor
+  is **parked** (`transport != Connected`) does **not** insert an optimistic bubble or
+  POST — it returns `CommandOutcome::SendRejected`. A parked stream can't reconcile the
+  send, so fabricating a bubble would strand it. (Only `Parked` rejects; `Reconnecting`/
+  `Connected` sends proceed.)
+- **Held bubbles are retained across reconnect, not dropped.** A Table B "keep" bubble
+  (POST failed without stamping an id ⇒ both `server_pending_id` and `store_item_id`
+  `None`) is **retained** on `SnapshotRestored` reconcile — it is neither landed nor
+  confirmed-lost, and the user's typed text must stay recoverable. This qualifies the
+  §4 P3(b) Signal-B "drop as lost" rule: only *stamped* bubbles absent from the server's
+  `pending_inputs`/items drop. Full restore-to-composer + landed-vs-lost dedup (the
+  deferred `SendLost` detector) is **P3-3** — see memory `composer-send-recovery-and-history`.
+- **Command-path `Auth 403` / `NotFound` escalation is deferred to §9.** Table B lists
+  registry-removal / tombstone for these, but the P3-2 command path only rolls back +
+  `SendFailed`; the stream's own terminal `Disconnected(Forbidden/NotFound)` drives the
+  Table A stop today.
+
 ### 13.2 Downstream contracts (the seams)
 
 What each rendering document reads from this layer. These surfaces are fixed
