@@ -1731,4 +1731,347 @@ mod tests {
             "parked actor must drop post-park events (got {post_park:?})"
         );
     }
+
+    /// Mock whose `send_event` blocks until the test sends on `release_tx`.
+    struct BlockingMockApi {
+        entered_tx: std::sync::mpsc::Sender<()>,
+        release_rx: std::sync::mpsc::Receiver<()>,
+        ack: SendEventAck,
+    }
+
+    impl BlockingMockApi {
+        fn with_ack(
+            ack: SendEventAck,
+        ) -> (
+            Box<dyn SessionApi + Send>,
+            std::sync::mpsc::Receiver<()>,
+            std::sync::mpsc::Sender<()>,
+        ) {
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let mock = BlockingMockApi {
+                entered_tx,
+                release_rx,
+                ack,
+            };
+            (Box::new(mock), entered_rx, release_tx)
+        }
+    }
+
+    impl SessionApi for BlockingMockApi {
+        fn send_event(
+            &self,
+            _id: &SessionId,
+            _evt: &SessionEventInput,
+        ) -> Result<SendEventAck, ClientError> {
+            let _ = self.entered_tx.send(());
+            self.release_rx
+                .recv()
+                .expect("test must release blocked send");
+            Ok(self.ack.clone())
+        }
+    }
+
+    #[test]
+    fn send_while_running_reconciles_without_teardown() {
+        let _dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(_dir.path());
+        seed_connection(&stores);
+
+        let (api, _mock) = MockApi::succeed_with_ack(SendEventAck {
+            queued: true,
+            item_id: Some("msg_running".into()),
+            pending_id: None,
+            ..Default::default()
+        });
+        let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, up_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+
+        ev_tx.send(status_running_event()).unwrap();
+        let _ = up_rx.recv_blocking().expect("running status delta");
+
+        handle
+            .commands
+            .send(SessionCommand::Send {
+                text: "while running".into(),
+                model_override: None,
+            })
+            .unwrap();
+
+        let optimistic = expect_pending_user_changed(&up_rx);
+        assert_eq!(optimistic.len(), 1);
+        assert_eq!(optimistic[0].content, "while running");
+
+        let stamped = expect_pending_user_changed(&up_rx);
+        assert_eq!(stamped[0].store_item_id.as_deref(), Some("msg_running"));
+
+        match handle.outcomes.recv_blocking().unwrap() {
+            ActorOutcome::Command(CommandOutcome::SendAccepted { .. }) => {}
+            other => panic!("expected SendAccepted, got {other:?}"),
+        }
+
+        ev_tx
+            .send(ServerStreamEvent::Session(SessionEvent::InputConsumed {
+                item_id: "msg_running".into(),
+                item_type: "message".into(),
+                cleared_pending_id: None,
+            }))
+            .unwrap();
+        let cleared = expect_pending_user_changed(&up_rx);
+        assert!(
+            cleared.is_empty(),
+            "InputConsumed clears bubble while running"
+        );
+
+        // Stream stays alive — further events and Stop still work.
+        ev_tx.send(status_running_event()).unwrap();
+        assert!(up_rx.recv_blocking().is_ok());
+        handle.stop_and_join();
+
+        // Network fail while running: rollback but no stream teardown.
+        let _dir2 = tempfile::tempdir().unwrap();
+        let stores2 = test_stores(_dir2.path());
+        seed_connection(&stores2);
+        let (api2, _mock2) = MockApi::fail(ClientError::network_for_test());
+        let (ev_tx2, ev_rx2) = crossbeam_channel::bounded(64);
+        let (up_tx2, up_rx2) = async_channel::bounded(64);
+        let handle2 = spawn_actor(fresh_state(), ev_rx2, up_tx2, stores2, test_clock(), api2);
+        ev_tx2.send(status_running_event()).unwrap();
+        let _ = up_rx2.recv_blocking();
+        handle2
+            .commands
+            .send(SessionCommand::Send {
+                text: "will fail".into(),
+                model_override: None,
+            })
+            .unwrap();
+        let _ = expect_pending_user_changed(&up_rx2);
+        assert!(expect_pending_user_changed(&up_rx2).is_empty());
+        match handle2.outcomes.recv_blocking().unwrap() {
+            ActorOutcome::Command(CommandOutcome::SendFailed { .. }) => {}
+            other => panic!("expected SendFailed, got {other:?}"),
+        }
+        ev_tx2.send(status_running_event()).unwrap();
+        assert!(up_rx2.recv_blocking().is_ok());
+        handle2.stop_and_join();
+    }
+
+    #[test]
+    fn send_while_reconnecting_retains_then_reconcile_clears() {
+        let _dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(_dir.path());
+        seed_connection(&stores);
+
+        let (api, _mock) = MockApi::succeed_with_ack(SendEventAck {
+            queued: true,
+            pending_id: Some("pend_recon".into()),
+            item_id: None,
+            ..Default::default()
+        });
+        let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, up_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+
+        handle
+            .commands
+            .send(SessionCommand::Send {
+                text: "mid-reconnect".into(),
+                model_override: None,
+            })
+            .unwrap();
+        let _ = expect_pending_user_changed(&up_rx);
+        let stamped = expect_pending_user_changed(&up_rx);
+        assert_eq!(stamped.len(), 1);
+        assert_eq!(stamped[0].server_pending_id.as_deref(), Some("pend_recon"));
+        let _ = handle.outcomes.recv_blocking().unwrap();
+
+        ev_tx
+            .send(ServerStreamEvent::Reconnecting { attempt: 1 })
+            .unwrap();
+
+        match handle.outcomes.recv_blocking().unwrap() {
+            ActorOutcome::TransportChanged {
+                transport: ActorTransport::Reconnecting,
+                reconcile_in_flight: true,
+            } => {}
+            other => panic!("expected TransportChanged Reconnecting, got {other:?}"),
+        }
+
+        // §4 P3(b) rule 1: gap/reconnect alone must not clear pending_user.
+        let reconnect_delta = up_rx.recv_blocking().expect("Reconnecting delta");
+        assert!(matches!(
+            reconnect_delta,
+            StreamUpdate::Reconnecting { attempt: 1 }
+        ));
+        while let Ok(u) = up_rx.try_recv() {
+            assert!(
+                !matches!(u, StreamUpdate::PendingUserChanged(ref v) if v.is_empty()),
+                "bubble must not be cleared before snapshot reconcile"
+            );
+        }
+
+        let snap = snapshot_fixture(serde_json::json!({
+            "id": "conv_1",
+            "status": "running",
+            "agent_id": "ag_9",
+            "created_at": 1_700_000_000,
+            "llm_model": "opus",
+            "pending_inputs": [],
+            "items": []
+        }));
+        ev_tx
+            .send(ServerStreamEvent::SnapshotRestored(Box::new(snap)))
+            .unwrap();
+
+        let mut saw_reconcile_clear = false;
+        while let Ok(u) = up_rx.recv_blocking() {
+            if matches!(&u, StreamUpdate::PendingUserChanged(v) if v.is_empty()) {
+                saw_reconcile_clear = true;
+                break;
+            }
+        }
+        assert!(
+            saw_reconcile_clear,
+            "SnapshotRestored reconcile must drop bubble missing from pending_inputs"
+        );
+
+        ev_tx
+            .send(ServerStreamEvent::Reconnected { gap: None })
+            .unwrap();
+
+        match handle.outcomes.recv_blocking().unwrap() {
+            ActorOutcome::TransportChanged {
+                transport: ActorTransport::Connected,
+                reconcile_in_flight: false,
+            } => {}
+            other => panic!("expected TransportChanged Connected, got {other:?}"),
+        }
+
+        handle.stop_and_join();
+    }
+
+    #[test]
+    fn demote_then_send_works_in_summary_mode() {
+        let _dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(_dir.path());
+        seed_connection(&stores);
+
+        let (api, _mock) = MockApi::succeed_with_ack(SendEventAck {
+            queued: true,
+            item_id: Some("msg_summary".into()),
+            pending_id: None,
+            ..Default::default()
+        });
+        let (_ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, _up_rx) = async_channel::bounded(64);
+        let (sum_tx, sum_rx) = async_channel::bounded(64);
+        let handle = spawn_actor_dual(
+            fresh_state(),
+            ev_rx,
+            up_tx,
+            sum_tx,
+            OutputMode::Summary,
+            stores,
+            test_clock(),
+            api,
+        );
+
+        handle.commands.send(SessionCommand::Demote).unwrap();
+
+        handle
+            .commands
+            .send(SessionCommand::Send {
+                text: "summary send".into(),
+                model_override: None,
+            })
+            .unwrap();
+
+        // Summary mode does not mirror pending_user on the Detailed channel (M2).
+        assert!(sum_rx.recv_blocking().is_ok(), "summary emitted on send");
+
+        match handle.outcomes.recv_blocking().unwrap() {
+            ActorOutcome::Command(CommandOutcome::SendAccepted {
+                lens_pending_id,
+                ack,
+            }) => {
+                assert_eq!(lens_pending_id, "lens_pend_1");
+                assert_eq!(ack.item_id.as_deref(), Some("msg_summary"));
+            }
+            other => panic!("expected SendAccepted, got {other:?}"),
+        }
+
+        handle.stop_and_join();
+
+        // Summary consumer dropped (spawn_actor) — Send still completes, actor survives.
+        let _dir2 = tempfile::tempdir().unwrap();
+        let stores2 = test_stores(_dir2.path());
+        seed_connection(&stores2);
+        let (api2, _mock2) = MockApi::succeed_with_ack(SendEventAck {
+            queued: true,
+            item_id: Some("msg_no_sum".into()),
+            pending_id: None,
+            ..Default::default()
+        });
+        let (ev_tx2, ev_rx2) = crossbeam_channel::bounded(64);
+        let (up_tx2, _up_rx2) = async_channel::bounded(64);
+        let handle2 = spawn_actor(fresh_state(), ev_rx2, up_tx2, stores2, test_clock(), api2);
+        handle2.commands.send(SessionCommand::Demote).unwrap();
+        handle2
+            .commands
+            .send(SessionCommand::Send {
+                text: "no consumer".into(),
+                model_override: None,
+            })
+            .unwrap();
+        match handle2.outcomes.recv_blocking().unwrap() {
+            ActorOutcome::Command(CommandOutcome::SendAccepted { .. }) => {}
+            other => panic!("expected SendAccepted, got {other:?}"),
+        }
+        ev_tx2.send(status_running_event()).unwrap();
+        handle2.stop_and_join();
+    }
+
+    #[test]
+    fn stop_during_in_flight_send_joins_after_send_returns() {
+        // Risk 5a: while blocked in `api.send_event`, Select services nothing — Stop
+        // queues until POST returns. Production bounds this via REST_TIMEOUT (Task 6 F1).
+        let _dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(_dir.path());
+        seed_connection(&stores);
+
+        let (api, entered_rx, release_tx) = BlockingMockApi::with_ack(SendEventAck {
+            queued: true,
+            item_id: Some("msg_blocked".into()),
+            pending_id: None,
+            ..Default::default()
+        });
+        let (_ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, up_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+
+        handle
+            .commands
+            .send(SessionCommand::Send {
+                text: "in flight".into(),
+                model_override: None,
+            })
+            .unwrap();
+
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("actor must enter blocking send_event");
+
+        handle.commands.send(SessionCommand::Stop).unwrap();
+
+        release_tx.send(()).expect("release blocked send");
+
+        let join = std::thread::spawn(move || handle.join_without_stop());
+        join.join()
+            .expect("join thread panicked — actor hung with Stop queued during in-flight send");
+
+        // Optimistic + stamp emits complete before join returns.
+        let _ = expect_pending_user_changed(&up_rx);
+        let _ = expect_pending_user_changed(&up_rx);
+    }
 }
