@@ -53,8 +53,8 @@ pub fn apply(state: &mut SessionState, update: StreamUpdate) {
         | ResourcesChanged
         | SnapshotRestored
         | Reconnecting { .. }
-        | Reconnected
-        | Disconnected => {}
+        | Reconnected => {}
+        Disconnected(_) => {}
     }
 }
 

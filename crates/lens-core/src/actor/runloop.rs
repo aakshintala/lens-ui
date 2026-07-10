@@ -2,7 +2,9 @@
 //! persist write-through, coalesce, emit to the foreground bridge.
 
 use crate::actor::api::{CommandOutcome, SessionApi};
+use crate::actor::outcome::ActorOutcome;
 use crate::actor::summary::SummaryUpdate;
+use crate::actor::transport::{ActorTransport, ParkReason};
 use crate::clock::Clock;
 use crate::domain::SessionState;
 use crate::domain::controls::PendingUserMessage;
@@ -10,6 +12,7 @@ use crate::persist::{ControlStore, TranscriptStore};
 use crate::reduce::{StreamUpdate, Updates, reduce};
 use crossbeam_channel::{Receiver, Select};
 use lens_client::sessions::SessionEventInput;
+use lens_client::stream::DisconnectReason;
 use lens_client::stream::ServerStreamEvent;
 use std::collections::HashSet;
 use std::mem::Discriminant;
@@ -43,7 +46,7 @@ pub enum OutputMode {
 
 pub struct ActorHandle {
     pub commands: crossbeam_channel::Sender<SessionCommand>,
-    pub outcomes: async_channel::Receiver<CommandOutcome>,
+    pub outcomes: async_channel::Receiver<ActorOutcome>,
     join: JoinHandle<()>,
 }
 
@@ -55,13 +58,20 @@ impl ActorHandle {
             .join()
             .expect("actor thread panicked or was poisoned");
     }
+
+    #[cfg(test)]
+    pub fn join_without_stop(self) {
+        self.join
+            .join()
+            .expect("actor thread panicked or was poisoned");
+    }
 }
 
 /// Bridge senders + output granularity for the actor run-loop.
 struct ActorOutput {
     updates: async_channel::Sender<StreamUpdate>,
     summaries: async_channel::Sender<SummaryUpdate>,
-    outcomes: async_channel::Sender<CommandOutcome>,
+    outcomes: async_channel::Sender<ActorOutcome>,
     mode: OutputMode,
 }
 
@@ -128,6 +138,7 @@ pub fn spawn_actor_dual(
     }
 }
 
+#[allow(unused_assignments)] // actor-owned transport/reconcile_in_flight persist for P3-3 quiescence gate
 fn run(
     mut state: SessionState,
     events: Receiver<ServerStreamEvent>,
@@ -149,9 +160,16 @@ fn run(
         })
         .max()
         .unwrap_or(0);
+    let mut transport = ActorTransport::Connected;
+    let mut reconcile_in_flight = false;
+    let mut parked = false;
     loop {
         let mut sel = Select::new();
-        let ev_idx = sel.recv(&events);
+        let ev_idx = if parked {
+            None
+        } else {
+            Some(sel.recv(&events))
+        };
         let cmd_idx = sel.recv(&commands);
         let oper = sel.select();
         match oper.index() {
@@ -198,10 +216,12 @@ fn run(
                             if !emit_pending_user(&output, &state) {
                                 return;
                             }
-                            let _ = output.outcomes.send_blocking(CommandOutcome::SendDenied {
-                                lens_pending_id,
-                                reason: ack.reason,
-                            });
+                            let _ = output.outcomes.send_blocking(ActorOutcome::Command(
+                                CommandOutcome::SendDenied {
+                                    lens_pending_id,
+                                    reason: ack.reason,
+                                },
+                            ));
                         }
                         Ok(ack) => {
                             let p = state
@@ -215,38 +235,53 @@ fn run(
                             if !emit_pending_user(&output, &state) {
                                 return;
                             }
-                            let _ = output.outcomes.send_blocking(CommandOutcome::SendAccepted {
-                                lens_pending_id,
-                                ack,
-                            });
+                            let _ = output.outcomes.send_blocking(ActorOutcome::Command(
+                                CommandOutcome::SendAccepted {
+                                    lens_pending_id,
+                                    ack,
+                                },
+                            ));
                         }
                         Err(e @ lens_client::error::ClientError::Network(_)) => {
                             rollback_pending(&mut state, &lens_pending_id);
                             if !emit_pending_user(&output, &state) {
                                 return;
                             }
-                            let _ = output.outcomes.send_blocking(CommandOutcome::SendFailed {
-                                lens_pending_id,
-                                error: e.to_string(),
-                            });
+                            let _ = output.outcomes.send_blocking(ActorOutcome::Command(
+                                CommandOutcome::SendFailed {
+                                    lens_pending_id,
+                                    error: e.to_string(),
+                                },
+                            ));
                         }
                         Err(e) => {
                             // TODO(P3-2 Task 9): refine per D18 Table B (Auth hold, NotFound tombstone, Server 5xx transient).
-                            let _ = output.outcomes.send_blocking(CommandOutcome::SendFailed {
-                                lens_pending_id,
-                                error: e.to_string(),
-                            });
+                            let _ = output.outcomes.send_blocking(ActorOutcome::Command(
+                                CommandOutcome::SendFailed {
+                                    lens_pending_id,
+                                    error: e.to_string(),
+                                },
+                            ));
                         }
                     }
                 }
             },
-            i if i == ev_idx => match oper.recv(&events) {
+            i if ev_idx == Some(i) => match oper.recv(&events) {
                 Ok(event) => {
                     let mut batch = reduce(&mut state, &event, clock.as_ref());
                     while let Ok(next) = events.try_recv() {
                         batch.extend(reduce(&mut state, &next, clock.as_ref()));
                     }
                     persist_write_through(&stores, &state, &batch, clock.now_millis());
+                    let disconnect_reason = batch.iter().find_map(|u| match u {
+                        StreamUpdate::Disconnected(reason) => Some(*reason),
+                        _ => None,
+                    });
+                    let saw_reconnecting = batch
+                        .iter()
+                        .any(|u| matches!(u, StreamUpdate::Reconnecting { .. }));
+                    let saw_reconnected =
+                        batch.iter().any(|u| matches!(u, StreamUpdate::Reconnected));
                     match output.mode {
                         OutputMode::Detailed => {
                             let had_snapshot = batch
@@ -279,6 +314,68 @@ fn run(
                                 .summaries
                                 .send_blocking(SummaryUpdate::from_state(&state));
                         }
+                    }
+                    if let Some(reason) = disconnect_reason {
+                        match reason {
+                            DisconnectReason::Unauthorized => {
+                                transport = ActorTransport::Parked {
+                                    reason: ParkReason::Unauthorized,
+                                };
+                                let _ = output.outcomes.send_blocking(ActorOutcome::Parked {
+                                    reason: ParkReason::Unauthorized,
+                                });
+                                parked = true;
+                            }
+                            DisconnectReason::SessionFailed => {
+                                transport = ActorTransport::Parked {
+                                    reason: ParkReason::SessionFailed,
+                                };
+                                let _ = output.outcomes.send_blocking(ActorOutcome::Parked {
+                                    reason: ParkReason::SessionFailed,
+                                });
+                                parked = true;
+                            }
+                            DisconnectReason::RetriesExhausted => {
+                                transport = ActorTransport::Parked {
+                                    reason: ParkReason::RetriesExhausted,
+                                };
+                                let _ = output.outcomes.send_blocking(ActorOutcome::Parked {
+                                    reason: ParkReason::RetriesExhausted,
+                                });
+                                parked = true;
+                            }
+                            DisconnectReason::Forbidden => {
+                                let _ = output.outcomes.send_blocking(ActorOutcome::StoppedRemoved);
+                                break;
+                            }
+                            DisconnectReason::NotFound => {
+                                // TODO(P3-3): SessionLifecycle::Deleted disk write + wake/tombstone schema
+                                let _ = output
+                                    .outcomes
+                                    .send_blocking(ActorOutcome::StoppedTombstone);
+                                break;
+                            }
+                        }
+                    }
+                    if saw_reconnecting {
+                        transport = ActorTransport::Reconnecting;
+                        reconcile_in_flight = true;
+                        let _ = output
+                            .outcomes
+                            .send_blocking(ActorOutcome::TransportChanged {
+                                transport,
+                                reconcile_in_flight,
+                            });
+                    }
+                    if saw_reconnected {
+                        transport = ActorTransport::Connected;
+                        reconcile_in_flight = false;
+                        let _ = output
+                            .outcomes
+                            .send_blocking(ActorOutcome::TransportChanged {
+                                transport,
+                                reconcile_in_flight,
+                            });
                     }
                 }
                 Err(_) => break,
@@ -337,8 +434,8 @@ fn persist_write_through(stores: &ActorStores, state: &SessionState, batch: &Upd
             | StreamUpdate::ChildSessionChanged
             | StreamUpdate::ResourcesChanged
             | StreamUpdate::Reconnecting { .. }
-            | StreamUpdate::Reconnected
-            | StreamUpdate::Disconnected => {}
+            | StreamUpdate::Reconnected => {}
+            StreamUpdate::Disconnected(_) => {}
             _ => touched_scalar = true,
         }
     }
@@ -380,6 +477,8 @@ fn coalesce(batch: Updates) -> Updates {
 mod tests {
     use super::*;
     use crate::actor::api::SessionApi;
+    use crate::actor::outcome::ActorOutcome;
+    use crate::actor::transport::{ActorTransport, ParkReason};
     use crate::clock::ManualClock;
     use crate::domain::controls::{Elicitation, ElicitationParams, PendingUserMessage};
     use crate::domain::ids::ElicitationId;
@@ -393,7 +492,9 @@ mod tests {
     use crate::reduce::testutil::{fresh_state, parse_response, snapshot_fixture};
     use lens_client::error::ClientError;
     use lens_client::sessions::{SendEventAck, SessionEventInput};
-    use lens_client::stream::{ServerStreamEvent, SessionEvent, SessionStatusValue as WireStatus};
+    use lens_client::stream::{
+        DisconnectReason, ServerStreamEvent, SessionEvent, SessionStatusValue as WireStatus,
+    };
     use smallvec::smallvec;
     use std::collections::VecDeque;
     use std::path::Path;
@@ -786,10 +887,10 @@ mod tests {
         assert_eq!(stamped[0].store_item_id.as_deref(), Some("msg_42"));
 
         match handle.outcomes.recv_blocking().unwrap() {
-            CommandOutcome::SendAccepted {
+            ActorOutcome::Command(CommandOutcome::SendAccepted {
                 lens_pending_id,
                 ack,
-            } => {
+            }) => {
                 assert_eq!(lens_pending_id, "lens_pend_1");
                 assert_eq!(ack.item_id.as_deref(), Some("msg_42"));
             }
@@ -890,9 +991,9 @@ mod tests {
         assert!(rolled_back.is_empty());
 
         match handle.outcomes.recv_blocking().unwrap() {
-            CommandOutcome::SendFailed {
+            ActorOutcome::Command(CommandOutcome::SendFailed {
                 lens_pending_id, ..
-            } => {
+            }) => {
                 assert_eq!(lens_pending_id, "lens_pend_1");
             }
             other => panic!("expected SendFailed, got {other:?}"),
@@ -931,9 +1032,9 @@ mod tests {
         assert!(up_rx.try_recv().is_err());
 
         match handle.outcomes.recv_blocking().unwrap() {
-            CommandOutcome::SendFailed {
+            ActorOutcome::Command(CommandOutcome::SendFailed {
                 lens_pending_id, ..
-            } => {
+            }) => {
                 assert_eq!(lens_pending_id, "lens_pend_1");
             }
             other => panic!("expected SendFailed, got {other:?}"),
@@ -971,10 +1072,10 @@ mod tests {
         assert!(rolled_back.is_empty());
 
         match handle.outcomes.recv_blocking().unwrap() {
-            CommandOutcome::SendDenied {
+            ActorOutcome::Command(CommandOutcome::SendDenied {
                 lens_pending_id,
                 reason,
-            } => {
+            }) => {
                 assert_eq!(lens_pending_id, "lens_pend_1");
                 assert_eq!(reason.as_deref(), Some("policy"));
             }
@@ -1017,9 +1118,9 @@ mod tests {
             );
             assert_eq!(stamped[0].store_item_id, None);
             match handle.outcomes.recv_blocking().unwrap() {
-                CommandOutcome::SendAccepted {
+                ActorOutcome::Command(CommandOutcome::SendAccepted {
                     lens_pending_id, ..
-                } => {
+                }) => {
                     assert_eq!(lens_pending_id, "lens_pend_1");
                 }
                 other => panic!("expected SendAccepted, got {other:?}"),
@@ -1053,9 +1154,9 @@ mod tests {
             assert_eq!(stamped[0].server_pending_id, None);
             assert_eq!(stamped[0].store_item_id.as_deref(), Some("msg_non_native"));
             match handle.outcomes.recv_blocking().unwrap() {
-                CommandOutcome::SendAccepted {
+                ActorOutcome::Command(CommandOutcome::SendAccepted {
                     lens_pending_id, ..
-                } => {
+                }) => {
                     assert_eq!(lens_pending_id, "lens_pend_1");
                 }
                 other => panic!("expected SendAccepted, got {other:?}"),
@@ -1101,6 +1202,144 @@ mod tests {
 
         let cleared = expect_pending_user_changed(&up_rx);
         assert!(cleared.is_empty(), "bubble removed after consumed");
+
+        handle.stop_and_join();
+    }
+
+    #[test]
+    fn disconnect_unauthorized_parks_actor_still_accepts_stop() {
+        let _dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(_dir.path());
+        seed_connection(&stores);
+
+        let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, up_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(
+            fresh_state(),
+            ev_rx,
+            up_tx,
+            stores,
+            test_clock(),
+            noop_api(),
+        );
+
+        ev_tx
+            .send(ServerStreamEvent::Disconnected {
+                reason: DisconnectReason::Unauthorized,
+            })
+            .unwrap();
+
+        match handle.outcomes.recv_blocking().unwrap() {
+            ActorOutcome::Parked {
+                reason: ParkReason::Unauthorized,
+            } => {}
+            other => panic!("expected Parked Unauthorized, got {other:?}"),
+        }
+
+        assert!(matches!(
+            up_rx.recv_blocking().unwrap(),
+            StreamUpdate::Disconnected(DisconnectReason::Unauthorized)
+        ));
+
+        ev_tx.send(status_running_event()).unwrap();
+        assert!(
+            up_rx.try_recv().is_err(),
+            "parked actor must not process further events"
+        );
+
+        handle.stop_and_join();
+    }
+
+    #[test]
+    fn disconnect_forbidden_stops_actor_thread() {
+        let _dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(_dir.path());
+        seed_connection(&stores);
+
+        let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, _up_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(
+            fresh_state(),
+            ev_rx,
+            up_tx,
+            stores,
+            test_clock(),
+            noop_api(),
+        );
+
+        ev_tx
+            .send(ServerStreamEvent::Disconnected {
+                reason: DisconnectReason::Forbidden,
+            })
+            .unwrap();
+
+        match handle.outcomes.recv_blocking().unwrap() {
+            ActorOutcome::StoppedRemoved => {}
+            other => panic!("expected StoppedRemoved, got {other:?}"),
+        }
+
+        handle.join_without_stop();
+    }
+
+    #[test]
+    fn disconnect_not_found_stops_with_tombstone_outcome() {
+        let _dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(_dir.path());
+        seed_connection(&stores);
+
+        let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, _up_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(
+            fresh_state(),
+            ev_rx,
+            up_tx,
+            stores,
+            test_clock(),
+            noop_api(),
+        );
+
+        ev_tx
+            .send(ServerStreamEvent::Disconnected {
+                reason: DisconnectReason::NotFound,
+            })
+            .unwrap();
+
+        match handle.outcomes.recv_blocking().unwrap() {
+            ActorOutcome::StoppedTombstone => {}
+            other => panic!("expected StoppedTombstone, got {other:?}"),
+        }
+
+        handle.join_without_stop();
+    }
+
+    #[test]
+    fn reconnecting_sets_reconcile_in_flight() {
+        let _dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(_dir.path());
+        seed_connection(&stores);
+
+        let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, _up_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(
+            fresh_state(),
+            ev_rx,
+            up_tx,
+            stores,
+            test_clock(),
+            noop_api(),
+        );
+
+        ev_tx
+            .send(ServerStreamEvent::Reconnecting { attempt: 2 })
+            .unwrap();
+
+        match handle.outcomes.recv_blocking().unwrap() {
+            ActorOutcome::TransportChanged {
+                transport: ActorTransport::Reconnecting,
+                reconcile_in_flight: true,
+            } => {}
+            other => panic!("expected TransportChanged Reconnecting, got {other:?}"),
+        }
 
         handle.stop_and_join();
     }

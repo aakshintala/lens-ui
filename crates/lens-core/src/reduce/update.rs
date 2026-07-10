@@ -58,7 +58,7 @@ pub enum StreamUpdate {
         attempt: u32,
     },
     Reconnected,
-    Disconnected,
+    Disconnected(lens_client::stream::DisconnectReason),
     SnapshotRestored,
 
     // D9: once-at-attach full baseline

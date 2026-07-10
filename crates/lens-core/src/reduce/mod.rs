@@ -149,7 +149,9 @@ pub fn reduce(state: &mut SessionState, event: &ServerStreamEvent, clock: &dyn C
         }
         ServerStreamEvent::Reconnected { gap } => snapshot::on_reconnected(state, *gap),
         ServerStreamEvent::SnapshotRestored(snap) => snapshot::fold_snapshot(state, snap),
-        ServerStreamEvent::Disconnected { .. } => smallvec![StreamUpdate::Disconnected],
+        ServerStreamEvent::Disconnected { reason } => {
+            smallvec![StreamUpdate::Disconnected(*reason)]
+        }
         ServerStreamEvent::Unknown { .. } => smallvec![],
         _ => SmallVec::new(),
     }
