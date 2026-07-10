@@ -15,10 +15,7 @@ pub fn reconcile_pending_user(
             item_id,
             content,
         } => reconcile_consumed(pending, cleared_pending_id, item_id, content),
-        ReconcileSignal::Snapshot {
-            pending_inputs,
-            trailing_user_item_ids_and_text,
-        } => reconcile_snapshot(pending, pending_inputs, trailing_user_item_ids_and_text),
+        ReconcileSignal::Snapshot { pending_inputs } => reconcile_snapshot(pending, pending_inputs),
     }
 }
 
@@ -30,7 +27,6 @@ pub enum ReconcileSignal<'a> {
     },
     Snapshot {
         pending_inputs: &'a [PendingInput],
-        trailing_user_item_ids_and_text: &'a [(String, String)],
     },
 }
 
@@ -59,6 +55,11 @@ fn reconcile_consumed(
             continue;
         }
     }
+    // Path-3 (content) runs only for reserved enriched/replayed signals (content:Some);
+    // live `session.input.consumed` passes content:None so this is inert. Semantics for
+    // content:Some: id-matches across the whole vec take precedence over any content match
+    // (a live id-drop preempts content); among both-None bubbles, drop the FIFO-oldest
+    // equal-content bubble.
     if let Some(c) = content
         && let Some(i) = pending.iter().position(|b| {
             b.server_pending_id.is_none() && b.store_item_id.is_none() && b.content == c
@@ -72,10 +73,12 @@ fn reconcile_consumed(
 
 /// Signal B (§4 P3(b)): retain a bubble iff its `server_pending_id` is still listed
 /// in `pending_inputs`. All other rows in the decision table drop.
+/// store_item_id/content drop-rows are outcome-identical to this retain rule (verified),
+/// so they are intentionally not implemented here; Task 9 re-derives landed-vs-lost
+/// actor-side.
 fn reconcile_snapshot(
     pending: &mut Vec<PendingUserMessage>,
     pending_inputs: &[PendingInput],
-    trailing_user_item_ids_and_text: &[(String, String)],
 ) -> bool {
     let still_pending: std::collections::HashSet<&str> = pending_inputs
         .iter()
@@ -88,10 +91,6 @@ fn reconcile_snapshot(
             .as_deref()
             .is_some_and(|sid| still_pending.contains(sid))
     });
-    // trailing ids/text inform the spec's drop rows (2)/(3); with retain-only KEEP
-    // semantics they are redundant — a landed bubble's server_pending_id is absent
-    // from `pending_inputs`, so it is already dropped above.
-    let _ = trailing_user_item_ids_and_text;
     pending.len() != before
 }
 
@@ -132,9 +131,13 @@ mod tests {
 
     #[test]
     fn precedence_server_pending_id_wins() {
-        let mut pending = vec![bubble("l1", Some("pend_a"), Some("msg_other"), "hi")];
-        assert!(consumed(&mut pending, Some("pend_a"), "msg_ignored", None));
-        assert!(pending.is_empty());
+        let mut pending = vec![
+            bubble("a", Some("pend_a"), None, "from server pending"),
+            bubble("b", None, Some("msg_1"), "from store item"),
+        ];
+        assert!(consumed(&mut pending, Some("pend_a"), "msg_1", None));
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].pending_id, "b");
     }
 
     #[test]
@@ -168,12 +171,10 @@ mod tests {
         let inputs = vec![PendingInput {
             pending_id: "pend_keep".into(),
         }];
-        let trailing = vec![("msg_1".into(), "landed by store id".into())];
         assert!(reconcile_pending_user(
             &mut pending,
             ReconcileSignal::Snapshot {
                 pending_inputs: &inputs,
-                trailing_user_item_ids_and_text: &trailing,
             },
         ));
         assert_eq!(pending.len(), 1);

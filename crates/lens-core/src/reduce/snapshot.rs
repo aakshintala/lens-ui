@@ -4,22 +4,8 @@ use crate::domain::{AgentId, HostId, ModelUsage, RunnerId, SessionId, SessionSta
 use crate::reduce::reconcile::{ReconcileSignal, reconcile_pending_user};
 use crate::reduce::{StreamUpdate, Updates};
 use lens_client::sessions::{SessionSnapshot, SessionStatus};
-use lens_client::stream::Item as WireItem;
 use smallvec::smallvec;
 use std::sync::Arc;
-
-fn trailing_user_item_ids_and_text(snap: &SessionSnapshot) -> Vec<(String, String)> {
-    snap.items()
-        .iter()
-        .filter_map(|item| match item {
-            WireItem::Message { id, role, content } if role == "user" => {
-                let text: String = content.iter().filter_map(|b| b.text()).collect();
-                Some((id.clone(), text))
-            }
-            _ => None,
-        })
-        .collect()
-}
 
 fn map_snapshot_status(s: SessionStatus) -> crate::domain::SessionStatusValue {
     use crate::domain::SessionStatusValue as V;
@@ -80,15 +66,11 @@ pub(crate) fn fold_snapshot(state: &mut SessionState, snap: &SessionSnapshot) ->
             description: Some(sk.description().to_string()).filter(|d| !d.is_empty()),
         })
         .collect();
-    // NOTE: snap.items() is read below ONLY for pending_user reconcile matching (D16) —
-    // it is NOT folded into state.items (D-P1-15: history replays as OutputItemDone).
-    let trailing = trailing_user_item_ids_and_text(snap);
     let mut pending = std::mem::take(&mut state.pending_user);
     let pending_changed = reconcile_pending_user(
         &mut pending,
         ReconcileSignal::Snapshot {
             pending_inputs: snap.pending_inputs(),
-            trailing_user_item_ids_and_text: &trailing,
         },
     );
     state.pending_user = pending;
@@ -150,6 +132,15 @@ mod tests {
         PendingUserMessage {
             pending_id: id.into(),
             server_pending_id: None,
+            store_item_id: None,
+            content: content.into(),
+            created_at: 1_700_000_000_000,
+        }
+    }
+    fn pending_server(local_id: &str, server_id: &str, content: &str) -> PendingUserMessage {
+        PendingUserMessage {
+            pending_id: local_id.into(),
+            server_pending_id: Some(server_id.into()),
             store_item_id: None,
             content: content.into(),
             created_at: 1_700_000_000_000,
@@ -219,5 +210,47 @@ mod tests {
                 .any(|i| matches!(i.kind, ItemKind::AgentChanged { .. }))
         );
         assert_eq!(&u[..], &[StreamUpdate::SnapshotRestored]);
+    }
+
+    #[test]
+    fn snapshot_restored_reconciles_pending_user_through_reduce() {
+        let mut s = st();
+        s.pending_user
+            .push(pending_server("l_keep", "pend_keep", "still pending"));
+        s.pending_user
+            .push(pending_server("l_drop", "pend_gone", "landed"));
+
+        let snap = build_snapshot(json!({
+            "id": "conv_1",
+            "status": "running",
+            "agent_id": "ag_9",
+            "created_at": 1_700_000_000,
+            "llm_model": "opus",
+            "pending_inputs": [{"pending_id": "pend_keep"}],
+            "items": [{
+                "id": "msg_embed_1",
+                "type": "message",
+                "data": {
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "embedded history"}]
+                }
+            }]
+        }));
+
+        let u = reduce(
+            &mut s,
+            &ServerStreamEvent::SnapshotRestored(Box::new(snap)),
+            &clock(),
+        );
+
+        assert_eq!(s.pending_user.len(), 1);
+        assert_eq!(s.pending_user[0].pending_id, "l_keep");
+        assert_eq!(
+            s.pending_user[0].server_pending_id.as_deref(),
+            Some("pend_keep")
+        );
+        assert!(s.items.is_empty());
+        assert!(u.contains(&StreamUpdate::SnapshotRestored));
+        assert!(u.contains(&StreamUpdate::PendingUserChanged(s.pending_user.clone())));
     }
 }
