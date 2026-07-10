@@ -307,6 +307,29 @@ preferred path when an `elicitation_id` is on hand.
 
 ## 7. The no-replay reconnect protocol
 
+> **Amendment (2026-07-10, state-model P3-3a grilling — engine spec §2.3 D19).
+> The reader is transport-only; it no longer replays `GET /items`.** This
+> **supersedes the 3b-2b "the reader owns reconnect item recovery end-to-end"
+> decision** for the item-recovery half. Rationale: durable, disk-backed,
+> ordinal-assigning gap-fill needs the consumer's disk frontier + ordinals, which
+> the stateless client cannot own; and two `/items` fetchers from opposite ends
+> (a reader tail-replay vs. the actor's forward catch-up) punch a hole and poison
+> the actor's contiguous frontier. So:
+> - **Steps 5 (History) and the "replayed `GET /items`" clause of step 6 are
+>   removed**, as is **bucket A's replay** in the three-bucket model. The reader
+>   still does steps 1–4, 6 (`Reconnected` → `SnapshotRestored`), and 7 (re-open +
+>   live-overlap dedup). It emits **no** `OutputItemDone` history.
+> - **Durable item recovery moves to the stateful consumer** (the state-model
+>   `ActiveSession` actor), which forward-pages `Sessions::items(after = frontier,
+>   order = asc)` until `has_more == false`, off the live path, appending to its
+>   `TranscriptStore`. `SnapshotRestored` stays scalar-only chrome.
+> - **API impact:** `Reopen` shrinks 3 → 2 methods (`open_stream`, `snapshot`);
+>   `HttpReopener::items()` and `items_to_replay()` are deleted. Subtractive change
+>   to a hardened crate → **MANDATORY cross-family review**.
+>
+> The step-by-step below is retained as history; read it with steps 5 and the
+> bucket-A replay struck.
+
 SSE is no-replay. Correct reconnect:
 
 1. **Detect disconnect** — stream closes or errors. Record `last_seen_seq`
@@ -553,14 +576,23 @@ is unit-testable with a scripted mock — no server. As-built specifics:
 
 ### Bootstrap (first open) — Plan 4
 
+> **Amendment (2026-07-10, P3-3a grilling — spec §2.3 D19).** As with reconnect,
+> bootstrap is **transport-only**: it emits `SnapshotRestored(SessionSnapshot)` →
+> live tail, and **no replayed `GET /items` history**. The actor loads its opening
+> transcript itself via forward catch-up from its disk `frontier` (first-attach with
+> an empty disk ⇒ from oldest; never-seen-huge tail-paint is deferred). The
+> "single-fold-path" benefit is preserved — the actor still folds caught-up items
+> through the same `OutputItemDone` reducer arm — it just originates them from the
+> frontier-aware actor, not the frontier-blind reader.
+
 First open of `Sessions::stream()` emits the **same post-open prelude as
 reconnect, minus the `Reconnecting`/`Reconnected` markers** (there is no gap on
-first connect): `SnapshotRestored(SessionSnapshot)` → replayed `GET /items`
-history (each as `OutputItemDone`), then the live tail. This makes the
-state-model `ActiveSession` actor fold initial state through the same reducer
-path as reconnect (app-arch §4.1/§8) — the consumer no longer loads the opening
-snapshot/items through a second path that must stay byte-aligned with the
-reconnect fold.
+first connect): `SnapshotRestored(SessionSnapshot)` → ~~replayed `GET /items`
+history (each as `OutputItemDone`)~~ (removed — see amendment above), then the
+live tail. This makes the state-model `ActiveSession` actor fold initial state
+through the same reducer path as reconnect (app-arch §4.1/§8) — the consumer no
+longer loads the opening snapshot/items through a second path that must stay
+byte-aligned with the reconnect fold.
 
 - The live body is already open before the prelude fetch (subscribe-first), so
   events buffered between open and the snapshot/items read are processed after the

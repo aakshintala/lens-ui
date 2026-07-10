@@ -407,6 +407,24 @@ different intent: the user is deliberately stopping a still-visible session.
 Archive does not imply stop; UI may offer "Archive and Sleep" as a composed
 command.
 
+> **Amendment (2026-07-10, P3-3a grilling D21 — spec §2.3).** Sleep and wake are
+> **asymmetric** because a slept actor is gone (thread stopped, RAM dropped):
+> - **Sleep = `SessionCommand::Sleep`** processed *in the actor's `Select` loop*
+>   (single-writer): re-check `is_quiesced()` atomically (abort-and-stay-Active if
+>   false) → flush durable (`lifecycle=Slept`, `last_seen_seq`) → best-effort
+>   fire-and-forget `stop_session` → stop actor → registry `Slept`.
+> - **Wake = respawn** a fresh actor from disk (load control scalars + `next_ordinal`
+>   → open stream → forward catch-up; D19). Not a command — there is no actor to
+>   command.
+> - **`is_quiesced()`** = pure `transient_work_outstanding()` (§3.2 content clauses)
+>   ∧ actor-owned `transport == Connected` ∧ `!reconcile_in_flight`. **Pinned** is a
+>   §9 scheduler gate ("don't *call* sleep"), not a predicate clause.
+> - The **trigger** (10-min timer, focus-set/LRU, force-reclaim of parked sessions)
+>   is the **§9 scheduler**; the engine only exposes `is_quiesced()` + `Sleep` +
+>   respawn. P3-3a ships a *skeletal* `FleetScheduler` seam + a deterministic
+>   round-trip test (injected `Clock`, mock `Reopen`, temp store) — no wall-clock,
+>   no UI.
+
 ### 3.5 Lifecycle transitions
 
 ```
@@ -492,6 +510,16 @@ Responsibilities:
   `Reconnected` marker — no gap), so initial state is folded through the same
   reducer arm as reconnect — the consumer no longer applies the opening
   snapshot/items through a separate path.
+
+  > **Amendment (2026-07-10, P3-3a grilling D19/D20 — spec §2.3).** The
+  > `SnapshotRestored` fold stays **scalar-only**, but the reader no longer emits a
+  > "replayed `GET /items` history" alongside it — the **actor is the sole `/items`
+  > fetcher** and catches up itself (forward from its disk `frontier`; typed-client
+  > §7 amendment). Correspondingly the reducer mutates a **small pruned working set**,
+  > not a full resident `items` list: finalized items are written through + emitted +
+  > **pruned**, disk is canonical, and a far-back re-fire is a disk upsert-by-id, not
+  > a RAM lookup (D20). The `Dedup against hydrated/disk items by id` guarantee above
+  > is now enforced at the **disk** upsert, which is where reconcile/catch-up merge.
 
 What the reducer finalizes becomes durable via `ActiveSession` write-through
 effects (§6, §8). In-progress accumulators in `StreamScratch` are actor-local
@@ -760,6 +788,8 @@ CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);   -- schema_version, …
 >   one page ahead) and the resident tail evicts. This promotes transcript
 >   retention from a deferred §15 tunable to a **designed seam** (thresholds still
 >   tunable); keeps fleet RAM flat (~240 MB @ 30 warm × ~8 MB) regardless of age.
+>   **[Superseded by the 2026-07-10 P3-3a amendment below — the ~8 MB byte-window
+>   is a *replica*/render concern, not an actor tail.]**
 > - **Reconcile scope (D12).** Naïve reconcile-by-id over 100k rows is
 >   O(transcript); on-wake/reconnect reconcile must **bound to the tail** (since
 >   `last_seen_seq`), which entangles the server `GET /items` pagination contract.
@@ -772,6 +802,35 @@ CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);   -- schema_version, …
 >   bounded, outcome→ring, never blocks the flush) → stop actor → drop RAM.
 >   Flush-first is safe because the quiescence predicate already guaranteed
 >   terminal state.
+
+> **Amendment (2026-07-10, P3-3a grilling D19–D21 — spec §2.3). Supersedes parts
+> of the 2026-07-09 block above.**
+> - **Actor holds a small pruned working set, not an 8 MB byte-window (D20).** The
+>   ~8 MB figure conflated the actor's *reduce working set* (scratch +
+>   `unpaired_calls` + a same-turn item window + `next_ordinal` + `frontier` —
+>   turn-bounded) with the *render window* (live-follow). A **finalized** item's only
+>   jobs are write-through + emit `StreamUpdate`; the actor then **prunes** it.
+>   **Disk is canonical** for finalized items; a far-back re-fire that misses the
+>   working set is a blind idempotent **disk upsert-by-id** (the event carries the
+>   full item), not a RAM lookup. The **render window (~8 MB live tail in RAM +
+>   disk scroll-back) is a *focused-replica* concern**, deferred with the viewport/UI
+>   work (live tail = actor→replica RAM; older = disk). So 3a does **prune-after-
+>   write-through**, not actor-side byte-window/eviction; fleet RAM = per-actor-small
+>   + one focused replica, not 30 × 8 MB. `Rebased` drops its item payload (baseline
+>   items from disk on promote).
+> - **Reconcile = bounded wake-load + unbounded forward catch-up; actor is the sole
+>   `/items` fetcher (D19).** Wake loads only control scalars + `next_ordinal`
+>   (bounded); the actor then pages `GET /items` **forward** from its contiguous disk
+>   `frontier` until `has_more == false`, on the actor thread (mode-switched,
+>   `Stop`/`Sleep`-checked between pages), live events buffered-then-drained.
+>   `lens-client`'s reader is **transport-only** — it no longer replays items (see
+>   typed-client §7 amendment). Never-seen-huge first-attach (snapshot-tail-paint +
+>   negative-ordinal scroll-back) is deferred whole.
+> - **Sleep = command, wake = respawn, trigger external (D21).** Sleep =
+>   `SessionCommand::Sleep` processed in the actor loop (re-check → flush →
+>   best-effort `stop_session` → stop → registry `Slept`). Wake respawns a fresh
+>   actor from disk. The 10-min timer / focus-set / LRU is the §9 scheduler
+>   (deferred); the engine exposes `is_quiesced()`/`Sleep`/respawn for it.
 
 ---
 
@@ -916,6 +975,19 @@ framework divergence there.
 >   resident item window); `*state = baseline`, then all subsequent deltas are
 >   incremental. This keeps index-based `ItemUpdated` sound. Distinct from the
 >   scalar-only `SnapshotRestored` (mid-session reconnect chrome).
+
+> **Amendment (2026-07-10, P3-3a grilling D20 — spec §2.3). Refines D8/D9 above.**
+> The **two copies (D14) stand**, but the "item bodies *shared* actor↔replica"
+> framing is corrected: the actor does **not** retain a resident `items` tail to
+> share. It **emits** each finalized `Arc<Item>` as a `StreamUpdate` and **prunes**
+> it, keeping only a turn-bounded working set; **disk is canonical** for finalized
+> items. The `Arc<Item>` is still the right type — it's a cheap ownership *transfer*
+> to the replica, not a retained shared body. The render `items` tail therefore
+> lives on the **focused replica** (accumulated from `StreamUpdate`s + disk
+> scroll-back), and `Rebased` drops its item payload (baseline items are re-hydrated
+> from disk on promote). Net: fleet RAM is per-actor-small + one focused replica,
+> not 30 × 8 MB (the D11 "byte-windowed actor tail" was a category error — §6.3
+> amendment).
 
 ---
 

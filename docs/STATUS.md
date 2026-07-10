@@ -285,6 +285,38 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Recent
 
+- **2026-07-10** — **state-model P3-3 SLICED + P3-3a GRILLED → LOCKED-doc amendments
+  written (Opus, this session).** P3-3 split into **P3-3a lifecycle core** / **P3-3b
+  recovery semantics**; 3a grilled to shared understanding, producing **four new
+  decisions (D19–D22) in spec §2.3** and a **material revision of D8/D9/D11 + the D14
+  rationale**. **Key outcomes:** (D19) reconcile = **bounded wake-load + unbounded
+  actor-owned forward catch-up** (`GET /items` `after=frontier, order=asc` until
+  `has_more=false`, on the actor thread, live buffered+drained); the **actor is the
+  sole `/items` fetcher** and the `lens-client` reader goes **transport-only**
+  (delete item-replay from `reconnect`+`bootstrap`, shrink `Reopen` 3→2, delete
+  `items_to_replay` — subtractive, still a MANDATORY cross-family-review seam; amends
+  the 3b-2b "reader owns item recovery" decision). (D20 — **category-error fix**) the
+  actor holds a **small pruned working set, NOT an 8 MB byte-window**; **disk is
+  canonical** for finalized items (write-through + emit + prune; far-back re-fire =
+  blind disk upsert-by-id); the ~8 MB render window is a **deferred replica concern**
+  (live tail = actor→replica RAM, scroll-back = disk) → 3a drops actor-side
+  eviction/byte-accounting. (D21) **sleep = `SessionCommand::Sleep`** (in-loop
+  re-check → flush → best-effort `stop_session` → stop → `Slept`), **wake = respawn**
+  from disk, external §9 trigger; 3a ships a **skeletal `FleetScheduler` seam** + a
+  deterministic round-trip test. (D22) **never-seen-huge first-attach deferred whole**
+  (snapshot-tail-paint + negative-ordinal scroll-back; `i64` ordinal leaves the door
+  open, no migration); **D15** (`created_at` fold+guard, still unfixed) rides in 3a.
+  **Amendments written** to `spec §2.3/§4/§7.1`, `app-arch §3.4/§4.1/§6.3/§8`,
+  `typed-client §7 + Bootstrap` (34 markers; +246/−7, docs-only). **3a task order**
+  (build catch-up *before* deleting reader replay): D15 → pure `is_quiesced`/
+  `transient_work_outstanding` → actor catch-up+prune+`Rebased`-drops-items → reader
+  transport-only (review seam) → `Sleep`+wake → `FleetScheduler` seam + round-trip
+  test + gated D17 live-verify → docs. **NOT committed→committed docs-only (not
+  pushed).** **NEXT (fresh session): `writing-plans` for P3-3a** from spec §2.3;
+  then execute subagent-driven. **P3-3b** (held-bubble resume, `SendLost`
+  re-derivation, cmd-path 403/404 §9 escalation, parked-feeder drain / outcome-channel
+  wedge; coupled to composer send-recovery) gets its own grilling+plan later.
+
 - **2026-07-09** — **state-model P3-2 (command semantics, D16/D18) EXECUTED & MERGED to
   main** (ff-only, `d5df2a1..51b10af`, 16 commits). Subagent-driven: composer-2.5 author +
   Opus inline review per task; **seams (Tasks 6–9) each got an Opus-subagent cross-family

@@ -146,7 +146,10 @@ section it is flagged **→ design-doc amendment** and listed in §7.1.
   hydrate-older** primitive. Keeps fleet RAM flat (~240 MB @ 30 warm × ~8 MB)
   regardless of session age. → **design-doc amendment §6/§15:** promotes "disk
   retention" from a deferred tunable to a **designed P3 seam** (thresholds still
-  tunable).
+  tunable). **[Refined by D20 (§2.3): the ~8 MB byte-window is a *replica*/render
+  concern, not an actor tail — the actor holds a small pruned working set and disk
+  is canonical for finalized items. 3a builds prune-after-write-through, not
+  actor-side eviction.]**
 - **D12 — Large-transcript latency spike (new P3 task, sequenced FIRST).**
   Throwaway harness against a synthetic **~500 MiB / ~100k-item** transcript,
   measuring: (1) windowed page-load (scroll-back) — expect ~1–10 ms/page;
@@ -257,6 +260,9 @@ run (§4 P3 gate).
   confirm post-`stop_session` server effects are durably re-fetchable on wake
   (`GET /items`/snapshot) — the design breaks only if some effect is live-stream-only
   and never persisted; that is the one thing the bytes must rule out.
+  **[Implemented/refined by D21 (§2.3): sleep = `SessionCommand::Sleep` (in-loop
+  re-check), wake = respawn-from-disk, trigger is the external §9 scheduler; 3a
+  ships a skeletal `FleetScheduler` seam + a deterministic round-trip test.]**
 - **D18 — §13.1 splits into two path-keyed tables; recoverable disconnects park,
   terminal ones stop.** **Finding:** `Disconnected { reason: DisconnectReason }`
   (`lens-client stream/event.rs`) already carries a 5-variant reason
@@ -280,6 +286,104 @@ run (§4 P3 gate).
   or mark forward-looking; `Network`/`Parse`/`Auth`/`NotFound`/`ContractMismatch`
   scope to command outcome (e.g. `Network` on `send` → roll back the optimistic
   bubble per D16), **not** stream teardown. → **design-doc amendment §13.1** (§7.1).
+
+### 2.3 P3-3a grilling refinements (2026-07-10) — D19–D22
+
+Resolved in a grilling pass over the P3-3 *lifecycle* seam (wake/sleep, reconcile
+scope, transcript retention) before writing the P3-3a plan. **These slice P3-3
+and materially revise D8/D9/D11 and the D14 rationale** — where a refinement
+supersedes an earlier decision it says so, and the change is listed in §7.1.
+
+- **D19 — Reconcile splits into a bounded wake-load and an unbounded actor-owned
+  forward catch-up; the actor is the *sole* `/items` fetcher, and the reader goes
+  transport-only.** "Reconcile" was conflating three concerns — durable
+  completeness (disk), the resident RAM window, and what blocks the wake hot-path.
+  Split them:
+  - **Bounded wake path:** on respawn the actor loads control scalars +
+    `next_ordinal` from disk and opens the stream. Bounded by construction — no
+    full-history read (the Task 0 spike's requirement).
+  - **Unbounded forward catch-up:** the actor pages `Sessions::items(after =
+    frontier_item_id, order = asc)` until `has_more == false`, appending to
+    `TranscriptStore` at contiguous ordinals. `frontier = newest item on disk`
+    (empty ⇒ from oldest). Gap-proportional ("takes as long as it takes") but
+    **off the hot path** and disk-targeted. Runs **on the actor thread**,
+    mode-switched (drain events/commands → one bounded blocking page → `Stop`/`Sleep`
+    check → repeat), consistent with P3-2's bounded-blocking `send_event` precedent;
+    live events arriving during catch-up are **buffered then drained** on completion
+    so ordinals stay contiguous. Triggered on `Reconnected`, wake-respawn, and
+    first-attach. A worker-thread variant is a deferred, localized upgrade.
+  - **Sole-fetcher / transport-only reader.** Two fetchers from opposite ends do
+    not compose: a reader tail-replay (newest-N, backward) punches a hole ahead of
+    the gap and poisons the actor's `frontier` (disk-max becomes the top of a hole →
+    forward-paging skips the middle → silent loss). Resolution: the **actor owns all
+    `/items`** (forward-only, contiguity-preserving); the `lens-client` reader is
+    demoted to **transport recovery only** (backoff → re-open stream → snapshot
+    chrome → synthetic `Reconnecting`/`Reconnected`/`SnapshotRestored`), and its
+    item-replay is **deleted**. Durable, disk-backed, ordinal-assigning gap-fill is
+    structurally a *stateful-consumer* job the stateless client cannot own. → **amends
+    the 3b-2b "reader owns item recovery end-to-end" decision** (typed-client §7);
+    `lens-client` change is subtractive (delete `items()`/`items_to_replay`, shrink
+    `Reopen` 3→2 methods) → **MANDATORY cross-family review** despite being deletion.
+  - **Never-seen-huge session deferred whole.** Forward-only catch-up is only bad
+    for a first attach to a large session Lens has *never* persisted (dawn-of-time
+    load, oldest-first). That case — snapshot-tail-paint + scroll-back-backfill on
+    **negative/anchored ordinals** — is deferred entirely to the composer/UI work.
+    The `ordinal` column is already `i64` (negatives representable today), so the
+    door is open with **no migration**. 3a must not foreclose negative-ordinal
+    prepend; nothing in the single-forward-behavior does.
+
+- **D20 — The actor holds a *small pruned working set*, NOT an 8 MB byte-windowed
+  tail; disk is canonical for finalized items; the render window is a deferred
+  *replica* concern. (Corrects D8/D9/D11 and the D14 "30 × 8 MB" figure — a category
+  error.)** Walking the reduce access pattern: streaming accumulation lives in
+  `StreamScratch`; tool pairing uses `unpaired_calls`; ordinal assignment needs one
+  number; reconcile dedup is a disk upsert-by-id. So a **finalized** item's only jobs
+  are write-through + emit `StreamUpdate`; after that the actor has no reason to
+  retain it. The actor keeps **scratch + scalars + a same-turn working set +
+  `next_ordinal` + `frontier`** (turn-bounded, not 8 MB); a far-back re-fire that
+  misses the window is a **blind idempotent disk upsert-by-id** (the event carries
+  the full item), not a RAM lookup. The ~8 MB figure was conflating the actor's
+  *reduce working set* (small) with the *render window* (live-follow) — the latter is
+  a **focused-replica** concern (live tail = actor→replica RAM; scroll-back = disk),
+  deferred with the viewport/UI work. **3a therefore drops actor-side byte-window /
+  eviction / byte-accounting** in favor of **prune-after-write-through**. Blast radius
+  is contained to the actor + this rationale correction: the P1 pure-reducer contract
+  is kept (`reduce` still mutates a small `state.items` the actor prunes); `Rebased`
+  drops its item payload (baseline items come from disk on promote — deferred).
+
+- **D21 — Sleep is a command; wake is a respawn; the trigger is external.**
+  Implements D17. `is_quiesced()` = pure `transient_work_outstanding()` ∧
+  actor-owned `transport == Connected` ∧ `!reconcile_in_flight` (the transport
+  conjuncts already exist from P3-2). **Sleep = `SessionCommand::Sleep`** processed
+  in the actor's `Select` loop (re-check quiescence in-loop → flush durable
+  [`lifecycle = Slept`, `last_seen_seq`] → best-effort fire-and-forget
+  `stop_session` → stop actor → registry `Slept`) — single-writer, closes the
+  scheduler→sleep TOCTOU. **Wake = respawn** a fresh actor from disk (a slept actor
+  is gone; wake can't be a command). The **trigger** (10-min timer, focus-set/LRU,
+  force-reclaim) is the **§9 scheduler**, deferred; 3a builds a **skeletal
+  `FleetScheduler` seam** (spawn-on-wake / `Sleep`-command entry points) driven by a
+  **deterministic round-trip test** (injected `Clock`, mock `Reopen`, temp
+  `TranscriptStore`) — no wall-clock timer, no UI.
+
+- **D22 — P3-3 is sliced into 3a (lifecycle core) and 3b (recovery semantics).**
+  3a and 3b have different risk profiles; 3b's held-bubble/`SendLost` logic depends
+  on 3a's wake/reconcile path existing.
+  - **P3-3a — lifecycle core (this section):** the D19 catch-up + transport-only
+    reader, the D20 working-set actor, the D21 sleep/wake + scheduler seam, plus the
+    **D15 rider** (`created_at` P1 fold + P2 first-non-zero guard — still unfixed).
+    Ships the auto-sleep/wake round-trip green. **Task order** (avoids a broken
+    intermediate — build catch-up *before* deleting reader replay): (1) D15;
+    (2) pure `transient_work_outstanding()`/`is_quiesced()`; (3) actor forward
+    catch-up + prune-working-set + `Rebased`-drops-items; (4) reader → transport-only
+    (**review seam**); (5) `Sleep` + wake respawn; (6) `FleetScheduler` skeletal
+    seam + deterministic round-trip test + gated D17 live-verify; (7) docs.
+  - **P3-3b — recovery semantics (deferred to its own grilling+plan):** held-bubble
+    resume (401/Parse/ContractMismatch bubbles have no resume-resend path today),
+    `SendLost` re-derivation (variant exists, unproduced — naive diff false-positives
+    on landed sends), command-path `Auth 403`/`NotFound` §9 escalation (deferred in
+    P3-2), and the parked-feeder drain / outcome-channel wedge policy. Coupled to the
+    deferred composer send-recovery + input-history feature (memory
+    `composer-send-recovery-and-history`).
 
 ---
 
@@ -402,6 +506,18 @@ schema_version gating test; open/close transcript file across the Active
 lifecycle; fmt · clippy.
 
 ### P3 — Actor + store + commands (`lens-core/actor` + `lens-store`, §8/§7/§13.1)
+
+> **Sliced (§2.3 D22).** P3 executed as **P3-1** (actor foundation — DONE),
+> **P3-2** (command semantics D16/D18 — DONE), and **P3-3**, itself split into
+> **P3-3a lifecycle core** (catch-up + transport-only reader D19, working-set actor
+> D20, sleep/wake D21, D15 rider) and **P3-3b recovery semantics** (held-bubble
+> resume, `SendLost`, cmd-path escalation, drain policy). The (a)/(c) prose below
+> predates the D19/D20 refinements — where it says "byte-windowed `items` tail" or
+> "disk-paint the byte-windowed tail," read **§2.3 D20** (the actor holds a *small
+> pruned working set*, disk is canonical, the render window is a deferred replica
+> concern) and **D19** (reconcile = bounded wake-load + unbounded forward catch-up;
+> the reader no longer replays items).
+
 **Task 0 = large-transcript latency spike (D12), sequenced FIRST.** Throwaway
 harness vs a synthetic ~500 MiB / ~100k-item transcript file: page-load, cold
 hydrate, and `reconcile`-at-scale + scope. Runs before the wake wiring because it
@@ -588,6 +704,25 @@ deliberately when the P3 plan is written so the design source stays the truth.
   park/stop lifecycle) and Table B (`ClientError` on command/REST → command
   outcome). Add the missing `Server{status,body}` (4xx/5xx split) and `ThreadSpawn`
   (fatal stream-open) rows; drop or mark-forward-looking the phantom `Ws` row.
+
+**From D19–D22 (§2.3, P3-3a — 2026-07-10):**
+
+- **typed-client §7 + §7 Bootstrap (D19):** the reader is **transport-only** —
+  reconnect/bootstrap no longer fetch/replay `GET /items`; delete the item-replay
+  steps + the three-bucket "bucket A" replay; amend the "reader owns item recovery
+  end-to-end" decision → "the stateful consumer (actor) owns durable item recovery
+  via forward catch-up." `Reopen` shrinks 3→2 methods.
+- **app-arch §4.1 (D19/D20):** the `SnapshotRestored` fold stays scalar-only, but
+  the accompanying "replayed `GET /items` history" is gone — the actor catches up
+  itself; the reducer mutates a **small pruned working set**, not a full resident
+  `items`; far-back re-fires are disk upserts-by-id.
+- **app-arch §6.3/§15 + §8 (D20, supersedes the 2026-07-09 D11/D8/D9 blocks):** the
+  ~8 MB byte-window is a **replica/render** concern, **not** an actor tail; the actor
+  holds a small pruned working set and **disk is canonical** for finalized items;
+  fleet RAM is per-actor-small + one focused replica, not 30 × 8 MB. `Rebased` drops
+  its item payload (baseline items from disk on promote).
+- **app-arch §3 (D21):** sleep = `SessionCommand::Sleep` (in-loop re-check), wake =
+  respawn-from-disk, external §9 trigger; `is_quiesced` conjuncts made explicit.
 
 ### 7.2 New dependencies / cross-crate touches (from D13)
 
