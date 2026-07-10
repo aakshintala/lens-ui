@@ -171,13 +171,13 @@ fn run(
                             }
                         }
                         OutputMode::Summary => {
-                            if output
+                            // Missing summary consumer (Detailed-only spawn_actor, summary rx dropped)
+                            // is non-fatal: Demote becomes a mode flip with no listener, and the actor
+                            // stays alive to accept Stop. TODO(P3-2 Task 9): push
+                            // ActorOutcome::SummaryConsumerGone to the introspection ring instead of dropping.
+                            let _ = output
                                 .summaries
-                                .send_blocking(SummaryUpdate::from_state(&state))
-                                .is_err()
-                            {
-                                return;
-                            }
+                                .send_blocking(SummaryUpdate::from_state(&state));
                         }
                     }
                 }
@@ -487,6 +487,28 @@ mod tests {
             saw_rebased,
             "Detailed replica must receive Rebased after snapshot fold"
         );
+        handle.stop_and_join();
+    }
+
+    #[test]
+    fn demote_on_detailed_only_handle_does_not_kill_actor() {
+        let _dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(_dir.path());
+        seed_connection(&stores);
+
+        let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, up_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock());
+
+        handle.commands.send(SessionCommand::Demote).unwrap();
+        ev_tx.send(status_running_event()).unwrap();
+
+        // Actor must survive Summary emit with no consumer and still accept Promote.
+        handle.commands.send(SessionCommand::Promote).unwrap();
+        assert!(matches!(
+            up_rx.recv_blocking().unwrap(),
+            StreamUpdate::Rebased(_)
+        ));
         handle.stop_and_join();
     }
 

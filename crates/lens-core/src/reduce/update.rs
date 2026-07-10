@@ -32,6 +32,7 @@ pub enum StreamUpdate {
         model_override: Option<String>,
     },
     ReasoningEffortChanged(Option<String>),
+    // reserved — no live SSE producer in P3; title mutates via SnapshotRestored/Rebased only unless a future fold emits this delta.
     CollaborationModeChanged(Option<String>),
     ModelOptionsChanged(Option<Vec<ModelOption>>),
     TodosChanged(Vec<Todo>),
@@ -47,6 +48,7 @@ pub enum StreamUpdate {
         agent_id: AgentId,
         agent_name: Option<String>,
     },
+    // reserved — no live SSE producer in P3; title mutates via SnapshotRestored/Rebased only unless a future fold emits this delta.
     TitleChanged(Option<String>),
     LastTokensChanged(Option<u64>),
     ContextWindowChanged(Option<u64>),
