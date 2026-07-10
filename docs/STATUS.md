@@ -285,6 +285,29 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Recent
 
+- **2026-07-09** — **state-model P3-2 (command semantics, D16/D18) EXECUTED & MERGED to
+  main** (ff-only, `d5df2a1..51b10af`, 16 commits). Subagent-driven: composer-2.5 author +
+  Opus inline review per task; **seams (Tasks 6–9) each got an Opus-subagent cross-family
+  review** (grok/cursor async was erroring mid-session → used Opus Agent); user then
+  revamped+reloaded cursor-delegate (plugin 0.1.0, +`doctor`/+`cursor_answer`) and the
+  **whole-branch consolidated review ran on grok-4.5-xhigh** — the 3rd family that found the
+  cross-task defects per-commit reviews structurally miss. **Delivered:** `SessionCommand::Send`
+  (optimistic bubble → blocking POST via injected `SessionApi` → stamp-whichever-ack-id →
+  `CommandOutcome`, Table-B rollback); reconcile precedence (1)pending_id (2)item_id
+  (3)content live + snapshot; D18 Table A park/stop + actor-owned `ActorTransport`/
+  `reconcile_in_flight`; Table B `map_client_error` + non-blocking `OutcomeRing`. **Cross-family
+  review caught real bugs the author+inline missed:** grok — `send_event` had no request
+  timeout (actor hang, risk 5a) + `lens_pend_` id collision on reconnect; Opus — same-batch
+  reconnect delta overwriting a terminal park (zombie transport); grok whole-branch — held
+  Table-B bubbles silently dropped on snapshot + Send accepted while parked. All fixed.
+  **Gate:** lens-client 146 / lens-core 141 / lens-store 7, fmt+clippy(-D warnings) clean,
+  `generated.rs` untouched. **NOT pushed** (awaiting call). **NEXT: P3-3** — D17 quiesce/
+  sleep/wake (`is_quiesced` = `transport==Connected && !reconcile_in_flight`), D11 byte-window
+  eviction, blocking `GET /items` tail-pagination; plus deferred **composer send-recovery +
+  input-history** (memory `composer-send-recovery-and-history`) and the P3-3 forward-notes in
+  `.superpowers/sdd/progress.md` (held-bubble resume, `SendLost` re-derivation, cmd-path
+  403/404 §9 escalation, parked-feeder drain policy, outcome-channel wedge).
+
 - **2026-07-09** — **state-model P3-2 PLANNED + D16 live-verify rider RESOLVED.** Plan
   `docs/superpowers/plans/2026-07-09-state-model-p3-2-command-semantics.md` (`bc3082d`,
   10 TDD tasks). **Authored by grok-4.5-xhigh** (cursor-delegate, model-eval experiment),
