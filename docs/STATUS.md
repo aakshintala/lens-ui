@@ -285,6 +285,31 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Recent
 
+- **2026-07-09** — **state-model P3-1 (actor foundation) EXECUTED & MERGED to main.**
+  All 7 TDD tasks done via subagent-driven-development (composer-2.5 build per task +
+  Opus per-task cross-family review + fixes; codex used for Task 1's mandatory seam
+  until credits ran out, then Opus = the cross-family diversity reviewer). **12 commits
+  `1096a8c..f7c9a64`**, fast-forward merged to `main` (**not pushed**). Gate green:
+  lens-client 139 / lens-core 89 / lens-store 6, fmt + clippy `all=deny` clean (spikes
+  excluded — no `lints.workspace`). Delivered: **D13** lens-client reader `mpsc`→crossbeam
+  + `receiver()`; **D8/D9** value-carrying `StreamUpdate` + `items: Vec<Arc<Item>>` +
+  `Rebased`; new **`crates/lens-store`** `SessionStore` replica + O(1) copy-assign `apply`
+  (~102ns, §5 met); **D7** off-thread→foreground `spawn_apply_bridge` (greedy-coalesced,
+  one `cx.notify()`/frame); the **`ActiveSession` actor** (`lens-core/actor`, gpui-free)
+  — crossbeam `Select` ingest + persist write-through + coalesce; **D10** dual-mode
+  `Detailed|Summary` + promote/demote. **Reviews caught real bugs:** Task 5 batched
+  multi-append ordinal collision (on-disk transcript corruption under load) → fixed +
+  regression test; whole-branch I1 = actor never emitted a `Rebased` after a
+  `SnapshotRestored` fold (Detailed replica silently missed ~20 chrome scalars) → fixed;
+  I2 = `last_task_error` had no delta variant (stale error banner) → `LastTaskErrorChanged`
+  added; plus `context_window` value-carrying gap + gpui `test-support` dev-dep scoping.
+  **DEFERRED to P3-2** (documented in `.superpowers/sdd/progress.md`): M1 `current_agent`/
+  `turn` non-guaranteed `ScratchChanged` (self-heals); M2 `Demote` on a Detailed-only
+  `spawn_actor()` handle silently kills the thread (guard when D16 lands); reserved
+  `CollaborationModeChanged`/`TitleChanged` variants have no producer. **NEXT: P3-2**
+  (D16 optimistic-send/reconcile + D18 §13.1 error-mapping), then **P3-3** (D17
+  quiesce/sleep/wake + D11 byte-window eviction + the blocking `GET /items` tail-pagination
+  dep from the Task 0 spike).
 - **2026-07-09** — **state-model P3 sliced + Task 0 spike DONE + P3-1 plan written.**
   P3 (actor + store + commands) is too big for one plan → sliced into **P3-1 actor
   foundation** (channel swap + skeleton + run-loop + dual-mode, D7/D8/D9/D10/D13),
@@ -320,8 +345,8 @@ and roll older "Recent" pointers off this page as they age.
   a missing sibling omnigent spec **hard-fails** (via `read_json`), never silently
   skips. Codex caught both benches charging teardown to the timed body (fixed) +
   overstated reduce comment; the gate caught its own unformatted code + a dead import.
-  **NEXT (fresh session):** execute P3-1
-  (`docs/superpowers/plans/2026-07-09-state-model-p3-1-actor-foundation.md`).
+  **P3-1: DONE & merged 2026-07-09** (see the entry above; plan
+  `docs/superpowers/plans/2026-07-09-state-model-p3-1-actor-foundation.md` fully executed).
 - **2026-07-09** — **state-model P3 GRILLING — CLOSED (session 2).** The 4 open
   branches resolved as **D15–D18** in new
   [`spec §2.2`](./superpowers/specs/2026-07-08-state-model-engine-design.md)
