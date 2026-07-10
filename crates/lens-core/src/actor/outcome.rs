@@ -101,16 +101,6 @@ impl OutcomeRing {
         self.buf.push_back(o);
     }
 
-    #[allow(dead_code)]
-    pub fn drain(&mut self) -> impl Iterator<Item = ActorOutcome> + '_ {
-        self.buf.drain(..)
-    }
-
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.buf.is_empty()
-    }
-
     /// Drain via `send`; stop on first `false` (e.g. channel full), leave remainder.
     pub fn try_drain<F>(&mut self, mut send: F)
     where

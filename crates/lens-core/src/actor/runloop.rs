@@ -316,6 +316,7 @@ fn run(
                             }
                         }
                     }
+                    drain_outcome_ring(&mut ring, &output.outcomes);
                     // park is terminal for this stream: transport=Parked and reconcile_in_flight=false are the final word; same-batch reconnect deltas are suppressed.
                     if let Some(reason) = disconnect_reason {
                         match reason {
@@ -382,7 +383,6 @@ fn run(
                                 reconcile_in_flight,
                             });
                     }
-                    drain_outcome_ring(&mut ring, &output.outcomes);
                 }
                 Err(_) => break,
             },
@@ -1470,6 +1470,50 @@ mod tests {
             updates_after_park.is_empty(),
             "parked actor must drop further events (got {updates_after_park:?})"
         );
+    }
+
+    #[test]
+    fn persist_error_drains_before_terminal_stop() {
+        let _dir = tempfile::tempdir().unwrap();
+        let stores = failing_transcript_stores(_dir.path());
+        seed_connection(&stores);
+
+        let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, _up_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(
+            fresh_state(),
+            ev_rx,
+            up_tx,
+            stores,
+            test_clock(),
+            noop_api(),
+        );
+
+        // Determinism: actor idle in select; queue item + Forbidden disconnect before greedy drain.
+        ev_tx.send(one_output_item_done_event()).unwrap();
+        ev_tx
+            .send(ServerStreamEvent::Disconnected {
+                reason: DisconnectReason::Forbidden,
+            })
+            .unwrap();
+
+        match handle.outcomes.recv_blocking().unwrap() {
+            ActorOutcome::PersistError { where_, message } => {
+                assert_eq!(where_, "transcript.upsert_item");
+                assert!(!message.is_empty());
+            }
+            other => panic!("expected PersistError first, got {other:?}"),
+        }
+        match handle.outcomes.recv_blocking().unwrap() {
+            ActorOutcome::StoppedRemoved => {}
+            other => panic!("expected StoppedRemoved after PersistError, got {other:?}"),
+        }
+        assert!(
+            handle.outcomes.try_recv().is_err(),
+            "no further outcomes after terminal stop"
+        );
+
+        handle.join_without_stop();
     }
 
     #[test]
