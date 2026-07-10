@@ -690,9 +690,14 @@ pub struct ChildSessionList {
     pub has_more: bool,
 }
 
-/// Ack for `POST /v1/sessions/{id}/events` (HTTP 202). The openapi declares an
-/// empty body, but the route always returns a small JSON ack — model it with
-/// defaults so an empty or future-extended body still deserializes.
+/// Ack for `POST /v1/sessions/{id}/events` (HTTP 202).
+///
+/// Live-verified 2026-07-09 (omnigent 0.4.0 @ 31669e1b; route
+/// `server/routes/sessions.py` bare dict return): body is NON-empty; exactly ONE
+/// of `item_id` (non-native / native-with-terminal-down) or `pending_id`
+/// (healthy native terminal) is populated per message POST. Do NOT assume
+/// `native ⇒ pending_id` — a native session whose ensure-probe fails returns
+/// `item_id`. `#[serde(default)]` remains so an empty/future body still parses.
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct SendEventAck {
     /// Whether the event was queued to the runner. Control events report `false`.
@@ -1903,6 +1908,37 @@ mod tests {
         assert!(ack.queued);
         assert_eq!(ack.item_id.as_deref(), Some("item_42"));
         assert!(!ack.denied);
+    }
+
+    #[test]
+    fn ack_non_native_message_carries_item_id_only() {
+        // Live 2026-07-09 vs omnigent 0.4.0 @ 31669e1b (HTTP 202).
+        let ack: SendEventAck = serde_json::from_str(
+            r#"{"queued":true,"item_id":"msg_f51e3a3a97524ae78a21b7d408b69ff3"}"#,
+        )
+        .unwrap();
+        assert!(ack.queued);
+        assert_eq!(
+            ack.item_id.as_deref(),
+            Some("msg_f51e3a3a97524ae78a21b7d408b69ff3")
+        );
+        assert_eq!(
+            ack.pending_id, None,
+            "exactly one id populated per message POST"
+        );
+    }
+
+    #[test]
+    fn ack_native_healthy_terminal_carries_pending_id_only() {
+        // Shape confirmed by server route + live-verify; bytes may be synthetic if
+        // the live capture was non-native-only — keep the invariant explicit.
+        let ack: SendEventAck =
+            serde_json::from_str(r#"{"queued":true,"pending_id":"pending_a1b2c3"}"#).unwrap();
+        assert_eq!(ack.pending_id.as_deref(), Some("pending_a1b2c3"));
+        assert_eq!(
+            ack.item_id, None,
+            "exactly one id populated per message POST"
+        );
     }
 
     #[test]
