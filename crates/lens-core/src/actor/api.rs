@@ -29,4 +29,6 @@ pub enum CommandOutcome {
         lens_pending_id: String,
         error: String,
     },
+    /// Actor is parked (Unauthorized/SessionFailed/RetriesExhausted) — no bubble inserted.
+    SendRejected { reason: String },
 }

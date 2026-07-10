@@ -194,74 +194,87 @@ fn run(
                     text,
                     model_override,
                 }) => {
-                    send_seq += 1;
-                    let lens_pending_id = format!("lens_pend_{send_seq}");
-                    state.pending_user.push(PendingUserMessage {
-                        pending_id: lens_pending_id.clone(),
-                        server_pending_id: None,
-                        store_item_id: None,
-                        content: text.clone(),
-                        created_at: clock.now_millis(),
-                    });
-                    if !emit_pending_user(&output, &state) {
-                        return;
-                    }
+                    if matches!(transport, ActorTransport::Parked { .. }) {
+                        let _ = output.outcomes.send_blocking(ActorOutcome::Command(
+                            CommandOutcome::SendRejected {
+                                reason: "session parked — awaiting re-auth/retry".into(),
+                            },
+                        ));
+                    } else {
+                        send_seq += 1;
+                        let lens_pending_id = format!("lens_pend_{send_seq}");
+                        state.pending_user.push(PendingUserMessage {
+                            pending_id: lens_pending_id.clone(),
+                            server_pending_id: None,
+                            store_item_id: None,
+                            content: text.clone(),
+                            created_at: clock.now_millis(),
+                        });
+                        if !emit_pending_user(&output, &state) {
+                            return;
+                        }
 
-                    let evt = SessionEventInput::Message {
-                        content: vec![serde_json::json!({"type":"input_text","text": text})],
-                        model_override,
-                        tools: None,
-                    };
-                    match api.send_event(&state.id, &evt) {
-                        Ok(ack) if ack.denied => {
-                            rollback_pending(&mut state, &lens_pending_id);
-                            if !emit_pending_user(&output, &state) {
-                                return;
-                            }
-                            let _ = output.outcomes.send_blocking(ActorOutcome::Command(
-                                CommandOutcome::SendDenied {
-                                    lens_pending_id,
-                                    reason: ack.reason,
-                                },
-                            ));
-                        }
-                        Ok(ack) => {
-                            let p = state
-                                .pending_user
-                                .iter_mut()
-                                .find(|p| p.pending_id == lens_pending_id)
-                                .expect("optimistic bubble present for stamp");
-                            // Stamp whichever id is present — NEVER branch on harness/native.
-                            p.server_pending_id = ack.pending_id.clone();
-                            p.store_item_id = ack.item_id.clone();
-                            if !emit_pending_user(&output, &state) {
-                                return;
-                            }
-                            let _ = output.outcomes.send_blocking(ActorOutcome::Command(
-                                CommandOutcome::SendAccepted {
-                                    lens_pending_id,
-                                    ack,
-                                },
-                            ));
-                        }
-                        Err(e) => {
-                            let m = map_client_error(&e);
-                            // Table B (§13.1) rollback: NetworkTransient, LostAccess,
-                            // Tombstone, Denied — send definitively won't land.
-                            // Hold bubble: ReAuth (401), ServerTransient (5xx),
-                            // WrongVersion, DecodeDrift — reached server or reconcile pending.
-                            if m.rolls_back_send() {
+                        let evt = SessionEventInput::Message {
+                            content: vec![serde_json::json!({"type":"input_text","text": text})],
+                            model_override,
+                            tools: None,
+                        };
+                        match api.send_event(&state.id, &evt) {
+                            Ok(ack) if ack.denied => {
                                 rollback_pending(&mut state, &lens_pending_id);
                                 if !emit_pending_user(&output, &state) {
                                     return;
                                 }
+                                let _ = output.outcomes.send_blocking(ActorOutcome::Command(
+                                    CommandOutcome::SendDenied {
+                                        lens_pending_id,
+                                        reason: ack.reason,
+                                    },
+                                ));
                             }
-                            let _ = output.outcomes.send_blocking(ActorOutcome::Command(
-                                CommandOutcome::SendFailed {
-                                    lens_pending_id,
-                                    error: e.to_string(),
-                                },
-                            ));
+                            Ok(ack) => {
+                                let p = state
+                                    .pending_user
+                                    .iter_mut()
+                                    .find(|p| p.pending_id == lens_pending_id)
+                                    .expect("optimistic bubble present for stamp");
+                                // Stamp whichever id is present — NEVER branch on harness/native.
+                                p.server_pending_id = ack.pending_id.clone();
+                                p.store_item_id = ack.item_id.clone();
+                                if !emit_pending_user(&output, &state) {
+                                    return;
+                                }
+                                let _ = output.outcomes.send_blocking(ActorOutcome::Command(
+                                    CommandOutcome::SendAccepted {
+                                        lens_pending_id,
+                                        ack,
+                                    },
+                                ));
+                            }
+                            Err(e) => {
+                                let m = map_client_error(&e);
+                                // Table B (§13.1) rollback: NetworkTransient, LostAccess,
+                                // Tombstone, Denied — send definitively won't land.
+                                // Hold bubble: ReAuth (401), ServerTransient (5xx),
+                                // WrongVersion, DecodeDrift — reached server or reconcile pending.
+                                // TODO(§9/P3-3): command-path LostAccess (Auth403) / Tombstone
+                                // (NotFound) should escalate to registry removal / tombstone per
+                                // design §13.1 Table B. Deferred — the stream's own terminal
+                                // Disconnected(Forbidden/NotFound) drives Table A stop today;
+                                // the command path only rolls back + SendFailed for now.
+                                if m.rolls_back_send() {
+                                    rollback_pending(&mut state, &lens_pending_id);
+                                    if !emit_pending_user(&output, &state) {
+                                        return;
+                                    }
+                                }
+                                let _ = output.outcomes.send_blocking(ActorOutcome::Command(
+                                    CommandOutcome::SendFailed {
+                                        lens_pending_id,
+                                        error: e.to_string(),
+                                    },
+                                ));
+                            }
                         }
                     }
                 }
@@ -460,6 +473,7 @@ fn persist_write_through(
             StreamUpdate::ScratchChanged(_)
             | StreamUpdate::ChildSessionChanged
             | StreamUpdate::ResourcesChanged
+            | StreamUpdate::PendingUserChanged(_)
             | StreamUpdate::Reconnecting { .. }
             | StreamUpdate::Reconnected => {}
             StreamUpdate::Disconnected(_) => {}
@@ -664,6 +678,95 @@ mod tests {
         }
     }
 
+    /// Counts `upsert_session` calls — persist introspection test stub.
+    struct CountingControlStore {
+        inner: SqliteControlStore,
+        upsert_session_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl CountingControlStore {
+        fn open(path: &Path) -> Self {
+            Self {
+                inner: SqliteControlStore::open(path).unwrap(),
+                upsert_session_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl ControlStore for CountingControlStore {
+        fn mode(&self) -> StoreMode {
+            self.inner.mode()
+        }
+
+        fn upsert_connection(&self, c: &ConnectionRecord) -> crate::persist::Result<()> {
+            self.inner.upsert_connection(c)
+        }
+
+        fn load_connections(&self) -> crate::persist::Result<Vec<ConnectionRecord>> {
+            self.inner.load_connections()
+        }
+
+        fn upsert_session(&self, s: &SessionState, now_ms: i64) -> crate::persist::Result<()> {
+            self.upsert_session_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.upsert_session(s, now_ms)
+        }
+
+        fn load_session(
+            &self,
+            conn: &ConnectionId,
+            id: &SessionId,
+        ) -> crate::persist::Result<Option<SessionState>> {
+            self.inner.load_session(conn, id)
+        }
+
+        fn list_sessions(
+            &self,
+            conn: &ConnectionId,
+        ) -> crate::persist::Result<Loaded<SessionState>> {
+            self.inner.list_sessions(conn)
+        }
+
+        fn insert_cost_sample(
+            &self,
+            conn: &ConnectionId,
+            id: &SessionId,
+            sampled_at: i64,
+            total_cost_usd: f64,
+        ) -> crate::persist::Result<()> {
+            self.inner
+                .insert_cost_sample(conn, id, sampled_at, total_cost_usd)
+        }
+
+        fn cost_samples_in(
+            &self,
+            conn: &ConnectionId,
+            id: &SessionId,
+            since: i64,
+            until: i64,
+        ) -> crate::persist::Result<Vec<(i64, f64)>> {
+            self.inner.cost_samples_in(conn, id, since, until)
+        }
+    }
+
+    fn counting_stores(dir: &Path) -> (ActorStores, Arc<std::sync::atomic::AtomicUsize>) {
+        let control = CountingControlStore::open(&dir.join("lens.db"));
+        let calls = Arc::clone(&control.upsert_session_calls);
+        let transcript = SqliteTranscriptStore::open(
+            &dir.join("conv_1.db"),
+            &ConnectionId::new("conn_1"),
+            &SessionId::new("conv_1"),
+        )
+        .unwrap();
+        (
+            ActorStores {
+                control: Box::new(control),
+                transcript: Box::new(transcript),
+            },
+            calls,
+        )
+    }
+
     fn one_output_item_done_event() -> ServerStreamEvent {
         parse_response(
             "response.output_item.done",
@@ -852,6 +955,51 @@ mod tests {
         assert_eq!(rows.len(), 2, "both batched appends must persist");
         assert_eq!(rows[0].id.as_str(), "fc_1");
         assert_eq!(rows[1].id.as_str(), "fc_2");
+    }
+
+    #[test]
+    fn persist_pending_user_changed_only_skips_control_upsert() {
+        let _dir = tempfile::tempdir().unwrap();
+        let (stores, upsert_calls) = counting_stores(_dir.path());
+        seed_connection(&stores);
+        let mut state = fresh_state();
+        state.pending_user.push(PendingUserMessage {
+            pending_id: "lens_pend_1".into(),
+            server_pending_id: None,
+            store_item_id: None,
+            content: "held".into(),
+            created_at: 0,
+        });
+        let batch: Updates =
+            smallvec![StreamUpdate::PendingUserChanged(state.pending_user.clone())];
+        persist_write_through(
+            &stores,
+            &state,
+            &batch,
+            1_700_000_000_000,
+            &mut OutcomeRing::with_cap(64),
+        );
+        assert_eq!(
+            upsert_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "PendingUserChanged is RAM-only — must not touch control store"
+        );
+
+        let status_batch: Updates = smallvec![StreamUpdate::StatusChanged(
+            crate::domain::scalars::SessionStatusValue::Running
+        )];
+        persist_write_through(
+            &stores,
+            &state,
+            &status_batch,
+            1_700_000_000_001,
+            &mut OutcomeRing::with_cap(64),
+        );
+        assert_eq!(
+            upsert_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "scalar deltas other than PendingUserChanged still upsert control"
+        );
     }
 
     #[test]
@@ -1470,6 +1618,138 @@ mod tests {
             updates_after_park.is_empty(),
             "parked actor must drop further events (got {updates_after_park:?})"
         );
+    }
+
+    #[test]
+    fn disconnect_session_failed_parks_actor() {
+        let _dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(_dir.path());
+        seed_connection(&stores);
+
+        let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, up_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(
+            fresh_state(),
+            ev_rx,
+            up_tx,
+            stores,
+            test_clock(),
+            noop_api(),
+        );
+
+        ev_tx
+            .send(ServerStreamEvent::Disconnected {
+                reason: DisconnectReason::SessionFailed,
+            })
+            .unwrap();
+
+        match handle.outcomes.recv_blocking().unwrap() {
+            ActorOutcome::Parked {
+                reason: ParkReason::SessionFailed,
+            } => {}
+            other => panic!("expected Parked SessionFailed, got {other:?}"),
+        }
+
+        assert!(matches!(
+            up_rx.recv_blocking().unwrap(),
+            StreamUpdate::Disconnected(DisconnectReason::SessionFailed)
+        ));
+
+        handle.stop_and_join();
+    }
+
+    #[test]
+    fn disconnect_retries_exhausted_parks_actor() {
+        let _dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(_dir.path());
+        seed_connection(&stores);
+
+        let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, up_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(
+            fresh_state(),
+            ev_rx,
+            up_tx,
+            stores,
+            test_clock(),
+            noop_api(),
+        );
+
+        ev_tx
+            .send(ServerStreamEvent::Disconnected {
+                reason: DisconnectReason::RetriesExhausted,
+            })
+            .unwrap();
+
+        match handle.outcomes.recv_blocking().unwrap() {
+            ActorOutcome::Parked {
+                reason: ParkReason::RetriesExhausted,
+            } => {}
+            other => panic!("expected Parked RetriesExhausted, got {other:?}"),
+        }
+
+        assert!(matches!(
+            up_rx.recv_blocking().unwrap(),
+            StreamUpdate::Disconnected(DisconnectReason::RetriesExhausted)
+        ));
+
+        handle.stop_and_join();
+    }
+
+    #[test]
+    fn send_while_parked_is_rejected_no_bubble() {
+        let _dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(_dir.path());
+        seed_connection(&stores);
+
+        let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, up_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(
+            fresh_state(),
+            ev_rx,
+            up_tx,
+            stores,
+            test_clock(),
+            noop_api(),
+        );
+
+        ev_tx
+            .send(ServerStreamEvent::Disconnected {
+                reason: DisconnectReason::Unauthorized,
+            })
+            .unwrap();
+
+        match handle.outcomes.recv_blocking().unwrap() {
+            ActorOutcome::Parked {
+                reason: ParkReason::Unauthorized,
+            } => {}
+            other => panic!("expected Parked Unauthorized, got {other:?}"),
+        }
+
+        let _ = up_rx.recv_blocking().unwrap();
+        while up_rx.try_recv().is_ok() {}
+
+        handle
+            .commands
+            .send(SessionCommand::Send {
+                text: "must not land".into(),
+                model_override: None,
+            })
+            .unwrap();
+
+        assert!(
+            up_rx.try_recv().is_err(),
+            "parked Send must not emit PendingUserChanged"
+        );
+
+        match handle.outcomes.recv_blocking().unwrap() {
+            ActorOutcome::Command(CommandOutcome::SendRejected { reason }) => {
+                assert!(reason.contains("parked"));
+            }
+            other => panic!("expected SendRejected, got {other:?}"),
+        }
+
+        handle.stop_and_join();
     }
 
     #[test]

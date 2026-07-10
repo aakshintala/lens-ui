@@ -71,11 +71,11 @@ fn reconcile_consumed(
     false
 }
 
-/// Signal B (§4 P3(b)): retain a bubble iff its `server_pending_id` is still listed
-/// in `pending_inputs`. All other rows in the decision table drop.
-/// store_item_id/content drop-rows are outcome-identical to this retain rule (verified),
-/// so they are intentionally not implemented here; Task 9 re-derives landed-vs-lost
-/// actor-side.
+/// Signal B (§4 P3(b)): retain a bubble iff (a) both ids are None — a held/unacked
+/// draft whose POST failed without stamping — or (b) its `server_pending_id` is still
+/// listed in `pending_inputs`. Stamped bubbles whose server id is absent from the
+/// snapshot drop (landed or confirmed-lost). Full landed-vs-lost dedup is deferred
+/// to SendLost (P3-3); never silently drop typed send text.
 fn reconcile_snapshot(
     pending: &mut Vec<PendingUserMessage>,
     pending_inputs: &[PendingInput],
@@ -86,7 +86,12 @@ fn reconcile_snapshot(
         .collect();
     let before = pending.len();
     pending.retain(|bubble| {
-        bubble
+        // Held/unacked draft (both server ids None): a Table B "keep" bubble whose POST
+        // failed without stamping an id. NOT landed and NOT confirmed-lost — retain so the
+        // text stays recoverable (future composer restores it). See design: never silently
+        // drop typed send text. (Full landed-vs-lost dedup = deferred SendLost, P3-3.)
+        let held = bubble.server_pending_id.is_none() && bubble.store_item_id.is_none();
+        held || bubble
             .server_pending_id
             .as_deref()
             .is_some_and(|sid| still_pending.contains(sid))
@@ -159,6 +164,25 @@ mod tests {
         let mut pending = vec![bubble("l1", None, Some("msg_native"), "hey")];
         assert!(consumed(&mut pending, None, "msg_native", None));
         assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn snapshot_retains_held_both_ids_none_bubble() {
+        let mut pending = vec![
+            bubble("held", None, None, "typed but unacked"),
+            bubble("stamped_gone", Some("pend_gone"), None, "landed"),
+        ];
+        let inputs: Vec<PendingInput> = vec![];
+        assert!(reconcile_pending_user(
+            &mut pending,
+            ReconcileSignal::Snapshot {
+                pending_inputs: &inputs,
+            },
+        ));
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].pending_id, "held");
+        assert!(pending[0].server_pending_id.is_none());
+        assert!(pending[0].store_item_id.is_none());
     }
 
     #[test]
