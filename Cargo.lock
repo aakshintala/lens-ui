@@ -3348,6 +3348,7 @@ dependencies = [
  "criterion",
  "crossbeam-channel",
  "lens-client",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
