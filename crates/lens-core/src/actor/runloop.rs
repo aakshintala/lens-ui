@@ -2,7 +2,7 @@
 //! persist write-through, coalesce, emit to the foreground bridge.
 
 use crate::actor::api::{CommandOutcome, SessionApi};
-use crate::actor::outcome::ActorOutcome;
+use crate::actor::outcome::{ActorOutcome, OutcomeRing, map_client_error};
 use crate::actor::summary::SummaryUpdate;
 use crate::actor::transport::{ActorTransport, ParkReason};
 use crate::clock::Clock;
@@ -164,6 +164,7 @@ fn run(
     // set true on Reconnecting, cleared on Reconnected or park; NOT set on a terminal Disconnected (park is not mid-reconcile).
     let mut reconcile_in_flight = false;
     let mut parked = false;
+    let mut ring = OutcomeRing::with_cap(64);
     loop {
         let mut sel = Select::new();
         let ev_idx = if parked {
@@ -243,20 +244,18 @@ fn run(
                                 },
                             ));
                         }
-                        Err(e @ lens_client::error::ClientError::Network(_)) => {
-                            rollback_pending(&mut state, &lens_pending_id);
-                            if !emit_pending_user(&output, &state) {
-                                return;
-                            }
-                            let _ = output.outcomes.send_blocking(ActorOutcome::Command(
-                                CommandOutcome::SendFailed {
-                                    lens_pending_id,
-                                    error: e.to_string(),
-                                },
-                            ));
-                        }
                         Err(e) => {
-                            // TODO(P3-2 Task 9): refine per D18 Table B (Auth hold, NotFound tombstone, Server 5xx transient).
+                            let m = map_client_error(&e);
+                            // Table B (§13.1) rollback: NetworkTransient, LostAccess,
+                            // Tombstone, Denied — send definitively won't land.
+                            // Hold bubble: ReAuth (401), ServerTransient (5xx),
+                            // WrongVersion, DecodeDrift — reached server or reconcile pending.
+                            if m.rolls_back_send() {
+                                rollback_pending(&mut state, &lens_pending_id);
+                                if !emit_pending_user(&output, &state) {
+                                    return;
+                                }
+                            }
                             let _ = output.outcomes.send_blocking(ActorOutcome::Command(
                                 CommandOutcome::SendFailed {
                                     lens_pending_id,
@@ -273,7 +272,7 @@ fn run(
                     while let Ok(next) = events.try_recv() {
                         batch.extend(reduce(&mut state, &next, clock.as_ref()));
                     }
-                    persist_write_through(&stores, &state, &batch, clock.now_millis());
+                    persist_write_through(&stores, &state, &batch, clock.now_millis(), &mut ring);
                     let disconnect_reason = batch.iter().find_map(|u| match u {
                         StreamUpdate::Disconnected(reason) => Some(*reason),
                         _ => None,
@@ -307,13 +306,14 @@ fn run(
                             }
                         }
                         OutputMode::Summary => {
-                            // Missing summary consumer (Detailed-only spawn_actor, summary rx dropped)
-                            // is non-fatal: Demote becomes a mode flip with no listener, and the actor
-                            // stays alive to accept Stop. TODO(P3-2 Task 9): push
-                            // ActorOutcome::SummaryConsumerGone to the introspection ring instead of dropping.
-                            let _ = output
+                            // Missing summary consumer is non-fatal — record on the ring.
+                            if output
                                 .summaries
-                                .send_blocking(SummaryUpdate::from_state(&state));
+                                .send_blocking(SummaryUpdate::from_state(&state))
+                                .is_err()
+                            {
+                                ring.push(ActorOutcome::SummaryConsumerGone);
+                            }
                         }
                     }
                     // park is terminal for this stream: transport=Parked and reconcile_in_flight=false are the final word; same-batch reconnect deltas are suppressed.
@@ -382,6 +382,7 @@ fn run(
                                 reconcile_in_flight,
                             });
                     }
+                    drain_outcome_ring(&mut ring, &output.outcomes);
                 }
                 Err(_) => break,
             },
@@ -413,9 +414,20 @@ fn rollback_pending(state: &mut SessionState, lens_pending_id: &str) {
         .retain(|p| p.pending_id != lens_pending_id);
 }
 
+/// Non-blocking drain: stop on first full channel, leave remainder for next batch.
+fn drain_outcome_ring(ring: &mut OutcomeRing, outcomes: &async_channel::Sender<ActorOutcome>) {
+    ring.try_drain(|o| outcomes.try_send(o).is_ok());
+}
+
 /// Write the deltas of this batch to disk. Items → `TranscriptStore` by ordinal;
 /// a scalar/collection change → one control upsert of the whole session row.
-fn persist_write_through(stores: &ActorStores, state: &SessionState, batch: &Updates, now_ms: i64) {
+fn persist_write_through(
+    stores: &ActorStores,
+    state: &SessionState,
+    batch: &Updates,
+    now_ms: i64,
+    ring: &mut OutcomeRing,
+) {
     // Appended items occupy the last `appends` slots of state.items, in batch order.
     let appends = batch
         .iter()
@@ -429,11 +441,21 @@ fn persist_write_through(stores: &ActorStores, state: &SessionState, batch: &Upd
             StreamUpdate::ItemAppended(item) => {
                 // TODO(P3-3): replace this positional ordinal with the owned ordinal cursor once byte-window eviction lands (D11).
                 let ordinal = (base + append_i) as i64;
-                let _ = stores.transcript.upsert_item(ordinal, item.as_ref());
+                if let Err(e) = stores.transcript.upsert_item(ordinal, item.as_ref()) {
+                    ring.push(ActorOutcome::PersistError {
+                        where_: "transcript.upsert_item",
+                        message: e.to_string(),
+                    });
+                }
                 append_i += 1;
             }
             StreamUpdate::ItemUpdated { index, item } => {
-                let _ = stores.transcript.upsert_item(*index as i64, item.as_ref());
+                if let Err(e) = stores.transcript.upsert_item(*index as i64, item.as_ref()) {
+                    ring.push(ActorOutcome::PersistError {
+                        where_: "transcript.upsert_item",
+                        message: e.to_string(),
+                    });
+                }
             }
             StreamUpdate::ScratchChanged(_)
             | StreamUpdate::ChildSessionChanged
@@ -444,8 +466,11 @@ fn persist_write_through(stores: &ActorStores, state: &SessionState, batch: &Upd
             _ => touched_scalar = true,
         }
     }
-    if touched_scalar {
-        let _ = stores.control.upsert_session(state, now_ms);
+    if touched_scalar && let Err(e) = stores.control.upsert_session(state, now_ms) {
+        ring.push(ActorOutcome::PersistError {
+            where_: "control.upsert_session",
+            message: e.to_string(),
+        });
     }
 }
 
@@ -492,7 +517,8 @@ mod tests {
     use crate::domain::item::{BlockContext, ContentBlock, Item, ItemKind};
     use crate::domain::scalars::Role;
     use crate::persist::{
-        ConnectionRecord, SqliteControlStore, SqliteTranscriptStore, TranscriptStore,
+        ConnectionRecord, Loaded, PersistError, SqliteControlStore, SqliteTranscriptStore,
+        StoreMode, TranscriptStore,
     };
     use crate::reduce::testutil::{fresh_state, parse_response, snapshot_fixture};
     use lens_client::error::ClientError;
@@ -602,6 +628,42 @@ mod tests {
         });
     }
 
+    /// Transcript role that always fails `upsert_item` — persist introspection test stub.
+    struct FailingTranscriptStore;
+
+    impl TranscriptStore for FailingTranscriptStore {
+        fn mode(&self) -> StoreMode {
+            StoreMode::ReadWrite
+        }
+
+        fn identity(&self) -> crate::persist::Result<(ConnectionId, SessionId)> {
+            Ok((ConnectionId::new("conn_1"), SessionId::new("conv_1")))
+        }
+
+        fn upsert_item(&self, _ordinal: i64, _item: &Item) -> crate::persist::Result<()> {
+            Err(PersistError::ReadOnly)
+        }
+
+        fn load_items(&self) -> crate::persist::Result<Loaded<Item>> {
+            Ok(Loaded {
+                rows: vec![],
+                skipped: vec![],
+            })
+        }
+
+        fn reconcile(&self, _items: &[Item]) -> crate::persist::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn failing_transcript_stores(dir: &Path) -> ActorStores {
+        let control = SqliteControlStore::open(&dir.join("lens.db")).unwrap();
+        ActorStores {
+            control: Box::new(control),
+            transcript: Box::new(FailingTranscriptStore),
+        }
+    }
+
     fn one_output_item_done_event() -> ServerStreamEvent {
         parse_response(
             "response.output_item.done",
@@ -679,6 +741,40 @@ mod tests {
     }
 
     #[test]
+    fn persist_error_lands_on_ring_without_blocking_emit() {
+        let _dir = tempfile::tempdir().unwrap();
+        let stores = failing_transcript_stores(_dir.path());
+        seed_connection(&stores);
+
+        let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, up_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(
+            fresh_state(),
+            ev_rx,
+            up_tx,
+            stores,
+            test_clock(),
+            noop_api(),
+        );
+
+        ev_tx.send(one_output_item_done_event()).unwrap();
+        let update = up_rx
+            .recv_blocking()
+            .expect("actor still emitted stream update");
+        assert!(matches!(update, StreamUpdate::ItemAppended(_)));
+
+        match handle.outcomes.recv_blocking().unwrap() {
+            ActorOutcome::PersistError { where_, message } => {
+                assert_eq!(where_, "transcript.upsert_item");
+                assert!(!message.is_empty());
+            }
+            other => panic!("expected PersistError, got {other:?}"),
+        }
+
+        handle.stop_and_join();
+    }
+
+    #[test]
     fn actor_reduces_persists_and_emits_on_event() {
         let _dir = tempfile::tempdir().unwrap();
         let stores = test_stores(_dir.path());
@@ -745,7 +841,13 @@ mod tests {
             StreamUpdate::ItemAppended(Arc::clone(&a)),
             StreamUpdate::ItemAppended(Arc::clone(&b)),
         ];
-        persist_write_through(&stores, &state, &batch, 1_700_000_000_000);
+        persist_write_through(
+            &stores,
+            &state,
+            &batch,
+            1_700_000_000_000,
+            &mut OutcomeRing::with_cap(64),
+        );
         let rows = stores.transcript.load_items().unwrap().rows;
         assert_eq!(rows.len(), 2, "both batched appends must persist");
         assert_eq!(rows[0].id.as_str(), "fc_1");
@@ -1011,7 +1113,7 @@ mod tests {
     }
 
     #[test]
-    fn send_non_network_error_leaves_optimistic_bubble() {
+    fn send_auth401_holds_bubble() {
         let _dir = tempfile::tempdir().unwrap();
         let stores = test_stores(_dir.path());
         seed_connection(&stores);
@@ -1042,6 +1144,110 @@ mod tests {
             }) => {
                 assert_eq!(lens_pending_id, "lens_pend_1");
             }
+            other => panic!("expected SendFailed, got {other:?}"),
+        }
+
+        handle.stop_and_join();
+    }
+
+    #[test]
+    fn send_server5xx_holds_bubble() {
+        let _dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(_dir.path());
+        seed_connection(&stores);
+
+        let (api, _mock) = MockApi::fail(ClientError::Server {
+            status: 503,
+            body: serde_json::json!({}),
+        });
+        let (_ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, up_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+
+        handle
+            .commands
+            .send(SessionCommand::Send {
+                text: "hello".into(),
+                model_override: None,
+            })
+            .unwrap();
+
+        let optimistic = expect_pending_user_changed(&up_rx);
+        assert_eq!(optimistic.len(), 1);
+        assert!(
+            up_rx.try_recv().is_err(),
+            "5xx keeps bubble — no rollback emit"
+        );
+
+        match handle.outcomes.recv_blocking().unwrap() {
+            ActorOutcome::Command(CommandOutcome::SendFailed { .. }) => {}
+            other => panic!("expected SendFailed, got {other:?}"),
+        }
+
+        handle.stop_and_join();
+    }
+
+    #[test]
+    fn send_server4xx_rolls_back() {
+        let _dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(_dir.path());
+        seed_connection(&stores);
+
+        let (api, _mock) = MockApi::fail(ClientError::Server {
+            status: 400,
+            body: serde_json::json!({}),
+        });
+        let (_ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, up_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+
+        handle
+            .commands
+            .send(SessionCommand::Send {
+                text: "hello".into(),
+                model_override: None,
+            })
+            .unwrap();
+
+        let _ = expect_pending_user_changed(&up_rx);
+        let rolled_back = expect_pending_user_changed(&up_rx);
+        assert!(rolled_back.is_empty());
+
+        match handle.outcomes.recv_blocking().unwrap() {
+            ActorOutcome::Command(CommandOutcome::SendFailed { .. }) => {}
+            other => panic!("expected SendFailed, got {other:?}"),
+        }
+
+        handle.stop_and_join();
+    }
+
+    #[test]
+    fn send_not_found_rolls_back() {
+        let _dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(_dir.path());
+        seed_connection(&stores);
+
+        let (api, _mock) = MockApi::fail(ClientError::NotFound {
+            what: "session".into(),
+        });
+        let (_ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, up_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+
+        handle
+            .commands
+            .send(SessionCommand::Send {
+                text: "hello".into(),
+                model_override: None,
+            })
+            .unwrap();
+
+        let _ = expect_pending_user_changed(&up_rx);
+        let rolled_back = expect_pending_user_changed(&up_rx);
+        assert!(rolled_back.is_empty());
+
+        match handle.outcomes.recv_blocking().unwrap() {
+            ActorOutcome::Command(CommandOutcome::SendFailed { .. }) => {}
             other => panic!("expected SendFailed, got {other:?}"),
         }
 
