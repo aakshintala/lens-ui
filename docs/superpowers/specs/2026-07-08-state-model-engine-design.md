@@ -107,6 +107,10 @@ section it is flagged **→ design-doc amendment** and listed in §7.1.
   (whole-state snapshot swap): a plain-`Vec` deep clone is O(n²) over a streaming
   turn and would force an `im::Vector`/`Arc<Vec>` restructure to be viable.
   Supersedes the P1 marker-only draft in `reduce/update.rs`.
+  **[Superseded in part by D23 (§2.3): `ItemAppended`/`ItemUpdated` are deleted —
+  the focused replica reads finalized items from disk (`TranscriptStore`), not
+  from shipped deltas; `ScratchChanged` + a `TranscriptAdvanced` watermark remain.
+  The value-carrying pattern stands for scalar/chrome deltas.]**
 - **D9 — `Rebased(Box<SessionState>)` bulk variant at actor attach; no
   remove/clear variant.** The reducer only ever **appends or updates-in-place**
   (verified `reduce/items.rs:183` — id-hit → `ItemUpdated { index }`, id-miss →
@@ -120,6 +124,10 @@ section it is flagged **→ design-doc amendment** and listed in §7.1.
   one place a whole-state swap is correct **and** cheap (once/attach, not per
   event). Distinct from `SnapshotRestored` (scalar-only mid-session reconnect
   chrome).
+  **[Superseded in part by D23 (§2.3): `Rebased` is scalars-only (no item
+  payload); baseline transcript comes from the disk `RowSource` on promote. The
+  index-based `ItemUpdated` soundness concern is moot — the delta is deleted, and
+  disk reads are ordinal/id-addressed.]**
 - **D10 — Fidelity is focus-scoped; the actor is dual-mode.** A **full** replica
   (with items) fed by full `StreamUpdate`s exists **only for focused sessions
   (≤ ~10)**. Background-warm Active sessions get only a coarse **`SummaryUpdate`**
@@ -129,7 +137,11 @@ section it is flagged **→ design-doc amendment** and listed in §7.1.
   the actor is the producer — two producers, one type.) The actor supports two
   output modes (`Detailed | Summary`); **promote** (on focus) emits a `Rebased`
   baseline then `Detailed` deltas; **demote** (on blur) drops the full items and
-  reverts to `Summary`. **This spec builds the actor's dual-mode capability + the
+  reverts to `Summary`.
+  **[D23: `Detailed` = `ScratchChanged` + `TranscriptAdvanced` (+ the focused
+  replica's disk `RowSource`); "drops the full items" on demote = releases the
+  `RowSource`/scratch subscription.]**
+  **This spec builds the actor's dual-mode capability + the
   promote/demote primitive; the trigger *policy* (focus set, active-set LRU) is
   §9 (seam only).** → **design-doc amendment §9:** the current wording ("every
   Active session's actor emits `StreamUpdate`s into [a full] replica") is
@@ -384,6 +396,74 @@ supersedes an earlier decision it says so, and the change is listed in §7.1.
     P3-2), and the parked-feeder drain / outcome-channel wedge policy. Coupled to the
     deferred composer send-recovery + input-history feature (memory
     `composer-send-recovery-and-history`).
+
+- **D23 — Render transcript is disk-sourced; item deltas deleted; a watermark
+  replaces them. (Supersedes D8/D9's *item-delta* portion; keeps D14's two-copy
+  rationale for chrome/scalars; completes D20.)** D20 made **disk canonical** for
+  finalized items and pruned the actor's item tail — which strands the
+  actor↔replica item-delta channel: `ItemAppended`/`ItemUpdated { index }` ship
+  bodies the actor no longer retains, and `index` addresses a replica `items` Vec
+  whose base **diverges** from the pruned working set the moment pruning lands
+  (actor `items.len()≈1` vs. focused-replica render window ≈ thousands →
+  `ItemUpdated { index: 0 }` corrupts the oldest visible row). Resolution — remove
+  the channel, don't re-address it:
+  - **Delete `ItemAppended` / `ItemUpdated` from `StreamUpdate`.** The live
+    in-flight tail already ships whole-value via `ScratchChanged(Arc<StreamScratch>)`
+    (bounded: ≤1 open message + ≤1 open reasoning + `unpaired_calls`) — kept.
+  - **Add `TranscriptAdvanced { committed_ordinal }`,** emitted by the actor
+    **after** its write-through commit (post-commit watermark). The focused
+    replica's `RowSource` reads `(last_rendered, committed_ordinal]` off-thread
+    from `TranscriptStore` and appends.
+  - **Split at the watermark:** disk owns everything **≤ `committed_ordinal`**; the
+    RAM scratch/working-set owns the tail **above** it. `watermark = last
+    terminal-committed ordinal`.
+  - **`Rebased` → scalars-only** (D20 already dropped its items; now fully
+    item-free). Baseline transcript comes from the disk `RowSource` on promote.
+  - **Actor commit rule (falls out of item immutability):** commit an item to disk
+    **only at terminal status** (`output_item.done` completed / turn-finalize),
+    never on an intermediate `in_progress`. Not-yet-terminal items stay in the
+    working-set (above watermark), so the `in_progress → completed` re-fire never
+    appears as a below-watermark change.
+  - **No below-watermark invalidation — ground-truth (omnigent 0.4.0).** Committed
+    conversation items are **append-only and immutable**: no
+    `item.updated/edited/deleted` event exists (verified against the pinned SSE
+    taxonomy); compaction is an additive summary item + a `last_item_id` boundary
+    (history stays — transcript §10); `/clear` supersession **appends** a notice
+    `message` (old history kept — `SessionSupersededEvent`); fork creates a *new*
+    session; the store `extend`s, never updates-in-place. **⟹ the render model
+    needs NO invalidation signal — only forward tail-append reads + viewport-pull
+    scroll-back reads.** *Pin-and-verify seam:* this rests on item immutability.
+    A future item-mutation **event** fails the `xtask taxonomy_drift` tripwire; a
+    *silent* store-side rewrite (same events, changed bytes) would **not** trip
+    drift — it would instead surface as a forward-catch-up reconcile/dedup
+    mismatch. Watch for either signal, then re-introduce a coarse
+    `TranscriptInvalidated { from_ordinal }`.
+  - **MANDATORY render constraint (spike-proven 2026-07-10,
+    `spikes/transcript-virtual -- --handoff`).** Disk-window ingestion into the
+    `RowSource` MUST be an **id-keyed upsert that reuses retained row entities** —
+    never clear-and-recreate. The scratch→disk finalize handoff is flash-free
+    (entity id preserved, no markdown re-init, bottom-pin held) under upsert; the
+    negative control (clear-recreate) remounts every row (`EntityId 86v1→31v3`). A
+    naive "re-read window → rebuild Vec each frame" remounts the whole viewport
+    every frame.
+  - **Scope.** *P3-3a (actor side):* delete item-delta emission; add
+    `TranscriptAdvanced` post-commit; commit-on-terminal; `Rebased` scalars-only
+    (prune working-set is already D20). **Subtractive** to the P3-1 apply bridge
+    (delete the item copy-assign path) → rides the same **MANDATORY cross-family
+    review** seam as the D19 reader change. Slots into the D22 task order after
+    step (3): **(3b) replace item-delta emission with the watermark +
+    commit-on-terminal.** *Deferred (viewport/UI plan):* the disk `RowSource`
+    (windowed read, scroll-back paging, id-upsert), promote-hydrate = start the
+    `RowSource`. **The D20 render-window "hole" is dissolved, not owned** — there
+    is no RAM render window to own, just a disk `RowSource` + the scratch tail.
+  - **Implementation hazard (P3-3a) — durable identity is the *store* id.** The
+    scaffold relay publishes harness `fc_*` ids on `output_item.done` while the
+    conversation store appends its **own** id (grok-verified `sessions.py:9716`);
+    native sessions are clean (`_publish_external_conversation_item` →
+    `to_api_dict`). So the commit-on-terminal write-through **and** the D19 forward
+    catch-up must key/dedup durable rows on the **store id** (or a content-stamp),
+    or a scaffold session double-writes the same logical item under two ids
+    (duplicate rows, not stale mutation). Reuses the D16 item-id reconcile.
 
 ---
 
@@ -723,6 +803,22 @@ deliberately when the P3 plan is written so the design source stays the truth.
   its item payload (baseline items from disk on promote).
 - **app-arch §3 (D21):** sleep = `SessionCommand::Sleep` (in-loop re-check), wake =
   respawn-from-disk, external §9 trigger; `is_quiesced` conjuncts made explicit.
+
+**From D23 (§2.3, P3-3a — 2026-07-10):**
+
+- **app-arch §8 (D23, supersedes D8/D9's item-delta portion):** delete
+  `ItemAppended`/`ItemUpdated`; add `TranscriptAdvanced { committed_ordinal }`;
+  `Rebased` scalars-only; the focused replica's render `items` are read from
+  `TranscriptStore` (disk) via an **id-keyed-upsert `RowSource`** (never
+  clear-recreate — spike-proven), the tail above the watermark from
+  `ScratchChanged`. Item-immutability is a pin-and-verify seam (a new mutation
+  *event* fails `taxonomy_drift`; a silent store rewrite would show as a reconcile
+  mismatch, not drift); no `TranscriptInvalidated` in v1.
+- **conversation-transcript §17 (D23):** the render window is disk-backed
+  steady-state (not just initial paint); ingest is id-keyed upsert.
+- **app-arch §6 (D23):** the wake-lag parenthetical drops the false "compaction
+  rewrote history, items edited" — committed items are immutable; the real lag is
+  *new items committed while sleeping* (forward catch-up).
 
 ### 7.2 New dependencies / cross-crate touches (from D13)
 

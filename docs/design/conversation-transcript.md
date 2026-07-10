@@ -530,12 +530,20 @@ the transcript at the relevant point.
 - **Empty session:** clean empty state; composer ready; agent greeting if the
   spec defines one.
 - **Disk-paint → reconcile:** on open/wake, paint from SQLite **instantly**,
-  then the typed-client reconnect (snapshot + `GET /items`, merged by item
-  **`id`**). Content is **flash-free** (items keyed by **`id`** — persisted items
+  then reconcile — the **transport-only** typed-client reconnect restores snapshot
+  chrome, and the actor forward-catches-up the transcript from `GET /items`,
+  merged by item **`id`** (D19; the reader no longer replays items). Content is
+  **flash-free** (items keyed by **`id`** — persisted items
   carry no `sequence_number`; `sequence_number` dedup applies only to the live
   SSE overlap window, typed client §7 — diffed in place, no remount; `↻` only on
   a real gap). Show a **debounced `syncing…` indicator** during reconcile — only
   if it takes >~150 ms.
+  The focused render window reads finalized items from `TranscriptStore` (disk)
+  **steady-state** — not only on open — via an **id-keyed-upsert `RowSource`**
+  (reuse retained row entities, never clear-recreate; flash-free handoff
+  spike-proven, D23); the live tail above the committed watermark comes from the
+  actor's scratch, and finalized items are append-only (no below-watermark
+  invalidation).
 - **Historical hydration:** items from `GET /items` run through the **same**
   `ViewBlock` projection as live — scrollback looks identical whether it
   streamed live or loaded from disk/server. No separate "history renderer."

@@ -349,16 +349,18 @@ from the default server listing.
   the registry row becomes a read-only local tombstone (history viewable, never
   re-streamed) until pruned.
 
-**Wake from Slept** = paint instantly from the disk snapshot → open a fresh
-typed-client stream (bootstrap `SnapshotRestored` + `GET /items` + live tail) →
-reconcile by item `id`. If the server reports that no runner/resource path is
+**Wake from Slept** = paint instantly from the disk snapshot → **respawn the
+`ActiveSession` actor** (D21), which opens a fresh **transport-only** stream
+(`SnapshotRestored` chrome + live tail) and forward-catches-up the transcript
+from `GET /items` (D19) → reconcile by item `id`. If the server reports that no
+runner/resource path is
 available, Lens surfaces a resume/rebind action then; wake does not assume every
 Sleep requires a runner relaunch. The runner relaunch/rebind sequence remains
 the server-lifecycle fallback (§6): optional `GET /v1/runners/{runner_id}/status`
 → `POST /v1/hosts/{host_id}/runners` → `PATCH /v1/sessions/{id}` with the new
 `runner_id` → reopen the stream. Disk-paint keeps wake flash-free; live typing
 deltas emitted while slept are gone, and committed state is recovered through
-`GET /items`.
+the actor's forward catch-up from `GET /items` (D19).
 
 `archived: bool` is server-owned and persisted on `SessionState`. `lifecycle:
 Slept` is Lens-local and persists so a poll-fed card survives restart. There is
@@ -429,8 +431,8 @@ command.
 
 ```
 focus / pin / resume ─▶ ACTIVE
-    (from Slept: disk-paint + stream bootstrap/reconcile; resume/rebind if needed;
-     from new:            typed client cold open: snapshot + items + stream)
+    (from Slept: disk-paint + actor respawn → transport-only stream + forward catch-up;
+     from new:   actor cold open: snapshot chrome + forward catch-up (GET /items) + stream)
 
 quiesced ≥10min & not pinned & no pending-elicit & no terminal activity
     ─▶ SLEPT     (best-effort stop_session; dim card; stop actor; flush; free RAM)
@@ -770,11 +772,13 @@ CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);   -- schema_version, …
 - **On sleep:** flush actor-local canonical state and persistence, send
   best-effort `stop_session`, then stop the actor and drop heavy RAM state.
 - **On wake:** load the disk snapshot into the foreground replica and paint
-  immediately, then start a fresh `ActiveSession` stream bootstrap
-  (`SnapshotRestored` + `GET /items` + live tail) and **reconcile by item
-  `id`** (persisted items carry no `sequence_number`) — the disk may lag the server (compaction rewrote history,
-  items edited, new items committed while sleeping), so reconnect/dedup is what
-  makes the card correct, not the disk read alone.
+  immediately, then **respawn the `ActiveSession` actor**: a fresh transport-only
+  stream restores `SnapshotRestored` chrome + the live tail, and the actor
+  forward-catches-up the transcript from `GET /items`, **reconciling by item
+  `id`** (persisted items carry no `sequence_number`; D19) — the disk may lag the
+  server (**new items committed while sleeping**; committed items are
+  append-only/immutable, so no in-place edits — D23), so the forward catch-up +
+  dedup-by-id is what makes the card correct, not the disk read alone.
 - **Schema versioning:** `meta.schema_version` gates migrations; an unrecognized
   future version is read-only-degraded, never silently corrupted.
 
@@ -988,6 +992,31 @@ framework divergence there.
 > from disk on promote). Net: fleet RAM is per-actor-small + one focused replica,
 > not 30 × 8 MB (the D11 "byte-windowed actor tail" was a category error — §6.3
 > amendment).
+> **[Superseded in part by the D23 amendment below: the "emits each finalized
+> `Arc<Item>` as a `StreamUpdate`" / "render `items` accumulated from
+> `StreamUpdate`s" mechanism is replaced — finalized items are written to disk and
+> read back by the focused replica's `RowSource`; only `ScratchChanged` +
+> `TranscriptAdvanced` remain on the channel.]**
+
+> **Amendment (2026-07-10, P3-3a grilling D23 — spec §2.3). Supersedes D8/D9's
+> item-delta portion; completes D20.** The focused replica's render transcript is
+> **read from disk (`TranscriptStore`), not shipped as deltas.** `ItemAppended`
+> and `ItemUpdated { index, .. }` are **deleted** from `StreamUpdate` (the
+> `index`-addressed delta is unsound once the actor prunes: actor `items.len()`
+> diverges from the replica render window). What remains: `ScratchChanged` (the
+> bounded live tail, unchanged) + a new **`TranscriptAdvanced { committed_ordinal }`**
+> the actor emits **after** each write-through commit; the replica's `RowSource`
+> reads `(last_rendered, committed_ordinal]` off-thread and appends. `Rebased` is
+> now **scalars-only**. Disk owns items ≤ the watermark; the scratch/working-set
+> owns the tail above it. The actor **commits on terminal status only** (in-progress
+> stays above the watermark). **No invalidation signal:** omnigent items are
+> append-only/immutable (compaction & `/clear` are additive; no `item.*` mutation
+> event) — a pin-and-verify seam: a new mutation *event* fails `taxonomy_drift`, a
+> silent store rewrite would show as a reconcile mismatch (not drift). **MANDATORY:**
+> disk-window ingest is an **id-keyed upsert reusing retained row entities, never
+> clear-recreate** (flash-free handoff spike-proven; clear-recreate remounts —
+> `spikes/transcript-virtual -- --handoff`). The D20 render-window concern is
+> thereby **dissolved** — there is no RAM render window to own.
 
 ---
 

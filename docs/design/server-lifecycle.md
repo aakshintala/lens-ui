@@ -272,8 +272,10 @@ is available, wake becomes a runner relaunch/rebind:
 2. `POST /v1/hosts/{host_id}/runners` (`LaunchRunnerRequest{session_id, workspace,
    git?}`) to relaunch the runner.
 3. `PATCH /v1/sessions/{id}` with the new `runner_id` to rebind the session.
-4. Reconnect the SSE stream (typed client §7) and reconcile from snapshot +
-   `GET /items`.
+4. Reopen the SSE stream (typed client §7, **transport-only**) to restore
+   snapshot chrome + the live tail; the respawned actor forward-catches-up the
+   transcript from `GET /items` and reconciles by item `id` (D19 — the reader no
+   longer replays items).
 Handle a `409` on relaunch (a runner is already coming up) by polling
 `runners/{id}/status` and rebinding rather than launching a second runner.
 
@@ -337,8 +339,10 @@ the user sees the real reason.
 - Lens attempts one auto-restart (§3.2). If it fails, the connection stays
   Down; the shell surfaces "Local server down — retry / diagnose".
 - **Session state is safe** — every session on the dead server was
-  persisted server-side; when the server comes back, the state model's
-  reconnect (snapshot + `GET /items` + dedup) reconciles cleanly. Only
+  persisted server-side; when the server comes back, the state model
+  reconciles cleanly — the transport-only reconnect restores snapshot chrome +
+  the live tail, and the actor forward-catches-up from `GET /items`, deduping by
+  item `id` (D19). Only
   in-flight live-typing deltas are lost (the SSE stream was no-replay);
   the transcript's `↻ reconnected` break marks the gap.
 - **In-flight elicitations** — a pending elicitation on a session whose
