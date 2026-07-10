@@ -1,10 +1,25 @@
 //! `SnapshotRestored` / `Reconnected` / lifecycle folds (§4.1).
 
 use crate::domain::{AgentId, HostId, ModelUsage, RunnerId, SessionId, SessionState, SkillSummary};
+use crate::reduce::reconcile::{ReconcileSignal, reconcile_pending_user};
 use crate::reduce::{StreamUpdate, Updates};
 use lens_client::sessions::{SessionSnapshot, SessionStatus};
+use lens_client::stream::Item as WireItem;
 use smallvec::smallvec;
 use std::sync::Arc;
+
+fn trailing_user_item_ids_and_text(snap: &SessionSnapshot) -> Vec<(String, String)> {
+    snap.items()
+        .iter()
+        .filter_map(|item| match item {
+            WireItem::Message { id, role, content } if role == "user" => {
+                let text: String = content.iter().filter_map(|b| b.text()).collect();
+                Some((id.clone(), text))
+            }
+            _ => None,
+        })
+        .collect()
+}
 
 fn map_snapshot_status(s: SessionStatus) -> crate::domain::SessionStatusValue {
     use crate::domain::SessionStatusValue as V;
@@ -65,9 +80,24 @@ pub(crate) fn fold_snapshot(state: &mut SessionState, snap: &SessionSnapshot) ->
             description: Some(sk.description().to_string()).filter(|d| !d.is_empty()),
         })
         .collect();
-    // NOTE: snap.items() is deliberately NOT read here (D-P1-15) — history is replayed as
-    // subsequent OutputItemDone events by lens-client (§7 ordering).
-    smallvec![StreamUpdate::SnapshotRestored]
+    // NOTE: snap.items() is read below ONLY for pending_user reconcile matching (D16) —
+    // it is NOT folded into state.items (D-P1-15: history replays as OutputItemDone).
+    let trailing = trailing_user_item_ids_and_text(snap);
+    let mut pending = std::mem::take(&mut state.pending_user);
+    let pending_changed = reconcile_pending_user(
+        &mut pending,
+        ReconcileSignal::Snapshot {
+            pending_inputs: snap.pending_inputs(),
+            trailing_user_item_ids_and_text: &trailing,
+        },
+    );
+    state.pending_user = pending;
+
+    let mut updates: Updates = smallvec![StreamUpdate::SnapshotRestored];
+    if pending_changed {
+        updates.push(StreamUpdate::PendingUserChanged(state.pending_user.clone()));
+    }
+    updates
 }
 
 pub(crate) fn on_reconnected(state: &mut SessionState, gap: Option<u64>) -> Updates {

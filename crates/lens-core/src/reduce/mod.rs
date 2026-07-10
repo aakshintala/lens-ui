@@ -3,6 +3,7 @@
 
 mod folds;
 mod items;
+mod reconcile;
 mod scratch;
 mod snapshot;
 pub mod transforms;

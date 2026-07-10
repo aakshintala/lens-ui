@@ -6,6 +6,7 @@ use crate::domain::{
     SessionStatusValue, Todo, TodoStatus,
 };
 use crate::reduce::items;
+use crate::reduce::reconcile::{ReconcileSignal, reconcile_pending_user};
 use crate::reduce::{StreamUpdate, Updates};
 use lens_client::stream::event::TodoItemStatus;
 use lens_client::stream::{ResponseEvent, SessionEvent, SessionStatusValue as WireStatus};
@@ -129,8 +130,28 @@ pub(crate) fn fold_session_field(
         SessionEvent::TerminalActivity { .. }
         | SessionEvent::ChangedFilesInvalidated { .. }
         | SessionEvent::Interrupted { .. }
-        | SessionEvent::Superseded { .. }
-        | SessionEvent::InputConsumed { .. } => return Some(smallvec![]),
+        | SessionEvent::Superseded { .. } => return Some(smallvec![]),
+        SessionEvent::InputConsumed {
+            item_id,
+            item_type: _,
+            cleared_pending_id,
+        } => {
+            let mut pending = std::mem::take(&mut state.pending_user);
+            let changed = reconcile_pending_user(
+                &mut pending,
+                ReconcileSignal::Consumed {
+                    cleared_pending_id: cleared_pending_id.as_deref(),
+                    item_id,
+                    content: None, // live event payload not required for (1)/(2)
+                },
+            );
+            state.pending_user = pending;
+            if changed {
+                smallvec![StreamUpdate::PendingUserChanged(state.pending_user.clone())]
+            } else {
+                smallvec![]
+            }
+        }
         // REVIEW#9: child spawn — D-P1-18 marker (no P1 field home; §9 owns child topology).
         SessionEvent::Created { .. } => smallvec![StreamUpdate::ChildSessionChanged],
         SessionEvent::ResourceCreated | SessionEvent::ResourceDeleted { .. } => {
@@ -538,5 +559,34 @@ mod tests {
         let scratch =
             scratch.expect("AgentChanged must emit ScratchChanged when current_agent updates");
         assert_eq!(scratch.current_agent, s.stream.current_agent);
+    }
+
+    #[test]
+    fn input_consumed_clears_matching_bubble_by_store_item_id() {
+        use crate::domain::controls::PendingUserMessage;
+
+        let mut s = st();
+        s.pending_user.push(PendingUserMessage {
+            pending_id: "lens_pend_1".into(),
+            server_pending_id: None,
+            store_item_id: Some("msg_1".into()),
+            content: "hello".into(),
+            created_at: 1_700_000_000_000,
+        });
+        let u = reduce(
+            &mut s,
+            &ServerStreamEvent::Session(SessionEvent::InputConsumed {
+                item_id: "msg_1".into(),
+                item_type: "message".into(),
+                cleared_pending_id: None,
+            }),
+            &clock(),
+        );
+        assert!(s.pending_user.is_empty());
+        assert!(
+            u.iter().any(
+                |update| matches!(update, StreamUpdate::PendingUserChanged(v) if v.is_empty())
+            )
+        );
     }
 }

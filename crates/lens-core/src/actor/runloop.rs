@@ -1063,4 +1063,45 @@ mod tests {
             handle.stop_and_join();
         }
     }
+
+    #[test]
+    fn send_then_input_consumed_clears_optimistic_bubble() {
+        let _dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(_dir.path());
+        seed_connection(&stores);
+
+        let (api, _mock) = MockApi::succeed_with_ack(SendEventAck {
+            queued: true,
+            item_id: Some("msg_1".into()),
+            pending_id: None,
+            ..Default::default()
+        });
+        let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, up_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+
+        handle
+            .commands
+            .send(SessionCommand::Send {
+                text: "hello".into(),
+                model_override: None,
+            })
+            .unwrap();
+        let _ = expect_pending_user_changed(&up_rx);
+        let _ = expect_pending_user_changed(&up_rx);
+        let _ = handle.outcomes.recv_blocking().unwrap();
+
+        ev_tx
+            .send(ServerStreamEvent::Session(SessionEvent::InputConsumed {
+                item_id: "msg_1".into(),
+                item_type: "message".into(),
+                cleared_pending_id: None,
+            }))
+            .unwrap();
+
+        let cleared = expect_pending_user_changed(&up_rx);
+        assert!(cleared.is_empty(), "bubble removed after consumed");
+
+        handle.stop_and_join();
+    }
 }
