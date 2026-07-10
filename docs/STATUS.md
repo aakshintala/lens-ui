@@ -285,6 +285,36 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Recent
 
+- **2026-07-10** — **state-model D23 (disk-sourced render) DECIDED + doc drift
+  consolidated + grok-verified + committed (Opus, this session).** Coherence audit
+  of the P3-3a-era design drift → three outcomes. **(1) Sweep:** D19's "reader
+  transport-only, actor sole `/items` fetcher" reversal left stale `/items`
+  attributions in the two docs the amendment pass missed (server-lifecycle §6/§9,
+  conversation-transcript §17) + app-arch narrative that predated its own D19/D21
+  blocks — reattributed to actor forward catch-up. **(2) Drift diagnosis:** the
+  reversals (D11→D20, 3b-2b→D19, D17→D21) are **convergent, not thrash** — all
+  unwind *premature layer-boundary bindings* (producer-side decisions locked before
+  the consumer's shape existed); all subtractive; each cites a mechanism invisible
+  at lock time. Real risk = rising **consolidation tax** (accreting supersede
+  markers + manual cross-ref). **(3) D23 — the render-window "hole" dissolved:** the
+  focused replica reads its transcript from disk (`TranscriptStore`) via an
+  **id-keyed-upsert `RowSource`**, NOT shipped item deltas. Delete `ItemAppended`/
+  `ItemUpdated` (index-addressed deltas go unsound once the actor prunes — actor
+  `items.len()≈1` vs replica window ≈thousands); add `TranscriptAdvanced
+  {committed_ordinal}` watermark; `Rebased`→scalars-only; actor **commits on
+  terminal status only**. **No `TranscriptInvalidated`** — omnigent 0.4.0 items are
+  append-only/immutable (compaction/`/clear`/fork all additive; no `item.*` mutation
+  event; store append-only), a pin-and-verify seam. **Spike** (`transcript-virtual
+  -- --handoff`, ran green): scratch→disk handoff is flash-free under id-upsert;
+  clear-recreate remounts (negative control). **Grok-4.5 cross-family pass** (vs
+  `../omnigent` source): immutability premise **CONFIRMED safe to lock**; 4 findings
+  folded in (softened `taxonomy_drift` guard; captured scaffold live-id≠store-id
+  dedup hazard; marked surviving D20 emit-as-StreamUpdate prose superseded; D10
+  wording). Commits `20c67de` (spike) + `1d0e97f` (docs), **not pushed**. D23 =
+  P3-3a scope (subtractive; MANDATORY cross-family review seam with D19). **NEXT:
+  `writing-plans` for P3-3a** now incorporating D23. **Deferred (viewport/UI plan):**
+  the disk `RowSource` (windowed read, scroll-back paging, id-upsert).
+
 - **2026-07-10** — **state-model P3-3 SLICED + P3-3a GRILLED → LOCKED-doc amendments
   written (Opus, this session).** P3-3 split into **P3-3a lifecycle core** / **P3-3b
   recovery semantics**; 3a grilled to shared understanding, producing **four new
