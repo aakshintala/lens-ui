@@ -285,6 +285,32 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Recent
 
+- **2026-07-10** — **state-model P3-3a PLAN WRITTEN + 5 design decisions locked + D19
+  source-verified against omnigent `31669e1b` (Opus, this session).** Ran `writing-plans`
+  for P3-3a from spec §2.3 (D19–D23) → **8-task subagent-driven plan**
+  ([`docs/superpowers/plans/2026-07-10-state-model-p3-3a-lifecycle-core.md`](./superpowers/plans/2026-07-10-state-model-p3-3a-lifecycle-core.md)),
+  regrouped from the spec's flat 7 into: (1) D15 `created_at` + **delete vestigial
+  `last_seen_seq`**; (2) pure `is_quiesced`/`transient_work_outstanding`; **(3)[GROK]**
+  actor item-lifecycle D20+D23 (commit-terminal-prefix + `TranscriptAdvanced` watermark +
+  prune + drop item deltas); **(4)[GROK]** D19 actor forward catch-up (sole `/items`
+  fetcher, mode-switched buffer-then-drain); **(5)[GROK]** reader transport-only; (6)
+  `Sleep`/wake respawn; (7) `FleetScheduler` seam + round-trip + gated D17 live-verify;
+  (8) docs + push. **Cross-family review = grok-4.5 via cursor-delegate at all three seams**
+  (user asked for the 3rd pass on Task 4). **5 owned decisions locked via grilling:**
+  commit-terminal-prefix ordinals; reducer emits no item signal (actor scans `state.items`);
+  `ordinal=items.ordinal` idempotent re-fire; **`last_seen_seq` deleted** (vestigial post-D19);
+  scaffold `fc_*` double-commit deferred to P3-3b (key on `Item::id()`). **D19 SOURCE-VERIFIED**
+  at the user's request before locking: `/items` = item-id cursor (no seq), `/stream` =
+  no-replay ("clients reconcile via the snapshot endpoint", `sessions.py:19387`),
+  `sequence_number` = per-stream wire metadata (not a durable resume cursor) → item-id
+  frontier is the ONLY durable resume path; holds. **Bonus finding:** omnigent's web UI hits
+  the identical scaffold two-id-space merge and dedupes by `call_id`/`itemId` in one ephemeral
+  `blocks` list, never persisting live items — a working reference for the P3-3b fix (memory
+  `omnigent-two-id-space-reconciliation`). Handoff:
+  [`docs/handoffs/2026-07-10-state-model-p3-3a-execution.md`](./handoffs/2026-07-10-state-model-p3-3a-execution.md).
+  **NEXT: execute P3-3a subagent-driven** (composer-2.5 per task + Opus inline + grok-4.5 at
+  seams 3/4/5); **push after completion** per user directive. Docs-only commit, **not pushed**.
+
 - **2026-07-10** — **state-model D23 (disk-sourced render) DECIDED + doc drift
   consolidated + grok-verified + committed (Opus, this session).** Coherence audit
   of the P3-3a-era design drift → three outcomes. **(1) Sweep:** D19's "reader
