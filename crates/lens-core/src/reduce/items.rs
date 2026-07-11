@@ -173,6 +173,8 @@ pub(crate) fn push_agent_changed(
 }
 
 /// Dedup-by-id insert (D-P1-13). Present ⇒ update in place; absent ⇒ append.
+/// FunctionCall twins sharing `call_id` but not `Item.id` supersede: remove the
+/// resident twin and append the incoming item at arrival position (wire order).
 pub(crate) fn push_item(
     state: &mut SessionState,
     id: ItemId,
@@ -186,6 +188,18 @@ pub(crate) fn push_item(
         existing.kind = kind;
         existing.seq = seq.or(existing.seq);
     } else {
+        if let ItemKind::FunctionCall {
+            call_id: new_cid, ..
+        } = &kind
+            && let Some(idx) = state.items.iter().position(|it| {
+                matches!(
+                    &it.kind,
+                    ItemKind::FunctionCall { call_id, .. } if call_id == new_cid
+                )
+            })
+        {
+            state.items.remove(idx);
+        }
         state.items.push(Arc::new(Item {
             id,
             seq,
@@ -214,6 +228,48 @@ mod tests {
     }
     fn clock() -> ManualClock {
         ManualClock::new(1_700_000_000_000)
+    }
+
+    #[test]
+    fn dual_id_function_call_supersedes_in_progress_twin_by_call_id() {
+        let mut s = st();
+        let clk = clock();
+        let in_prog = parse_response(
+            "response.output_item.done",
+            r#"{"item":{"id":"fc_52","type":"function_call","status":"in_progress","name":"sys_os_shell","arguments":"{}","call_id":"toolu_X"}}"#,
+        );
+        reduce(&mut s, &in_prog, &clk);
+        assert_eq!(s.items.len(), 1);
+        assert_eq!(s.items[0].id.as_str(), "fc_52");
+
+        let msg = parse_response(
+            "response.output_item.done",
+            r#"{"item":{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"output_text","text":"hi"}]}}"#,
+        );
+        reduce(&mut s, &msg, &clk);
+        assert_eq!(s.items.len(), 2);
+        assert_eq!(s.items[0].id.as_str(), "fc_52");
+        assert_eq!(s.items[1].id.as_str(), "msg_1");
+
+        let completed = parse_response(
+            "response.output_item.done",
+            r#"{"item":{"id":"fc_5a","type":"function_call","status":"completed","name":"sys_os_shell","arguments":"{}","call_id":"toolu_X"}}"#,
+        );
+        reduce(&mut s, &completed, &clk);
+        assert_eq!(s.items.len(), 2, "in_progress twin removed");
+        assert_eq!(s.items[0].id.as_str(), "msg_1");
+        assert_eq!(s.items[1].id.as_str(), "fc_5a");
+
+        let fco = parse_response(
+            "response.output_item.done",
+            r#"{"item":{"id":"fco_1","type":"function_call_output","call_id":"toolu_X","output":"ok"}}"#,
+        );
+        reduce(&mut s, &fco, &clk);
+        assert_eq!(s.items.len(), 3);
+        assert!(matches!(
+            s.items[2].kind,
+            ItemKind::FunctionCallOutput { .. }
+        ));
     }
 
     #[test]
