@@ -13,6 +13,30 @@ subagent-driven** (same shape as P3-1/P3-2). Nothing is blocking.
 - **Builds on:** merged P3-1 (`crates/lens-core/src/actor/`, `crates/lens-store/`) + P3-2
   (D16/D18). This plan **revises** merged P3-1 code (item deltas, apply bridge) — deliberate.
 
+## Update 2026-07-10 (later) — omnigent bumped 0.4.0 → 0.5.1; two P3-3a risks retired
+
+A later session in this thread bumped the pin and de-risked two things this plan rests on.
+**Nothing here changes the plan — both results confirm its assumptions.** (Details:
+memory `[[omnigent-pin-bump-0-3-0]]`, `[[contract-coverage-gap-2026-07]]`; STATUS 2026-07-10.)
+
+- **Pin is now `v0.5.1` (commit `08285468`), vendored `vendor/omnigent-0.5.1/`.** Contract
+  delta vs 0.4.0 was all additions and **touched NONE of P3-3a's surfaces** — `/items`
+  (cursor pagination), `GET /stream` (no-replay), and the snapshot are byte-for-byte the
+  same. So the D19 source-verification below (done against `31669e1b`) **still holds** — the
+  `/items` item-id-cursor resume path is unchanged. The two new SSE events
+  (`session.mcp_startup`, `response.policy_denied`) are modeled marker-only in `folds.rs`;
+  they are NOT transcript items and do not affect item-lifecycle (Task 3).
+- **`turn.*` deferral VALIDATED live → Task 2 quiescence keying is correct.** Drove real
+  turns across 4 harnesses (claude-sdk/codex/opencode/cursor); **no `turn.*` fired on any** —
+  every harness expresses turn lifecycle via `response.in_progress` → `response.completed`/
+  `.failed` + `session.status`. So `transient_work_outstanding()`/`is_quiesced()` keying on
+  the response lifecycle (NOT on a `turn.*` family) is provably right; don't add `turn.*`.
+- **Runner infra for Task 7's D17 live-verify:** the "offline runner" state is just no host
+  daemon attached. Bring one up with `omnigent host http://127.0.0.1:6767 --non-interactive`;
+  drive turns headlessly via the API (`omnigent run --harness … --server …` crashes on the
+  missing TTY but creates the session + attaches the runner first). `omnigent stop` to tear
+  down. Full recipe in `[[contract-coverage-gap-2026-07]]`.
+
 ## Execution protocol (per CLAUDE.md)
 
 - **Author each task** with `cursor-delegate` / **composer-2.5**.
@@ -86,7 +110,9 @@ Done this session at the user's request, before committing to D19:
 - **`/items` persisted rows have no `seq`** — frontier/tail delimited by `item_id`, not sequence.
 - **Catch-up = actor-thread mode-switched** — do NOT build a worker thread + third channel in 3a.
 - **D17 live-verify (Task 7 Step 5)** is the only live-server dep; batch into one gated run
-  (`installing-omnigent-from-source`, pinned 0.4.0). Informational, never in `xtask gate`.
+  (`installing-omnigent-from-source`, pinned 0.5.1 — server already reinstalled to
+  `0.5.1 (08285468)` this thread; just restart it + attach a host daemon). Informational,
+  never in `xtask gate`.
 
 ## Deferred to P3-3b (its own grilling+plan)
 
