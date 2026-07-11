@@ -285,6 +285,44 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Recent
 
+- **2026-07-10** — **state-model P3-3a (lifecycle core) EXECUTED & COMPLETE — merged to `main`.**
+  8-task subagent-driven plan executed (composer-2.5 author + Opus per-task + **grok-4.5 seam
+  review on Tasks 3/4/5** + Opus whole-branch); branch `feat/state-model-p3-3a-lifecycle-core`
+  **21 commits** off `main@8a13057`, full `xtask gate` green (lens-core 157 / lens-client 149 /
+  lens-store 7, fmt+clippy `-D warnings`, drift, `generated.rs` untouched). Ships: **disk-canonical
+  transcript** — reducer stops emitting item deltas (deleted `ItemAppended`/`ItemUpdated`, added
+  `TranscriptAdvanced{committed_ordinal}` watermark), actor commits the **terminal-prefix** of
+  `state.items` to `TranscriptStore` at contiguous ordinals seeded from `frontier()`, prunes RAM
+  (D20/D23); **actor is the sole `/items` fetcher** — forward `order=asc` catch-up from the disk
+  frontier on spawn + `Reconnected`, buffer-live-then-drain-after (D19); **reader demoted to
+  transport-only** (`Reopen` 3→2, item replay deleted); **`SessionCommand::Sleep`** (in-loop
+  `is_quiesced` recheck, flush `lifecycle=Slept`, best-effort `StopSession`, unit
+  `ActorOutcome::Slept`/`SleepDeclined`) + skeletal **`FleetScheduler`** (sleep/wake registry) +
+  wake-respawn round-trip (D21); D15 `created_at` fold+guard + deleted vestigial `last_seen_seq`.
+  **The seam review earned its keep**: grok caught **3 correctness bugs invisible to spec-vs-code
+  review** — (1) **dual-id `function_call` stranding** (golden `happy_path.stream.sse` L38–50:
+  `in_progress` `fc_52…` and `completed` `fc_5a…` carry **different ids / same `call_id`** with a
+  terminal message between → the in-progress twin becomes a permanent non-terminal zombie freezing
+  all commits + unbounding RAM; **locked decision #1's own pin-and-verify precondition was FALSE
+  against real bytes**) → fixed by **`call_id` supersession** in `push_item` (completed FC supersedes
+  the resident in-progress twin; store-twin `fc_*` deferred P3-3b); (2) **re-fire ordinal gap**
+  (conflict-preserving upsert still bumped `next_ordinal`) → RETURNING insert-vs-conflict; (3)
+  **Reconnected greedy-drain ordinal inversion** (live tail committed before catch-up history,
+  masked until Task 5 removed the reader replay) → defer-commit on Reconnected batches. Plus **two
+  false-green tests** caught + rewritten to true regressions. Opus **whole-branch review** found one
+  more cross-task Important (**N1**: a `Sleep` deferred through catch-up rechecked `is_quiesced`
+  against stale pre-buffered state + dropped buffered live events → defeats D21) → fixed by replaying
+  buffered events before deferred commands; grok-verified. **D17 live-verify RAN & PASSED** vs a live
+  0.5.1 server (drove a headless claude-sdk turn → idle session, 3 items; `StopSession`→202
+  `queued:false`; **post-stop `/items` forward re-fetch IDENTICAL** — durable; `after` cursor
+  **exclusive** confirmed live; gated `live_sleep_wake.rs` codifies it). **Deferred to P3-3b**
+  (all documented, none block): scaffold `fc_*` store-twin double-commit; N1-class refinements;
+  the disk `RowSource` viewport/UI; `frontier()`-Err fail-loud hardening; catch-up recursion→iteration;
+  `RunCtx` arg-bundling. Handoff:
+  [`docs/handoffs/2026-07-10-state-model-p3-3a-execution.md`](./handoffs/2026-07-10-state-model-p3-3a-execution.md);
+  memory `state-model-p3-3a-executed`. **NEXT: P3-3b** (grilling + plan) — scaffold-id
+  reconciliation, held-bubble resume, `SendLost`, the RowSource UI.
+
 - **2026-07-10** — **Contract-coverage gap analysis (post-0.5.1).** lens-client models a
   **deliberate consumer-driven subset** of the omnigent contract (ADR-0001 / reuse-only-ids),
   NOT the whole surface — the unmodeled routes/events are model-on-demand, **not debt**. Gap:

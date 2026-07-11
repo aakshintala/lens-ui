@@ -1,123 +1,116 @@
-# Handoff — execute state-model P3-3a (lifecycle core) — 2026-07-10
+# Handoff — state-model P3-3a EXECUTED & COMPLETE → next is P3-3b — 2026-07-10
 
-## TL;DR for the next session
+## TL;DR
 
-The **P3-3a plan is written, grilled, and finalized** — all design decisions locked,
-D19 source-verified against omnigent `31669e1b`. **Start a fresh session and execute it
-subagent-driven** (same shape as P3-1/P3-2). Nothing is blocking.
+**P3-3a (lifecycle core) is done and merged to `main`.** 21 commits, full `xtask gate`
+green, D17 live-verify PASSED. The session lifecycle core ships: disk-canonical transcript,
+actor-owned forward `/items` catch-up, transport-only reader, command sleep/wake, skeletal
+`FleetScheduler`. **Next session: grill + plan P3-3b.**
 
-- **Plan (execute this):** `docs/superpowers/plans/2026-07-10-state-model-p3-3a-lifecycle-core.md`
-  — 8 tasks, TDD, `- [ ]` checkboxes. Header names the REQUIRED SUB-SKILL
-  (`superpowers:subagent-driven-development`).
+- **Plan executed:** `docs/superpowers/plans/2026-07-10-state-model-p3-3a-lifecycle-core.md`
+  (8 tasks, all `- [x]`).
 - **Spec SSOT:** `docs/superpowers/specs/2026-07-08-state-model-engine-design.md` §2.3 (D19–D23).
-- **Builds on:** merged P3-1 (`crates/lens-core/src/actor/`, `crates/lens-store/`) + P3-2
-  (D16/D18). This plan **revises** merged P3-1 code (item deltas, apply bridge) — deliberate.
+- **Execution ledger (as-built, per-task + every review/fix wave):** `.superpowers/sdd/progress.md`
+  — the P3-3a section is the authoritative blow-by-blow.
+- **Memory:** `state-model-p3-3a-executed` (the golden-byte dual-id gotcha + as-built decisions).
 
-## Update 2026-07-10 (later) — omnigent bumped 0.4.0 → 0.5.1; two P3-3a risks retired
+## As-built — what changed vs the plan
 
-A later session in this thread bumped the pin and de-risked two things this plan rests on.
-**Nothing here changes the plan — both results confirm its assumptions.** (Details:
-memory `[[omnigent-pin-bump-0-3-0]]`, `[[contract-coverage-gap-2026-07]]`; STATUS 2026-07-10.)
+The plan was followed faithfully; **five deviations/discoveries**, all forced by review and all
+folded in:
 
-- **Pin is now `v0.5.1` (commit `08285468`), vendored `vendor/omnigent-0.5.1/`.** Contract
-  delta vs 0.4.0 was all additions and **touched NONE of P3-3a's surfaces** — `/items`
-  (cursor pagination), `GET /stream` (no-replay), and the snapshot are byte-for-byte the
-  same. So the D19 source-verification below (done against `31669e1b`) **still holds** — the
-  `/items` item-id-cursor resume path is unchanged. The two new SSE events
-  (`session.mcp_startup`, `response.policy_denied`) are modeled marker-only in `folds.rs`;
-  they are NOT transcript items and do not affect item-lifecycle (Task 3).
-- **`turn.*` deferral VALIDATED live → Task 2 quiescence keying is correct.** Drove real
-  turns across 4 harnesses (claude-sdk/codex/opencode/cursor); **no `turn.*` fired on any** —
-  every harness expresses turn lifecycle via `response.in_progress` → `response.completed`/
-  `.failed` + `session.status`. So `transient_work_outstanding()`/`is_quiesced()` keying on
-  the response lifecycle (NOT on a `turn.*` family) is provably right; don't add `turn.*`.
-- **Runner infra for Task 7's D17 live-verify:** the "offline runner" state is just no host
-  daemon attached. Bring one up with `omnigent host http://127.0.0.1:6767 --non-interactive`;
-  drive turns headlessly via the API (`omnigent run --harness … --server …` crashes on the
-  missing TTY but creates the session + attaches the runner first). `omnigent stop` to tear
-  down. Full recipe in `[[contract-coverage-gap-2026-07]]`.
+1. **`ActorOutcome::Slept` is a UNIT variant** (not `Slept { last_seen_seq }`). The plan's Task 6
+   Step 4 carried a pre-deletion leftover; `last_seen_seq` was deleted in Task 1 as vestigial
+   (D19 makes the disk item-id frontier the resume cursor; the server has no seq-based resume).
+   Controller override, user-confirmed at kickoff.
+2. **Reconcile upsert split** (Task 3): the plan said "change the conflict clause to
+   `ordinal=items.ordinal` everywhere; reconcile unaffected." **That was wrong** — reconcile parks
+   ordinals negative then re-stamps; a preserve clause there would let `DELETE WHERE ordinal < 0`
+   wipe rows. Composer caught it → `upsert_item_stmt_inner(preserve_ordinal: bool)`: commit path
+   preserves, reconcile re-stamps. Verified by both reviewers.
+3. **`call_id` supersession** (Task 3, the big one — see below): the commit-terminal-prefix design's
+   locked precondition ("an in-progress function call completes before any later item finalizes;
+   golden-capture true") was **FALSE against the golden bytes**. Fixed with a `call_id`-keyed
+   supersession in `push_item`. **User decided the fix approach** (kept store-twin `fc_*` deferred).
+4. **Defer-commit on `Reconnected` batches** (Task 4): the live tail must not commit before catch-up
+   (else ordinal inversion once Task 5 removed the reader replay masking it). Main + nested paths.
+5. **N1 fix** (whole-branch): replay buffered live events **before** deferred commands, so a `Sleep`
+   deferred through catch-up rechecks quiescence against true state.
 
-## Execution protocol (per CLAUDE.md)
+## The seam review earned its keep — 3 correctness bugs spec-vs-code review could not see
 
-- **Author each task** with `cursor-delegate` / **composer-2.5**.
-- **Review between tasks** with Opus (inline).
-- **MANDATORY cross-family review at the three seams — Tasks 3, 4, 5 — with
-  grok-4.5 via `cursor-delegate`** (a family other than the composer author). These are
-  the actor-mutation (3), temporal catch-up (4), and subtractive-lens-client (5) seams.
-  Mind Cursor-credit cost (`[[review-spend-policy]]`) — but the user explicitly asked for
-  the third grok pass on Task 4, so all three seams get it.
-- **Gate:** `cargo run -p xtask -- gate` green at every task boundary.
-- **Integrate + PUSH after completion** — the user directed: push this branch along with
-  the implementation once done (Task 8). Solo-project ff-merge to `main` if on a branch.
+grok-4.5 reviewed Tasks 3/4/5 (per the plan's mandate + the user's extra grok pass on Task 4):
 
-## The five locked decisions (do not re-litigate — folded into the plan)
+- **C1 — dual-id `function_call` stranding (CRITICAL, golden-byte-confirmed).**
+  `docs/spikes/captures/2026-06-26-sse/happy_path.stream.sse` L38–50: the `in_progress`
+  function_call (`fc_52f8…`) and its `completed` twin (`fc_5a32…`) have **different `id`, same
+  `call_id`**, with a terminal `message` finalizing between them. `push_item` keys on `id`, so the
+  in-progress twin becomes a **permanent non-terminal zombie** at the front of `state.items` →
+  `commit_terminal_prefix` freezes forever (live disk transcript stuck at the first tool call; RAM
+  working set unbounded — defeats D20). **Fix:** `push_item` supersedes a resident in-progress
+  function_call by `call_id` when the completed twin (any different id) arrives — collapse to one
+  item that flips terminal and commits, landing at wire-order position. Store-twin (`live fc_5a`
+  vs `/items` store id) stays **P3-3b**.
+- **C2 — re-fire ordinal gap (CRITICAL).** A far-back re-fire of a pruned id got a
+  conflict-preserving upsert but still bumped `next_ordinal` → permanent ordinal gap + false
+  watermark. **Fix:** commit upsert uses `RETURNING ordinal`; advance/watermark only when
+  `stored == requested` (fresh insert), else pop without advancing.
+- **Reconnected greedy-drain inversion (CRITICAL, Task 4).** On `Reconnected` the actor
+  greedy-drained queued live events and committed them **before** running catch-up → live tail at
+  low ordinals, catch-up history at higher ones (`item_0, item_3, item_1, item_2`). **Masked until
+  Task 5 removed the reader `/items` replay.** **Fix:** defer the transcript commit on any batch
+  containing `Reconnected` (main + nested buffered-replay paths) until after catch-up.
+- **Two false-green tests** caught by grok and rewritten as true fail-pre/pass-post regressions
+  (the reconnect greedy test's spawn-catch-up consumed the scripted page; the nested test's outer
+  catch-up wrote all history before replay).
 
-1. **Ordinal assignment = commit-terminal-prefix** (Task 3). Walk `state.items` front→back;
-   commit each terminal item at `next_ordinal++`, STOP at the first non-terminal. Dense
-   contiguous ordinals + transcript order + trivial watermark. Rests on: an in-progress
-   function call completes before any later item finalizes (golden-capture true; pin-and-verify).
-2. **Reducer emits no item signal** (Task 3). `push_item` mutates `state.items`, returns no
-   delta; the actor derives persistence by scanning the working set. Matches spec's "delete
-   item-delta emission."
-3. **`ordinal=items.ordinal` on conflict** (Task 3). A far-back re-fire refreshes payload
-   without moving the row (idempotent-by-id). `reconcile()` re-stamps in its own txn, unaffected.
-4. **`last_seen_seq` deleted** (Task 1) from `SessionState` + P2 schema/map/control. Vestigial:
-   no producer, no consumer; D19's disk item-id frontier is the resume cursor. Sleep flush =
-   `lifecycle=Slept` only. The lens-client reader's OWN `last_seen_seq` local (live overlap
-   dedup) is a different thing — **do not touch it.**
-5. **Scaffold `fc_*` double-commit deferred to P3-3b** (Tasks 3/4). Key durable rows on
-   `Item::id()`; native sessions correct; scaffold hazard flagged `TODO(P3-3b, scaffold-id)`
-   for the reviewer.
+**Opus whole-branch review** then found **N1** (deferred-Sleep-rechecks-stale-state) — fixed +
+grok-verified. All other findings triaged **OK-TO-DEFER**.
 
-## Source-verification results (omnigent v0.4.0 `31669e1b`) — D19 grounded
+## D17 live-verify — RAN & PASSED (informational, never gated)
 
-Done this session at the user's request, before committing to D19:
-- **`/items` is item-id cursor-paginated** (`after`/`before` = item id, `order`, `limit`;
-  no seq param) — `sessions.py:16801 list_session_items`.
-- **`GET /stream` is subscribe-from-now, no replay, no resume token** (params: `session_id`,
-  `idle` only) — docstring: *"Does NOT replay history; clients reconcile via the snapshot
-  endpoint"* — `sessions.py:19387`.
-- **`sequence_number` is per-stream, assigned at serialize time, `None` on many events** —
-  `schemas.py:2253`. Not a durable resume cursor. `last_event_seq` (heartbeat) is gap-
-  DETECTION only, not replay. ⟹ D19's item-id frontier resume is the ONLY durable path; holds.
-- **Scaffold two-id-space confirmed:** `NewConversationItem` has no id (`entities/conversation.py:652`);
-  the store mints its own on `append()` (`:683`); the web UI dedupes live vs `/items` in one
-  ephemeral `blocks` list by `call_id`(tools)/`itemId`(messages), never persisting live items.
-  Memory `omnigent-two-id-space-reconciliation` — a working reference for the P3-3b fix.
+Against a live omnigent **0.5.1** server (`omnigent server start` + host daemon `host_e0b4c26`,
+drove a headless `claude-sdk` turn → session `conv_8647debd…`, idle, 3 items):
+- forward `/items?order=asc` → 3 items, `has_more=false`;
+- `after=<first_id>` → 2 items (**cursor EXCLUSIVE** — the catch-up property, now live-confirmed,
+  previously only openapi-confirmed);
+- `StopSession` → HTTP 202 `{"queued":false}`;
+- **post-stop forward `/items` → IDENTICAL 3 ids** — the transcript is durably re-fetchable via
+  forward catch-up (the D17 claim). Codified in gated `crates/lens-client/tests/live_sleep_wake.rs`.
+- **Live finding:** `StopSession` drives the server session `status` to `failed` (runner torn
+  down) — irrelevant to D17 (our `lifecycle=Slept` is our own control-store field; the transcript
+  persists regardless).
 
-## Task order (build catch-up BEFORE deleting reader replay — else broken intermediate)
+> A throwaway omnigent server was left running from the verify; `omnigent stop` to tear it down.
 
-1. **D15** `created_at` fold + P2 guard **+ delete `last_seen_seq`** (small, independent).
-2. Pure `transient_work_outstanding()` + actor `is_quiesced()` (no thread).
-3. **[GROK]** Actor item-lifecycle (D20+D23): delete item deltas, `is_terminal`, `frontier`,
-   `next_ordinal`, commit-terminal-prefix, prune, `TranscriptAdvanced` watermark,
-   `Rebased` scalars-only, apply-bridge subtractive.
-4. **[GROK]** Actor forward catch-up (D19): `SessionApi::fetch_items`, mode-switched loop,
-   buffer-then-drain, on spawn + `Reconnected`.
-5. **[GROK]** Reader → transport-only (D19): delete `items()`/`items_to_replay`, `Reopen` 3→2.
-6. `SessionCommand::Sleep` (in-loop quiesce recheck) + wake respawn.
-7. `FleetScheduler` skeletal seam + deterministic round-trip test + gated D17 live-verify.
-8. Docs (STATUS/handoff/progress) + **push**.
+## Deferred to P3-3b (its own grilling + plan)
 
-## Gotchas / non-obvious
+All documented, none block P3-3a:
+- **Scaffold `fc_*` store-twin double-commit** — the live-committed `fc_5a` id vs the `/items`
+  store-minted id differ for scaffold/native; catch-up could double-commit under two ids.
+  `TODO(P3-3b, scaffold-id)` at `runloop.rs` frontier-seed + `commit_terminal_prefix`. The omnigent
+  web-UI dedupes live-vs-`/items` by `call_id`/`itemId` at render (memory
+  `omnigent-two-id-space-reconciliation` — the working reference).
+- **N1-class hardening** — the deferred-command/buffered-replay interleaving is correct for Sleep
+  now; a fuller command-ordering model is P3-3b.
+- **Disk `RowSource` viewport/UI** (D23) — the focused replica reading `(last_rendered,
+  committed_ordinal]` off `TranscriptStore`; windowed read, scroll-back paging, negative-ordinal
+  prepend (D22 never-seen-huge). The renderer consumes `TranscriptAdvanced` (today an apply no-op).
+- **`frontier()`-Err fail-loud** — currently seeds `next_ordinal=0` on error (non-silent via ring
+  `PersistError`, and `UNIQUE(ordinal)` makes a mis-seed loud not corrupting; both reviewers judged
+  the path effectively unreachable). Fail-closed (park/skip commits) is the hardening.
+- **catch-up recursion→iteration** — `finish→invoke→replay→finish` recurses per buffered
+  `Reconnected`; realistic backoff bounds depth, but convert to iteration.
+- **`RunCtx` arg-bundling** — 5 `#[allow(clippy::too_many_arguments)]` in the runloop.
+- Held-bubble resume, `SendLost` re-derivation, command-path `Auth403`/`NotFound` §9 escalation,
+  parked-feeder drain (all inherited from P3-2 forward-notes).
 
-- **Transient double-fetch (accepted):** between Task 4 and Task 5 the reader still replays
-  `/items` AND the actor catches up — idempotent by id, Task 5 removes the reader half.
-- **Blast radius:** Tasks 3 touches merged P3-1 (`items: Vec<Arc<Item>>`, apply-bridge copy-
-  assign). Deliberate deletion, low-risk (no renderer consumes it yet). Keep the P1 pure-
-  reducer contract intact — the actor prunes, the reducer still mutates a small `state.items`.
-- **`native ⇏ pending_id`** carries from P3-2 — don't regress the send-reconcile keying.
-- **`/items` persisted rows have no `seq`** — frontier/tail delimited by `item_id`, not sequence.
-- **Catch-up = actor-thread mode-switched** — do NOT build a worker thread + third channel in 3a.
-- **D17 live-verify (Task 7 Step 5)** is the only live-server dep; batch into one gated run
-  (`installing-omnigent-from-source`, pinned 0.5.1 — server already reinstalled to
-  `0.5.1 (08285468)` this thread; just restart it + attach a host daemon). Informational,
-  never in `xtask gate`.
+## Process notes
 
-## Deferred to P3-3b (its own grilling+plan)
-
-Scaffold-id reconciliation (call_id/content-stamp dedup — the omnigent web-UI mechanism);
-held-bubble resume; `SendLost` re-derivation; command-path `Auth 403`/`NotFound` §9 escalation;
-parked-feeder drain / outcome-channel wedge; never-seen-huge first attach + negative-ordinal
-scroll-back (D22); the disk `RowSource` viewport/UI plan (windowed read, scroll-back paging,
-id-upsert). Coupled to composer send-recovery + input-history (`[[composer-send-recovery-and-history]]`).
+- **cursor-async backend dies when the laptop sleeps** — grok jobs return empty `ERROR`. Fix:
+  reconnect the MCP (`/mcp`) after a sleep. Fallback when grok is down: Opus Agent as the
+  cross-family reviewer (per the P3-2 precedent).
+- **grok's final findings block truncates in transport** — resume the session with "restate your
+  complete verdict" to recover it. Happened on every grok seam review this session.
+- **composer's scoped gate omits `cargo fmt --check`** — have it run `cargo fmt` (write) before
+  committing, or the controller fmt-amends. Bit us on Tasks 1/2.
