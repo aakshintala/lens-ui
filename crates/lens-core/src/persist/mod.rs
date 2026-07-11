@@ -130,4 +130,7 @@ pub trait TranscriptStore {
     /// Make the file match server truth by `item_id`: upsert each at `ordinal =
     /// index`, delete rows whose id is absent (§6.3 reconcile-by-id).
     fn reconcile(&self, items: &[Item]) -> Result<()>;
+    /// Newest persisted item: `(max ordinal, its item_id)`, or `None` when empty.
+    /// Seeds the actor's `next_ordinal` and the D19 forward-catch-up `after` cursor.
+    fn frontier(&self) -> Result<Option<(i64, crate::domain::ids::ItemId)>>;
 }
