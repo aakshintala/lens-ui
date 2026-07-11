@@ -856,23 +856,6 @@ fn invoke_catchup_and_replay(
             buffered_events,
             deferred_commands,
         } => {
-            for cmd in deferred_commands {
-                if handle_command(
-                    cmd,
-                    state,
-                    stores,
-                    output,
-                    ring,
-                    clock,
-                    api,
-                    transport,
-                    *reconcile_in_flight,
-                    send_seq,
-                ) == LoopControl::Break
-                {
-                    return LoopControl::Break;
-                }
-            }
             if !buffered_events.is_empty()
                 && replay_buffered_batch(
                     &buffered_events,
@@ -892,6 +875,23 @@ fn invoke_catchup_and_replay(
                 ) == LoopControl::Break
             {
                 return LoopControl::Break;
+            }
+            for cmd in deferred_commands {
+                if handle_command(
+                    cmd,
+                    state,
+                    stores,
+                    output,
+                    ring,
+                    clock,
+                    api,
+                    transport,
+                    *reconcile_in_flight,
+                    send_seq,
+                ) == LoopControl::Break
+                {
+                    return LoopControl::Break;
+                }
             }
             LoopControl::Continue
         }
@@ -2044,10 +2044,7 @@ mod tests {
 
         // Actor must survive Summary emit with no consumer and still accept Promote.
         handle.commands.send(SessionCommand::Promote).unwrap();
-        assert!(matches!(
-            up_rx.recv_blocking().unwrap(),
-            StreamUpdate::Rebased(_)
-        ));
+        while !matches!(up_rx.recv_blocking().unwrap(), StreamUpdate::Rebased(_)) {}
         handle.stop_and_join();
     }
 
@@ -2985,9 +2982,11 @@ mod tests {
         block_on_fetch: u32,
         entered_tx: std::sync::mpsc::Sender<u32>,
         release_rx: std::sync::mpsc::Receiver<()>,
+        sent_stop: Arc<Mutex<bool>>,
     }
 
     impl GateFetchMock {
+        #[allow(clippy::type_complexity)]
         fn with_script(
             script: VecDeque<Result<ItemList, ClientError>>,
             block_on_fetch: u32,
@@ -2995,9 +2994,11 @@ mod tests {
             Box<dyn SessionApi + Send>,
             std::sync::mpsc::Receiver<u32>,
             std::sync::mpsc::Sender<()>,
+            Arc<Mutex<bool>>,
         ) {
             let (entered_tx, entered_rx) = std::sync::mpsc::channel();
             let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let sent_stop = Arc::new(Mutex::new(false));
             (
                 Box::new(Self {
                     script: Mutex::new(script),
@@ -3005,9 +3006,11 @@ mod tests {
                     block_on_fetch,
                     entered_tx,
                     release_rx,
+                    sent_stop: Arc::clone(&sent_stop),
                 }),
                 entered_rx,
                 release_tx,
+                sent_stop,
             )
         }
     }
@@ -3016,9 +3019,15 @@ mod tests {
         fn send_event(
             &self,
             _id: &SessionId,
-            _evt: &SessionEventInput,
+            evt: &SessionEventInput,
         ) -> Result<SendEventAck, ClientError> {
-            panic!("send_event not expected in this test");
+            if matches!(evt, SessionEventInput::StopSession) {
+                *self.sent_stop.lock().unwrap() = true;
+            }
+            Ok(SendEventAck {
+                queued: true,
+                ..Default::default()
+            })
         }
 
         fn fetch_items(
@@ -3720,7 +3729,7 @@ mod tests {
         // Fetch #2 uses has_more=true so the loop drains channel events queued during the gate
         // before the outer catch-up exits; fetch #3 is the outer's terminal empty page.
         let history_page = item_list_from_messages(&["item_1", "item_2"], false);
-        let (api, fetch_done_rx, release_fetch2) = GateFetchMock::with_script(
+        let (api, fetch_done_rx, release_fetch2, _sent_stop) = GateFetchMock::with_script(
             VecDeque::from([
                 Ok(empty_item_list()),
                 Ok(item_list_from_messages(&[], true)),
@@ -3790,5 +3799,67 @@ mod tests {
             vec!["item_0", "item_1", "item_2", "item_3"],
             "nested catch-up must write history before the deferred live tail commits"
         );
+    }
+
+    #[test]
+    fn catchup_replays_buffered_live_before_deferred_sleep_recheck() {
+        use crate::domain::scalars::SessionStatusValue;
+
+        let _dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(_dir.path());
+        seed_connection(&stores);
+
+        // Spawn catch-up blocks on fetch #1; has_more=true forces a drain of channel
+        // events/commands before the catch-up exits on fetch #2.
+        let (api, fetch_done_rx, release_fetch1, sent_stop) = GateFetchMock::with_script(
+            VecDeque::from([
+                Ok(item_list_from_messages(&[], true)),
+                Ok(empty_item_list()),
+            ]),
+            1,
+        );
+
+        let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, up_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+
+        assert_eq!(
+            fetch_done_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("spawn catch-up must block on fetch #1"),
+            1
+        );
+
+        ev_tx.send(status_running_event()).unwrap();
+        handle.commands.send(SessionCommand::Sleep).unwrap();
+        release_fetch1
+            .send(())
+            .expect("release blocked spawn catch-up fetch");
+
+        loop {
+            match up_rx.recv_blocking() {
+                Ok(StreamUpdate::StatusChanged(SessionStatusValue::Running)) => break,
+                Ok(_) => {}
+                Err(_) => panic!("updates channel closed before Running status"),
+            }
+        }
+
+        match handle.outcomes.recv_blocking() {
+            Ok(ActorOutcome::SleepDeclined) => {}
+            Ok(other) => panic!("expected SleepDeclined, got {other:?}"),
+            Err(_) => panic!("outcomes channel closed before SleepDeclined"),
+        }
+        assert!(
+            !*sent_stop.lock().unwrap(),
+            "StopSession must not be sent when transient work is outstanding"
+        );
+
+        ev_tx.send(status_running_event()).unwrap();
+        assert!(
+            up_rx.recv_blocking().is_ok(),
+            "actor must survive and keep processing events"
+        );
+
+        handle.stop_and_join();
     }
 }
