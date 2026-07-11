@@ -425,6 +425,7 @@ fn handle_command(
                             .iter_mut()
                             .find(|p| p.pending_id == lens_pending_id)
                             .expect("optimistic bubble present for stamp");
+                        // Stamp whichever id is present — NEVER branch on harness/native.
                         p.server_pending_id = ack.pending_id.clone();
                         p.store_item_id = ack.item_id.clone();
                         if !emit_pending_user(output, state) {
@@ -439,6 +440,15 @@ fn handle_command(
                     }
                     Err(e) => {
                         let m = map_client_error(&e);
+                        // Table B (§13.1) rollback: NetworkTransient, LostAccess,
+                        // Tombstone, Denied — send definitively won't land.
+                        // Hold bubble: ReAuth (401), ServerTransient (5xx),
+                        // WrongVersion, DecodeDrift — reached server or reconcile pending.
+                        // TODO(§9/P3-3): command-path LostAccess (Auth403) / Tombstone
+                        // (NotFound) should escalate to registry removal / tombstone per
+                        // design §13.1 Table B. Deferred — the stream's own terminal
+                        // Disconnected(Forbidden/NotFound) drives Table A stop today;
+                        // the command path only rolls back + SendFailed for now.
                         if m.rolls_back_send() {
                             rollback_pending(state, &lens_pending_id);
                             if !emit_pending_user(output, state) {
@@ -471,10 +481,13 @@ fn apply_reduced_batch(
     transport: &mut ActorTransport,
     reconcile_in_flight: &mut bool,
     parked: &mut bool,
+    defer_transcript_commit: bool,
 ) -> (LoopControl, bool) {
     persist_scalars(stores, state, &batch, clock.now_millis(), ring);
     let mut batch = batch;
-    if let Some(ord) = commit_terminal_prefix(stores, state, next_ordinal, ring) {
+    if !defer_transcript_commit
+        && let Some(ord) = commit_terminal_prefix(stores, state, next_ordinal, ring)
+    {
         batch.push(StreamUpdate::TranscriptAdvanced {
             committed_ordinal: ord,
         });
@@ -577,10 +590,34 @@ fn apply_reduced_batch(
     )
 }
 
+/// Commit transcript items deferred across a Reconnected batch (live tail lands after catch-up).
+fn finish_deferred_transcript_commit(
+    stores: &ActorStores,
+    state: &mut SessionState,
+    next_ordinal: &mut i64,
+    ring: &mut OutcomeRing,
+    output: &mut ActorOutput,
+) -> LoopControl {
+    if let Some(ord) = commit_terminal_prefix(stores, state, next_ordinal, ring)
+        && output
+            .updates
+            .send_blocking(StreamUpdate::TranscriptAdvanced {
+                committed_ordinal: ord,
+            })
+            .is_err()
+    {
+        return LoopControl::Break;
+    }
+    drain_outcome_ring(ring, &output.outcomes);
+    LoopControl::Continue
+}
+
 #[allow(clippy::too_many_arguments)]
-fn process_event_batch(
+fn process_main_loop_event(
     event: ServerStreamEvent,
     events: &Receiver<ServerStreamEvent>,
+    commands: &Receiver<SessionCommand>,
+    api: &dyn SessionApi,
     state: &mut SessionState,
     stores: &ActorStores,
     output: &mut ActorOutput,
@@ -590,15 +627,20 @@ fn process_event_batch(
     transport: &mut ActorTransport,
     reconcile_in_flight: &mut bool,
     parked: &mut bool,
-    greedy_drain: bool,
-) -> (LoopControl, bool) {
+    send_seq: &mut u64,
+) -> LoopControl {
     let mut batch = reduce(state, &event, clock);
-    if greedy_drain {
-        while let Ok(next) = events.try_recv() {
-            batch.extend(reduce(state, &next, clock));
-        }
+    while let Ok(next) = events.try_recv() {
+        batch.extend(reduce(state, &next, clock));
     }
-    apply_reduced_batch(
+    let has_disconnect = batch
+        .iter()
+        .any(|u| matches!(u, StreamUpdate::Disconnected(_)));
+    let saw_reconnected = batch.iter().any(|u| matches!(u, StreamUpdate::Reconnected));
+    // D19: live follow-ons in the same greedy-drained batch must not commit before catch-up.
+    let defer_transcript_commit = saw_reconnected && !has_disconnect;
+
+    let (ctrl, needs_catchup) = apply_reduced_batch(
         batch,
         state,
         stores,
@@ -609,7 +651,36 @@ fn process_event_batch(
         transport,
         reconcile_in_flight,
         parked,
-    )
+        defer_transcript_commit,
+    );
+    if ctrl == LoopControl::Break {
+        return LoopControl::Break;
+    }
+    if needs_catchup {
+        if invoke_catchup_and_replay(
+            api,
+            stores,
+            state,
+            events,
+            commands,
+            output,
+            ring,
+            clock,
+            next_ordinal,
+            transport,
+            reconcile_in_flight,
+            parked,
+            send_seq,
+            true,
+        ) == LoopControl::Break
+        {
+            return LoopControl::Break;
+        }
+        if defer_transcript_commit {
+            return finish_deferred_transcript_commit(stores, state, next_ordinal, ring, output);
+        }
+    }
+    LoopControl::Continue
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -677,6 +748,7 @@ fn invoke_catchup_and_replay(
                     transport,
                     reconcile_in_flight,
                     parked,
+                    false,
                 );
                 if ctrl == LoopControl::Break {
                     return LoopControl::Break;
@@ -795,9 +867,11 @@ fn run(
             },
             i if ev_idx == Some(i) => match oper.recv(&events) {
                 Ok(event) => {
-                    let (ctrl, saw_reconnected) = process_event_batch(
+                    if process_main_loop_event(
                         event,
                         &events,
+                        &commands,
+                        api.as_ref(),
                         &mut state,
                         &stores,
                         &mut output,
@@ -807,28 +881,8 @@ fn run(
                         &mut transport,
                         &mut reconcile_in_flight,
                         &mut parked,
-                        true,
-                    );
-                    if ctrl == LoopControl::Break {
-                        break;
-                    }
-                    if saw_reconnected
-                        && invoke_catchup_and_replay(
-                            api.as_ref(),
-                            &stores,
-                            &mut state,
-                            &events,
-                            &commands,
-                            &mut output,
-                            &mut ring,
-                            clock.as_ref(),
-                            &mut next_ordinal,
-                            &mut transport,
-                            &mut reconcile_in_flight,
-                            &mut parked,
-                            &mut send_seq,
-                            true,
-                        ) == LoopControl::Break
+                        &mut send_seq,
+                    ) == LoopControl::Break
                     {
                         break;
                     }
@@ -3218,5 +3272,61 @@ mod tests {
         for (i, row) in rows.iter().enumerate() {
             assert_eq!(row.id.as_str(), ids[i]);
         }
+    }
+
+    #[test]
+    fn reconnected_greedy_drain_defers_live_commit_until_after_catchup() {
+        let dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(dir.path());
+        seed_connection(&stores);
+        seed_message_item(&*stores.transcript, 0, "item_0", "item_0");
+        assert_eq!(
+            stores.transcript.frontier().unwrap(),
+            Some((0, ItemId::new("item_0")))
+        );
+
+        let fetch_page = item_list_from_messages(&["item_1", "item_2"], false);
+        let (api, _mock) = MockApi::with_fetch_script(VecDeque::from([Ok(fetch_page)]));
+
+        let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, up_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+
+        ev_tx
+            .send(ServerStreamEvent::Reconnected { gap: None })
+            .unwrap();
+        ev_tx
+            .send(parse_response(
+                "response.output_item.done",
+                r#"{"item":{"id":"item_3","type":"message","role":"assistant","content":[{"type":"output_text","text":"live"}]}}"#,
+            ))
+            .unwrap();
+
+        while let Ok(u) = up_rx.recv_blocking() {
+            if matches!(
+                u,
+                StreamUpdate::TranscriptAdvanced {
+                    committed_ordinal: 3
+                }
+            ) {
+                break;
+            }
+        }
+
+        handle.stop_and_join();
+
+        let reopened = SqliteTranscriptStore::open(
+            &dir.path().join("conv_1.db"),
+            &ConnectionId::new("conn_1"),
+            &SessionId::new("conv_1"),
+        )
+        .unwrap();
+        let rows = reopened.load_items().unwrap().rows;
+        let ids: Vec<_> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["item_0", "item_1", "item_2", "item_3"],
+            "durable history must land before the greedy-drained live tail"
+        );
     }
 }
