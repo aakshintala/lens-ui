@@ -51,19 +51,25 @@ fn bench_apply(c: &mut Criterion) {
     let mut group = c.benchmark_group("apply");
 
     for n in [0usize, 1_000, 10_000] {
-        group.bench_with_input(BenchmarkId::new("apply_item_appended", n), &n, |b, &n| {
-            b.iter_batched(
-                || state_with_n_items(n),
-                |mut state| {
-                    apply(
-                        &mut state,
-                        StreamUpdate::ItemAppended(Arc::new(sample_item("bench"))),
-                    );
-                    state
-                },
-                BatchSize::SmallInput,
-            );
-        });
+        group.bench_with_input(
+            BenchmarkId::new("apply_transcript_advanced", n),
+            &n,
+            |b, &n| {
+                b.iter_batched(
+                    || state_with_n_items(n),
+                    |mut state| {
+                        apply(
+                            &mut state,
+                            StreamUpdate::TranscriptAdvanced {
+                                committed_ordinal: 0,
+                            },
+                        );
+                        state
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
     }
 
     group.bench_function("apply_status_changed", |b| {

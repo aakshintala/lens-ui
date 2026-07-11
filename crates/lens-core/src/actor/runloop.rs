@@ -14,8 +14,6 @@ use crossbeam_channel::{Receiver, Select};
 use lens_client::sessions::SessionEventInput;
 use lens_client::stream::DisconnectReason;
 use lens_client::stream::ServerStreamEvent;
-use std::collections::HashSet;
-use std::mem::Discriminant;
 use std::thread::JoinHandle;
 
 /// Commands to the actor thread.
@@ -172,6 +170,14 @@ fn run(
         })
         .max()
         .unwrap_or(0);
+    // TODO(P3-3b, scaffold-id): frontier seeds next_ordinal by item_id; scaffold fc_* vs store-native id reconciliation is deferred.
+    let mut next_ordinal: i64 = stores
+        .transcript
+        .frontier()
+        .ok()
+        .flatten()
+        .map(|(o, _)| o + 1)
+        .unwrap_or(0);
     let mut transport = ActorTransport::Connected;
     // set true on Reconnecting, cleared on Reconnected or park; NOT set on a terminal Disconnected (park is not mid-reconcile).
     let mut reconcile_in_flight = false;
@@ -192,7 +198,7 @@ fn run(
                 Ok(SessionCommand::Promote) => {
                     if output
                         .updates
-                        .send_blocking(StreamUpdate::Rebased(Box::new(state.clone())))
+                        .send_blocking(StreamUpdate::Rebased(scalars_baseline(&state)))
                         .is_err()
                     {
                         return;
@@ -297,7 +303,14 @@ fn run(
                     while let Ok(next) = events.try_recv() {
                         batch.extend(reduce(&mut state, &next, clock.as_ref()));
                     }
-                    persist_write_through(&stores, &state, &batch, clock.now_millis(), &mut ring);
+                    persist_scalars(&stores, &state, &batch, clock.now_millis(), &mut ring);
+                    if let Some(ord) =
+                        commit_terminal_prefix(&stores, &mut state, &mut next_ordinal, &mut ring)
+                    {
+                        batch.push(StreamUpdate::TranscriptAdvanced {
+                            committed_ordinal: ord,
+                        });
+                    }
                     let disconnect_reason = batch.iter().find_map(|u| match u {
                         StreamUpdate::Disconnected(reason) => Some(*reason),
                         _ => None,
@@ -323,7 +336,7 @@ fn run(
                                 // baseline. (review I1)
                                 if output
                                     .updates
-                                    .send_blocking(StreamUpdate::Rebased(Box::new(state.clone())))
+                                    .send_blocking(StreamUpdate::Rebased(scalars_baseline(&state)))
                                     .is_err()
                                 {
                                     return;
@@ -444,50 +457,31 @@ fn drain_outcome_ring(ring: &mut OutcomeRing, outcomes: &async_channel::Sender<A
     ring.try_drain(|o| outcomes.try_send(o).is_ok());
 }
 
-/// Write the deltas of this batch to disk. Items → `TranscriptStore` by ordinal;
-/// a scalar/collection change → one control upsert of the whole session row.
-fn persist_write_through(
+/// D23: Rebased is scalars-only; baseline items come from disk on promote (deferred UI).
+fn scalars_baseline(state: &SessionState) -> Box<SessionState> {
+    let mut b = state.clone();
+    b.items.clear();
+    Box::new(b)
+}
+
+/// Scalar/collection persistence only — items are committed via `commit_terminal_prefix`.
+fn persist_scalars(
     stores: &ActorStores,
     state: &SessionState,
     batch: &Updates,
     now_ms: i64,
     ring: &mut OutcomeRing,
 ) {
-    // Appended items occupy the last `appends` slots of state.items, in batch order.
-    let appends = batch
-        .iter()
-        .filter(|u| matches!(u, StreamUpdate::ItemAppended(_)))
-        .count();
-    let base = state.items.len().saturating_sub(appends);
-    let mut append_i = 0usize;
     let mut touched_scalar = false;
     for u in batch {
         match u {
-            StreamUpdate::ItemAppended(item) => {
-                // TODO(P3-3): replace this positional ordinal with the owned ordinal cursor once byte-window eviction lands (D11).
-                let ordinal = (base + append_i) as i64;
-                if let Err(e) = stores.transcript.upsert_item(ordinal, item.as_ref()) {
-                    ring.push(ActorOutcome::PersistError {
-                        where_: "transcript.upsert_item",
-                        message: e.to_string(),
-                    });
-                }
-                append_i += 1;
-            }
-            StreamUpdate::ItemUpdated { index, item } => {
-                if let Err(e) = stores.transcript.upsert_item(*index as i64, item.as_ref()) {
-                    ring.push(ActorOutcome::PersistError {
-                        where_: "transcript.upsert_item",
-                        message: e.to_string(),
-                    });
-                }
-            }
             StreamUpdate::ScratchChanged(_)
             | StreamUpdate::ChildSessionChanged
             | StreamUpdate::ResourcesChanged
             | StreamUpdate::PendingUserChanged(_)
             | StreamUpdate::Reconnecting { .. }
-            | StreamUpdate::Reconnected => {}
+            | StreamUpdate::Reconnected
+            | StreamUpdate::TranscriptAdvanced { .. } => {}
             StreamUpdate::Disconnected(_) => {}
             _ => touched_scalar = true,
         }
@@ -500,32 +494,57 @@ fn persist_write_through(
     }
 }
 
-/// Drop superseded scratch/scalar deltas within one batch (keep the last of each
-/// kind); item deltas always survive (order-significant transcript growth).
-fn coalesce(batch: Updates) -> Updates {
-    let mut last_non_item: Vec<(Discriminant<StreamUpdate>, usize)> = Vec::new();
-    for (i, u) in batch.iter().enumerate() {
-        match u {
-            StreamUpdate::ItemAppended(_) | StreamUpdate::ItemUpdated { .. } => {}
-            _ => {
-                let d = std::mem::discriminant(u);
-                if let Some(entry) = last_non_item.iter_mut().find(|(k, _)| *k == d) {
-                    entry.1 = i;
-                } else {
-                    last_non_item.push((d, i));
-                }
+/// D20/D23: commit the terminal PREFIX of the working set to disk in order,
+/// prune it from RAM, advance `next_ordinal`. Returns the new watermark iff ≥1
+/// item committed. A non-terminal front item stops the prefix (it and everything
+/// after stay above the watermark). A persist error stops the prefix and leaves
+/// the item resident for the next batch (no ordinal gap, no RAM loss).
+fn commit_terminal_prefix(
+    stores: &ActorStores,
+    state: &mut SessionState,
+    next_ordinal: &mut i64,
+    ring: &mut OutcomeRing,
+) -> Option<i64> {
+    let mut committed = false;
+    while let Some(front) = state.items.first() {
+        if !front.kind.is_terminal() {
+            break;
+        }
+        // TODO(P3-3b, scaffold-id): scaffold fc_* ids may double-commit vs store-native ids.
+        match stores.transcript.upsert_item(*next_ordinal, front) {
+            Ok(()) => {
+                state.items.remove(0);
+                *next_ordinal += 1;
+                committed = true;
+            }
+            Err(e) => {
+                ring.push(ActorOutcome::PersistError {
+                    where_: "transcript.upsert_item",
+                    message: e.to_string(),
+                });
+                break;
             }
         }
     }
-    let keep: HashSet<usize> = last_non_item.into_iter().map(|(_, i)| i).collect();
+    committed.then(|| *next_ordinal - 1)
+}
+
+/// Drop superseded deltas within one batch (keep the last of each discriminant).
+fn coalesce(batch: Updates) -> Updates {
+    let mut last: Vec<(std::mem::Discriminant<StreamUpdate>, usize)> = Vec::new();
+    for (i, u) in batch.iter().enumerate() {
+        let d = std::mem::discriminant(u);
+        if let Some(entry) = last.iter_mut().find(|(k, _)| *k == d) {
+            entry.1 = i;
+        } else {
+            last.push((d, i));
+        }
+    }
+    let keep: std::collections::HashSet<usize> = last.into_iter().map(|(_, i)| i).collect();
     batch
         .into_iter()
         .enumerate()
-        .filter_map(|(i, u)| match &u {
-            StreamUpdate::ItemAppended(_) | StreamUpdate::ItemUpdated { .. } => Some(u),
-            _ if keep.contains(&i) => Some(u),
-            _ => None,
-        })
+        .filter_map(|(i, u)| keep.contains(&i).then_some(u))
         .collect()
 }
 
@@ -540,8 +559,7 @@ mod tests {
     use crate::domain::ids::ElicitationId;
     use crate::domain::ids::ItemId;
     use crate::domain::ids::{ConnectionId, SessionId};
-    use crate::domain::item::{BlockContext, ContentBlock, Item, ItemKind};
-    use crate::domain::scalars::Role;
+    use crate::domain::item::{Item, ItemKind};
     use crate::persist::{
         ConnectionRecord, Loaded, PersistError, SqliteControlStore, SqliteTranscriptStore,
         StoreMode, TranscriptStore,
@@ -679,6 +697,10 @@ mod tests {
 
         fn reconcile(&self, _items: &[Item]) -> crate::persist::Result<()> {
             Ok(())
+        }
+
+        fn frontier(&self) -> crate::persist::Result<Option<(i64, ItemId)>> {
+            Ok(None)
         }
     }
 
@@ -873,10 +895,9 @@ mod tests {
         );
 
         ev_tx.send(one_output_item_done_event()).unwrap();
-        let update = up_rx
+        let _update = up_rx
             .recv_blocking()
             .expect("actor still emitted stream update");
-        assert!(matches!(update, StreamUpdate::ItemAppended(_)));
 
         match handle.outcomes.recv_blocking().unwrap() {
             ActorOutcome::PersistError { where_, message } => {
@@ -907,8 +928,22 @@ mod tests {
         );
 
         ev_tx.send(one_output_item_done_event()).unwrap();
-        let update = up_rx.recv_blocking().expect("actor emitted an update");
-        assert!(matches!(update, StreamUpdate::ItemAppended(_)));
+        let mut saw_watermark = false;
+        while let Ok(update) = up_rx.recv_blocking() {
+            if matches!(
+                update,
+                StreamUpdate::TranscriptAdvanced {
+                    committed_ordinal: 0
+                }
+            ) {
+                saw_watermark = true;
+                break;
+            }
+        }
+        assert!(
+            saw_watermark,
+            "expected TranscriptAdvanced{{committed_ordinal:0}}"
+        );
 
         handle.stop_and_join();
 
@@ -921,52 +956,85 @@ mod tests {
         assert_eq!(reopened.load_items().unwrap().rows.len(), 1);
     }
 
-    fn test_item(id: &str, text: &str) -> Item {
-        Item {
-            id: ItemId::new(id),
-            seq: None,
-            ctx: BlockContext {
-                agent: None,
-                depth: 0,
-                turn: 0,
-            },
-            created_at: 0,
-            kind: ItemKind::Message {
-                role: Role::Assistant,
-                content: vec![ContentBlock {
-                    kind: "text".into(),
-                    text: Some(text.into()),
-                    data: serde_json::Value::Null,
-                }],
-            },
-        }
-    }
-
     #[test]
-    fn batched_appends_persist_at_distinct_ordinals() {
-        let _dir = tempfile::tempdir().unwrap();
-        let stores = test_stores(_dir.path());
+    fn in_progress_call_blocks_commit_completed_message_advances_watermark() {
+        use lens_client::stream::ResponseEvent;
+
+        let dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(dir.path());
         seed_connection(&stores);
-        let mut state = fresh_state();
-        let a = Arc::new(test_item("fc_1", "a"));
-        let b = Arc::new(test_item("fc_2", "b"));
-        state.items.push(Arc::clone(&a));
-        state.items.push(Arc::clone(&b));
-        let batch: Updates = smallvec![
-            StreamUpdate::ItemAppended(Arc::clone(&a)),
-            StreamUpdate::ItemAppended(Arc::clone(&b)),
-        ];
-        persist_write_through(
-            &stores,
-            &state,
-            &batch,
-            1_700_000_000_000,
-            &mut OutcomeRing::with_cap(64),
+        let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, up_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(
+            fresh_state(),
+            ev_rx,
+            up_tx,
+            stores,
+            test_clock(),
+            noop_api(),
         );
-        let rows = stores.transcript.load_items().unwrap().rows;
-        assert_eq!(rows.len(), 2, "both batched appends must persist");
-        assert_eq!(rows[0].id.as_str(), "fc_1");
-        assert_eq!(rows[1].id.as_str(), "fc_2");
+
+        // Terminal assistant message commits at ordinal 0 (must precede a non-terminal
+        // front item — prefix commit stops at the first in-progress function call).
+        ev_tx
+            .send(ServerStreamEvent::Response(
+                ResponseEvent::OutputTextDelta {
+                    delta: "hello".into(),
+                    message_id: None,
+                    index: None,
+                    last: None,
+                },
+            ))
+            .unwrap();
+        ev_tx
+            .send(ServerStreamEvent::Response(ResponseEvent::Completed))
+            .unwrap();
+
+        let mut saw_watermark = false;
+        while let Ok(u) = up_rx.recv_blocking() {
+            if matches!(
+                u,
+                StreamUpdate::TranscriptAdvanced {
+                    committed_ordinal: 0
+                }
+            ) {
+                saw_watermark = true;
+                break;
+            }
+        }
+        assert!(
+            saw_watermark,
+            "expected TranscriptAdvanced{{committed_ordinal:0}}"
+        );
+
+        let reopened = SqliteTranscriptStore::open(
+            &dir.path().join("conv_1.db"),
+            &ConnectionId::new("conn_1"),
+            &SessionId::new("conv_1"),
+        )
+        .unwrap();
+        let rows = reopened.load_items().unwrap().rows;
+        assert_eq!(rows.len(), 1, "only the terminal message is on disk");
+        assert!(matches!(rows[0].kind, ItemKind::Message { .. }));
+
+        // In-progress function call — non-terminal, must NOT commit.
+        ev_tx
+            .send(parse_response(
+                "response.output_item.done",
+                r#"{"item":{"id":"fc_1","type":"function_call","status":"in_progress","name":"read","arguments":"{}","call_id":"toolu_1"}}"#,
+            ))
+            .unwrap();
+
+        while up_rx.try_recv().is_ok() {}
+
+        let rows = reopened.load_items().unwrap().rows;
+        assert_eq!(rows.len(), 1, "fc_1 must stay above the watermark");
+        assert!(
+            !rows.iter().any(|r| r.id.as_str() == "fc_1"),
+            "in-progress fc_1 must not be on disk"
+        );
+
+        handle.stop_and_join();
     }
 
     #[test]
@@ -984,7 +1052,7 @@ mod tests {
         });
         let batch: Updates =
             smallvec![StreamUpdate::PendingUserChanged(state.pending_user.clone())];
-        persist_write_through(
+        persist_scalars(
             &stores,
             &state,
             &batch,
@@ -1000,7 +1068,7 @@ mod tests {
         let status_batch: Updates = smallvec![StreamUpdate::StatusChanged(
             crate::domain::scalars::SessionStatusValue::Running
         )];
-        persist_write_through(
+        persist_scalars(
             &stores,
             &state,
             &status_batch,
@@ -1053,6 +1121,7 @@ mod tests {
                     saw_rebased = true;
                     assert_eq!(baseline.title.as_deref(), Some("snapshot title"));
                     assert_eq!(baseline.llm_model.as_deref(), Some("opus"));
+                    assert!(baseline.items.is_empty(), "D23: Rebased is scalars-only");
                 }
                 _ => {}
             }

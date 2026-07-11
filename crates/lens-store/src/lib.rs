@@ -10,12 +10,6 @@ use lens_core::reduce::StreamUpdate;
 pub fn apply(state: &mut SessionState, update: StreamUpdate) {
     use StreamUpdate::*;
     match update {
-        ItemAppended(item) => state.items.push(item),
-        ItemUpdated { index, item } => {
-            if index < state.items.len() {
-                state.items[index] = item;
-            }
-        }
         ScratchChanged(scratch) => state.stream = (*scratch).clone(),
         StatusChanged(v) => state.status = v,
         LastTaskErrorChanged(v) => state.last_task_error = v,
@@ -53,7 +47,8 @@ pub fn apply(state: &mut SessionState, update: StreamUpdate) {
         | ResourcesChanged
         | SnapshotRestored
         | Reconnecting { .. }
-        | Reconnected => {}
+        | Reconnected
+        | TranscriptAdvanced { .. } => {}
         Disconnected(_) => {}
     }
 }
@@ -185,15 +180,16 @@ mod tests {
     }
 
     #[test]
-    fn apply_item_appended_pushes_shared_body() {
+    fn apply_transcript_advanced_is_no_op() {
         let mut s = state();
-        let item = std::sync::Arc::new(sample_item("item_1"));
+        s.items.push(std::sync::Arc::new(sample_item("item_0")));
         super::apply(
             &mut s,
-            StreamUpdate::ItemAppended(std::sync::Arc::clone(&item)),
+            StreamUpdate::TranscriptAdvanced {
+                committed_ordinal: 0,
+            },
         );
         assert_eq!(s.items.len(), 1);
-        assert!(std::sync::Arc::ptr_eq(&s.items[0], &item));
     }
 
     #[test]
