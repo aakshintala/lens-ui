@@ -3285,11 +3285,16 @@ mod tests {
             Some((0, ItemId::new("item_0")))
         );
 
-        let fetch_page = item_list_from_messages(&["item_1", "item_2"], false);
-        let (api, _mock) = MockApi::with_fetch_script(VecDeque::from([Ok(fetch_page)]));
+        // Spawn catch-up consumes page 1 (empty); Reconnected catch-up consumes page 2.
+        let history_page = item_list_from_messages(&["item_1", "item_2"], false);
+        let (api, _mock) = MockApi::with_fetch_script(VecDeque::from([
+            Ok(empty_item_list()),
+            Ok(history_page),
+        ]));
 
         let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
         let (up_tx, up_rx) = async_channel::bounded(64);
+        // spawn_actor returns only after spawn catch-up completes (empty page).
         let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
 
         ev_tx
