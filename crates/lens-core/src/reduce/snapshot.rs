@@ -39,6 +39,7 @@ pub(crate) fn fold_snapshot(state: &mut SessionState, snap: &SessionSnapshot) ->
         .map(|p| SessionId::new(p.to_string()));
     state.permission_level = snap.permission_level().and_then(|p| u8::try_from(p).ok());
     state.archived = snap.archived();
+    state.created_at = snap.created_at();
     state.cumulative_cost.cumulative_usage.usage_by_model = snap
         .usage_by_model()
         .iter()
@@ -191,6 +192,18 @@ mod tests {
             &clock(),
         );
         assert!(s.stream.open_message.is_some());
+    }
+
+    #[test]
+    fn fold_snapshot_sets_created_at_from_wire() {
+        let mut s = crate::reduce::testutil::fresh_state();
+        assert_eq!(s.created_at, 0);
+        let snap = crate::reduce::testutil::snapshot_fixture(serde_json::json!({
+            "id": "conv_1", "status": "running", "agent_id": "ag_1",
+            "created_at": 1_700_000_000, "items": []
+        }));
+        super::fold_snapshot(&mut s, &snap);
+        assert_eq!(s.created_at, 1_700_000_000);
     }
 
     #[test]

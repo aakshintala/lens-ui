@@ -71,8 +71,6 @@ pub struct SessionState {
     pub lifecycle: SessionLifecycle,
     /// active-set LRU (epoch millis).
     pub last_focused_at: i64,
-    /// reconcile cursor (typed client §7).
-    pub last_seen_seq: Option<u64>,
 }
 
 impl SessionState {
@@ -118,7 +116,6 @@ impl SessionState {
             archived: false,
             lifecycle: SessionLifecycle::Active,
             last_focused_at: 0,
-            last_seen_seq: None,
         }
     }
 }

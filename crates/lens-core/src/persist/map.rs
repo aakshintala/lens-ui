@@ -92,7 +92,7 @@ pub const SESSION_COLUMNS: &str = "connection_id, id, agent_id, agent_name, runn
     parent_session_id, status, last_task_error, llm_model, model_override, reasoning_effort, \
     collaboration_mode, context_window, last_total_tokens, cost_json, workspace, git_branch, \
     host_type, host_id, title, labels, permission_level, owner, todos, skills, terminal_pending, \
-    created_at, archived, lifecycle, last_focused_at, last_seen_seq";
+    created_at, archived, lifecycle, last_focused_at";
 
 /// Reconstruct a disk-snapshot `SessionState` (items empty; RAM-only fields
 /// defaulted — D-P2-6). Total over decodable rows (never panics on disk data).
@@ -123,7 +123,7 @@ pub fn row_to_session(r: &rusqlite::Row) -> rusqlite::Result<SessionState> {
     st.model_override = r.get(9)?;
     st.reasoning_effort = r.get(10)?;
     st.collaboration_mode = r.get(11)?;
-    // REVIEW#6: read unsigned columns through i64 uniformly (like last_seen_seq /
+    // REVIEW#6: read unsigned columns through i64 uniformly (like
     // permission_level) so a high-bit value loads (rusqlite's u64 FromSql errors
     // on > i64::MAX) — keeps loads total.
     st.context_window = r.get::<_, Option<i64>>(12)?.map(|v| v as u64);
@@ -156,7 +156,6 @@ pub fn row_to_session(r: &rusqlite::Row) -> rusqlite::Result<SessionState> {
     st.archived = r.get::<_, i64>(27)? != 0;
     st.lifecycle = from_token::<SessionLifecycle>(r.get::<_, String>(28)?).map_err(to_sql_err)?;
     st.last_focused_at = r.get(29)?;
-    st.last_seen_seq = r.get::<_, Option<i64>>(30)?.map(|v| v as u64);
     // items, presence, stream, pending_user, model_options, sandbox_status,
     // pending_elicitations: NOT persisted (D-P2-5/D-P2-6) — left at `new()` defaults.
     Ok(st)

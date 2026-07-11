@@ -52,7 +52,6 @@ CREATE TABLE IF NOT EXISTS sessions (
   tombstoned_at     INTEGER,
   last_focused_at   INTEGER,
   last_status       TEXT,
-  last_seen_seq     INTEGER,
   updated_at        INTEGER NOT NULL,
   PRIMARY KEY (connection_id, id)
 );

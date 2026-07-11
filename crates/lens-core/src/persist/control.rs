@@ -99,10 +99,10 @@ impl ControlStore for SqliteControlStore {
                collaboration_mode, context_window, last_total_tokens, cumulative_cost,
                usage_by_model, cost_json, workspace, git_branch, host_type, host_id,
                title, labels, permission_level, owner, todos, skills, terminal_pending,
-               created_at, archived, lifecycle, last_focused_at, last_seen_seq, updated_at
+               created_at, archived, lifecycle, last_focused_at, updated_at
              ) VALUES (
                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-               ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34
+               ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33
              )
              ON CONFLICT(connection_id, id) DO UPDATE SET
                agent_id=excluded.agent_id, agent_name=excluded.agent_name,
@@ -116,8 +116,8 @@ impl ControlStore for SqliteControlStore {
                host_type=excluded.host_type, host_id=excluded.host_id, title=excluded.title,
                labels=excluded.labels, permission_level=excluded.permission_level, owner=excluded.owner,
                todos=excluded.todos, skills=excluded.skills, terminal_pending=excluded.terminal_pending,
-               created_at=excluded.created_at, archived=excluded.archived, lifecycle=excluded.lifecycle,
-               last_focused_at=excluded.last_focused_at, last_seen_seq=excluded.last_seen_seq,
+               created_at=CASE WHEN sessions.created_at != 0 THEN sessions.created_at ELSE excluded.created_at END, archived=excluded.archived, lifecycle=excluded.lifecycle,
+               last_focused_at=excluded.last_focused_at,
                updated_at=excluded.updated_at",
             rusqlite::params![
                 s.connection_id.as_str(),
@@ -152,7 +152,6 @@ impl ControlStore for SqliteControlStore {
                 s.archived as i64,
                 lifecycle,
                 s.last_focused_at,
-                s.last_seen_seq.map(|v| v as i64),
                 now_ms,
             ],
         )?;
@@ -233,6 +232,50 @@ mod tests {
         let dir = tempdir().unwrap();
         let s = SqliteControlStore::open(&dir.path().join("lens.db")).unwrap();
         (dir, s)
+    }
+
+    fn conn_record() -> ConnectionRecord {
+        ConnectionRecord {
+            id: ConnectionId::new("conn_1"),
+            base_url: "u".into(),
+            auth_kind: "none".into(),
+            label: None,
+            server_info: None,
+            created_at: 1,
+        }
+    }
+
+    fn session_fixture() -> SessionState {
+        use crate::domain::ids::{AgentId, SessionId};
+        SessionState::new(
+            ConnectionId::new("conn_1"),
+            SessionId::new("conv_1"),
+            AgentId::new("agent_1"),
+        )
+    }
+
+    #[test]
+    fn upsert_session_keeps_existing_nonzero_created_at() {
+        let d = tempdir().unwrap();
+        let store = SqliteControlStore::open(&d.path().join("lens.db")).unwrap();
+        store.upsert_connection(&conn_record()).unwrap();
+
+        let mut s = session_fixture();
+        s.created_at = 1_700_000_000;
+        store.upsert_session(&s, 1).unwrap();
+
+        // A later actor upsert with a not-yet-bootstrapped created_at=0 must NOT clobber.
+        s.created_at = 0;
+        store.upsert_session(&s, 2).unwrap();
+
+        let loaded = store
+            .load_session(&s.connection_id, &s.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            loaded.created_at, 1_700_000_000,
+            "non-zero created_at preserved"
+        );
     }
 
     #[test]
