@@ -21,6 +21,10 @@ pub enum ActorOutcome {
     },
     StoppedRemoved,
     StoppedTombstone,
+    /// D21: in-loop sleep succeeded — lifecycle flushed `Slept`, actor stopping.
+    Slept,
+    /// D21: sleep declined — session not quiescent; actor continues.
+    SleepDeclined,
     SummaryConsumerGone,
     /// Optimistic bubble that never persisted server-side. UX-polish, deferred.
     /// TODO(followup, Opus#1): correct detection needs the actor to re-derive

@@ -9,6 +9,7 @@ use crate::clock::Clock;
 use crate::domain::SessionState;
 use crate::domain::controls::PendingUserMessage;
 use crate::domain::item::{BlockContext, Item};
+use crate::domain::scalars::SessionLifecycle;
 use crate::persist::{ControlStore, TranscriptStore};
 use crate::reduce::map_wire_item;
 use crate::reduce::{StreamUpdate, Updates, reduce};
@@ -34,6 +35,8 @@ pub enum SessionCommand {
         text: String,
         model_override: Option<String>,
     },
+    /// D21: durable sleep — in-loop quiescence recheck, flush `Slept`, stop actor.
+    Sleep,
 }
 
 /// Persist role stores moved into the actor thread.
@@ -144,7 +147,6 @@ pub fn spawn_actor_dual(
 }
 
 /// §2.3 D21: quiescent ⇔ no transient work ∧ transport live ∧ not mid-reconcile.
-#[allow(dead_code)] // consumed by Task 6 sleep gate
 fn is_quiesced(
     state: &SessionState,
     transport: &ActorTransport,
@@ -352,16 +354,34 @@ fn end_catchup_reconcile(
 fn handle_command(
     cmd: SessionCommand,
     state: &mut SessionState,
-    _stores: &ActorStores,
+    stores: &ActorStores,
     output: &mut ActorOutput,
-    _ring: &mut OutcomeRing,
+    ring: &mut OutcomeRing,
     clock: &dyn Clock,
     api: &dyn SessionApi,
     transport: &ActorTransport,
+    reconcile_in_flight: bool,
     send_seq: &mut u64,
 ) -> LoopControl {
     match cmd {
         SessionCommand::Stop => LoopControl::Break,
+        SessionCommand::Sleep => {
+            if !is_quiesced(state, transport, reconcile_in_flight) {
+                let _ = output.outcomes.send_blocking(ActorOutcome::SleepDeclined);
+                return LoopControl::Continue;
+            }
+            state.lifecycle = SessionLifecycle::Slept;
+            let now = clock.now_millis();
+            if let Err(e) = stores.control.upsert_session(state, now) {
+                ring.push(ActorOutcome::PersistError {
+                    where_: "control.upsert_session",
+                    message: e.to_string(),
+                });
+            }
+            let _ = api.send_event(&state.id, &SessionEventInput::StopSession);
+            let _ = output.outcomes.send_blocking(ActorOutcome::Slept);
+            LoopControl::Break
+        }
         SessionCommand::Promote => {
             if output
                 .updates
@@ -830,7 +850,16 @@ fn invoke_catchup_and_replay(
         } => {
             for cmd in deferred_commands {
                 if handle_command(
-                    cmd, state, stores, output, ring, clock, api, transport, send_seq,
+                    cmd,
+                    state,
+                    stores,
+                    output,
+                    ring,
+                    clock,
+                    api,
+                    transport,
+                    *reconcile_in_flight,
+                    send_seq,
                 ) == LoopControl::Break
                 {
                     return LoopControl::Break;
@@ -939,6 +968,7 @@ fn run(
                         clock.as_ref(),
                         api.as_ref(),
                         &transport,
+                        reconcile_in_flight,
                         &mut send_seq,
                     ) == LoopControl::Break
                     {
@@ -3279,6 +3309,70 @@ mod tests {
         // Optimistic + stamp emits complete before join returns.
         let _ = expect_pending_user_changed(&up_rx);
         let _ = expect_pending_user_changed(&up_rx);
+    }
+
+    #[test]
+    fn sleep_when_quiescent_flushes_slept_and_stops() {
+        use crate::domain::scalars::SessionLifecycle;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("lens.db");
+        let stores = test_stores(dir.path());
+        seed_connection(&stores);
+        let (_ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, _up_rx) = async_channel::bounded(64);
+        let (api, mock) = MockApi::succeed_with_ack(SendEventAck {
+            queued: true,
+            ..Default::default()
+        });
+        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+
+        handle.commands.send(SessionCommand::Sleep).unwrap();
+        match handle.outcomes.recv_blocking().unwrap() {
+            ActorOutcome::Slept => {}
+            other => panic!("expected Slept, got {other:?}"),
+        }
+        handle.join_without_stop();
+
+        let control = SqliteControlStore::open(&db_path).unwrap();
+        let loaded = control.list_sessions(&ConnectionId::new("conn_1")).unwrap();
+        assert_eq!(loaded.rows[0].lifecycle, SessionLifecycle::Slept);
+        assert!(matches!(
+            mock.last_evt(),
+            Some(SessionEventInput::StopSession)
+        ));
+    }
+
+    #[test]
+    fn sleep_while_running_is_declined_and_actor_survives() {
+        use crate::domain::scalars::SessionStatusValue;
+
+        let _dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(_dir.path());
+        seed_connection(&stores);
+        let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, up_rx) = async_channel::bounded(64);
+        let (api, mock) = MockApi::succeed_with_ack(SendEventAck {
+            queued: true,
+            ..Default::default()
+        });
+        let mut state = fresh_state();
+        state.status = SessionStatusValue::Running;
+        let handle = spawn_actor(state, ev_rx, up_tx, stores, test_clock(), api);
+
+        handle.commands.send(SessionCommand::Sleep).unwrap();
+        match handle.outcomes.recv_blocking().unwrap() {
+            ActorOutcome::SleepDeclined => {}
+            other => panic!("expected SleepDeclined, got {other:?}"),
+        }
+        assert!(
+            mock.last_evt().is_none(),
+            "StopSession must not be sent when sleep is declined"
+        );
+
+        ev_tx.send(status_running_event()).unwrap();
+        assert!(up_rx.recv_blocking().is_ok());
+        handle.stop_and_join();
     }
 
     #[test]
