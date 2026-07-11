@@ -8,13 +8,20 @@ use crate::actor::transport::{ActorTransport, ParkReason};
 use crate::clock::Clock;
 use crate::domain::SessionState;
 use crate::domain::controls::PendingUserMessage;
+use crate::domain::item::{BlockContext, Item};
 use crate::persist::{ControlStore, TranscriptStore};
+use crate::reduce::map_wire_item;
 use crate::reduce::{StreamUpdate, Updates, reduce};
 use crossbeam_channel::{Receiver, Select};
+use lens_client::sessions::ItemsPage;
 use lens_client::sessions::SessionEventInput;
 use lens_client::stream::DisconnectReason;
+use lens_client::stream::Item as WireItem;
 use lens_client::stream::ServerStreamEvent;
 use std::thread::JoinHandle;
+
+/// Forward catch-up page size (D19).
+const CATCHUP_PAGE: u32 = 200;
 
 /// Commands to the actor thread.
 #[derive(Debug)]
@@ -148,6 +155,558 @@ fn is_quiesced(
         && !reconcile_in_flight
 }
 
+enum LoopControl {
+    Continue,
+    Break,
+}
+
+impl PartialEq for LoopControl {
+    fn eq(&self, other: &Self) -> bool {
+        matches!(
+            (self, other),
+            (LoopControl::Continue, LoopControl::Continue)
+                | (LoopControl::Break, LoopControl::Break)
+        )
+    }
+}
+
+enum CatchupResult {
+    CaughtUp {
+        buffered_events: Vec<ServerStreamEvent>,
+        deferred_commands: Vec<SessionCommand>,
+    },
+    Aborted,
+}
+
+/// Map a durable `/items` wire row to a domain `Item` for catch-up persist.
+fn wire_to_domain_item(wire: &WireItem, clock: &dyn Clock) -> Option<Item> {
+    let (id, kind) = map_wire_item(wire)?;
+    Some(Item {
+        id,
+        seq: None,
+        ctx: BlockContext {
+            agent: None,
+            depth: 0,
+            turn: 0,
+        },
+        created_at: clock.now_millis(),
+        kind,
+    })
+}
+
+/// Catch-up upsert: advance `next_ordinal` only on a fresh insert at the passed ordinal
+/// (same discipline as `commit_terminal_prefix`).
+fn upsert_catchup_item(
+    stores: &ActorStores,
+    next_ordinal: &mut i64,
+    item: &Item,
+    ring: &mut OutcomeRing,
+) -> bool {
+    match stores.transcript.upsert_item(*next_ordinal, item) {
+        Ok(stored_ord) => {
+            let requested = *next_ordinal;
+            if stored_ord == requested {
+                *next_ordinal += 1;
+                true
+            } else {
+                false
+            }
+        }
+        Err(e) => {
+            ring.push(ActorOutcome::PersistError {
+                where_: "transcript.upsert_item",
+                message: e.to_string(),
+            });
+            false
+        }
+    }
+}
+
+/// D19: mode-switched forward catch-up on the actor thread. Drains live events into RAM
+/// between pages; honors `Stop` immediately; stashes other commands for post-catch-up replay.
+#[allow(clippy::too_many_arguments)]
+fn run_catchup(
+    api: &dyn SessionApi,
+    stores: &ActorStores,
+    state: &SessionState,
+    next_ordinal: &mut i64,
+    events: &Receiver<ServerStreamEvent>,
+    commands: &Receiver<SessionCommand>,
+    output: &ActorOutput,
+    ring: &mut OutcomeRing,
+    clock: &dyn Clock,
+) -> CatchupResult {
+    let mut after = stores
+        .transcript
+        .frontier()
+        .ok()
+        .flatten()
+        .map(|(_, id)| id.to_string());
+    let mut buffered_events = Vec::new();
+    let mut deferred_commands = Vec::new();
+
+    loop {
+        while let Ok(ev) = events.try_recv() {
+            buffered_events.push(ev);
+        }
+        while let Ok(cmd) = commands.try_recv() {
+            match cmd {
+                SessionCommand::Stop => return CatchupResult::Aborted,
+                other => deferred_commands.push(other),
+            }
+        }
+
+        let page = ItemsPage {
+            after: after.clone(),
+            order: Some("asc".into()),
+            before: None,
+            limit: Some(CATCHUP_PAGE),
+        };
+        let list = match api.fetch_items(&state.id, &page) {
+            Ok(l) => l,
+            Err(e) => {
+                ring.push(ActorOutcome::PersistError {
+                    where_: "catchup.fetch_items",
+                    message: e.to_string(),
+                });
+                break;
+            }
+        };
+
+        let mut wrote_any = false;
+        for wire in list.items() {
+            if let Some(domain) = wire_to_domain_item(wire, clock)
+                && upsert_catchup_item(stores, next_ordinal, &domain, ring)
+            {
+                wrote_any = true;
+            }
+            after = Some(wire.id().to_string());
+        }
+        if wrote_any
+            && output
+                .updates
+                .send_blocking(StreamUpdate::TranscriptAdvanced {
+                    committed_ordinal: *next_ordinal - 1,
+                })
+                .is_err()
+        {
+            return CatchupResult::Aborted;
+        }
+        if !list.has_more() {
+            break;
+        }
+    }
+
+    CatchupResult::CaughtUp {
+        buffered_events,
+        deferred_commands,
+    }
+}
+
+fn emit_transport_changed(
+    output: &ActorOutput,
+    transport: ActorTransport,
+    reconcile_in_flight: bool,
+) -> bool {
+    output
+        .outcomes
+        .send_blocking(ActorOutcome::TransportChanged {
+            transport,
+            reconcile_in_flight,
+        })
+        .is_ok()
+}
+
+/// Set/clear `reconcile_in_flight` around catch-up; emit only when the flag changes.
+fn begin_catchup_reconcile(
+    reconcile_in_flight: &mut bool,
+    output: &ActorOutput,
+    transport: ActorTransport,
+    emit_transport: bool,
+) -> bool {
+    if !*reconcile_in_flight {
+        *reconcile_in_flight = true;
+        if emit_transport {
+            return emit_transport_changed(output, transport, true);
+        }
+    }
+    true
+}
+
+fn end_catchup_reconcile(
+    reconcile_in_flight: &mut bool,
+    output: &ActorOutput,
+    transport: ActorTransport,
+    emit_transport: bool,
+) -> bool {
+    if *reconcile_in_flight {
+        *reconcile_in_flight = false;
+        if emit_transport {
+            return emit_transport_changed(output, transport, false);
+        }
+    }
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_command(
+    cmd: SessionCommand,
+    state: &mut SessionState,
+    _stores: &ActorStores,
+    output: &mut ActorOutput,
+    _ring: &mut OutcomeRing,
+    clock: &dyn Clock,
+    api: &dyn SessionApi,
+    transport: &ActorTransport,
+    send_seq: &mut u64,
+) -> LoopControl {
+    match cmd {
+        SessionCommand::Stop => LoopControl::Break,
+        SessionCommand::Promote => {
+            if output
+                .updates
+                .send_blocking(StreamUpdate::Rebased(scalars_baseline(state)))
+                .is_err()
+            {
+                return LoopControl::Break;
+            }
+            output.mode = OutputMode::Detailed;
+            LoopControl::Continue
+        }
+        SessionCommand::Demote => {
+            output.mode = OutputMode::Summary;
+            LoopControl::Continue
+        }
+        SessionCommand::Send {
+            text,
+            model_override,
+        } => {
+            if matches!(transport, ActorTransport::Parked { .. }) {
+                let _ = output.outcomes.send_blocking(ActorOutcome::Command(
+                    CommandOutcome::SendRejected {
+                        reason: "session parked — awaiting re-auth/retry".into(),
+                    },
+                ));
+            } else {
+                *send_seq += 1;
+                let lens_pending_id = format!("lens_pend_{send_seq}");
+                state.pending_user.push(PendingUserMessage {
+                    pending_id: lens_pending_id.clone(),
+                    server_pending_id: None,
+                    store_item_id: None,
+                    content: text.clone(),
+                    created_at: clock.now_millis(),
+                });
+                if !emit_pending_user(output, state) {
+                    return LoopControl::Break;
+                }
+
+                let evt = SessionEventInput::Message {
+                    content: vec![serde_json::json!({"type":"input_text","text": text})],
+                    model_override,
+                    tools: None,
+                };
+                match api.send_event(&state.id, &evt) {
+                    Ok(ack) if ack.denied => {
+                        rollback_pending(state, &lens_pending_id);
+                        if !emit_pending_user(output, state) {
+                            return LoopControl::Break;
+                        }
+                        let _ = output.outcomes.send_blocking(ActorOutcome::Command(
+                            CommandOutcome::SendDenied {
+                                lens_pending_id,
+                                reason: ack.reason,
+                            },
+                        ));
+                    }
+                    Ok(ack) => {
+                        let p = state
+                            .pending_user
+                            .iter_mut()
+                            .find(|p| p.pending_id == lens_pending_id)
+                            .expect("optimistic bubble present for stamp");
+                        p.server_pending_id = ack.pending_id.clone();
+                        p.store_item_id = ack.item_id.clone();
+                        if !emit_pending_user(output, state) {
+                            return LoopControl::Break;
+                        }
+                        let _ = output.outcomes.send_blocking(ActorOutcome::Command(
+                            CommandOutcome::SendAccepted {
+                                lens_pending_id,
+                                ack,
+                            },
+                        ));
+                    }
+                    Err(e) => {
+                        let m = map_client_error(&e);
+                        if m.rolls_back_send() {
+                            rollback_pending(state, &lens_pending_id);
+                            if !emit_pending_user(output, state) {
+                                return LoopControl::Break;
+                            }
+                        }
+                        let _ = output.outcomes.send_blocking(ActorOutcome::Command(
+                            CommandOutcome::SendFailed {
+                                lens_pending_id,
+                                error: e.to_string(),
+                            },
+                        ));
+                    }
+                }
+            }
+            LoopControl::Continue
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_reduced_batch(
+    batch: Updates,
+    state: &mut SessionState,
+    stores: &ActorStores,
+    output: &mut ActorOutput,
+    ring: &mut OutcomeRing,
+    clock: &dyn Clock,
+    next_ordinal: &mut i64,
+    transport: &mut ActorTransport,
+    reconcile_in_flight: &mut bool,
+    parked: &mut bool,
+) -> (LoopControl, bool) {
+    persist_scalars(stores, state, &batch, clock.now_millis(), ring);
+    let mut batch = batch;
+    if let Some(ord) = commit_terminal_prefix(stores, state, next_ordinal, ring) {
+        batch.push(StreamUpdate::TranscriptAdvanced {
+            committed_ordinal: ord,
+        });
+    }
+    let disconnect_reason = batch.iter().find_map(|u| match u {
+        StreamUpdate::Disconnected(reason) => Some(*reason),
+        _ => None,
+    });
+    let saw_reconnecting = batch
+        .iter()
+        .any(|u| matches!(u, StreamUpdate::Reconnecting { .. }));
+    let saw_reconnected = batch.iter().any(|u| matches!(u, StreamUpdate::Reconnected));
+    match output.mode {
+        OutputMode::Detailed => {
+            let had_snapshot = batch
+                .iter()
+                .any(|u| matches!(u, StreamUpdate::SnapshotRestored));
+            for u in coalesce(batch) {
+                if output.updates.send_blocking(u).is_err() {
+                    return (LoopControl::Break, false);
+                }
+            }
+            if had_snapshot
+                && output
+                    .updates
+                    .send_blocking(StreamUpdate::Rebased(scalars_baseline(state)))
+                    .is_err()
+            {
+                return (LoopControl::Break, false);
+            }
+        }
+        OutputMode::Summary => {
+            if output
+                .summaries
+                .send_blocking(SummaryUpdate::from_state(state))
+                .is_err()
+            {
+                ring.push(ActorOutcome::SummaryConsumerGone);
+            }
+        }
+    }
+    drain_outcome_ring(ring, &output.outcomes);
+    if let Some(reason) = disconnect_reason {
+        match reason {
+            DisconnectReason::Unauthorized => {
+                *transport = ActorTransport::Parked {
+                    reason: ParkReason::Unauthorized,
+                };
+                *reconcile_in_flight = false;
+                let _ = output.outcomes.send_blocking(ActorOutcome::Parked {
+                    reason: ParkReason::Unauthorized,
+                });
+                *parked = true;
+            }
+            DisconnectReason::SessionFailed => {
+                *transport = ActorTransport::Parked {
+                    reason: ParkReason::SessionFailed,
+                };
+                *reconcile_in_flight = false;
+                let _ = output.outcomes.send_blocking(ActorOutcome::Parked {
+                    reason: ParkReason::SessionFailed,
+                });
+                *parked = true;
+            }
+            DisconnectReason::RetriesExhausted => {
+                *transport = ActorTransport::Parked {
+                    reason: ParkReason::RetriesExhausted,
+                };
+                *reconcile_in_flight = false;
+                let _ = output.outcomes.send_blocking(ActorOutcome::Parked {
+                    reason: ParkReason::RetriesExhausted,
+                });
+                *parked = true;
+            }
+            DisconnectReason::Forbidden => {
+                let _ = output.outcomes.send_blocking(ActorOutcome::StoppedRemoved);
+                return (LoopControl::Break, false);
+            }
+            DisconnectReason::NotFound => {
+                let _ = output
+                    .outcomes
+                    .send_blocking(ActorOutcome::StoppedTombstone);
+                return (LoopControl::Break, false);
+            }
+        }
+    }
+    if disconnect_reason.is_none() && saw_reconnecting {
+        *transport = ActorTransport::Reconnecting;
+        *reconcile_in_flight = true;
+        if !emit_transport_changed(output, *transport, *reconcile_in_flight) {
+            return (LoopControl::Break, false);
+        }
+    }
+    if disconnect_reason.is_none() && saw_reconnected {
+        *transport = ActorTransport::Connected;
+    }
+    (
+        LoopControl::Continue,
+        disconnect_reason.is_none() && saw_reconnected,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_event_batch(
+    event: ServerStreamEvent,
+    events: &Receiver<ServerStreamEvent>,
+    state: &mut SessionState,
+    stores: &ActorStores,
+    output: &mut ActorOutput,
+    ring: &mut OutcomeRing,
+    clock: &dyn Clock,
+    next_ordinal: &mut i64,
+    transport: &mut ActorTransport,
+    reconcile_in_flight: &mut bool,
+    parked: &mut bool,
+    greedy_drain: bool,
+) -> (LoopControl, bool) {
+    let mut batch = reduce(state, &event, clock);
+    if greedy_drain {
+        while let Ok(next) = events.try_recv() {
+            batch.extend(reduce(state, &next, clock));
+        }
+    }
+    apply_reduced_batch(
+        batch,
+        state,
+        stores,
+        output,
+        ring,
+        clock,
+        next_ordinal,
+        transport,
+        reconcile_in_flight,
+        parked,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn invoke_catchup_and_replay(
+    api: &dyn SessionApi,
+    stores: &ActorStores,
+    state: &mut SessionState,
+    events: &Receiver<ServerStreamEvent>,
+    commands: &Receiver<SessionCommand>,
+    output: &mut ActorOutput,
+    ring: &mut OutcomeRing,
+    clock: &dyn Clock,
+    next_ordinal: &mut i64,
+    transport: &mut ActorTransport,
+    reconcile_in_flight: &mut bool,
+    parked: &mut bool,
+    send_seq: &mut u64,
+    emit_transport: bool,
+) -> LoopControl {
+    if !begin_catchup_reconcile(reconcile_in_flight, output, *transport, emit_transport) {
+        return LoopControl::Break;
+    }
+    let catchup = run_catchup(
+        api,
+        stores,
+        state,
+        next_ordinal,
+        events,
+        commands,
+        output,
+        ring,
+        clock,
+    );
+    if !end_catchup_reconcile(reconcile_in_flight, output, *transport, emit_transport) {
+        return LoopControl::Break;
+    }
+    drain_outcome_ring(ring, &output.outcomes);
+    match catchup {
+        CatchupResult::Aborted => LoopControl::Break,
+        CatchupResult::CaughtUp {
+            buffered_events,
+            deferred_commands,
+        } => {
+            for cmd in deferred_commands {
+                if handle_command(
+                    cmd, state, stores, output, ring, clock, api, transport, send_seq,
+                ) == LoopControl::Break
+                {
+                    return LoopControl::Break;
+                }
+            }
+            if !buffered_events.is_empty() {
+                let mut batch = reduce(state, &buffered_events[0], clock);
+                for ev in &buffered_events[1..] {
+                    batch.extend(reduce(state, ev, clock));
+                }
+                let (ctrl, saw_reconnected) = apply_reduced_batch(
+                    batch,
+                    state,
+                    stores,
+                    output,
+                    ring,
+                    clock,
+                    next_ordinal,
+                    transport,
+                    reconcile_in_flight,
+                    parked,
+                );
+                if ctrl == LoopControl::Break {
+                    return LoopControl::Break;
+                }
+                if saw_reconnected
+                    && invoke_catchup_and_replay(
+                        api,
+                        stores,
+                        state,
+                        events,
+                        commands,
+                        output,
+                        ring,
+                        clock,
+                        next_ordinal,
+                        transport,
+                        reconcile_in_flight,
+                        parked,
+                        send_seq,
+                        true,
+                    ) == LoopControl::Break
+                {
+                    return LoopControl::Break;
+                }
+            }
+            LoopControl::Continue
+        }
+    }
+}
+
 #[allow(unused_assignments)] // actor-owned transport/reconcile_in_flight persist for P3-3 quiescence gate
 fn run(
     mut state: SessionState,
@@ -158,8 +717,6 @@ fn run(
     clock: Box<dyn Clock + Send>,
     api: Box<dyn SessionApi + Send>,
 ) {
-    // Seed past any lens-local ids already resident (reconnect carries pending_user
-    // over — D16 KEEP path), so respawn cannot re-mint a colliding lens_pend_N.
     let mut send_seq: u64 = state
         .pending_user
         .iter()
@@ -184,9 +741,29 @@ fn run(
         }
     };
     let mut transport = ActorTransport::Connected;
-    // set true on Reconnecting, cleared on Reconnected or park; NOT set on a terminal Disconnected (park is not mid-reconcile).
     let mut reconcile_in_flight = false;
     let mut parked = false;
+
+    if invoke_catchup_and_replay(
+        api.as_ref(),
+        &stores,
+        &mut state,
+        &events,
+        &commands,
+        &mut output,
+        &mut ring,
+        clock.as_ref(),
+        &mut next_ordinal,
+        &mut transport,
+        &mut reconcile_in_flight,
+        &mut parked,
+        &mut send_seq,
+        false, // pre-loop spawn catch-up: no TransportChanged — Sleep cannot race yet
+    ) == LoopControl::Break
+    {
+        return;
+    }
+
     loop {
         let mut sel = Select::new();
         let ev_idx = if parked {
@@ -198,232 +775,62 @@ fn run(
         let oper = sel.select();
         match oper.index() {
             i if i == cmd_idx => match oper.recv(&commands) {
-                Ok(SessionCommand::Stop) | Err(_) => break,
-                Ok(SessionCommand::Promote) => {
-                    if output
-                        .updates
-                        .send_blocking(StreamUpdate::Rebased(scalars_baseline(&state)))
-                        .is_err()
+                Ok(cmd) => {
+                    if handle_command(
+                        cmd,
+                        &mut state,
+                        &stores,
+                        &mut output,
+                        &mut ring,
+                        clock.as_ref(),
+                        api.as_ref(),
+                        &transport,
+                        &mut send_seq,
+                    ) == LoopControl::Break
                     {
-                        return;
-                    }
-                    output.mode = OutputMode::Detailed;
-                }
-                Ok(SessionCommand::Demote) => {
-                    output.mode = OutputMode::Summary;
-                }
-                Ok(SessionCommand::Send {
-                    text,
-                    model_override,
-                }) => {
-                    if matches!(transport, ActorTransport::Parked { .. }) {
-                        let _ = output.outcomes.send_blocking(ActorOutcome::Command(
-                            CommandOutcome::SendRejected {
-                                reason: "session parked — awaiting re-auth/retry".into(),
-                            },
-                        ));
-                    } else {
-                        send_seq += 1;
-                        let lens_pending_id = format!("lens_pend_{send_seq}");
-                        state.pending_user.push(PendingUserMessage {
-                            pending_id: lens_pending_id.clone(),
-                            server_pending_id: None,
-                            store_item_id: None,
-                            content: text.clone(),
-                            created_at: clock.now_millis(),
-                        });
-                        if !emit_pending_user(&output, &state) {
-                            return;
-                        }
-
-                        let evt = SessionEventInput::Message {
-                            content: vec![serde_json::json!({"type":"input_text","text": text})],
-                            model_override,
-                            tools: None,
-                        };
-                        match api.send_event(&state.id, &evt) {
-                            Ok(ack) if ack.denied => {
-                                rollback_pending(&mut state, &lens_pending_id);
-                                if !emit_pending_user(&output, &state) {
-                                    return;
-                                }
-                                let _ = output.outcomes.send_blocking(ActorOutcome::Command(
-                                    CommandOutcome::SendDenied {
-                                        lens_pending_id,
-                                        reason: ack.reason,
-                                    },
-                                ));
-                            }
-                            Ok(ack) => {
-                                let p = state
-                                    .pending_user
-                                    .iter_mut()
-                                    .find(|p| p.pending_id == lens_pending_id)
-                                    .expect("optimistic bubble present for stamp");
-                                // Stamp whichever id is present — NEVER branch on harness/native.
-                                p.server_pending_id = ack.pending_id.clone();
-                                p.store_item_id = ack.item_id.clone();
-                                if !emit_pending_user(&output, &state) {
-                                    return;
-                                }
-                                let _ = output.outcomes.send_blocking(ActorOutcome::Command(
-                                    CommandOutcome::SendAccepted {
-                                        lens_pending_id,
-                                        ack,
-                                    },
-                                ));
-                            }
-                            Err(e) => {
-                                let m = map_client_error(&e);
-                                // Table B (§13.1) rollback: NetworkTransient, LostAccess,
-                                // Tombstone, Denied — send definitively won't land.
-                                // Hold bubble: ReAuth (401), ServerTransient (5xx),
-                                // WrongVersion, DecodeDrift — reached server or reconcile pending.
-                                // TODO(§9/P3-3): command-path LostAccess (Auth403) / Tombstone
-                                // (NotFound) should escalate to registry removal / tombstone per
-                                // design §13.1 Table B. Deferred — the stream's own terminal
-                                // Disconnected(Forbidden/NotFound) drives Table A stop today;
-                                // the command path only rolls back + SendFailed for now.
-                                if m.rolls_back_send() {
-                                    rollback_pending(&mut state, &lens_pending_id);
-                                    if !emit_pending_user(&output, &state) {
-                                        return;
-                                    }
-                                }
-                                let _ = output.outcomes.send_blocking(ActorOutcome::Command(
-                                    CommandOutcome::SendFailed {
-                                        lens_pending_id,
-                                        error: e.to_string(),
-                                    },
-                                ));
-                            }
-                        }
+                        break;
                     }
                 }
+                Err(_) => break,
             },
             i if ev_idx == Some(i) => match oper.recv(&events) {
                 Ok(event) => {
-                    let mut batch = reduce(&mut state, &event, clock.as_ref());
-                    while let Ok(next) = events.try_recv() {
-                        batch.extend(reduce(&mut state, &next, clock.as_ref()));
+                    let (ctrl, saw_reconnected) = process_event_batch(
+                        event,
+                        &events,
+                        &mut state,
+                        &stores,
+                        &mut output,
+                        &mut ring,
+                        clock.as_ref(),
+                        &mut next_ordinal,
+                        &mut transport,
+                        &mut reconcile_in_flight,
+                        &mut parked,
+                        true,
+                    );
+                    if ctrl == LoopControl::Break {
+                        break;
                     }
-                    persist_scalars(&stores, &state, &batch, clock.now_millis(), &mut ring);
-                    if let Some(ord) =
-                        commit_terminal_prefix(&stores, &mut state, &mut next_ordinal, &mut ring)
+                    if saw_reconnected
+                        && invoke_catchup_and_replay(
+                            api.as_ref(),
+                            &stores,
+                            &mut state,
+                            &events,
+                            &commands,
+                            &mut output,
+                            &mut ring,
+                            clock.as_ref(),
+                            &mut next_ordinal,
+                            &mut transport,
+                            &mut reconcile_in_flight,
+                            &mut parked,
+                            &mut send_seq,
+                            true,
+                        ) == LoopControl::Break
                     {
-                        batch.push(StreamUpdate::TranscriptAdvanced {
-                            committed_ordinal: ord,
-                        });
-                    }
-                    let disconnect_reason = batch.iter().find_map(|u| match u {
-                        StreamUpdate::Disconnected(reason) => Some(*reason),
-                        _ => None,
-                    });
-                    let saw_reconnecting = batch
-                        .iter()
-                        .any(|u| matches!(u, StreamUpdate::Reconnecting { .. }));
-                    let saw_reconnected =
-                        batch.iter().any(|u| matches!(u, StreamUpdate::Reconnected));
-                    match output.mode {
-                        OutputMode::Detailed => {
-                            let had_snapshot = batch
-                                .iter()
-                                .any(|u| matches!(u, StreamUpdate::SnapshotRestored));
-                            for u in coalesce(batch) {
-                                if output.updates.send_blocking(u).is_err() {
-                                    return;
-                                }
-                            }
-                            if had_snapshot {
-                                // SnapshotRestored bulk-folds ~20 chrome scalars actor-side with no
-                                // per-field delta; a Detailed replica learns them only via a full
-                                // baseline. (review I1)
-                                if output
-                                    .updates
-                                    .send_blocking(StreamUpdate::Rebased(scalars_baseline(&state)))
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                            }
-                        }
-                        OutputMode::Summary => {
-                            // Missing summary consumer is non-fatal — record on the ring.
-                            if output
-                                .summaries
-                                .send_blocking(SummaryUpdate::from_state(&state))
-                                .is_err()
-                            {
-                                ring.push(ActorOutcome::SummaryConsumerGone);
-                            }
-                        }
-                    }
-                    drain_outcome_ring(&mut ring, &output.outcomes);
-                    // park is terminal for this stream: transport=Parked and reconcile_in_flight=false are the final word; same-batch reconnect deltas are suppressed.
-                    if let Some(reason) = disconnect_reason {
-                        match reason {
-                            DisconnectReason::Unauthorized => {
-                                transport = ActorTransport::Parked {
-                                    reason: ParkReason::Unauthorized,
-                                };
-                                reconcile_in_flight = false;
-                                let _ = output.outcomes.send_blocking(ActorOutcome::Parked {
-                                    reason: ParkReason::Unauthorized,
-                                });
-                                parked = true;
-                            }
-                            DisconnectReason::SessionFailed => {
-                                transport = ActorTransport::Parked {
-                                    reason: ParkReason::SessionFailed,
-                                };
-                                reconcile_in_flight = false;
-                                let _ = output.outcomes.send_blocking(ActorOutcome::Parked {
-                                    reason: ParkReason::SessionFailed,
-                                });
-                                parked = true;
-                            }
-                            DisconnectReason::RetriesExhausted => {
-                                transport = ActorTransport::Parked {
-                                    reason: ParkReason::RetriesExhausted,
-                                };
-                                reconcile_in_flight = false;
-                                let _ = output.outcomes.send_blocking(ActorOutcome::Parked {
-                                    reason: ParkReason::RetriesExhausted,
-                                });
-                                parked = true;
-                            }
-                            DisconnectReason::Forbidden => {
-                                let _ = output.outcomes.send_blocking(ActorOutcome::StoppedRemoved);
-                                break;
-                            }
-                            DisconnectReason::NotFound => {
-                                // TODO(P3-3): SessionLifecycle::Deleted disk write + wake/tombstone schema
-                                let _ = output
-                                    .outcomes
-                                    .send_blocking(ActorOutcome::StoppedTombstone);
-                                break;
-                            }
-                        }
-                    }
-                    if disconnect_reason.is_none() && saw_reconnecting {
-                        transport = ActorTransport::Reconnecting;
-                        reconcile_in_flight = true;
-                        let _ = output
-                            .outcomes
-                            .send_blocking(ActorOutcome::TransportChanged {
-                                transport,
-                                reconcile_in_flight,
-                            });
-                    }
-                    if disconnect_reason.is_none() && saw_reconnected {
-                        transport = ActorTransport::Connected;
-                        reconcile_in_flight = false;
-                        let _ = output
-                            .outcomes
-                            .send_blocking(ActorOutcome::TransportChanged {
-                                transport,
-                                reconcile_in_flight,
-                            });
+                        break;
                     }
                 }
                 Err(_) => break,
@@ -566,14 +973,15 @@ mod tests {
     use crate::domain::ids::ElicitationId;
     use crate::domain::ids::ItemId;
     use crate::domain::ids::{ConnectionId, SessionId};
-    use crate::domain::item::{Item, ItemKind};
+    use crate::domain::item::{BlockContext, ContentBlock, Item, ItemKind};
+    use crate::domain::scalars::Role;
     use crate::persist::{
         ConnectionRecord, Loaded, PersistError, SqliteControlStore, SqliteTranscriptStore,
         StoreMode, TranscriptStore,
     };
     use crate::reduce::testutil::{fresh_state, parse_response, snapshot_fixture};
     use lens_client::error::ClientError;
-    use lens_client::sessions::{SendEventAck, SessionEventInput};
+    use lens_client::sessions::{ItemList, SendEventAck, SessionEventInput};
     use lens_client::stream::{
         DisconnectReason, ServerStreamEvent, SessionEvent, SessionStatusValue as WireStatus,
     };
@@ -586,16 +994,33 @@ mod tests {
         Box::new(ManualClock::new(1_700_000_000_000))
     }
 
-    /// Scriptable mock — one scripted result per `send_event` call (FIFO).
+    /// Scriptable mock — one scripted result per `send_event` / `fetch_items` call (FIFO).
     struct MockApi {
-        script: Mutex<VecDeque<Result<SendEventAck, ClientError>>>,
+        send_script: Mutex<VecDeque<Result<SendEventAck, ClientError>>>,
+        fetch_script: Mutex<VecDeque<Result<ItemList, ClientError>>>,
         last_evt: Mutex<Option<SessionEventInput>>,
+    }
+
+    fn empty_item_list() -> ItemList {
+        serde_json::from_str(r#"{"data":[],"has_more":false}"#).expect("empty item list")
     }
 
     impl MockApi {
         fn succeed_with_ack(ack: SendEventAck) -> (Box<dyn SessionApi + Send>, Arc<MockApi>) {
             let mock = Arc::new(Self {
-                script: Mutex::new(VecDeque::from([Ok(ack)])),
+                send_script: Mutex::new(VecDeque::from([Ok(ack)])),
+                fetch_script: Mutex::new(VecDeque::new()),
+                last_evt: Mutex::new(None),
+            });
+            (Box::new(Arc::clone(&mock)), mock)
+        }
+
+        fn with_fetch_script(
+            fetch_script: VecDeque<Result<ItemList, ClientError>>,
+        ) -> (Box<dyn SessionApi + Send>, Arc<MockApi>) {
+            let mock = Arc::new(Self {
+                send_script: Mutex::new(VecDeque::new()),
+                fetch_script: Mutex::new(fetch_script),
                 last_evt: Mutex::new(None),
             });
             (Box::new(Arc::clone(&mock)), mock)
@@ -603,7 +1028,8 @@ mod tests {
 
         fn fail(err: ClientError) -> (Box<dyn SessionApi + Send>, Arc<MockApi>) {
             let mock = Arc::new(Self {
-                script: Mutex::new(VecDeque::from([Err(err)])),
+                send_script: Mutex::new(VecDeque::from([Err(err)])),
+                fetch_script: Mutex::new(VecDeque::new()),
                 last_evt: Mutex::new(None),
             });
             (Box::new(Arc::clone(&mock)), mock)
@@ -621,11 +1047,23 @@ mod tests {
             evt: &SessionEventInput,
         ) -> Result<SendEventAck, ClientError> {
             *self.last_evt.lock().unwrap() = Some(evt.clone());
-            self.script
+            self.send_script
                 .lock()
                 .unwrap()
                 .pop_front()
                 .expect("mock send_event called more times than scripted")
+        }
+
+        fn fetch_items(
+            &self,
+            _id: &SessionId,
+            _page: &lens_client::sessions::ItemsPage,
+        ) -> Result<ItemList, ClientError> {
+            self.fetch_script
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Ok(empty_item_list()))
         }
     }
 
@@ -638,6 +1076,14 @@ mod tests {
             _evt: &SessionEventInput,
         ) -> Result<SendEventAck, ClientError> {
             panic!("send_event not expected in this test");
+        }
+
+        fn fetch_items(
+            &self,
+            _id: &SessionId,
+            _page: &lens_client::sessions::ItemsPage,
+        ) -> Result<ItemList, ClientError> {
+            Ok(empty_item_list())
         }
     }
 
@@ -2319,6 +2765,14 @@ mod tests {
                 .expect("test must release blocked send");
             Ok(self.ack.clone())
         }
+
+        fn fetch_items(
+            &self,
+            _id: &SessionId,
+            _page: &lens_client::sessions::ItemsPage,
+        ) -> Result<ItemList, ClientError> {
+            Ok(empty_item_list())
+        }
     }
 
     #[test]
@@ -2647,5 +3101,122 @@ mod tests {
         let mut busy = fresh_state();
         busy.status = SessionStatusValue::Running;
         assert!(!is_quiesced(&busy, &ActorTransport::Connected, false));
+    }
+
+    fn seed_message_item(transcript: &dyn TranscriptStore, ordinal: i64, id: &str, text: &str) {
+        let item = Item {
+            id: ItemId::new(id),
+            seq: None,
+            ctx: BlockContext {
+                agent: None,
+                depth: 0,
+                turn: 0,
+            },
+            created_at: 1_700_000_000_000,
+            kind: ItemKind::Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock {
+                    kind: "output_text".into(),
+                    text: Some(text.into()),
+                    data: serde_json::Value::Null,
+                }],
+            },
+        };
+        transcript.upsert_item(ordinal, &item).unwrap();
+    }
+
+    fn item_list_from_messages(ids: &[&str], has_more: bool) -> ItemList {
+        let data: Vec<serde_json::Value> = ids
+            .iter()
+            .map(|id| {
+                serde_json::json!({
+                    "id": id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": id}]
+                })
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "data": data,
+            "has_more": has_more,
+        }))
+        .expect("item list fixture")
+    }
+
+    #[test]
+    fn catchup_pages_forward_from_frontier_then_applies_buffered_live_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(dir.path());
+        seed_connection(&stores);
+        for (id, ord) in [("item_0", 0), ("item_1", 1), ("item_2", 2)] {
+            seed_message_item(&*stores.transcript, ord, id, id);
+        }
+        assert_eq!(
+            stores.transcript.frontier().unwrap(),
+            Some((2, ItemId::new("item_2")))
+        );
+
+        let page1 = item_list_from_messages(&["item_3", "item_4"], true);
+        let page2 = item_list_from_messages(&["item_5"], false);
+        let (api, _mock) = MockApi::with_fetch_script(VecDeque::from([Ok(page1), Ok(page2)]));
+
+        let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, up_rx) = async_channel::bounded(64);
+        ev_tx
+            .send(parse_response(
+                "response.output_item.done",
+                r#"{"item":{"id":"item_6","type":"message","role":"assistant","content":[{"type":"output_text","text":"live"}]}}"#,
+            ))
+            .unwrap();
+
+        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+
+        let mut saw_catchup_watermark = false;
+        while let Ok(u) = up_rx.recv_blocking() {
+            if matches!(
+                u,
+                StreamUpdate::TranscriptAdvanced {
+                    committed_ordinal: 4
+                } | StreamUpdate::TranscriptAdvanced {
+                    committed_ordinal: 5
+                }
+            ) {
+                saw_catchup_watermark = true;
+            }
+            if matches!(
+                u,
+                StreamUpdate::TranscriptAdvanced {
+                    committed_ordinal: 6
+                }
+            ) {
+                break;
+            }
+        }
+        assert!(
+            saw_catchup_watermark,
+            "catch-up must emit TranscriptAdvanced with committed_ordinal >= 5"
+        );
+
+        handle.stop_and_join();
+
+        let reopened = SqliteTranscriptStore::open(
+            &dir.path().join("conv_1.db"),
+            &ConnectionId::new("conn_1"),
+            &SessionId::new("conv_1"),
+        )
+        .unwrap();
+        let rows = reopened.load_items().unwrap().rows;
+        assert_eq!(rows.len(), 7, "item_0..item_6 on disk");
+        let ids: Vec<_> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "item_0", "item_1", "item_2", "item_3", "item_4", "item_5", "item_6"
+            ]
+        );
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(row.id.as_str(), ids[i]);
+        }
     }
 }
