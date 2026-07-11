@@ -285,6 +285,22 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Recent
 
+- **2026-07-10** — **Contract-coverage gap analysis (post-0.5.1).** lens-client models a
+  **deliberate consumer-driven subset** of the omnigent contract (ADR-0001 / reuse-only-ids),
+  NOT the whole surface — the unmodeled routes/events are model-on-demand, **not debt**. Gap:
+  **14 contract routes with no typed method** (all non-store: infra/registry `/v1/harnesses`,
+  `/v1/runners`(+`/{id}/token`), `/v1/hosts/{id}/worktrees`; session config/admin
+  `/sessions/projects`, `/agent/contents`, `/agent/mcp-servers*`, `/codex_goal*`, `/v1/sharing`;
+  env editing `/resources/environments`(+`/changes`), `/resources/files:copy`) + **11 DEFERRED
+  SSE events** (`turn.*`, `response.created/queued/retry/heartbeat/output_file.done/client_task.cancel`,
+  `session.collaboration_mode` — deferred because absent from golden captures). **Nothing in the
+  gap blocks P3-3a** — all store deps (`/stream`, `/items`, snapshot, send) are modeled; safety
+  net = unmodeled routes never called, unmodeled events → `Unknown` + `live_taxonomy` alarm.
+  **One targeted TODO folded into P3-3a:** capture one live turn and check whether `turn.*` /
+  `response.output_file.done` actually fire — the state model infers quiescence from `response.*`
+  + `session.status`, so if harnesses emit `turn.*` and we ignore them, quiescence could be
+  subtly wrong. Fire → model just those (real bytes); don't fire → deferral provably correct.
+  See memory [[contract-coverage-gap-2026-07]].
 - **2026-07-10** — **omnigent pin bumped `v0.4.0` → `v0.5.1`** (`bumping-the-omnigent-pin`
   runbook; tag `v0.5.1`, Source HEAD `08285468`; pinned the latest patch since it's
   contract-identical to `v0.5.0` — only a web-shell UI fix on top). Contract delta: +3 routes
