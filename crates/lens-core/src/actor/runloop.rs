@@ -356,7 +356,7 @@ fn handle_command(
     state: &mut SessionState,
     stores: &ActorStores,
     output: &mut ActorOutput,
-    ring: &mut OutcomeRing,
+    _ring: &mut OutcomeRing,
     clock: &dyn Clock,
     api: &dyn SessionApi,
     transport: &ActorTransport,
@@ -370,17 +370,25 @@ fn handle_command(
                 let _ = output.outcomes.send_blocking(ActorOutcome::SleepDeclined);
                 return LoopControl::Continue;
             }
+            let prev_lifecycle = state.lifecycle;
             state.lifecycle = SessionLifecycle::Slept;
             let now = clock.now_millis();
-            if let Err(e) = stores.control.upsert_session(state, now) {
-                ring.push(ActorOutcome::PersistError {
-                    where_: "control.upsert_session",
-                    message: e.to_string(),
-                });
+            match stores.control.upsert_session(state, now) {
+                Ok(()) => {
+                    let _ = api.send_event(&state.id, &SessionEventInput::StopSession);
+                    let _ = output.outcomes.send_blocking(ActorOutcome::Slept);
+                    LoopControl::Break
+                }
+                Err(e) => {
+                    state.lifecycle = prev_lifecycle;
+                    let _ = output.outcomes.send_blocking(ActorOutcome::PersistError {
+                        where_: "sleep.upsert_session",
+                        message: e.to_string(),
+                    });
+                    let _ = output.outcomes.send_blocking(ActorOutcome::SleepDeclined);
+                    LoopControl::Continue
+                }
             }
-            let _ = api.send_event(&state.id, &SessionEventInput::StopSession);
-            let _ = output.outcomes.send_blocking(ActorOutcome::Slept);
-            LoopControl::Break
         }
         SessionCommand::Promote => {
             if output
@@ -1329,6 +1337,83 @@ mod tests {
             control: Box::new(control),
             transcript: Box::new(FailingTranscriptStore),
         }
+    }
+
+    /// Control role that always fails `upsert_session` — persist introspection test stub.
+    struct FailingControlStore {
+        inner: SqliteControlStore,
+    }
+
+    impl ControlStore for FailingControlStore {
+        fn mode(&self) -> StoreMode {
+            self.inner.mode()
+        }
+
+        fn upsert_connection(&self, c: &ConnectionRecord) -> crate::persist::Result<()> {
+            self.inner.upsert_connection(c)
+        }
+
+        fn load_connections(&self) -> crate::persist::Result<Vec<ConnectionRecord>> {
+            self.inner.load_connections()
+        }
+
+        fn upsert_session(&self, _s: &SessionState, _now_ms: i64) -> crate::persist::Result<()> {
+            Err(PersistError::ReadOnly)
+        }
+
+        fn load_session(
+            &self,
+            conn: &ConnectionId,
+            id: &SessionId,
+        ) -> crate::persist::Result<Option<SessionState>> {
+            self.inner.load_session(conn, id)
+        }
+
+        fn list_sessions(
+            &self,
+            conn: &ConnectionId,
+        ) -> crate::persist::Result<Loaded<SessionState>> {
+            self.inner.list_sessions(conn)
+        }
+
+        fn insert_cost_sample(
+            &self,
+            conn: &ConnectionId,
+            id: &SessionId,
+            sampled_at: i64,
+            total_cost_usd: f64,
+        ) -> crate::persist::Result<()> {
+            self.inner
+                .insert_cost_sample(conn, id, sampled_at, total_cost_usd)
+        }
+
+        fn cost_samples_in(
+            &self,
+            conn: &ConnectionId,
+            id: &SessionId,
+            since: i64,
+            until: i64,
+        ) -> crate::persist::Result<Vec<(i64, f64)>> {
+            self.inner.cost_samples_in(conn, id, since, until)
+        }
+    }
+
+    fn failing_control_stores(dir: &Path) -> (ActorStores, std::path::PathBuf) {
+        let db_path = dir.join("lens.db");
+        let inner = SqliteControlStore::open(&db_path).unwrap();
+        let transcript = SqliteTranscriptStore::open(
+            &dir.join("conv_1.db"),
+            &ConnectionId::new("conn_1"),
+            &SessionId::new("conv_1"),
+        )
+        .unwrap();
+        (
+            ActorStores {
+                control: Box::new(FailingControlStore { inner }),
+                transcript: Box::new(transcript),
+            },
+            db_path,
+        )
     }
 
     /// Counts `upsert_session` calls — persist introspection test stub.
@@ -3341,6 +3426,54 @@ mod tests {
             mock.last_evt(),
             Some(SessionEventInput::StopSession)
         ));
+    }
+
+    #[test]
+    fn sleep_when_quiescent_but_flush_fails_is_declined_and_actor_survives() {
+        use crate::domain::scalars::SessionLifecycle;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (stores, db_path) = failing_control_stores(dir.path());
+        seed_connection(&stores);
+        SqliteControlStore::open(&db_path)
+            .unwrap()
+            .upsert_session(&fresh_state(), 1)
+            .unwrap();
+        let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, up_rx) = async_channel::bounded(64);
+        let (api, mock) = MockApi::succeed_with_ack(SendEventAck {
+            queued: true,
+            ..Default::default()
+        });
+        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+
+        handle.commands.send(SessionCommand::Sleep).unwrap();
+        match handle.outcomes.recv_blocking().unwrap() {
+            ActorOutcome::PersistError { where_, .. } => {
+                assert_eq!(where_, "sleep.upsert_session");
+            }
+            other => panic!("expected PersistError first, got {other:?}"),
+        }
+        match handle.outcomes.recv_blocking().unwrap() {
+            ActorOutcome::SleepDeclined => {}
+            other => panic!("expected SleepDeclined after flush failure, got {other:?}"),
+        }
+        assert!(
+            mock.last_evt().is_none(),
+            "StopSession must not be sent when sleep flush fails"
+        );
+
+        ev_tx.send(status_running_event()).unwrap();
+        assert!(
+            up_rx.recv_blocking().is_ok(),
+            "actor must survive and process events"
+        );
+
+        let control = SqliteControlStore::open(&db_path).unwrap();
+        let loaded = control.list_sessions(&ConnectionId::new("conn_1")).unwrap();
+        assert_eq!(loaded.rows[0].lifecycle, SessionLifecycle::Active);
+
+        handle.stop_and_join();
     }
 
     #[test]
