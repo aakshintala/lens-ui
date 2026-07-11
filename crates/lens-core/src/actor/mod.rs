@@ -7,7 +7,7 @@ mod runloop;
 mod summary;
 mod transport;
 
-pub use api::{CommandOutcome, SessionApi};
+pub use api::{ClientSessionApi, CommandOutcome, SessionApi};
 pub use outcome::ActorOutcome;
 pub use runloop::{
     ActorHandle, ActorStores, OutputMode, SessionCommand, spawn_actor, spawn_actor_dual,

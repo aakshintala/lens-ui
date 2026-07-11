@@ -14,6 +14,13 @@ pub(crate) mod testutil;
 
 pub use update::{StreamUpdate, Updates};
 
+/// Wire `stream::Item` → domain `(ItemId, ItemKind)` for catch-up persist (D19).
+pub(crate) fn map_wire_item(
+    wire: &lens_client::stream::Item,
+) -> Option<(crate::domain::ItemId, crate::domain::item::ItemKind)> {
+    items::map_item(wire)
+}
+
 use crate::clock::Clock;
 use crate::domain::SessionState;
 use lens_client::stream::{ResponseEvent, ServerStreamEvent};

@@ -1,8 +1,9 @@
 //! Actor-thread HTTP surface and command outcomes (D16 send half).
 
+use lens_client::Client;
 use lens_client::error::ClientError;
 use lens_client::ids::SessionId;
-use lens_client::sessions::{SendEventAck, SessionEventInput};
+use lens_client::sessions::{ItemList, ItemsPage, SendEventAck, SessionEventInput};
 
 /// Actor-thread HTTP surface (the lens-client Sessions subset the actor needs).
 /// Send-not-Sync: owned by and moved to the actor OS thread (mirrors `Box<dyn Clock + Send>`).
@@ -12,6 +13,34 @@ pub trait SessionApi: Send {
         id: &SessionId,
         evt: &SessionEventInput,
     ) -> Result<SendEventAck, ClientError>;
+
+    /// D19: the actor is the SOLE `/items` fetcher (forward catch-up). Blocking GET.
+    fn fetch_items(&self, id: &SessionId, page: &ItemsPage) -> Result<ItemList, ClientError>;
+}
+
+/// Production adapter: thin delegation over `lens_client::Sessions`.
+pub struct ClientSessionApi {
+    client: Client,
+}
+
+impl ClientSessionApi {
+    pub fn new(client: Client) -> Self {
+        Self { client }
+    }
+}
+
+impl SessionApi for ClientSessionApi {
+    fn send_event(
+        &self,
+        id: &SessionId,
+        evt: &SessionEventInput,
+    ) -> Result<SendEventAck, ClientError> {
+        self.client.sessions().send_event(id, evt)
+    }
+
+    fn fetch_items(&self, id: &SessionId, page: &ItemsPage) -> Result<ItemList, ClientError> {
+        self.client.sessions().items(id, page)
+    }
 }
 
 /// Command-branch outcomes surfaced to the foreground (Task 8 deepens Table B mapping).
