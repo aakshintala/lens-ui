@@ -590,6 +590,121 @@ fn apply_reduced_batch(
     )
 }
 
+fn reconnected_defer_commit(batch: &Updates) -> bool {
+    let has_disconnect = batch
+        .iter()
+        .any(|u| matches!(u, StreamUpdate::Disconnected(_)));
+    let saw_reconnected = batch.iter().any(|u| matches!(u, StreamUpdate::Reconnected));
+    saw_reconnected && !has_disconnect
+}
+
+/// Shared Reconnected path: catch-up (if needed), then commit deferred live tail.
+#[allow(clippy::too_many_arguments)]
+fn finish_reconnected_catchup(
+    needs_catchup: bool,
+    defer_transcript_commit: bool,
+    api: &dyn SessionApi,
+    stores: &ActorStores,
+    state: &mut SessionState,
+    events: &Receiver<ServerStreamEvent>,
+    commands: &Receiver<SessionCommand>,
+    output: &mut ActorOutput,
+    ring: &mut OutcomeRing,
+    clock: &dyn Clock,
+    next_ordinal: &mut i64,
+    transport: &mut ActorTransport,
+    reconcile_in_flight: &mut bool,
+    parked: &mut bool,
+    send_seq: &mut u64,
+    emit_transport: bool,
+) -> LoopControl {
+    if !needs_catchup {
+        return LoopControl::Continue;
+    }
+    if invoke_catchup_and_replay(
+        api,
+        stores,
+        state,
+        events,
+        commands,
+        output,
+        ring,
+        clock,
+        next_ordinal,
+        transport,
+        reconcile_in_flight,
+        parked,
+        send_seq,
+        emit_transport,
+    ) == LoopControl::Break
+    {
+        return LoopControl::Break;
+    }
+    if defer_transcript_commit {
+        return finish_deferred_transcript_commit(stores, state, next_ordinal, ring, output);
+    }
+    LoopControl::Continue
+}
+
+/// Reduce a buffered event slice and run the Reconnected defer/catch-up/finish path.
+#[allow(clippy::too_many_arguments)]
+fn replay_buffered_batch(
+    buffered_events: &[ServerStreamEvent],
+    api: &dyn SessionApi,
+    stores: &ActorStores,
+    state: &mut SessionState,
+    events: &Receiver<ServerStreamEvent>,
+    commands: &Receiver<SessionCommand>,
+    output: &mut ActorOutput,
+    ring: &mut OutcomeRing,
+    clock: &dyn Clock,
+    next_ordinal: &mut i64,
+    transport: &mut ActorTransport,
+    reconcile_in_flight: &mut bool,
+    parked: &mut bool,
+    send_seq: &mut u64,
+) -> LoopControl {
+    let mut batch = reduce(state, &buffered_events[0], clock);
+    for ev in &buffered_events[1..] {
+        batch.extend(reduce(state, ev, clock));
+    }
+    let defer_transcript_commit = reconnected_defer_commit(&batch);
+    let (ctrl, needs_catchup) = apply_reduced_batch(
+        batch,
+        state,
+        stores,
+        output,
+        ring,
+        clock,
+        next_ordinal,
+        transport,
+        reconcile_in_flight,
+        parked,
+        defer_transcript_commit,
+    );
+    if ctrl == LoopControl::Break {
+        return LoopControl::Break;
+    }
+    finish_reconnected_catchup(
+        needs_catchup,
+        defer_transcript_commit,
+        api,
+        stores,
+        state,
+        events,
+        commands,
+        output,
+        ring,
+        clock,
+        next_ordinal,
+        transport,
+        reconcile_in_flight,
+        parked,
+        send_seq,
+        true,
+    )
+}
+
 /// Commit transcript items deferred across a Reconnected batch (live tail lands after catch-up).
 fn finish_deferred_transcript_commit(
     stores: &ActorStores,
@@ -633,12 +748,8 @@ fn process_main_loop_event(
     while let Ok(next) = events.try_recv() {
         batch.extend(reduce(state, &next, clock));
     }
-    let has_disconnect = batch
-        .iter()
-        .any(|u| matches!(u, StreamUpdate::Disconnected(_)));
-    let saw_reconnected = batch.iter().any(|u| matches!(u, StreamUpdate::Reconnected));
     // D19: live follow-ons in the same greedy-drained batch must not commit before catch-up.
-    let defer_transcript_commit = saw_reconnected && !has_disconnect;
+    let defer_transcript_commit = reconnected_defer_commit(&batch);
 
     let (ctrl, needs_catchup) = apply_reduced_batch(
         batch,
@@ -656,31 +767,24 @@ fn process_main_loop_event(
     if ctrl == LoopControl::Break {
         return LoopControl::Break;
     }
-    if needs_catchup {
-        if invoke_catchup_and_replay(
-            api,
-            stores,
-            state,
-            events,
-            commands,
-            output,
-            ring,
-            clock,
-            next_ordinal,
-            transport,
-            reconcile_in_flight,
-            parked,
-            send_seq,
-            true,
-        ) == LoopControl::Break
-        {
-            return LoopControl::Break;
-        }
-        if defer_transcript_commit {
-            return finish_deferred_transcript_commit(stores, state, next_ordinal, ring, output);
-        }
-    }
-    LoopControl::Continue
+    finish_reconnected_catchup(
+        needs_catchup,
+        defer_transcript_commit,
+        api,
+        stores,
+        state,
+        events,
+        commands,
+        output,
+        ring,
+        clock,
+        next_ordinal,
+        transport,
+        reconcile_in_flight,
+        parked,
+        send_seq,
+        true,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -732,15 +836,14 @@ fn invoke_catchup_and_replay(
                     return LoopControl::Break;
                 }
             }
-            if !buffered_events.is_empty() {
-                let mut batch = reduce(state, &buffered_events[0], clock);
-                for ev in &buffered_events[1..] {
-                    batch.extend(reduce(state, ev, clock));
-                }
-                let (ctrl, saw_reconnected) = apply_reduced_batch(
-                    batch,
-                    state,
+            if !buffered_events.is_empty()
+                && replay_buffered_batch(
+                    &buffered_events,
+                    api,
                     stores,
+                    state,
+                    events,
+                    commands,
                     output,
                     ring,
                     clock,
@@ -748,31 +851,10 @@ fn invoke_catchup_and_replay(
                     transport,
                     reconcile_in_flight,
                     parked,
-                    false,
-                );
-                if ctrl == LoopControl::Break {
-                    return LoopControl::Break;
-                }
-                if saw_reconnected
-                    && invoke_catchup_and_replay(
-                        api,
-                        stores,
-                        state,
-                        events,
-                        commands,
-                        output,
-                        ring,
-                        clock,
-                        next_ordinal,
-                        transport,
-                        reconcile_in_flight,
-                        parked,
-                        send_seq,
-                        true,
-                    ) == LoopControl::Break
-                {
-                    return LoopControl::Break;
-                }
+                    send_seq,
+                ) == LoopControl::Break
+            {
+                return LoopControl::Break;
             }
             LoopControl::Continue
         }
@@ -2781,6 +2863,73 @@ mod tests {
         );
     }
 
+    /// `fetch_items` blocks on the Nth call until released; signals each completed fetch.
+    struct GateFetchMock {
+        script: Mutex<VecDeque<Result<ItemList, ClientError>>>,
+        fetch_count: Mutex<u32>,
+        block_on_fetch: u32,
+        entered_tx: std::sync::mpsc::Sender<u32>,
+        release_rx: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl GateFetchMock {
+        fn with_script(
+            script: VecDeque<Result<ItemList, ClientError>>,
+            block_on_fetch: u32,
+        ) -> (
+            Box<dyn SessionApi + Send>,
+            std::sync::mpsc::Receiver<u32>,
+            std::sync::mpsc::Sender<()>,
+        ) {
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            (
+                Box::new(Self {
+                    script: Mutex::new(script),
+                    fetch_count: Mutex::new(0),
+                    block_on_fetch,
+                    entered_tx,
+                    release_rx,
+                }),
+                entered_rx,
+                release_tx,
+            )
+        }
+    }
+
+    impl SessionApi for GateFetchMock {
+        fn send_event(
+            &self,
+            _id: &SessionId,
+            _evt: &SessionEventInput,
+        ) -> Result<SendEventAck, ClientError> {
+            panic!("send_event not expected in this test");
+        }
+
+        fn fetch_items(
+            &self,
+            _id: &SessionId,
+            _page: &lens_client::sessions::ItemsPage,
+        ) -> Result<ItemList, ClientError> {
+            let n = {
+                let mut c = self.fetch_count.lock().unwrap();
+                *c += 1;
+                *c
+            };
+            let _ = self.entered_tx.send(n);
+            if n == self.block_on_fetch {
+                self.release_rx
+                    .recv()
+                    .expect("test must release blocked fetch");
+            }
+            self.script
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Ok(empty_item_list()))
+        }
+    }
+
     /// Mock whose `send_event` blocks until the test sends on `release_tx`.
     struct BlockingMockApi {
         entered_tx: std::sync::mpsc::Sender<()>,
@@ -3287,10 +3436,8 @@ mod tests {
 
         // Spawn catch-up consumes page 1 (empty); Reconnected catch-up consumes page 2.
         let history_page = item_list_from_messages(&["item_1", "item_2"], false);
-        let (api, _mock) = MockApi::with_fetch_script(VecDeque::from([
-            Ok(empty_item_list()),
-            Ok(history_page),
-        ]));
+        let (api, _mock) =
+            MockApi::with_fetch_script(VecDeque::from([Ok(empty_item_list()), Ok(history_page)]));
 
         let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
         let (up_tx, up_rx) = async_channel::bounded(64);
@@ -3332,6 +3479,83 @@ mod tests {
             ids,
             vec!["item_0", "item_1", "item_2", "item_3"],
             "durable history must land before the greedy-drained live tail"
+        );
+    }
+
+    #[test]
+    fn nested_buffered_reconnected_defers_live_until_nested_catchup() {
+        let dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(dir.path());
+        seed_connection(&stores);
+        seed_message_item(&*stores.transcript, 0, "item_0", "item_0");
+
+        let page1 = item_list_from_messages(&["item_1"], true);
+        let page2 = item_list_from_messages(&["item_2"], false);
+        let (api, fetch_done_rx, release_fetch2) = GateFetchMock::with_script(
+            VecDeque::from([Ok(empty_item_list()), Ok(page1), Ok(page2)]),
+            2, // block 2nd fetch (first catch-up page) until live events are queued
+        );
+
+        let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, up_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+
+        // Reconnected only — live tail arrives while catch-up is blocked in fetch_items.
+        assert_eq!(
+            fetch_done_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("spawn catch-up fetch"),
+            1
+        );
+
+        ev_tx
+            .send(ServerStreamEvent::Reconnected { gap: None })
+            .unwrap();
+
+        assert_eq!(
+            fetch_done_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("catch-up must enter blocked fetch"),
+            2,
+            "first catch-up page blocks on fetch #2"
+        );
+
+        ev_tx
+            .send(ServerStreamEvent::Reconnected { gap: None })
+            .unwrap();
+        ev_tx
+            .send(parse_response(
+                "response.output_item.done",
+                r#"{"item":{"id":"item_3","type":"message","role":"assistant","content":[{"type":"output_text","text":"live"}]}}"#,
+            ))
+            .unwrap();
+        release_fetch2.send(()).expect("release blocked fetch");
+
+        while let Ok(u) = up_rx.recv_blocking() {
+            if matches!(
+                u,
+                StreamUpdate::TranscriptAdvanced {
+                    committed_ordinal: 3
+                }
+            ) {
+                break;
+            }
+        }
+
+        handle.stop_and_join();
+
+        let reopened = SqliteTranscriptStore::open(
+            &dir.path().join("conv_1.db"),
+            &ConnectionId::new("conn_1"),
+            &SessionId::new("conv_1"),
+        )
+        .unwrap();
+        let rows = reopened.load_items().unwrap().rows;
+        let ids: Vec<_> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["item_0", "item_1", "item_2", "item_3"],
+            "nested buffered replay must commit history before the live tail"
         );
     }
 }
