@@ -5,6 +5,7 @@ use crate::actor::api::SessionApi;
 use crate::actor::runloop::{ActorHandle, ActorStores, SessionCommand, spawn_actor};
 use crate::clock::Clock;
 use crate::domain::ids::{ConnectionId, SessionId};
+use crate::domain::scalars::SessionLifecycle;
 use crate::reduce::StreamUpdate;
 use crossbeam_channel::Receiver;
 use lens_client::stream::ServerStreamEvent;
@@ -33,6 +34,7 @@ impl FleetScheduler {
 
     /// Respawn a session actor from disk control scalars. `spawn_actor` seeds
     /// `next_ordinal` from `transcript.frontier()` and runs forward catch-up.
+    /// The registry retains ownership of the handle until `take_handle`.
     #[allow(clippy::too_many_arguments)]
     pub fn wake(
         &mut self,
@@ -43,17 +45,28 @@ impl FleetScheduler {
         stores: ActorStores,
         clock: Box<dyn Clock + Send>,
         api: Box<dyn SessionApi + Send>,
-    ) -> Result<ActorHandle, FleetSchedulerError> {
+    ) -> Result<(), FleetSchedulerError> {
         if self.registry.contains_key(session_id) {
             return Err(FleetSchedulerError::AlreadyRunning);
         }
-        let state =
+        let mut state =
             crate::persist::ControlStore::load_session(stores.control.as_ref(), conn, session_id)
                 .map_err(|e| FleetSchedulerError::Persist(e.to_string()))?
                 .ok_or(FleetSchedulerError::SessionNotFound)?;
+        state.lifecycle = SessionLifecycle::Active;
+        let now = clock.now_millis();
+        stores
+            .control
+            .upsert_session(&state, now)
+            .map_err(|e| FleetSchedulerError::Persist(e.to_string()))?;
         let handle = spawn_actor(state, events, updates, stores, clock, api);
         self.registry.insert(session_id.clone(), handle);
-        Ok(self.take_handle(session_id).expect("just inserted"))
+        Ok(())
+    }
+
+    /// Borrow a registered handle to send commands or read outcome/bridge channels.
+    pub fn handle(&self, session_id: &SessionId) -> Option<&ActorHandle> {
+        self.registry.get(session_id)
     }
 
     /// Route durable sleep to a running actor's command channel.
@@ -68,12 +81,7 @@ impl FleetScheduler {
             .map_err(|_| FleetSchedulerError::CommandSendFailed)
     }
 
-    /// Re-register a handle after `wake` (or for tests that took ownership temporarily).
-    pub fn register(&mut self, session_id: SessionId, handle: ActorHandle) {
-        self.registry.insert(session_id, handle);
-    }
-
-    /// Remove and return a running handle (e.g. to await outcomes / join).
+    /// Remove and return a running handle for final outcome drain / join.
     pub fn take_handle(&mut self, session_id: &SessionId) -> Option<ActorHandle> {
         self.registry.remove(session_id)
     }
@@ -263,9 +271,13 @@ mod tests {
         let sid = SessionId::new("conv_1");
 
         let mut scheduler = FleetScheduler::new();
-        let handle = scheduler
+        scheduler
             .wake(&conn, &sid, ev_rx, up_tx, stores, test_clock(), api)
             .expect("wake from slept disk");
+        assert!(
+            scheduler.is_running(&sid),
+            "registry must retain the handle after wake"
+        );
 
         let mut saw_catchup_tail = false;
         while let Ok(update) = up_rx.recv_blocking() {
@@ -293,18 +305,34 @@ mod tests {
             "catch-up must materialize tail ordinals 3..=4 after frontier 2"
         );
 
-        handle.commands.send(SessionCommand::Promote).unwrap();
+        let control = SqliteControlStore::open(&db_path).unwrap();
+        let after_wake = control
+            .load_session(&conn, &sid)
+            .unwrap()
+            .expect("session on disk");
+        assert_eq!(
+            after_wake.lifecycle,
+            SessionLifecycle::Active,
+            "wake must flip disk lifecycle Slept → Active"
+        );
+
+        scheduler
+            .handle(&sid)
+            .expect("handle registered")
+            .commands
+            .send(SessionCommand::Promote)
+            .unwrap();
         match up_rx.recv_blocking().unwrap() {
             StreamUpdate::Rebased(baseline) => {
                 assert_eq!(baseline.title.as_deref(), Some("slept-roundtrip"));
                 assert_eq!(baseline.reasoning_effort.as_deref(), Some("high"));
-                assert_eq!(baseline.lifecycle, SessionLifecycle::Slept);
+                assert_eq!(baseline.lifecycle, SessionLifecycle::Active);
                 assert!(baseline.items.is_empty(), "Rebased is scalars-only");
             }
             other => panic!("expected Rebased after Promote, got {other:?}"),
         }
 
-        scheduler.register(sid.clone(), handle);
+        assert!(scheduler.is_running(&sid));
         scheduler.sleep(&sid).expect("sleep routed to actor");
         let handle = scheduler
             .take_handle(&sid)
@@ -315,9 +343,12 @@ mod tests {
         }
         handle.join_without_stop();
 
-        let control = SqliteControlStore::open(&db_path).unwrap();
         let loaded = control.list_sessions(&conn).unwrap();
-        assert_eq!(loaded.rows[0].lifecycle, SessionLifecycle::Slept);
+        assert_eq!(
+            loaded.rows[0].lifecycle,
+            SessionLifecycle::Slept,
+            "sleep must flip disk lifecycle Active → Slept"
+        );
 
         let transcript =
             SqliteTranscriptStore::open(&dir.path().join("conv_1.db"), &conn, &sid).unwrap();
@@ -326,5 +357,39 @@ mod tests {
         let ids: Vec<_> = rows.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(ids, vec!["item_0", "item_1", "item_2", "item_3", "item_4"]);
         assert!(!scheduler.is_running(&sid), "actor stopped after sleep");
+    }
+
+    #[test]
+    fn second_wake_while_running_returns_already_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(dir.path());
+        seed_connection(&stores);
+        seed_slept_session(&stores);
+
+        let (api, _mock) =
+            MockApi::with_scripts(VecDeque::new(), VecDeque::from([Ok(empty_item_list())]));
+
+        let (_ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, _up_rx) = async_channel::bounded(64);
+        let conn = ConnectionId::new("conn_1");
+        let sid = SessionId::new("conv_1");
+
+        let mut scheduler = FleetScheduler::new();
+        scheduler
+            .wake(&conn, &sid, ev_rx, up_tx, stores, test_clock(), api)
+            .expect("first wake");
+        assert!(scheduler.is_running(&sid));
+
+        let (_ev_tx2, ev_rx2) = crossbeam_channel::bounded(64);
+        let (up_tx2, _up_rx2) = async_channel::bounded(64);
+        let stores2 = test_stores(dir.path());
+        let (api2, _mock2) = MockApi::with_scripts(VecDeque::new(), VecDeque::new());
+        let err = scheduler.wake(&conn, &sid, ev_rx2, up_tx2, stores2, test_clock(), api2);
+        assert_eq!(err, Err(FleetSchedulerError::AlreadyRunning));
+
+        scheduler
+            .take_handle(&sid)
+            .expect("still registered")
+            .stop_and_join();
     }
 }
