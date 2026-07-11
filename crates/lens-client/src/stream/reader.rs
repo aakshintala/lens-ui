@@ -11,7 +11,7 @@ use std::time::Duration;
 use crossbeam_channel::{Receiver, Sender, bounded};
 
 use crate::error::ClientError;
-use crate::reconnect::{BACKOFF_MS, Reopen, items_to_replay};
+use crate::reconnect::{BACKOFF_MS, Reopen};
 use crate::sessions::SessionStatus;
 
 use super::event::{DisconnectReason, ServerStreamEvent, parse_event};
@@ -115,11 +115,8 @@ fn bootstrap<Re: Reopen>(
     tx: &Sender<ServerStreamEvent>,
     stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> bool {
-    match reopener
-        .snapshot()
-        .and_then(|snap| reopener.items().map(|items| (snap, items)))
-    {
-        Ok((snap, items)) => {
+    match reopener.snapshot() {
+        Ok(snap) => {
             if stop.load(std::sync::atomic::Ordering::Relaxed) {
                 return false;
             }
@@ -128,11 +125,6 @@ fn bootstrap<Re: Reopen>(
                 .is_err()
             {
                 return false;
-            }
-            for ev in items_to_replay(items) {
-                if tx.send(ev).is_err() {
-                    return false;
-                }
             }
             true
         }
@@ -277,18 +269,6 @@ fn reconnect<Re: Reopen>(
             });
             return None;
         }
-        // Fetch durable history BEFORE opening the live body: a retryable `/items`
-        // failure must never discard an already-opened no-replay stream.
-        let list = match reopener.items() {
-            Ok(l) => l,
-            Err(e) => {
-                if let Some(r) = stop_reason(&e) {
-                    let _ = tx.send(ServerStreamEvent::Disconnected { reason: r });
-                    return None;
-                }
-                continue;
-            }
-        };
         // open_stream is the LAST fallible call: if it fails retryably, no body was
         // opened, so `continue` drops nothing.
         let new_body = match reopener.open_stream() {
@@ -313,11 +293,6 @@ fn reconnect<Re: Reopen>(
             .is_err()
         {
             return None;
-        }
-        for ev in items_to_replay(list) {
-            if tx.send(ev).is_err() {
-                return None;
-            }
         }
         return Some(new_body);
     }
@@ -385,13 +360,6 @@ mod tests {
         fn snapshot(&self) -> crate::error::Result<crate::sessions::SessionSnapshot> {
             Ok(self.snapshot.clone())
         }
-
-        fn items(&self) -> crate::error::Result<crate::sessions::ItemList> {
-            Err(crate::error::ClientError::Server {
-                status: 503,
-                body: serde_json::json!({}),
-            })
-        }
     }
 
     #[test]
@@ -409,12 +377,11 @@ mod tests {
         use std::sync::atomic::AtomicBool;
 
         use crate::reconnect::Reopen;
-        use crate::sessions::{ItemList, SessionSnapshot};
+        use crate::sessions::SessionSnapshot;
         use crate::stream::event::ResponseEvent;
 
         struct MockReopen {
             snapshot: SessionSnapshot,
-            items: std::sync::Mutex<Option<ItemList>>,
         }
 
         impl Reopen for MockReopen {
@@ -428,26 +395,10 @@ mod tests {
             fn snapshot(&self) -> crate::error::Result<SessionSnapshot> {
                 Ok(self.snapshot.clone())
             }
-
-            fn items(&self) -> crate::error::Result<ItemList> {
-                match self.items.lock().unwrap().take() {
-                    Some(list) => Ok(list),
-                    None => Err(crate::error::ClientError::Server {
-                        status: 503,
-                        body: serde_json::json!({}),
-                    }),
-                }
-            }
         }
 
         let reopener = MockReopen {
             snapshot: happy_idle_snapshot(),
-            items: std::sync::Mutex::new(Some({
-                let raw = include_str!(
-                    "../../../../docs/spikes/captures/2026-06-26-sse/happy_path.items.json"
-                );
-                serde_json::from_str(raw).expect("parse happy items")
-            })),
         };
         let (tx, rx) = bounded(EVENT_CHANNEL_BOUND);
         let body: Box<dyn Read + Send> = Box::new(Cursor::new(Vec::<u8>::new()));
@@ -456,11 +407,16 @@ mod tests {
 
         let first = rx.recv().expect("snapshot via crossbeam receiver");
         assert!(matches!(first, ServerStreamEvent::SnapshotRestored(_)));
-        let second = rx.recv().expect("replayed item via crossbeam receiver");
-        assert!(matches!(
-            second,
-            ServerStreamEvent::Response(ResponseEvent::OutputItemDone { .. })
-        ));
+        let rest: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            !rest.iter().any(|e| {
+                matches!(
+                    e,
+                    ServerStreamEvent::Response(ResponseEvent::OutputItemDone { .. })
+                )
+            }),
+            "bootstrap must not replay OutputItemDone — actor owns item recovery"
+        );
     }
 
     /// Crossbeam bounded `Sender::send` unblocks when all receivers drop — the
@@ -621,7 +577,7 @@ mod reconnect_tests {
     use super::*;
     use crate::error::ClientError;
     use crate::reconnect::Reopen;
-    use crate::sessions::{ItemList, SessionSnapshot};
+    use crate::sessions::SessionSnapshot;
     use crate::stream::event::ResponseEvent;
     use std::io::{Cursor, Read};
     use std::sync::Mutex;
@@ -640,12 +596,6 @@ mod reconnect_tests {
         .expect("parse minimal failed snapshot")
     }
 
-    fn happy_items() -> ItemList {
-        let raw =
-            include_str!("../../../../docs/spikes/captures/2026-06-26-sse/happy_path.items.json");
-        serde_json::from_str(raw).expect("parse happy items")
-    }
-
     fn output_text_delta_frame(seq: u64, delta: &str) -> Vec<u8> {
         format!(
             "event: response.output_text.delta\ndata: {{\"sequence_number\": {seq}, \"type\": \"response.output_text.delta\", \"delta\": {delta:?}}}\n\n"
@@ -656,9 +606,6 @@ mod reconnect_tests {
     struct MockReopen {
         snapshot: SessionSnapshot,
         snapshot_auth_401: bool,
-        items: Mutex<Option<ItemList>>,
-        items_retry_503_first: bool,
-        items_call_count: Mutex<u32>,
         bodies: Mutex<Vec<Vec<u8>>>,
         open_stream_always_503: bool,
     }
@@ -688,26 +635,6 @@ mod reconnect_tests {
             }
             Ok(self.snapshot.clone())
         }
-
-        fn items(&self) -> crate::error::Result<ItemList> {
-            if self.items_retry_503_first {
-                let mut count = self.items_call_count.lock().unwrap();
-                *count += 1;
-                if *count == 1 {
-                    return Err(ClientError::Server {
-                        status: 503,
-                        body: serde_json::json!({}),
-                    });
-                }
-            }
-            match self.items.lock().unwrap().take() {
-                Some(list) => Ok(list),
-                None => Err(ClientError::Server {
-                    status: 503,
-                    body: serde_json::json!({}),
-                }),
-            }
-        }
     }
 
     fn idx_reconnecting(events: &[ServerStreamEvent], attempt: u32) -> Option<usize> {
@@ -731,15 +658,6 @@ mod reconnect_tests {
             .position(|e| matches!(e, ServerStreamEvent::SnapshotRestored(_)))
     }
 
-    fn idx_first_replayed_item(events: &[ServerStreamEvent]) -> Option<usize> {
-        events.iter().position(|e| {
-            matches!(
-                e,
-                ServerStreamEvent::Response(ResponseEvent::OutputItemDone { .. })
-            )
-        })
-    }
-
     fn idx_live_delta(events: &[ServerStreamEvent], delta: &str) -> Option<usize> {
         events.iter().position(|e| {
             matches!(
@@ -757,9 +675,6 @@ mod reconnect_tests {
         let mock = MockReopen {
             snapshot: happy_idle_snapshot(),
             snapshot_auth_401: false,
-            items: Mutex::new(Some(happy_items())),
-            items_retry_503_first: false,
-            items_call_count: Mutex::new(0),
             bodies: Mutex::new(vec![body2]),
             open_stream_always_503: false,
         };
@@ -777,13 +692,20 @@ mod reconnect_tests {
         let r1 = idx_reconnecting(&events, 1).expect("Reconnecting{1}");
         let rec = idx_reconnected(&events).expect("Reconnected");
         let snap = idx_snapshot_restored(&events).expect("SnapshotRestored");
-        let replay = idx_first_replayed_item(&events).expect("replayed OutputItemDone");
         let live = idx_live_delta(&events, "after reopen").expect("live frame after reopen");
 
         assert!(r1 < rec);
         assert!(rec < snap);
-        assert!(snap < replay);
-        assert!(replay < live);
+        assert!(snap < live);
+        assert!(
+            !events.iter().any(|e| {
+                matches!(
+                    e,
+                    ServerStreamEvent::Response(ResponseEvent::OutputItemDone { .. })
+                )
+            }),
+            "reconnect must not replay OutputItemDone — actor owns item recovery"
+        );
     }
 
     #[test]
@@ -791,9 +713,6 @@ mod reconnect_tests {
         let mock = MockReopen {
             snapshot: happy_idle_snapshot(),
             snapshot_auth_401: true,
-            items: Mutex::new(None),
-            items_retry_503_first: false,
-            items_call_count: Mutex::new(0),
             bodies: Mutex::new(vec![]),
             open_stream_always_503: false,
         };
@@ -831,9 +750,6 @@ mod reconnect_tests {
         let mock = MockReopen {
             snapshot: failed_snapshot(),
             snapshot_auth_401: false,
-            items: Mutex::new(None),
-            items_retry_503_first: false,
-            items_call_count: Mutex::new(0),
             bodies: Mutex::new(vec![]),
             open_stream_always_503: false,
         };
@@ -876,58 +792,10 @@ mod reconnect_tests {
     }
 
     #[test]
-    fn retryable_items_failure_does_not_drop_the_reopened_body() {
-        let reopen_body = output_text_delta_frame(99, "live after items retry");
-        let mock = MockReopen {
-            snapshot: happy_idle_snapshot(),
-            snapshot_auth_401: false,
-            items: Mutex::new(Some(happy_items())),
-            items_retry_503_first: true,
-            items_call_count: Mutex::new(0),
-            bodies: Mutex::new(vec![reopen_body]),
-            open_stream_always_503: false,
-        };
-        let (tx, rx) = bounded(EVENT_CHANNEL_BOUND);
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        read_loop(
-            Box::new(Cursor::new(Vec::<u8>::new())) as Box<dyn Read + Send>,
-            tx,
-            mock,
-            |_| {},
-            &stop,
-        );
-        let events: Vec<_> = rx.iter().collect();
-
-        assert!(idx_reconnecting(&events, 1).is_some());
-        assert!(idx_reconnecting(&events, 2).is_some());
-        assert_eq!(
-            events
-                .iter()
-                .filter(|e| matches!(e, ServerStreamEvent::Reconnected { gap: None }))
-                .count(),
-            1
-        );
-        assert_eq!(
-            events
-                .iter()
-                .filter(|e| matches!(e, ServerStreamEvent::SnapshotRestored(_)))
-                .count(),
-            1
-        );
-        assert!(
-            idx_live_delta(&events, "live after items retry").is_some(),
-            "live delta from open_stream body must be delivered"
-        );
-    }
-
-    #[test]
     fn exhausted_backoff_emits_retries_exhausted() {
         let mock = MockReopen {
             snapshot: happy_idle_snapshot(),
             snapshot_auth_401: false,
-            items: Mutex::new(None),
-            items_retry_503_first: false,
-            items_call_count: Mutex::new(0),
             bodies: Mutex::new(vec![]),
             open_stream_always_503: true,
         };
@@ -962,15 +830,12 @@ mod reconnect_tests {
     }
 
     #[test]
-    fn first_open_emits_snapshot_then_items_before_live_tail() {
+    fn first_open_emits_snapshot_only_before_live_tail() {
         use std::sync::Arc;
         use std::sync::atomic::AtomicBool;
         let reopener = MockReopen {
             snapshot: happy_idle_snapshot(),
             snapshot_auth_401: false,
-            items: Mutex::new(Some(happy_items())),
-            items_retry_503_first: false,
-            items_call_count: Mutex::new(0),
             bodies: Mutex::new(vec![]),
             open_stream_always_503: true,
         };
@@ -985,12 +850,14 @@ mod reconnect_tests {
             evs[0]
         );
         assert!(
-            matches!(
-                evs[1],
-                ServerStreamEvent::Response(ResponseEvent::OutputItemDone { .. })
-            ),
-            "second: {:?}",
-            evs[1]
+            !evs.iter().any(|e| {
+                matches!(
+                    e,
+                    ServerStreamEvent::Response(ResponseEvent::OutputItemDone { .. })
+                )
+            }),
+            "bootstrap must emit only SnapshotRestored, no item replay: {:?}",
+            evs
         );
     }
 }

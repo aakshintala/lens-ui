@@ -8,9 +8,7 @@ use crate::client::Client;
 use crate::connection::Connection;
 use crate::error::Result;
 use crate::ids::SessionId;
-use crate::sessions::{GetOpts, ItemList, ItemsPage, SessionSnapshot};
-use crate::stream::ServerStreamEvent;
-use crate::stream::event::ResponseEvent;
+use crate::sessions::{GetOpts, SessionSnapshot};
 
 /// §7 backoff schedule (ms): 100→200→400→800→1600→3000→3000. ~7s through six.
 pub(crate) const BACKOFF_MS: &[u64] = &[100, 200, 400, 800, 1600, 3000, 3000];
@@ -22,8 +20,6 @@ pub(crate) trait Reopen: Send {
     fn open_stream(&self) -> Result<Box<dyn Read + Send>>;
     /// `GET /v1/sessions/{id}` with items+liveness (bucket B chrome).
     fn snapshot(&self) -> Result<SessionSnapshot>;
-    /// `GET /v1/sessions/{id}/items` (bucket A history).
-    fn items(&self) -> Result<ItemList>;
 }
 
 /// Real impl: clones the cheap, `Send + 'static` request machinery. No `info`.
@@ -77,58 +73,5 @@ impl Reopen for HttpReopener {
         let status = resp.status().as_u16();
         let body = resp.text()?;
         crate::http::decode_json("v1/sessions", status, &body)
-    }
-
-    fn items(&self) -> Result<ItemList> {
-        let page = ItemsPage::default();
-        let url = self
-            .conn
-            .url(&format!("/v1/sessions/{}/items", self.session_id))?;
-        let resp = self
-            .conn
-            .auth
-            .apply(
-                self.http
-                    .get(url)
-                    .query(&page.to_query())
-                    .timeout(crate::client::REST_TIMEOUT),
-            )
-            .send()?;
-        let status = resp.status().as_u16();
-        let body = resp.text()?;
-        crate::http::decode_json("v1/sessions/items", status, &body)
-    }
-}
-
-/// Bucket A: replay the durable transcript as `OutputItemDone` events. The
-/// consumer merges by `Item::id()` (idempotent upsert), so duplicates are safe.
-pub(crate) fn items_to_replay(list: ItemList) -> Vec<ServerStreamEvent> {
-    list.into_items()
-        .into_iter()
-        .map(|item| ServerStreamEvent::Response(ResponseEvent::OutputItemDone { item }))
-        .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::sessions::ItemList;
-    use crate::stream::ServerStreamEvent;
-    use crate::stream::event::ResponseEvent;
-
-    #[test]
-    fn items_to_replay_maps_each_item_to_output_item_done() {
-        // Build an ItemList from the golden /items capture so payloads are real.
-        let raw =
-            include_str!("../../../docs/spikes/captures/2026-06-26-sse/happy_path.items.json");
-        let list: ItemList = serde_json::from_str(raw).expect("parse items capture");
-        let n = list.items().len();
-        assert!(n > 0, "fixture must have items");
-        let out = items_to_replay(list);
-        assert_eq!(out.len(), n);
-        assert!(out.iter().all(|e| matches!(
-            e,
-            ServerStreamEvent::Response(ResponseEvent::OutputItemDone { .. })
-        )));
     }
 }

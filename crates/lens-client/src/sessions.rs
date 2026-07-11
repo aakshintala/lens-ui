@@ -428,9 +428,6 @@ impl ItemList {
     pub fn items(&self) -> &[crate::stream::Item] {
         &self.items
     }
-    pub(crate) fn into_items(self) -> Vec<crate::stream::Item> {
-        self.items
-    }
     pub fn has_more(&self) -> bool {
         self.has_more
     }
