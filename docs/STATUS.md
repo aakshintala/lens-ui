@@ -296,11 +296,16 @@ and roll older "Recent" pointers off this page as they age.
   `session.collaboration_mode` — deferred because absent from golden captures). **Nothing in the
   gap blocks P3-3a** — all store deps (`/stream`, `/items`, snapshot, send) are modeled; safety
   net = unmodeled routes never called, unmodeled events → `Unknown` + `live_taxonomy` alarm.
-  **One targeted TODO folded into P3-3a:** capture one live turn and check whether `turn.*` /
-  `response.output_file.done` actually fire — the state model infers quiescence from `response.*`
-  + `session.status`, so if harnesses emit `turn.*` and we ignore them, quiescence could be
-  subtly wrong. Fire → model just those (real bytes); don't fire → deferral provably correct.
-  See memory [[contract-coverage-gap-2026-07]].
+  **turn.* capture-check — DONE this session, deferral VALIDATED.** Brought a host daemon
+  online (`omnigent host …` — the "offline runner" was just no daemon attached) and drove a
+  real "say hello" turn across **4 harnesses** (claude-sdk/codex/opencode completed; cursor
+  failed on its own auth), capturing raw SSE. **No `turn.*` fired on any** — every harness
+  expresses turn lifecycle via `response.in_progress` → deltas → `response.completed`/`.failed`
+  + `session.status`. So the quiescence model (`response.*` + `session.status`) is correct and
+  `turn.*` staying DEFERRED is provably safe. (Other deferred events — `output_file.done`,
+  `queued`, `client_task.cancel`, `collaboration_mode` — need triggers a trivial turn doesn't
+  exercise; not observed, `live_taxonomy` alarms if one ever surfaces.) See memory
+  [[contract-coverage-gap-2026-07]].
 - **2026-07-10** — **omnigent pin bumped `v0.4.0` → `v0.5.1`** (`bumping-the-omnigent-pin`
   runbook; tag `v0.5.1`, Source HEAD `08285468`; pinned the latest patch since it's
   contract-identical to `v0.5.0` — only a web-shell UI fix on top). Contract delta: +3 routes
