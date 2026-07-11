@@ -579,8 +579,11 @@ mod reconnect_tests {
     use crate::reconnect::Reopen;
     use crate::sessions::SessionSnapshot;
     use crate::stream::event::ResponseEvent;
+    use std::collections::VecDeque;
     use std::io::{Cursor, Read};
+    use std::sync::Arc;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn happy_idle_snapshot() -> SessionSnapshot {
         let raw = include_str!(
@@ -603,19 +606,52 @@ mod reconnect_tests {
         .into_bytes()
     }
 
+    /// After the live chunk is consumed, spin until `stop` is set so `read_loop`
+    /// does not immediately EOF into a second reconnect (race-free, no sleeps).
+    struct LiveThenWaitStop {
+        inner: Cursor<Vec<u8>>,
+        stop: Arc<AtomicBool>,
+    }
+
+    impl Read for LiveThenWaitStop {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            if n == 0 {
+                while !self.stop.load(Ordering::Relaxed) {
+                    std::hint::spin_loop();
+                }
+            }
+            Ok(n)
+        }
+    }
+
     struct MockReopen {
         snapshot: SessionSnapshot,
         snapshot_auth_401: bool,
+        /// Scripted snapshot outcomes, consumed front-to-back; empty => `Ok(snapshot.clone())`.
+        snapshot_script: Mutex<VecDeque<crate::error::Result<SessionSnapshot>>>,
         bodies: Mutex<Vec<Vec<u8>>>,
         open_stream_always_503: bool,
+        open_stream_call_count: Arc<Mutex<u32>>,
+        /// When set, reopened bodies park after EOF until this flag is raised.
+        read_stop: Option<Arc<AtomicBool>>,
     }
 
     impl Reopen for MockReopen {
         fn open_stream(&self) -> crate::error::Result<Box<dyn Read + Send>> {
+            *self.open_stream_call_count.lock().unwrap() += 1;
             let mut bodies = self.bodies.lock().unwrap();
             if !bodies.is_empty() {
                 let body = bodies.remove(0);
-                return Ok(Box::new(Cursor::new(body)));
+                let reader: Box<dyn Read + Send> = if let Some(stop) = &self.read_stop {
+                    Box::new(LiveThenWaitStop {
+                        inner: Cursor::new(body),
+                        stop: Arc::clone(stop),
+                    })
+                } else {
+                    Box::new(Cursor::new(body))
+                };
+                return Ok(reader);
             }
             if self.open_stream_always_503 {
                 return Err(ClientError::Server {
@@ -632,6 +668,9 @@ mod reconnect_tests {
         fn snapshot(&self) -> crate::error::Result<SessionSnapshot> {
             if self.snapshot_auth_401 {
                 return Err(ClientError::Auth { status: 401 });
+            }
+            if let Some(next) = self.snapshot_script.lock().unwrap().pop_front() {
+                return next;
             }
             Ok(self.snapshot.clone())
         }
@@ -675,8 +714,11 @@ mod reconnect_tests {
         let mock = MockReopen {
             snapshot: happy_idle_snapshot(),
             snapshot_auth_401: false,
+            snapshot_script: Mutex::new(VecDeque::new()),
             bodies: Mutex::new(vec![body2]),
             open_stream_always_503: false,
+            open_stream_call_count: Arc::new(Mutex::new(0)),
+            read_stop: None,
         };
         let (tx, rx) = bounded(EVENT_CHANNEL_BOUND);
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -713,8 +755,11 @@ mod reconnect_tests {
         let mock = MockReopen {
             snapshot: happy_idle_snapshot(),
             snapshot_auth_401: true,
+            snapshot_script: Mutex::new(VecDeque::new()),
             bodies: Mutex::new(vec![]),
             open_stream_always_503: false,
+            open_stream_call_count: Arc::new(Mutex::new(0)),
+            read_stop: None,
         };
         let (tx, rx) = bounded(EVENT_CHANNEL_BOUND);
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -750,8 +795,11 @@ mod reconnect_tests {
         let mock = MockReopen {
             snapshot: failed_snapshot(),
             snapshot_auth_401: false,
+            snapshot_script: Mutex::new(VecDeque::new()),
             bodies: Mutex::new(vec![]),
             open_stream_always_503: false,
+            open_stream_call_count: Arc::new(Mutex::new(0)),
+            read_stop: None,
         };
         let (tx, rx) = bounded(EVENT_CHANNEL_BOUND);
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -791,13 +839,102 @@ mod reconnect_tests {
         }));
     }
 
+    /// Replacement for deleted `retryable_items_failure_does_not_drop_the_reopened_body`.
+    /// Locks the snapshot → open_stream ordering invariant: `open_stream` is the last
+    /// fallible reconnect step, so a retryable snapshot failure must not open a body.
+    #[test]
+    fn retryable_snapshot_failure_does_not_open_stream_before_success() {
+        let reopen_body = output_text_delta_frame(99, "live after snapshot retry");
+        let mut snapshot_script = VecDeque::new();
+        snapshot_script.push_back(Err(ClientError::Server {
+            status: 503,
+            body: serde_json::json!({}),
+        }));
+        let read_stop = Arc::new(AtomicBool::new(false));
+        let loop_stop = Arc::new(AtomicBool::new(false));
+        let open_stream_call_count = Arc::new(Mutex::new(0));
+        let mock = MockReopen {
+            snapshot: happy_idle_snapshot(),
+            snapshot_auth_401: false,
+            snapshot_script: Mutex::new(snapshot_script),
+            bodies: Mutex::new(vec![reopen_body]),
+            open_stream_always_503: false,
+            open_stream_call_count: Arc::clone(&open_stream_call_count),
+            read_stop: Some(Arc::clone(&read_stop)),
+        };
+        let (tx, rx) = bounded(EVENT_CHANNEL_BOUND);
+        let reader = std::thread::spawn({
+            let loop_stop = Arc::clone(&loop_stop);
+            move || {
+                read_loop(
+                    Box::new(Cursor::new(Vec::<u8>::new())) as Box<dyn Read + Send>,
+                    tx,
+                    mock,
+                    |_| {},
+                    &loop_stop,
+                );
+            }
+        });
+
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.recv() {
+            events.push(ev);
+            if idx_live_delta(&events, "live after snapshot retry").is_some() {
+                read_stop.store(true, Ordering::Relaxed);
+                loop_stop.store(true, Ordering::Relaxed);
+                break;
+            }
+        }
+        reader.join().expect("read_loop join");
+
+        assert_eq!(
+            *open_stream_call_count.lock().unwrap(),
+            1,
+            "open_stream must run only after snapshot succeeds — not on the failed attempt"
+        );
+        assert!(idx_reconnecting(&events, 1).is_some());
+        assert!(idx_reconnecting(&events, 2).is_some());
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, ServerStreamEvent::Reconnected { gap: None }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, ServerStreamEvent::SnapshotRestored(_)))
+                .count(),
+            1
+        );
+        let rec = idx_reconnected(&events).expect("Reconnected");
+        let snap = idx_snapshot_restored(&events).expect("SnapshotRestored");
+        let live = idx_live_delta(&events, "live after snapshot retry")
+            .expect("live frame from the opened body on the channel");
+        assert!(rec < snap);
+        assert!(snap < live);
+        assert!(
+            !events.iter().any(|e| {
+                matches!(
+                    e,
+                    ServerStreamEvent::Response(ResponseEvent::OutputItemDone { .. })
+                )
+            }),
+            "reconnect must not replay OutputItemDone — actor owns item recovery"
+        );
+    }
+
     #[test]
     fn exhausted_backoff_emits_retries_exhausted() {
         let mock = MockReopen {
             snapshot: happy_idle_snapshot(),
             snapshot_auth_401: false,
+            snapshot_script: Mutex::new(VecDeque::new()),
             bodies: Mutex::new(vec![]),
             open_stream_always_503: true,
+            open_stream_call_count: Arc::new(Mutex::new(0)),
+            read_stop: None,
         };
         let (tx, rx) = bounded(EVENT_CHANNEL_BOUND);
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -836,8 +973,11 @@ mod reconnect_tests {
         let reopener = MockReopen {
             snapshot: happy_idle_snapshot(),
             snapshot_auth_401: false,
+            snapshot_script: Mutex::new(VecDeque::new()),
             bodies: Mutex::new(vec![]),
             open_stream_always_503: true,
+            open_stream_call_count: Arc::new(Mutex::new(0)),
+            read_stop: None,
         };
         let (tx, rx) = bounded(EVENT_CHANNEL_BOUND);
         let body: Box<dyn Read + Send> = Box::new(Cursor::new(Vec::<u8>::new()));
