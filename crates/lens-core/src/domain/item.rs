@@ -106,6 +106,13 @@ pub enum ItemKind {
     },
 }
 
+impl ItemKind {
+    /// D23 commit rule: everything is terminal EXCEPT an in-progress function call.
+    pub fn is_terminal(&self) -> bool {
+        !matches!(self, ItemKind::FunctionCall { status, .. } if status != "completed")
+    }
+}
+
 // ── §4.2 transient accumulators (RAM-only) ──
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

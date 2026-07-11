@@ -4,7 +4,7 @@ use crate::clock::Clock;
 use crate::domain::item::ReasoningAcc;
 use crate::domain::item::{BlockContext, ContentBlock, Item, ItemKind, StreamScratch};
 use crate::domain::{AgentId, CallId, ErrorSource, ItemId, Role, SessionState};
-use crate::reduce::{StreamUpdate, Updates};
+use crate::reduce::Updates;
 use lens_client::stream::Item as WireItem;
 use serde_json::Value;
 use smallvec::smallvec;
@@ -185,21 +185,16 @@ pub(crate) fn push_item(
         let existing = Arc::make_mut(&mut state.items[idx]);
         existing.kind = kind;
         existing.seq = seq.or(existing.seq);
-        smallvec![StreamUpdate::ItemUpdated {
-            index: idx,
-            item: Arc::clone(&state.items[idx]),
-        }]
     } else {
-        let item = Arc::new(Item {
+        state.items.push(Arc::new(Item {
             id,
             seq,
             ctx,
             created_at: clock.now_millis(),
             kind,
-        });
-        state.items.push(Arc::clone(&item));
-        smallvec![StreamUpdate::ItemAppended(item)]
+        }));
     }
+    smallvec![] // D23: no replica-facing item delta; the actor commits terminal items to disk.
 }
 
 #[cfg(test)]
@@ -245,13 +240,7 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        assert!(matches!(
-            &u[..],
-            [
-                StreamUpdate::ItemAppended(_),
-                StreamUpdate::ScratchChanged(_)
-            ]
-        ));
+        assert!(matches!(&u[..], [StreamUpdate::ScratchChanged(_)]));
         assert_eq!(s.items[0].created_at, 1_700_000_000_000); // clock-stamped
     }
 
@@ -283,10 +272,15 @@ mod tests {
         );
         let u = reduce(&mut s, &second, &clock());
         assert_eq!(s.items.len(), 1); // no double-insert (D-P1-13)
-        assert!(matches!(
-            &u[..],
-            [StreamUpdate::ItemUpdated { index: 0, .. }]
-        ));
+        match &s.items[0].kind {
+            ItemKind::FunctionCall { status, .. } => assert_eq!(status, "completed"),
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            u.is_empty()
+                || u.iter()
+                    .all(|u| matches!(u, StreamUpdate::ScratchChanged(_)))
+        );
     }
 
     use lens_client::stream::{ResponseEvent, ServerStreamEvent};
@@ -445,17 +439,20 @@ mod tests {
     }
 
     #[test]
-    fn appended_delta_carries_the_same_arc_body_as_state() {
+    fn push_item_mutates_working_set_without_emitting_delta() {
         let mut s = st();
         let ev = parse_response(
             "response.output_item.done",
             r#"{"item":{"id":"item_1","type":"function_call","status":"completed","name":"read","arguments":"{}","call_id":"c"}}"#,
         );
         let out = reduce(&mut s, &ev, &clock());
-        let StreamUpdate::ItemAppended(arc) = &out[0] else {
-            panic!("expected ItemAppended")
-        };
-        assert!(std::sync::Arc::ptr_eq(arc, s.items.last().unwrap()));
+        assert!(
+            out.is_empty()
+                || out
+                    .iter()
+                    .all(|u| !matches!(u, StreamUpdate::TranscriptAdvanced { .. }))
+        );
+        assert_eq!(s.items.last().unwrap().id.as_str(), "item_1");
     }
 
     #[test]

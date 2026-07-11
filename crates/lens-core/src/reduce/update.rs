@@ -2,7 +2,7 @@ use crate::domain::controls::{
     Elicitation, ModelOption, PendingUserMessage, SandboxStatus, SkillSummary, Todo,
 };
 use crate::domain::ids::AgentId;
-use crate::domain::item::{Item, StreamScratch};
+use crate::domain::item::StreamScratch;
 use crate::domain::scalars::{ErrorInfo, SessionStatusValue};
 use crate::domain::session::SessionState;
 use crate::domain::usage::{Cost, PresenceViewer};
@@ -16,10 +16,11 @@ use std::sync::Arc;
 #[derive(Clone, Debug, PartialEq)]
 pub enum StreamUpdate {
     // ── transcript deltas (value-carrying) ──
-    ItemAppended(Arc<Item>),
-    ItemUpdated {
-        index: usize,
-        item: Arc<Item>,
+    /// D23: disk-canonical transcript watermark. The actor emits this AFTER a
+    /// commit-on-terminal write-through; the focused replica reads
+    /// `(last_rendered, committed_ordinal]` off `TranscriptStore` (RowSource — deferred UI).
+    TranscriptAdvanced {
+        committed_ordinal: i64,
     },
     ScratchChanged(Arc<StreamScratch>),
 
@@ -70,32 +71,15 @@ pub type Updates = SmallVec<[StreamUpdate; 2]>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::ids::ItemId;
-    use crate::domain::item::{BlockContext, ContentBlock, ItemKind};
-    use crate::domain::scalars::Role;
+    use crate::domain::scalars::SessionStatusValue;
 
     #[test]
     fn updates_smallvec_stays_inline_for_two() {
         let mut u: Updates = SmallVec::new();
         u.push(StreamUpdate::StatusChanged(SessionStatusValue::Idle));
-        u.push(StreamUpdate::ItemAppended(Arc::new(Item {
-            id: ItemId::new("item_0"),
-            seq: None,
-            ctx: BlockContext {
-                agent: None,
-                depth: 0,
-                turn: 0,
-            },
-            created_at: 0,
-            kind: ItemKind::Message {
-                role: Role::User,
-                content: vec![ContentBlock {
-                    kind: "text".into(),
-                    text: Some("x".into()),
-                    data: serde_json::Value::Null,
-                }],
-            },
-        })));
+        u.push(StreamUpdate::TranscriptAdvanced {
+            committed_ordinal: 0,
+        });
         assert_eq!(u.len(), 2);
         assert!(
             !u.spilled(),
