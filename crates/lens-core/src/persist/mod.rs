@@ -122,8 +122,10 @@ pub trait TranscriptStore {
     fn mode(&self) -> StoreMode;
     /// The `(connection_id, session_id)` from the file's self-describing meta.
     fn identity(&self) -> Result<(ConnectionId, SessionId)>;
-    /// Write-through one finalized item at its canonical `ordinal` (D-P2-7).
-    fn upsert_item(&self, ordinal: i64, item: &Item) -> Result<()>;
+    /// Write-through one finalized item at `ordinal`. Returns the ordinal actually
+    /// stored (via `RETURNING`); on id conflict with preserved ordinal, the returned
+    /// value may differ from the requested `ordinal` (D20 re-fire path).
+    fn upsert_item(&self, ordinal: i64, item: &Item) -> Result<i64>;
     /// All items ordered by `ordinal`. A row that fails to decode is skipped
     /// (recorded in `Loaded::skipped`), never aborting the whole transcript load.
     fn load_items(&self) -> Result<Loaded<Item>>;

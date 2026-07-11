@@ -45,12 +45,54 @@ impl SqliteTranscriptStore {
         }
     }
 
-    fn upsert_item_stmt(&self, ordinal: i64, item: &Item) -> Result<()> {
-        self.upsert_item_stmt_inner(ordinal, item, true)
+    fn upsert_item_stmt(&self, ordinal: i64, item: &Item) -> Result<i64> {
+        self.upsert_item_stmt_returning(ordinal, item, true)
     }
 
     /// `preserve_ordinal_on_conflict`: commit-path re-fires keep the stored row
     /// position (`ordinal=items.ordinal`); reconcile re-stamps (`ordinal=excluded.ordinal`).
+    fn upsert_item_stmt_returning(
+        &self,
+        ordinal: i64,
+        item: &Item,
+        preserve_ordinal_on_conflict: bool,
+    ) -> Result<i64> {
+        let ordinal_clause = if preserve_ordinal_on_conflict {
+            "ordinal=items.ordinal"
+        } else {
+            "ordinal=excluded.ordinal"
+        };
+        let payload = json_string(&item.kind)?;
+        let kind = item_kind_token(&item.kind);
+        let sql = format!(
+            "INSERT INTO items (item_id, live_seq, ordinal, kind, payload, agent, depth, turn, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(item_id) DO UPDATE SET
+               live_seq=excluded.live_seq, {ordinal_clause}, kind=excluded.kind,
+               payload=excluded.payload, agent=excluded.agent, depth=excluded.depth,
+               turn=excluded.turn, created_at=excluded.created_at
+             RETURNING ordinal"
+        );
+        self.conn
+            .query_row(
+                &sql,
+                rusqlite::params![
+                    item.id.as_str(),
+                    item.seq.map(|v| v as i64),
+                    ordinal,
+                    kind,
+                    payload,
+                    item.ctx.agent,
+                    item.ctx.depth as i64,
+                    item.ctx.turn as i64,
+                    item.created_at,
+                ],
+                |r| r.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    /// Reconcile re-stamp path — no `RETURNING`; ordinal is always the passed index.
     fn upsert_item_stmt_inner(
         &self,
         ordinal: i64,
@@ -107,11 +149,10 @@ impl TranscriptStore for SqliteTranscriptStore {
         ))
     }
 
-    /// PRECONDITION (D-P2-7): `ordinal` is a FRESH append position (the item's
-    /// index in the actor's canonical `Vec<Item>`). Conflicts resolve on `item_id`
-    /// only — reusing an ordinal for a *different* `item_id` raises `UNIQUE(ordinal)`
-    /// (a non-panic `Err`). P3 routes any replace/reorder through `reconcile`, not here.
-    fn upsert_item(&self, ordinal: i64, item: &Item) -> Result<()> {
+    /// D20 commit path: `ordinal` is the actor's `next_ordinal` cursor. Conflicts
+    /// resolve on `item_id` only — re-fire preserves the stored ordinal (`RETURNING`
+    /// may differ from the requested value). Reconcile re-stamps via its own txn.
+    fn upsert_item(&self, ordinal: i64, item: &Item) -> Result<i64> {
         self.guard_write()?;
         self.upsert_item_stmt(ordinal, item)
     }
@@ -233,6 +274,23 @@ mod tests {
         assert_eq!(s.frontier().unwrap(), Some((5, ItemId::new("item_a"))));
         let rows = s.load_items().unwrap().rows;
         assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn refire_returns_stored_ordinal_without_bumping_cursor() {
+        let d = tempdir().unwrap();
+        let s = store(d.path());
+        s.upsert_item(0, &item("item_a", 0, "a")).unwrap();
+        s.upsert_item(1, &item("item_b", 0, "b")).unwrap();
+        // Re-fire at a blind ordinal — conflict preserves ordinal 0.
+        let stored = s.upsert_item(99, &item("item_a", 0, "a-refire")).unwrap();
+        assert_eq!(stored, 0);
+        // Fresh insert still lands at the requested ordinal.
+        let stored = s.upsert_item(2, &item("item_c", 0, "c")).unwrap();
+        assert_eq!(stored, 2);
+        let rows = s.load_items().unwrap().rows;
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[2].id.as_str(), "item_c");
     }
 
     #[test]

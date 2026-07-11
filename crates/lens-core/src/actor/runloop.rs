@@ -170,19 +170,23 @@ fn run(
         })
         .max()
         .unwrap_or(0);
+    let mut ring = OutcomeRing::with_cap(64);
     // TODO(P3-3b, scaffold-id): frontier seeds next_ordinal by item_id; scaffold fc_* vs store-native id reconciliation is deferred.
-    let mut next_ordinal: i64 = stores
-        .transcript
-        .frontier()
-        .ok()
-        .flatten()
-        .map(|(o, _)| o + 1)
-        .unwrap_or(0);
+    let mut next_ordinal: i64 = match stores.transcript.frontier() {
+        Ok(Some((o, _))) => o + 1,
+        Ok(None) => 0,
+        Err(e) => {
+            ring.push(ActorOutcome::PersistError {
+                where_: "transcript.frontier",
+                message: e.to_string(),
+            });
+            0
+        }
+    };
     let mut transport = ActorTransport::Connected;
     // set true on Reconnecting, cleared on Reconnected or park; NOT set on a terminal Disconnected (park is not mid-reconcile).
     let mut reconcile_in_flight = false;
     let mut parked = false;
-    let mut ring = OutcomeRing::with_cap(64);
     loop {
         let mut sel = Select::new();
         let ev_idx = if parked {
@@ -512,10 +516,13 @@ fn commit_terminal_prefix(
         }
         // TODO(P3-3b, scaffold-id): scaffold fc_* ids may double-commit vs store-native ids.
         match stores.transcript.upsert_item(*next_ordinal, front) {
-            Ok(()) => {
+            Ok(stored_ord) => {
+                let requested = *next_ordinal;
                 state.items.remove(0);
-                *next_ordinal += 1;
-                committed = true;
+                if stored_ord == requested {
+                    *next_ordinal += 1;
+                    committed = true;
+                }
             }
             Err(e) => {
                 ring.push(ActorOutcome::PersistError {
@@ -684,7 +691,7 @@ mod tests {
             Ok((ConnectionId::new("conn_1"), SessionId::new("conv_1")))
         }
 
-        fn upsert_item(&self, _ordinal: i64, _item: &Item) -> crate::persist::Result<()> {
+        fn upsert_item(&self, _ordinal: i64, _item: &Item) -> crate::persist::Result<i64> {
             Err(PersistError::ReadOnly)
         }
 
@@ -1033,6 +1040,187 @@ mod tests {
             !rows.iter().any(|r| r.id.as_str() == "fc_1"),
             "in-progress fc_1 must not be on disk"
         );
+
+        handle.stop_and_join();
+    }
+
+    #[test]
+    fn golden_order_dual_id_function_call_commits_in_wire_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(dir.path());
+        seed_connection(&stores);
+        let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, up_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(
+            fresh_state(),
+            ev_rx,
+            up_tx,
+            stores,
+            test_clock(),
+            noop_api(),
+        );
+
+        // Golden happy_path.stream.sse L38–L50 order (dual-id function_call seam).
+        ev_tx
+            .send(parse_response(
+                "response.output_item.done",
+                r#"{"item":{"id":"fc_52f83171c226","type":"function_call","status":"in_progress","name":"sys_os_shell","arguments":"{}","call_id":"toolu_01HijYUkd7fDUELjLrF5bsKy"}}"#,
+            ))
+            .unwrap();
+        ev_tx
+            .send(parse_response(
+                "response.output_item.done",
+                r#"{"item":{"id":"msg_957e7144","type":"message","role":"assistant","content":[{"type":"output_text","text":"confirmed"}]}}"#,
+            ))
+            .unwrap();
+        ev_tx
+            .send(parse_response(
+                "response.output_item.done",
+                r#"{"item":{"id":"fc_5a32092a5f02","type":"function_call","status":"completed","name":"sys_os_shell","arguments":"{}","call_id":"toolu_01HijYUkd7fDUELjLrF5bsKy"}}"#,
+            ))
+            .unwrap();
+        ev_tx
+            .send(parse_response(
+                "response.output_item.done",
+                r#"{"item":{"id":"fco_d56eb811c793","type":"function_call_output","call_id":"toolu_01HijYUkd7fDUELjLrF5bsKy","output":"ok"}}"#,
+            ))
+            .unwrap();
+
+        let mut saw_final_watermark = false;
+        while let Ok(u) = up_rx.recv_blocking() {
+            if matches!(
+                u,
+                StreamUpdate::TranscriptAdvanced {
+                    committed_ordinal: 2
+                }
+            ) {
+                saw_final_watermark = true;
+                break;
+            }
+        }
+        assert!(
+            saw_final_watermark,
+            "FCO commit must advance watermark to ordinal 2"
+        );
+
+        handle.stop_and_join();
+
+        let reopened = SqliteTranscriptStore::open(
+            &dir.path().join("conv_1.db"),
+            &ConnectionId::new("conn_1"),
+            &SessionId::new("conv_1"),
+        )
+        .unwrap();
+        let rows = reopened.load_items().unwrap().rows;
+        let ids: Vec<_> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["msg_957e7144", "fc_5a32092a5f02", "fco_d56eb811c793"],
+            "wire order: message, completed FC, FCO"
+        );
+        assert!(
+            !ids.contains(&"fc_52f83171c226"),
+            "in_progress twin must be superseded, not on disk"
+        );
+    }
+
+    #[test]
+    fn refire_of_pruned_item_does_not_gap_ordinals() {
+        let dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(dir.path());
+        seed_connection(&stores);
+        let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, up_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(
+            fresh_state(),
+            ev_rx,
+            up_tx,
+            stores,
+            test_clock(),
+            noop_api(),
+        );
+
+        ev_tx
+            .send(parse_response(
+                "response.output_item.done",
+                r#"{"item":{"id":"item_a","type":"message","role":"assistant","content":[{"type":"output_text","text":"a"}]}}"#,
+            ))
+            .unwrap();
+        ev_tx
+            .send(parse_response(
+                "response.output_item.done",
+                r#"{"item":{"id":"item_b","type":"message","role":"assistant","content":[{"type":"output_text","text":"b"}]}}"#,
+            ))
+            .unwrap();
+        while let Ok(u) = up_rx.recv_blocking() {
+            if matches!(
+                u,
+                StreamUpdate::TranscriptAdvanced {
+                    committed_ordinal: 1
+                }
+            ) {
+                break;
+            }
+        }
+
+        let reopened = SqliteTranscriptStore::open(
+            &dir.path().join("conv_1.db"),
+            &ConnectionId::new("conn_1"),
+            &SessionId::new("conv_1"),
+        )
+        .unwrap();
+        assert_eq!(reopened.load_items().unwrap().rows.len(), 2);
+
+        ev_tx
+            .send(parse_response(
+                "response.output_item.done",
+                r#"{"item":{"id":"item_a","type":"message","role":"assistant","content":[{"type":"output_text","text":"a-refire"}]}}"#,
+            ))
+            .unwrap();
+        let mut saw_watermark_on_refire = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        while std::time::Instant::now() < deadline {
+            match up_rx.try_recv() {
+                Ok(StreamUpdate::TranscriptAdvanced { .. }) => {
+                    saw_watermark_on_refire = true;
+                }
+                Ok(_) => {}
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        }
+        assert!(
+            !saw_watermark_on_refire,
+            "re-fire of an already-persisted id must not emit TranscriptAdvanced"
+        );
+
+        ev_tx
+            .send(parse_response(
+                "response.output_item.done",
+                r#"{"item":{"id":"item_c","type":"message","role":"assistant","content":[{"type":"output_text","text":"c"}]}}"#,
+            ))
+            .unwrap();
+        while let Ok(u) = up_rx.recv_blocking() {
+            if matches!(
+                u,
+                StreamUpdate::TranscriptAdvanced {
+                    committed_ordinal: 2
+                }
+            ) {
+                break;
+            }
+        }
+
+        let rows = reopened.load_items().unwrap().rows;
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].id.as_str(), "item_a");
+        assert_eq!(rows[1].id.as_str(), "item_b");
+        assert_eq!(rows[2].id.as_str(), "item_c");
+        match &rows[0].kind {
+            ItemKind::Message { content, .. } => {
+                assert_eq!(content[0].text.as_deref(), Some("a-refire"));
+            }
+            other => panic!("{other:?}"),
+        }
 
         handle.stop_and_join();
     }
