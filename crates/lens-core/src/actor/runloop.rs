@@ -3489,18 +3489,24 @@ mod tests {
         seed_connection(&stores);
         seed_message_item(&*stores.transcript, 0, "item_0", "item_0");
 
-        let page1 = item_list_from_messages(&["item_1"], true);
-        let page2 = item_list_from_messages(&["item_2"], false);
+        // Spawn: empty. Outer catch-up: empty (no history). Nested catch-up: [item_1, item_2].
+        // Fetch #2 uses has_more=true so the loop drains channel events queued during the gate
+        // before the outer catch-up exits; fetch #3 is the outer's terminal empty page.
+        let history_page = item_list_from_messages(&["item_1", "item_2"], false);
         let (api, fetch_done_rx, release_fetch2) = GateFetchMock::with_script(
-            VecDeque::from([Ok(empty_item_list()), Ok(page1), Ok(page2)]),
-            2, // block 2nd fetch (first catch-up page) until live events are queued
+            VecDeque::from([
+                Ok(empty_item_list()),
+                Ok(item_list_from_messages(&[], true)),
+                Ok(empty_item_list()),
+                Ok(history_page),
+            ]),
+            2, // block outer catch-up on fetch #2 until buffered slice is queued
         );
 
         let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
         let (up_tx, up_rx) = async_channel::bounded(64);
         let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
 
-        // Reconnected only — live tail arrives while catch-up is blocked in fetch_items.
         assert_eq!(
             fetch_done_rx
                 .recv_timeout(std::time::Duration::from_secs(5))
@@ -3515,9 +3521,9 @@ mod tests {
         assert_eq!(
             fetch_done_rx
                 .recv_timeout(std::time::Duration::from_secs(5))
-                .expect("catch-up must enter blocked fetch"),
+                .expect("outer catch-up must enter blocked fetch"),
             2,
-            "first catch-up page blocks on fetch #2"
+            "outer catch-up blocks on fetch #2"
         );
 
         ev_tx
@@ -3555,7 +3561,7 @@ mod tests {
         assert_eq!(
             ids,
             vec!["item_0", "item_1", "item_2", "item_3"],
-            "nested buffered replay must commit history before the live tail"
+            "nested catch-up must write history before the deferred live tail commits"
         );
     }
 }
