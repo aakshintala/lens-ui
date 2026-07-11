@@ -118,6 +118,18 @@ impl SessionState {
             last_focused_at: 0,
         }
     }
+
+    /// True while the session has in-flight work that must NOT be interrupted by an
+    /// auto-sleep (§2.3 D21). Pure; the actor ANDs this with transport liveness.
+    pub fn transient_work_outstanding(&self) -> bool {
+        use crate::domain::scalars::SessionStatusValue::*;
+        self.stream.open_message.is_some()
+            || self.stream.open_reasoning.is_some()
+            || !self.stream.unpaired_calls.is_empty()
+            || !self.pending_user.is_empty()
+            || !self.pending_elicitations.is_empty()
+            || matches!(self.status, Running | Launching | Waiting)
+    }
 }
 
 #[cfg(test)]
@@ -146,6 +158,37 @@ mod tests {
         );
         let back: SessionState = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back, s);
+    }
+
+    #[test]
+    fn transient_work_outstanding_flags() {
+        let mut s = SessionState::new(
+            ConnectionId::new("c"),
+            SessionId::new("conv"),
+            AgentId::new("ag"),
+        );
+        assert!(
+            !s.transient_work_outstanding(),
+            "fresh idle session is quiet"
+        );
+
+        s.status = crate::domain::scalars::SessionStatusValue::Running;
+        assert!(s.transient_work_outstanding(), "running = work");
+        s.status = crate::domain::scalars::SessionStatusValue::Idle;
+
+        s.stream.open_reasoning = Some(Default::default());
+        assert!(s.transient_work_outstanding(), "open reasoning = work");
+        s.stream.open_reasoning = None;
+
+        s.pending_user
+            .push(crate::domain::controls::PendingUserMessage {
+                pending_id: "lens_pend_1".into(),
+                server_pending_id: None,
+                store_item_id: None,
+                content: "x".into(),
+                created_at: 0,
+            });
+        assert!(s.transient_work_outstanding(), "unacked send = work");
     }
 
     #[test]

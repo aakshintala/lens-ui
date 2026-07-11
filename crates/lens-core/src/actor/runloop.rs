@@ -138,6 +138,18 @@ pub fn spawn_actor_dual(
     }
 }
 
+/// §2.3 D21: quiescent ⇔ no transient work ∧ transport live ∧ not mid-reconcile.
+#[allow(dead_code)] // consumed by Task 6 sleep gate
+fn is_quiesced(
+    state: &SessionState,
+    transport: &ActorTransport,
+    reconcile_in_flight: bool,
+) -> bool {
+    !state.transient_work_outstanding()
+        && matches!(transport, ActorTransport::Connected)
+        && !reconcile_in_flight
+}
+
 #[allow(unused_assignments)] // actor-owned transport/reconcile_in_flight persist for P3-3 quiescence gate
 fn run(
     mut state: SessionState,
@@ -2353,5 +2365,30 @@ mod tests {
         // Optimistic + stamp emits complete before join returns.
         let _ = expect_pending_user_changed(&up_rx);
         let _ = expect_pending_user_changed(&up_rx);
+    }
+
+    #[test]
+    fn is_quiesced_requires_quiet_connected_and_settled() {
+        use crate::domain::scalars::SessionStatusValue;
+
+        let s = fresh_state(); // idle
+        assert!(is_quiesced(&s, &ActorTransport::Connected, false));
+        assert!(
+            !is_quiesced(&s, &ActorTransport::Connected, true),
+            "mid-reconcile"
+        );
+        assert!(
+            !is_quiesced(
+                &s,
+                &ActorTransport::Parked {
+                    reason: ParkReason::Unauthorized
+                },
+                false
+            ),
+            "parked is not quiesced"
+        );
+        let mut busy = fresh_state();
+        busy.status = SessionStatusValue::Running;
+        assert!(!is_quiesced(&busy, &ActorTransport::Connected, false));
     }
 }
