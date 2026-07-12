@@ -107,11 +107,18 @@ impl FleetScheduler {
     }
 
     /// Atomic park bookkeeping: reap the exited handle and record the park reason (R2-5).
+    /// No-op when a live actor is already registered (stale `Parked` after early reconnect).
     pub fn mark_parked(&mut self, session_id: &SessionId, reason: ParkReason) {
         if let Some(handle) = self.registry.remove(session_id) {
-            handle.join_exited();
+            if handle.is_exited() {
+                handle.join_exited();
+                self.parked.insert(session_id.clone(), reason);
+            } else {
+                self.registry.insert(session_id.clone(), handle);
+            }
+        } else {
+            self.parked.insert(session_id.clone(), reason);
         }
-        self.parked.insert(session_id.clone(), reason);
     }
 
     pub fn park_reason(&self, id: &SessionId) -> Option<ParkReason> {
@@ -582,6 +589,13 @@ mod tests {
             ActorOutcome::Parked { reason } => reason,
             other => panic!("expected Parked, got {other:?}"),
         };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if scheduler.handle(&sid).is_some_and(|h| h.is_exited()) {
+                break;
+            }
+            std::thread::yield_now();
+        }
         scheduler.mark_parked(&sid, parked_reason);
         assert_eq!(
             scheduler.park_reason(&sid),
@@ -680,6 +694,70 @@ mod tests {
         assert!(
             scheduler.park_reason(&sid).is_none(),
             "reconnect clears stale park bookkeeping"
+        );
+
+        scheduler.take_handle(&sid).unwrap().stop_and_join();
+    }
+
+    #[test]
+    fn stale_mark_parked_after_early_reconnect_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(dir.path());
+        seed_connection(&stores);
+        seed_active_session(&stores);
+
+        let conn = ConnectionId::new("conn_1");
+        let sid = SessionId::new("conv_1");
+
+        let (api, _mock) =
+            MockApi::with_status(VecDeque::new(), VecDeque::from([Ok(empty_item_list())]));
+
+        let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, _up_rx) = async_channel::bounded(64);
+        let mut scheduler = FleetScheduler::new();
+        scheduler
+            .wake(&conn, &sid, ev_rx, up_tx.clone(), stores, test_clock(), api)
+            .expect("wake");
+
+        ev_tx
+            .send(ServerStreamEvent::Disconnected {
+                reason: DisconnectReason::Unauthorized,
+            })
+            .unwrap();
+
+        // Parked outcome left undrained — simulate caller queue lag.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if scheduler.handle(&sid).is_some_and(|h| h.is_exited()) {
+                break;
+            }
+            std::thread::yield_now();
+        }
+
+        let stores2 = test_stores(dir.path());
+        let (api2, _mock2) = MockApi::with_status(
+            VecDeque::from([Ok(SessionStatus::Idle)]),
+            VecDeque::from([Ok(empty_item_list())]),
+        );
+        let (_ev_tx2, ev_rx2) = crossbeam_channel::bounded(64);
+        scheduler
+            .reconnect(&conn, &sid, ev_rx2, up_tx, stores2, test_clock(), api2)
+            .expect("early reconnect respawns live actor");
+
+        // Stale drain contract: late mark_parked must not wedge or re-stamp.
+        scheduler.mark_parked(&sid, ParkReason::Unauthorized);
+
+        assert!(
+            scheduler.is_running(&sid),
+            "live respawned actor must survive stale mark_parked"
+        );
+        assert!(
+            scheduler.park_reason(&sid).is_none(),
+            "stale mark_parked must not stamp park reason on live session"
+        );
+        assert!(
+            !scheduler.handle(&sid).unwrap().is_exited(),
+            "live actor thread must still be running"
         );
 
         scheduler.take_handle(&sid).unwrap().stop_and_join();
