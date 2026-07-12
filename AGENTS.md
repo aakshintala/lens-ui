@@ -26,6 +26,11 @@ Claude reads `CLAUDE.md` in addition.
 - **MANDATORY** Ground-truth discipline — cite the pinned contract, never trust memory. → `.agents/principles.md`
 - **MANDATORY** Introspectable at every layer — gated, on-demand state snapshots + event stream; zero-cost when off. → `.agents/principles.md`
 - **MANDATORY** `clippy` clean + `rustfmt`; `unsafe` needs a `// SAFETY:` note.
+  The clippy gate is **workspace-wide** — `cargo clippy --workspace --all-targets
+  -- -D warnings` — because per-crate green can hide workspace-red (e.g. throwaway
+  `spikes/`). It MUST be clean before any push / end-of-session; **and if it is red
+  when you pick up a task, resolve that first, before starting execution** — never
+  build on a red gate.
 
 ## Index
 
