@@ -2,7 +2,7 @@
 //! persist write-through, coalesce, emit to the foreground bridge.
 
 use crate::actor::api::{CommandOutcome, SessionApi};
-use crate::actor::outcome::{ActorOutcome, OutcomeRing, map_client_error};
+use crate::actor::outcome::{ActorOutcome, Mapped, OutcomeRing, map_client_error};
 use crate::actor::summary::SummaryUpdate;
 use crate::actor::transport::{ActorTransport, ParkReason};
 use crate::clock::Clock;
@@ -439,6 +439,12 @@ fn handle_command(
             };
             match api.send_event(&state.id, &evt) {
                 Ok(ack) if ack.denied => {
+                    let content = state
+                        .pending_user
+                        .iter()
+                        .find(|p| p.pending_id == lens_pending_id)
+                        .map(|p| p.content.clone())
+                        .unwrap_or_default();
                     rollback_pending(state, &lens_pending_id);
                     if !emit_pending_user(output, state) {
                         return LoopControl::Break;
@@ -446,6 +452,7 @@ fn handle_command(
                     let _ = output.outcomes.send_blocking(ActorOutcome::Command(
                         CommandOutcome::SendDenied {
                             lens_pending_id,
+                            content,
                             reason: ack.reason,
                         },
                     ));
@@ -471,27 +478,40 @@ fn handle_command(
                 }
                 Err(e) => {
                     let m = map_client_error(&e);
-                    // Table B (§13.1) rollback: NetworkTransient, LostAccess,
-                    // Tombstone, Denied — send definitively won't land.
-                    // Hold bubble: ReAuth (401), ServerTransient (5xx),
-                    // WrongVersion, DecodeDrift — reached server or reconcile pending.
-                    // TODO(§9/P3-3): command-path LostAccess (Auth403) / Tombstone
-                    // (NotFound) should escalate to registry removal / tombstone per
-                    // design §13.1 Table B. Deferred — the stream's own terminal
-                    // Disconnected(Forbidden/NotFound) drives Table A stop today;
-                    // the command path only rolls back + SendFailed for now.
+                    let content = state
+                        .pending_user
+                        .iter()
+                        .find(|p| p.pending_id == lens_pending_id)
+                        .map(|p| p.content.clone())
+                        .unwrap_or_default();
                     if m.rolls_back_send() {
                         rollback_pending(state, &lens_pending_id);
                         if !emit_pending_user(output, state) {
                             return LoopControl::Break;
                         }
+                        // Denied (Auth403) vs Failed (Network/404/other-4xx): both remove the bubble
+                        // and restore to composer; Denied carries the server reason.
+                        let outcome = match m {
+                            Mapped::LostAccess | Mapped::Denied => CommandOutcome::SendDenied {
+                                lens_pending_id,
+                                content,
+                                reason: Some(e.to_string()),
+                            },
+                            _ => CommandOutcome::SendFailed {
+                                lens_pending_id,
+                                content,
+                                error: e.to_string(),
+                            },
+                        };
+                        let _ = output
+                            .outcomes
+                            .send_blocking(ActorOutcome::Command(outcome));
+                    } else {
+                        // Held (5xx/401/ContractMismatch/Parse): bubble stays, soft pending, no content.
+                        let _ = output.outcomes.send_blocking(ActorOutcome::Command(
+                            CommandOutcome::SendPending { lens_pending_id },
+                        ));
                     }
-                    let _ = output.outcomes.send_blocking(ActorOutcome::Command(
-                        CommandOutcome::SendFailed {
-                            lens_pending_id,
-                            error: e.to_string(),
-                        },
-                    ));
                 }
             }
             LoopControl::Continue
@@ -2180,9 +2200,12 @@ mod tests {
 
         match handle.outcomes.recv_blocking().unwrap() {
             ActorOutcome::Command(CommandOutcome::SendFailed {
-                lens_pending_id, ..
+                lens_pending_id,
+                content,
+                ..
             }) => {
                 assert_eq!(lens_pending_id, "lens_pend_1");
+                assert_eq!(content, "hello");
             }
             other => panic!("expected SendFailed, got {other:?}"),
         }
@@ -2220,12 +2243,10 @@ mod tests {
         assert!(up_rx.try_recv().is_err());
 
         match handle.outcomes.recv_blocking().unwrap() {
-            ActorOutcome::Command(CommandOutcome::SendFailed {
-                lens_pending_id, ..
-            }) => {
+            ActorOutcome::Command(CommandOutcome::SendPending { lens_pending_id }) => {
                 assert_eq!(lens_pending_id, "lens_pend_1");
             }
-            other => panic!("expected SendFailed, got {other:?}"),
+            other => panic!("expected SendPending, got {other:?}"),
         }
 
         handle.stop_and_join();
@@ -2261,8 +2282,8 @@ mod tests {
         );
 
         match handle.outcomes.recv_blocking().unwrap() {
-            ActorOutcome::Command(CommandOutcome::SendFailed { .. }) => {}
-            other => panic!("expected SendFailed, got {other:?}"),
+            ActorOutcome::Command(CommandOutcome::SendPending { .. }) => {}
+            other => panic!("expected SendPending, got {other:?}"),
         }
 
         handle.stop_and_join();
@@ -2295,8 +2316,8 @@ mod tests {
         assert!(rolled_back.is_empty());
 
         match handle.outcomes.recv_blocking().unwrap() {
-            ActorOutcome::Command(CommandOutcome::SendFailed { .. }) => {}
-            other => panic!("expected SendFailed, got {other:?}"),
+            ActorOutcome::Command(CommandOutcome::SendDenied { .. }) => {}
+            other => panic!("expected SendDenied, got {other:?}"),
         }
 
         handle.stop_and_join();
@@ -2366,10 +2387,116 @@ mod tests {
         match handle.outcomes.recv_blocking().unwrap() {
             ActorOutcome::Command(CommandOutcome::SendDenied {
                 lens_pending_id,
+                content,
                 reason,
             }) => {
                 assert_eq!(lens_pending_id, "lens_pend_1");
+                assert_eq!(content, "blocked");
                 assert_eq!(reason.as_deref(), Some("policy"));
+            }
+            other => panic!("expected SendDenied, got {other:?}"),
+        }
+
+        handle.stop_and_join();
+    }
+
+    #[test]
+    fn send_fate_network_error_carries_content_and_clears_bubble() {
+        let _dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(_dir.path());
+        seed_connection(&stores);
+
+        let (api, _mock) = MockApi::fail(ClientError::network_for_test());
+        let (_ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, up_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+
+        handle
+            .commands
+            .send(SessionCommand::Send {
+                text: "typed text".into(),
+                model_override: None,
+            })
+            .unwrap();
+
+        let _ = expect_pending_user_changed(&up_rx);
+        assert!(expect_pending_user_changed(&up_rx).is_empty());
+
+        match handle.outcomes.recv_blocking().unwrap() {
+            ActorOutcome::Command(CommandOutcome::SendFailed { content, .. }) => {
+                assert_eq!(content, "typed text");
+            }
+            other => panic!("expected SendFailed, got {other:?}"),
+        }
+
+        handle.stop_and_join();
+    }
+
+    #[test]
+    fn send_fate_server503_emits_pending_and_retains_bubble() {
+        let _dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(_dir.path());
+        seed_connection(&stores);
+
+        let (api, _mock) = MockApi::fail(ClientError::Server {
+            status: 503,
+            body: serde_json::json!({}),
+        });
+        let (_ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, up_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+
+        handle
+            .commands
+            .send(SessionCommand::Send {
+                text: "held".into(),
+                model_override: None,
+            })
+            .unwrap();
+
+        let optimistic = expect_pending_user_changed(&up_rx);
+        assert_eq!(optimistic.len(), 1);
+        assert_eq!(optimistic[0].content, "held");
+        assert!(
+            up_rx.try_recv().is_err(),
+            "503 retains bubble — no rollback emit"
+        );
+
+        match handle.outcomes.recv_blocking().unwrap() {
+            ActorOutcome::Command(CommandOutcome::SendPending { lens_pending_id }) => {
+                assert_eq!(lens_pending_id, "lens_pend_1");
+            }
+            other => panic!("expected SendPending, got {other:?}"),
+        }
+
+        handle.stop_and_join();
+    }
+
+    #[test]
+    fn send_fate_auth403_emits_denied_with_content() {
+        let _dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(_dir.path());
+        seed_connection(&stores);
+
+        let (api, _mock) = MockApi::fail(ClientError::Auth { status: 403 });
+        let (_ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, up_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+
+        handle
+            .commands
+            .send(SessionCommand::Send {
+                text: "forbidden".into(),
+                model_override: None,
+            })
+            .unwrap();
+
+        let _ = expect_pending_user_changed(&up_rx);
+        assert!(expect_pending_user_changed(&up_rx).is_empty());
+
+        match handle.outcomes.recv_blocking().unwrap() {
+            ActorOutcome::Command(CommandOutcome::SendDenied { content, .. }) => {
+                assert_eq!(content, "forbidden");
             }
             other => panic!("expected SendDenied, got {other:?}"),
         }

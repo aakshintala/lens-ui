@@ -53,6 +53,10 @@ impl SessionApi for ClientSessionApi {
 }
 
 /// Command-branch outcomes surfaced to the foreground (Task 8 deepens Table B mapping).
+///
+/// A send outcome carries `content` **iff it removes the bubble**. Fail/Denied/Lost
+/// restore-to-composer → carry content; Pending keeps the bubble (the bubble is the
+/// home of the text) → no content.
 #[derive(Clone, Debug)]
 pub enum CommandOutcome {
     SendAccepted {
@@ -61,12 +65,14 @@ pub enum CommandOutcome {
     },
     SendDenied {
         lens_pending_id: String,
+        content: String,
         reason: Option<String>,
     },
     SendFailed {
         lens_pending_id: String,
+        content: String,
         error: String,
     },
-    /// Actor is parked (Unauthorized/SessionFailed/RetriesExhausted) — no bubble inserted.
-    SendRejected { reason: String },
+    /// Held/maybe-landed: bubble stays, soft pending — no content (text lives in the bubble).
+    SendPending { lens_pending_id: String },
 }
