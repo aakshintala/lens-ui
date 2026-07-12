@@ -12,6 +12,8 @@ pub mod update;
 #[cfg(test)]
 pub(crate) mod testutil;
 
+pub(crate) use reconcile::user_text;
+pub use reconcile::{LostSend, reconcile_held_landed};
 pub use update::{StreamUpdate, Updates};
 
 /// Wire `stream::Item` → domain `(ItemId, ItemKind)` for catch-up persist (D19).

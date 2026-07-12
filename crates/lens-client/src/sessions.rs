@@ -72,14 +72,15 @@ fn hoist_embedded_item_payload(v: Value) -> Value {
 }
 
 /// One un-consumed native web-composer message from a snapshot's `pending_inputs`.
-/// Only `pending_id` is modeled: it is the sole field reconcile keys on (D16
-/// Signal B keeps a bubble iff its server_pending_id is in this list). The wire
-/// `content` field is `additionalProperties:true` (untyped; see generated.rs
-/// ~L8084) and has no consumer — serde ignores it. Add it (shape-tolerant) only
-/// when a consumer needs it.
+/// `pending_id` is the id reconcile keys on (D16 Signal B keeps a stamped bubble
+/// iff its `server_pending_id` is still listed). `content` is shape-tolerant
+/// (`Option`, `#[serde(default)]`) — the wire field is `additionalProperties:true`
+/// (generated.rs ~L8084) and is consumed by D28 held-bubble path-1 stamping.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct PendingInput {
     pub pending_id: String,
+    #[serde(default)]
+    pub content: Option<String>,
 }
 
 /// A session snapshot (`GET /v1/sessions/{id}`). Mirrors the CORE fields of
@@ -2045,6 +2046,15 @@ mod tests {
         let s: SessionSnapshot = serde_json::from_str(raw).unwrap();
         assert_eq!(s.pending_inputs().len(), 1);
         assert_eq!(s.pending_inputs()[0].pending_id, "pending_a1");
+        assert_eq!(s.pending_inputs()[0].content.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn pending_input_content_absent_deserializes_none() {
+        let raw = r#"{"pending_id":"p1"}"#;
+        let p: PendingInput = serde_json::from_str(raw).unwrap();
+        assert_eq!(p.pending_id, "p1");
+        assert!(p.content.is_none());
     }
 
     #[test]

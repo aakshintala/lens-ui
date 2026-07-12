@@ -9,14 +9,15 @@ use crate::clock::Clock;
 use crate::domain::SessionState;
 use crate::domain::controls::PendingUserMessage;
 use crate::domain::item::{BlockContext, Item, ItemKind};
-use crate::domain::scalars::{Role, SessionLifecycle};
+use crate::domain::scalars::SessionLifecycle;
 use crate::persist::map::item_kind_token;
 use crate::persist::{ControlStore, LiveKey, ReconcileOutcome, TranscriptStore};
 use crate::reduce::map_wire_item;
+use crate::reduce::user_text;
 use crate::reduce::{StreamUpdate, Updates, reduce};
 use crossbeam_channel::{Receiver, Select};
-use lens_client::sessions::ItemsPage;
 use lens_client::sessions::SessionEventInput;
+use lens_client::sessions::{ItemsPage, PendingInput};
 use lens_client::stream::DisconnectReason;
 use lens_client::stream::Item as WireItem;
 use lens_client::stream::ServerStreamEvent;
@@ -109,6 +110,7 @@ struct RunCtx<'a> {
     reconcile_in_flight: &'a mut bool,
     send_seq: &'a mut u64,
     catchup_accum: &'a mut Vec<(String, i64)>,
+    snapshot_pending_inputs: &'a mut Vec<PendingInput>,
 }
 
 /// Spawn the actor thread in `Detailed` mode (Task 5 API). Summary channel is
@@ -258,20 +260,34 @@ fn live_key_for_store_item(item: &Item) -> LiveKey {
 }
 
 fn user_message_text(item: &Item) -> Option<String> {
-    match &item.kind {
-        ItemKind::Message {
-            role: Role::User,
-            content,
-        } => {
-            let text: String = content
-                .iter()
-                .filter(|b| b.kind == "input_text" || b.kind == "output_text")
-                .filter_map(|b| b.text.as_deref())
-                .collect();
-            if text.is_empty() { None } else { Some(text) }
+    user_text(item)
+}
+
+fn apply_held_reconcile(ctx: &mut RunCtx<'_>) -> LoopControl {
+    let before = ctx.state.pending_user.clone();
+    let lost = crate::reduce::reconcile_held_landed(
+        &mut ctx.state.pending_user,
+        ctx.snapshot_pending_inputs,
+        ctx.catchup_accum,
+    );
+    for l in &lost {
+        if ctx
+            .output
+            .outcomes
+            .send_blocking(ActorOutcome::SendLost {
+                lens_pending_id: l.lens_pending_id.clone(),
+                content: l.content.clone(),
+            })
+            .is_err()
+        {
+            return LoopControl::Break;
         }
-        _ => None,
     }
+    if ctx.state.pending_user != before && !emit_pending_user(ctx.output, ctx.state) {
+        return LoopControl::Break;
+    }
+    drain_outcome_ring(ctx.ring, &ctx.output.outcomes);
+    LoopControl::Continue
 }
 
 /// Catch-up upsert: advance `next_ordinal` only on a fresh insert at the passed ordinal.
@@ -647,11 +663,18 @@ fn apply_reduced_batch(
         .iter()
         .any(|u| matches!(u, StreamUpdate::Reconnecting { .. }));
     let saw_reconnected = batch.iter().any(|u| matches!(u, StreamUpdate::Reconnected));
+    if let Some(inputs) = batch.iter().rev().find_map(|u| match u {
+        StreamUpdate::SnapshotRestored(inputs) => Some(inputs.clone()),
+        _ => None,
+    }) {
+        ctx.snapshot_pending_inputs.clear();
+        ctx.snapshot_pending_inputs.extend(inputs);
+    }
     match ctx.output.mode {
         OutputMode::Detailed => {
             let had_snapshot = batch
                 .iter()
-                .any(|u| matches!(u, StreamUpdate::SnapshotRestored));
+                .any(|u| matches!(u, StreamUpdate::SnapshotRestored(_)));
             for u in coalesce(batch) {
                 if ctx.output.updates.send_blocking(u).is_err() {
                     return (LoopControl::Break, false);
@@ -728,7 +751,7 @@ fn finish_reconnected_catchup(
     if !needs_catchup {
         return LoopControl::Continue;
     }
-    if invoke_catchup_and_replay(ctx, emit_transport) == LoopControl::Break {
+    if invoke_catchup_and_replay(ctx, emit_transport, true) == LoopControl::Break {
         return LoopControl::Break;
     }
     if defer_transcript_commit {
@@ -798,7 +821,11 @@ fn process_main_loop_event(ctx: &mut RunCtx<'_>, event: ServerStreamEvent) -> Lo
     finish_reconnected_catchup(ctx, needs_catchup, defer_transcript_commit, true)
 }
 
-fn invoke_catchup_and_replay(ctx: &mut RunCtx<'_>, emit_transport: bool) -> LoopControl {
+fn invoke_catchup_and_replay(
+    ctx: &mut RunCtx<'_>,
+    emit_transport: bool,
+    held_reconcile: bool,
+) -> LoopControl {
     ctx.catchup_accum.clear();
     let mut frame_stack: Vec<CatchupFrame> = Vec::new();
     let mut current_emit_transport = emit_transport;
@@ -915,6 +942,9 @@ fn invoke_catchup_and_replay(ctx: &mut RunCtx<'_>, emit_transport: bool) -> Loop
             }
         }
     }
+    if held_reconcile && apply_held_reconcile(ctx) == LoopControl::Break {
+        return LoopControl::Break;
+    }
     LoopControl::Continue
 }
 
@@ -956,6 +986,7 @@ fn run(
     let mut transport = ActorTransport::Connected;
     let mut reconcile_in_flight = false;
     let mut catchup_accum = Vec::new();
+    let mut snapshot_pending_inputs = Vec::new();
     let mut ctx = RunCtx {
         api: api.as_ref(),
         stores: &stores,
@@ -970,9 +1001,10 @@ fn run(
         reconcile_in_flight: &mut reconcile_in_flight,
         send_seq: &mut send_seq,
         catchup_accum: &mut catchup_accum,
+        snapshot_pending_inputs: &mut snapshot_pending_inputs,
     };
 
-    if invoke_catchup_and_replay(&mut ctx, false) == LoopControl::Break {
+    if invoke_catchup_and_replay(&mut ctx, false, false) == LoopControl::Break {
         // pre-loop spawn catch-up: no TransportChanged — Sleep cannot race yet
         return;
     }
@@ -1289,6 +1321,20 @@ mod tests {
         match up_rx.recv_blocking().unwrap() {
             StreamUpdate::PendingUserChanged(v) => v,
             other => panic!("expected PendingUserChanged, got {other:?}"),
+        }
+    }
+
+    fn recv_pending_user_changed_or_none(
+        up_rx: &async_channel::Receiver<StreamUpdate>,
+    ) -> Option<Vec<PendingUserMessage>> {
+        loop {
+            match up_rx.recv_blocking().unwrap() {
+                StreamUpdate::PendingUserChanged(v) => return Some(v),
+                StreamUpdate::Reconnected | StreamUpdate::TranscriptAdvanced { .. } => {}
+                other => {
+                    panic!("unexpected update while waiting for PendingUserChanged: {other:?}")
+                }
+            }
         }
     }
 
@@ -2036,7 +2082,7 @@ mod tests {
         let mut saw_rebased = false;
         while let Ok(u) = up_rx.recv_blocking() {
             match &u {
-                StreamUpdate::SnapshotRestored => saw_snapshot = true,
+                StreamUpdate::SnapshotRestored(_) => saw_snapshot = true,
                 StreamUpdate::Rebased(baseline) => {
                     saw_rebased = true;
                     assert_eq!(baseline.title.as_deref(), Some("snapshot title"));
@@ -3687,6 +3733,159 @@ mod tests {
             "has_more": has_more,
         }))
         .expect("item list fixture")
+    }
+
+    fn item_list_from_user_messages(entries: &[(&str, &str)], has_more: bool) -> ItemList {
+        let data: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|(id, text)| {
+                serde_json::json!({
+                    "id": id,
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": text}]
+                })
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "data": data,
+            "has_more": has_more,
+        }))
+        .expect("user item list fixture")
+    }
+
+    fn seed_user_message_item(
+        transcript: &dyn TranscriptStore,
+        ordinal: i64,
+        id: &str,
+        text: &str,
+    ) {
+        let item = Item {
+            id: ItemId::new(id),
+            seq: None,
+            ctx: BlockContext {
+                agent: None,
+                depth: 0,
+                turn: 0,
+            },
+            created_at: 1_700_000_000_000,
+            kind: ItemKind::Message {
+                role: Role::User,
+                content: vec![ContentBlock {
+                    kind: "input_text".into(),
+                    text: Some(text.into()),
+                    data: serde_json::Value::Null,
+                }],
+            },
+        };
+        transcript.upsert_item(ordinal, &item, false).unwrap();
+    }
+
+    fn mock_fail_with_fetch(
+        err: ClientError,
+        fetch_script: VecDeque<Result<ItemList, ClientError>>,
+    ) -> (Box<dyn SessionApi + Send>, Arc<MockApi>) {
+        let mock = Arc::new(MockApi {
+            send_script: Mutex::new(VecDeque::from([Err(err)])),
+            fetch_script: Mutex::new(fetch_script),
+            status_script: Mutex::new(VecDeque::new()),
+            last_evt: Mutex::new(None),
+        });
+        (Box::new(Arc::clone(&mock)), mock)
+    }
+
+    fn expect_send_lost(handle: &ActorHandle, content: &str) {
+        loop {
+            match handle.outcomes.recv_blocking().unwrap() {
+                ActorOutcome::SendLost { content: c, .. } => {
+                    assert_eq!(c, content);
+                    return;
+                }
+                ActorOutcome::TransportChanged { .. } => {}
+                other => panic!("expected SendLost, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn held_reconnect_no_inputs_no_delta_emits_send_lost() {
+        let _dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(_dir.path());
+        seed_connection(&stores);
+
+        let (api, _mock) = mock_fail_with_fetch(
+            ClientError::Server {
+                status: 503,
+                body: serde_json::json!({}),
+            },
+            VecDeque::from([Ok(empty_item_list()), Ok(empty_item_list())]),
+        );
+
+        let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, up_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+
+        handle
+            .commands
+            .send(SessionCommand::Send {
+                text: "gone".into(),
+                model_override: None,
+            })
+            .unwrap();
+        let held = expect_pending_user_changed(&up_rx);
+        assert_eq!(held.len(), 1);
+        assert!(held[0].server_pending_id.is_none());
+        let _ = handle.outcomes.recv_blocking();
+
+        ev_tx
+            .send(ServerStreamEvent::Reconnected { gap: None })
+            .unwrap();
+
+        expect_send_lost(&handle, "gone");
+        let cleared = recv_pending_user_changed_or_none(&up_rx).expect("cleared pending_user");
+        assert!(cleared.is_empty());
+        handle.stop_and_join();
+    }
+
+    #[test]
+    fn held_reconnect_folded_same_content_still_send_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(dir.path());
+        seed_connection(&stores);
+        seed_user_message_item(&*stores.transcript, 0, "item_0", "lost send");
+
+        let folded_page = item_list_from_user_messages(&[("item_0", "lost send")], false);
+        let (api, _mock) = mock_fail_with_fetch(
+            ClientError::Server {
+                status: 503,
+                body: serde_json::json!({}),
+            },
+            VecDeque::from([Ok(empty_item_list()), Ok(folded_page)]),
+        );
+
+        let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, up_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+
+        handle
+            .commands
+            .send(SessionCommand::Send {
+                text: "lost send".into(),
+                model_override: None,
+            })
+            .unwrap();
+        let held = expect_pending_user_changed(&up_rx);
+        assert_eq!(held.len(), 1);
+        let _ = handle.outcomes.recv_blocking();
+
+        ev_tx
+            .send(ServerStreamEvent::Reconnected { gap: None })
+            .unwrap();
+
+        expect_send_lost(&handle, "lost send");
+        let cleared = recv_pending_user_changed_or_none(&up_rx).expect("cleared pending_user");
+        assert!(cleared.is_empty());
+        handle.stop_and_join();
     }
 
     #[test]

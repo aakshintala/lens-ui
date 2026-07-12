@@ -45,7 +45,7 @@ pub fn apply(state: &mut SessionState, update: StreamUpdate) {
         // markers with no replica-visible payload in P3-1
         ChildSessionChanged
         | ResourcesChanged
-        | SnapshotRestored
+        | SnapshotRestored(_)
         | Reconnecting { .. }
         | Reconnected
         | TranscriptAdvanced { .. } => {}

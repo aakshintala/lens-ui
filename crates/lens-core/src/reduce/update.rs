@@ -6,6 +6,7 @@ use crate::domain::item::StreamScratch;
 use crate::domain::scalars::{ErrorInfo, SessionStatusValue};
 use crate::domain::session::SessionState;
 use crate::domain::usage::{Cost, PresenceViewer};
+use lens_client::sessions::PendingInput;
 use smallvec::SmallVec;
 use std::sync::Arc;
 
@@ -60,7 +61,8 @@ pub enum StreamUpdate {
     },
     Reconnected,
     Disconnected(lens_client::stream::DisconnectReason),
-    SnapshotRestored,
+    /// D28: snapshot `pending_inputs` plumbed for held-bubble path-1 stamping on reconnect.
+    SnapshotRestored(Vec<PendingInput>),
 
     // D9: once-at-attach full baseline
     Rebased(Box<SessionState>),

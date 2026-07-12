@@ -78,7 +78,9 @@ pub(crate) fn fold_snapshot(state: &mut SessionState, snap: &SessionSnapshot) ->
     );
     state.pending_user = pending;
 
-    let mut updates: Updates = smallvec![StreamUpdate::SnapshotRestored];
+    let mut updates: Updates = smallvec![StreamUpdate::SnapshotRestored(
+        snap.pending_inputs().to_vec(),
+    )];
     if pending_changed {
         updates.push(StreamUpdate::PendingUserChanged(state.pending_user.clone()));
     }
@@ -224,7 +226,7 @@ mod tests {
                 .iter()
                 .any(|i| matches!(i.kind, ItemKind::AgentChanged { .. }))
         );
-        assert_eq!(&u[..], &[StreamUpdate::SnapshotRestored]);
+        assert_eq!(&u[..], &[StreamUpdate::SnapshotRestored(vec![])]);
     }
 
     #[test]
@@ -265,7 +267,10 @@ mod tests {
             Some("pend_keep")
         );
         assert!(s.items.is_empty());
-        assert!(u.contains(&StreamUpdate::SnapshotRestored));
+        assert!(
+            u.iter()
+                .any(|u| matches!(u, StreamUpdate::SnapshotRestored(_)))
+        );
         assert!(u.contains(&StreamUpdate::PendingUserChanged(s.pending_user.clone())));
     }
 }

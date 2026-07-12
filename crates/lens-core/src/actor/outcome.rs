@@ -26,14 +26,7 @@ pub enum ActorOutcome {
     /// D21: sleep declined — session not quiescent; actor continues.
     SleepDeclined,
     SummaryConsumerGone,
-    /// Optimistic bubble that never persisted server-side. UX-polish, deferred.
-    /// TODO(followup, Opus#1): correct detection needs the actor to re-derive
-    /// landed-vs-lost from the snapshot's items (Task 7 removed that from the pure
-    /// reducer). A naive pending_user before/after diff FALSE-POSITIVES on LANDED
-    /// bubbles (a message that actually arrived would show "send lost"). Do NOT emit
-    /// this from a naive diff — leave the variant defined and unproduced until the
-    /// actor-side item re-derivation lands.
-    #[allow(dead_code)] // deferred until D28 held-bubble reconciler lands
+    /// Optimistic bubble confirmed lost after reconnect held reconcile (D28).
     SendLost {
         lens_pending_id: String,
         content: String,
