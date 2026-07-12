@@ -191,6 +191,18 @@ enum CatchupResult {
     Aborted,
 }
 
+/// Deferred work from an outer catch-up round while a nested `Reconnected` replays.
+struct CatchupFrame {
+    deferred_commands: Vec<SessionCommand>,
+    defer_transcript_commit: bool,
+}
+
+struct ReplayBatchResult {
+    control: LoopControl,
+    defer_transcript_commit: bool,
+    needs_catchup: bool,
+}
+
 /// Map a durable `/items` wire row to a domain `Item` for catch-up persist.
 fn wire_to_domain_item(wire: &WireItem, clock: &dyn Clock) -> Option<Item> {
     let (id, kind) = map_wire_item(wire)?;
@@ -715,24 +727,19 @@ fn finish_reconnected_catchup(
     LoopControl::Continue
 }
 
-/// Reduce a buffered event slice and run the Reconnected defer/catch-up/finish path.
+/// Reduce a buffered event slice; caller owns nested catch-up iteration (C3).
 #[allow(clippy::too_many_arguments)]
 fn replay_buffered_batch(
     buffered_events: &[ServerStreamEvent],
-    api: &dyn SessionApi,
     stores: &ActorStores,
     state: &mut SessionState,
-    events: &Receiver<ServerStreamEvent>,
-    commands: &Receiver<SessionCommand>,
     output: &mut ActorOutput,
     ring: &mut OutcomeRing,
     clock: &dyn Clock,
     next_ordinal: &mut i64,
     transport: &mut ActorTransport,
     reconcile_in_flight: &mut bool,
-    send_seq: &mut u64,
-    catchup_accum: &mut Vec<(String, i64)>,
-) -> LoopControl {
+) -> ReplayBatchResult {
     let mut batch = reduce(state, &buffered_events[0], clock);
     for ev in &buffered_events[1..] {
         batch.extend(reduce(state, ev, clock));
@@ -750,27 +757,11 @@ fn replay_buffered_batch(
         reconcile_in_flight,
         defer_transcript_commit,
     );
-    if ctrl == LoopControl::Break {
-        return LoopControl::Break;
-    }
-    finish_reconnected_catchup(
-        needs_catchup,
+    ReplayBatchResult {
+        control: ctrl,
         defer_transcript_commit,
-        api,
-        stores,
-        state,
-        events,
-        commands,
-        output,
-        ring,
-        clock,
-        next_ordinal,
-        transport,
-        reconcile_in_flight,
-        send_seq,
-        true,
-        catchup_accum,
-    )
+        needs_catchup,
+    }
 }
 
 /// Commit transcript items deferred across a Reconnected batch (live tail lands after catch-up).
@@ -871,72 +862,115 @@ fn invoke_catchup_and_replay(
     emit_transport: bool,
     catchup_accum: &mut Vec<(String, i64)>,
 ) -> LoopControl {
-    if !begin_catchup_reconcile(reconcile_in_flight, output, *transport, emit_transport) {
-        return LoopControl::Break;
+    let mut frame_stack: Vec<CatchupFrame> = Vec::new();
+    'catchup: loop {
+        if !begin_catchup_reconcile(reconcile_in_flight, output, *transport, emit_transport) {
+            return LoopControl::Break;
+        }
+        let catchup = run_catchup(
+            api,
+            stores,
+            state,
+            next_ordinal,
+            events,
+            commands,
+            output,
+            ring,
+            clock,
+        );
+        if !end_catchup_reconcile(reconcile_in_flight, output, *transport, emit_transport) {
+            return LoopControl::Break;
+        }
+        drain_outcome_ring(ring, &output.outcomes);
+        match catchup {
+            CatchupResult::Aborted => return LoopControl::Break,
+            CatchupResult::CaughtUp {
+                buffered_events,
+                deferred_commands,
+                catchup_new_user_contents,
+            } => {
+                catchup_accum.extend(catchup_new_user_contents);
+                if !buffered_events.is_empty() {
+                    let replay = replay_buffered_batch(
+                        &buffered_events,
+                        stores,
+                        state,
+                        output,
+                        ring,
+                        clock,
+                        next_ordinal,
+                        transport,
+                        reconcile_in_flight,
+                    );
+                    if replay.control == LoopControl::Break {
+                        return LoopControl::Break;
+                    }
+                    if replay.needs_catchup {
+                        frame_stack.push(CatchupFrame {
+                            deferred_commands,
+                            defer_transcript_commit: replay.defer_transcript_commit,
+                        });
+                        continue 'catchup;
+                    }
+                    if replay.defer_transcript_commit
+                        && finish_deferred_transcript_commit(
+                            stores,
+                            state,
+                            next_ordinal,
+                            ring,
+                            output,
+                        ) == LoopControl::Break
+                    {
+                        return LoopControl::Break;
+                    }
+                }
+                for cmd in deferred_commands {
+                    if handle_command(
+                        cmd,
+                        state,
+                        stores,
+                        output,
+                        ring,
+                        clock,
+                        api,
+                        transport,
+                        *reconcile_in_flight,
+                        send_seq,
+                    ) == LoopControl::Break
+                    {
+                        return LoopControl::Break;
+                    }
+                }
+                break 'catchup;
+            }
+        }
     }
-    let catchup = run_catchup(
-        api,
-        stores,
-        state,
-        next_ordinal,
-        events,
-        commands,
-        output,
-        ring,
-        clock,
-    );
-    if !end_catchup_reconcile(reconcile_in_flight, output, *transport, emit_transport) {
-        return LoopControl::Break;
-    }
-    drain_outcome_ring(ring, &output.outcomes);
-    match catchup {
-        CatchupResult::Aborted => LoopControl::Break,
-        CatchupResult::CaughtUp {
-            buffered_events,
-            deferred_commands,
-            catchup_new_user_contents,
-        } => {
-            catchup_accum.extend(catchup_new_user_contents);
-            if !buffered_events.is_empty()
-                && replay_buffered_batch(
-                    &buffered_events,
-                    api,
-                    stores,
-                    state,
-                    events,
-                    commands,
-                    output,
-                    ring,
-                    clock,
-                    next_ordinal,
-                    transport,
-                    reconcile_in_flight,
-                    send_seq,
-                    catchup_accum,
-                ) == LoopControl::Break
+    while let Some(frame) = frame_stack.pop() {
+        if frame.defer_transcript_commit
+            && finish_deferred_transcript_commit(stores, state, next_ordinal, ring, output)
+                == LoopControl::Break
+        {
+            return LoopControl::Break;
+        }
+        for cmd in frame.deferred_commands {
+            if handle_command(
+                cmd,
+                state,
+                stores,
+                output,
+                ring,
+                clock,
+                api,
+                transport,
+                *reconcile_in_flight,
+                send_seq,
+            ) == LoopControl::Break
             {
                 return LoopControl::Break;
             }
-            for cmd in deferred_commands {
-                if handle_command(
-                    cmd,
-                    state,
-                    stores,
-                    output,
-                    ring,
-                    clock,
-                    api,
-                    transport,
-                    *reconcile_in_flight,
-                    send_seq,
-                ) == LoopControl::Break
-                {
-                    return LoopControl::Break;
-                }
-            }
-            LoopControl::Continue
         }
     }
+    LoopControl::Continue
 }
 
 #[allow(unused_assignments)] // actor-owned transport/reconcile_in_flight persist for P3-3 quiescence gate
