@@ -9,10 +9,15 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Open threads & next up
 
-- **▶ NEXT (2026-07-11): `writing-plans` for state-model P3-3b, then execute** — grill CLOSED,
-  decisions locked in **spec §2.4 D24–D31**, app-arch amended. Do this in a NEW session. See the
-  2026-07-11 Recent entry + `docs/handoffs/2026-07-11-state-model-p3-3b-grilling.md` + memory
-  `state-model-p3-3b-grilling`. (Bucket B viewport = a separate later plan / new `lens-ui` crate.)
+- **▶ NEXT (2026-07-12): EXECUTE state-model P3-3b** — plan WRITTEN + double cross-family reviewed
+  (grok round 1 → 10 findings, gpt-5.5/codex round 2 → 5 more, all folded). Plan is
+  `docs/superpowers/plans/2026-07-12-state-model-p3-3b.md` (SSOT for execution; §2.4 D24–D31 =
+  decisions SSOT). Execute in a NEW session via `subagent-driven-development`: composer-2.5 per
+  task, grok cross-family review each MANDATORY seam. **Task order:** T1 (D24 park=exit + D25/26
+  reconnect) → T2 (D27 send 3-fate) → T4 (`lens-drive` binary) → T5 (D30 scaffold-id + C2/C3/C4)
+  → T6 (D28 held-reconcile) → T7 (docs incl. app-arch §4.1/§6.2 D30 amendment + spec §2.4 D28
+  FIFO→unique+temporal correction + memory). See `docs/handoffs/2026-07-12-state-model-p3-3b-execution.md`.
+  (Bucket B viewport / `lens-ui` crate = separate later plan.)
 
 - **lens-client benchmarks: DONE** (2026-06-27, composer-2.5 build + free codex
   cross-family review → 4 Important + 1 Nit, all applied). Closes the MANDATORY
