@@ -4609,113 +4609,241 @@ mod tests {
     }
 
     fn item_provisional_flag(db_path: &Path, item_id: &str) -> i64 {
+        item_provisional_opt(db_path, item_id)
+            .unwrap_or_else(|| panic!("provisional lookup for {item_id}: row absent"))
+    }
+
+    /// `provisional` flag for `item_id`, or `None` if the row is not yet on disk.
+    /// Safe to call against the live actor's WAL db from a fresh reader connection.
+    fn item_provisional_opt(db_path: &Path, item_id: &str) -> Option<i64> {
         let conn = rusqlite::Connection::open(db_path).expect("open transcript db");
-        conn.query_row(
+        match conn.query_row(
             "SELECT provisional FROM items WHERE item_id = ?1",
             [item_id],
             |r| r.get(0),
-        )
-        .unwrap_or_else(|e| panic!("provisional lookup for {item_id}: {e}"))
+        ) {
+            Ok(v) => Some(v),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => panic!("provisional lookup for {item_id}: {e}"),
+        }
     }
 
+    /// Extract the FunctionCall/FunctionCallOutput domain items produced by reducing
+    /// the golden live stream — the tool call as the actor's live path materializes it.
+    fn golden_live_tool_items() -> Vec<Item> {
+        let clock = test_clock();
+        let mut state = fresh_state();
+        for ev in decode_all(include_bytes!(
+            "../../tests/fixtures/d30/tool_fold.stream.sse"
+        )) {
+            let _ = crate::reduce::reduce(&mut state, &ev, clock.as_ref());
+        }
+        state
+            .items
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i.kind,
+                    ItemKind::FunctionCall { .. } | ItemKind::FunctionCallOutput { .. }
+                )
+            })
+            .map(|i| i.as_ref().clone())
+            .collect()
+    }
+
+    /// Store-layer D30 fold sentinel on real 0.5.1 bytes. Drives the exact fold path
+    /// the actor's catch-up uses (`wire_to_domain_item` + `live_key_for_store_item` +
+    /// `reconcile_store_item`) against a live provisional tool call — proving the
+    /// two-id-space fold on captured bytes, isolated from catch-up ordering.
+    ///
+    /// Fixtures: tests/fixtures/d30/tool_fold.{stream.sse,items.json}, captured
+    /// 2026-07-12 from omnigent 0.5.1 (source HEAD 08285468). The live stream splits
+    /// the call across fc_1a36 (in_progress) -> fc_7ad9 (completed) sharing one
+    /// call_id; /items carries the same call_id under a different store id (fc_9bb8).
     #[test]
-    fn d30_golden_tool_fold_replays_live_0_5_1_capture() {
-        // Golden fixtures: tests/fixtures/d30/tool_fold.{stream.sse,items.json}.
-        // Captured 2026-07-12 from omnigent 0.5.1 (source HEAD 08285468).
+    fn d30_golden_reconcile_folds_tool_call() {
+        let clock = test_clock();
         let dir = tempfile::tempdir().unwrap();
         let stores = test_stores(dir.path());
         seed_connection(&stores);
+        let db_path = dir.path().join("conv_1.db");
 
+        // LIVE: commit the streamed tool call as PROVISIONAL (as the actor does).
+        let live_items = golden_live_tool_items();
+        assert!(
+            live_items
+                .iter()
+                .any(|i| i.id.as_str() == "fc_7ad94742b335"),
+            "stream must materialize the completed live function_call fc_7ad94742b335"
+        );
+        for (ord, item) in live_items.iter().enumerate() {
+            stores
+                .transcript
+                .upsert_item(ord as i64, item, true)
+                .unwrap();
+        }
+        assert_eq!(
+            item_provisional_flag(&db_path, "fc_7ad94742b335"),
+            1,
+            "live tool-call committed provisional before the fold (fold is load-bearing)"
+        );
+
+        // CATCH-UP: reconcile the /items canonical tool rows — folds by call_id.
         let items: ItemList = serde_json::from_str(include_str!(
             "../../tests/fixtures/d30/tool_fold.items.json"
         ))
         .expect("golden /items JSON");
-        let (api, _mock) =
-            MockApi::with_fetch_script(VecDeque::from([Ok(empty_item_list()), Ok(items)]));
+        for wire in items.items() {
+            let Some(domain) = wire_to_domain_item(wire, clock.as_ref()) else {
+                continue;
+            };
+            if !matches!(
+                domain.kind,
+                ItemKind::FunctionCall { .. } | ItemKind::FunctionCallOutput { .. }
+            ) {
+                continue;
+            }
+            let live_key = live_key_for_store_item(&domain);
+            stores
+                .transcript
+                .reconcile_store_item(&domain, &live_key)
+                .unwrap();
+        }
+
+        assert_d30_tool_fold(&db_path);
+    }
+
+    /// End-to-end D30 fold on real bytes through the FULL actor: startup catch-up
+    /// seeds the pre-turn history as canonical, the live stream commits the tool call
+    /// provisional, then a reconnect DELTA catch-up (only the new turn's rows) folds
+    /// the provisional fc_* into the /items canonical. This is the production path
+    /// (attach -> live turn -> reconnect); the catch-up here is a genuine delta, so
+    /// the provisional row exists before the canonical arrives.
+    #[test]
+    fn d30_golden_end_to_end_attach_turn_reconnect_fold() {
+        let dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(dir.path());
+        seed_connection(&stores);
+        let db_path = dir.path().join("conv_1.db");
+
+        // Partition the golden /items at the turn boundary: history (everything up to
+        // the first new-turn row) vs delta (the tool call + its surrounding messages).
+        let (history, delta) = split_golden_items_at("msg_f6bac737d81e4fe4aebd48ad654cdbdc");
+        let (api, _mock) = MockApi::with_fetch_script(VecDeque::from([Ok(history), Ok(delta)]));
 
         let (ev_tx, ev_rx) = crossbeam_channel::bounded(1);
         let (up_tx, up_rx) = async_channel::bounded(64);
+        // spawn_actor's startup catch-up consumes `history` -> canonical pre-turn state.
         let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
 
+        // LIVE turn: stream commits the tool call provisional above the history frontier.
         for ev in decode_all(include_bytes!(
             "../../tests/fixtures/d30/tool_fold.stream.sse"
         )) {
             ev_tx.send(ev).unwrap();
         }
-        while up_rx.try_recv().is_ok() {}
+        // Durable sync: block until the live provisional fc is on disk (acceptance !=
+        // commit under greedy drain), using emitted updates as the wakeup.
+        loop {
+            if item_provisional_opt(&db_path, "fc_7ad94742b335") == Some(1) {
+                break;
+            }
+            match up_rx.recv_blocking() {
+                Ok(_) => continue,
+                Err(_) => panic!("actor exited before committing the live provisional fc"),
+            }
+        }
 
+        // RECONNECT: delta catch-up fetches only the new-turn rows -> folds.
         ev_tx
             .send(ServerStreamEvent::Reconnected { gap: None })
             .unwrap();
-
-        let mut saw_catchup = false;
-        while let Ok(u) = up_rx.recv_blocking() {
-            if matches!(u, StreamUpdate::TranscriptAdvanced { .. }) {
-                saw_catchup = true;
+        // Wait until the canonical folded row is durable on disk.
+        loop {
+            if item_provisional_opt(&db_path, "fc_9bb8ae52357c40a2a2f696e37b81d681") == Some(0) {
                 break;
             }
+            match up_rx.recv_blocking() {
+                Ok(_) => continue,
+                Err(_) => panic!("actor exited before the reconnect delta fold landed"),
+            }
         }
-        assert!(
-            saw_catchup,
-            "Reconnected catch-up must emit TranscriptAdvanced watermarks"
-        );
         handle.stop_and_join();
-        while up_rx.try_recv().is_ok() {}
 
-        let db_path = dir.path().join("conv_1.db");
+        assert_d30_tool_fold(&db_path);
+    }
+
+    /// Deserialize the golden /items and split `data` at the first item whose id is
+    /// `boundary_id` (inclusive on the delta side): everything before is the pre-turn
+    /// history page; `boundary_id` onward is the reconnect delta page.
+    fn split_golden_items_at(boundary_id: &str) -> (ItemList, ItemList) {
+        let raw = include_str!("../../tests/fixtures/d30/tool_fold.items.json");
+        let mut v: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let data = v["data"].as_array().unwrap().clone();
+        let cut = data
+            .iter()
+            .position(|it| it["id"].as_str() == Some(boundary_id))
+            .expect("boundary id present in golden /items");
+        let (hist, delta) = data.split_at(cut);
+        let mut mk = |items: &[serde_json::Value]| -> ItemList {
+            v["data"] = serde_json::Value::Array(items.to_vec());
+            v["has_more"] = serde_json::Value::Bool(false);
+            serde_json::from_value(v.clone()).unwrap()
+        };
+        (mk(hist), mk(delta))
+    }
+
+    /// Shared D30 fold assertion: exactly one function_call (= /items canonical id,
+    /// provisional=0) and one function_call_output, with the live provisional fc_*/fco_*
+    /// ids folded away.
+    fn assert_d30_tool_fold(db_path: &Path) {
         let reopened = SqliteTranscriptStore::open(
-            &db_path,
+            db_path,
             &ConnectionId::new("conn_1"),
             &SessionId::new("conv_1"),
         )
         .unwrap();
         let rows = reopened.load_items().unwrap().rows;
+        let ids: Vec<_> = rows.iter().map(|r| r.id.as_str().to_string()).collect();
 
-        let fc_rows: Vec<_> = rows
+        let fc: Vec<_> = rows
             .iter()
             .filter(|r| matches!(r.kind, ItemKind::FunctionCall { .. }))
             .collect();
+        assert_eq!(fc.len(), 1, "one function_call after fold; ids: {ids:?}");
         assert_eq!(
-            fc_rows.len(),
-            1,
-            "D30 fold must leave exactly one function_call row; on-disk ids: {:?}",
-            rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            fc_rows[0].id.as_str(),
+            fc[0].id.as_str(),
             "fc_9bb8ae52357c40a2a2f696e37b81d681",
-            "/items canonical fc_* id must win the fold"
+            "/items canonical fc_* id wins the fold"
         );
         assert_eq!(
-            item_provisional_flag(&db_path, "fc_9bb8ae52357c40a2a2f696e37b81d681"),
+            item_provisional_flag(db_path, "fc_9bb8ae52357c40a2a2f696e37b81d681"),
             0,
-            "folded function_call must be durable (provisional=0)"
+            "folded function_call is durable (provisional=0)"
         );
         assert!(
-            !rows
-                .iter()
-                .any(|r| r.id.as_str() == "fc_1a365818d5b6" || r.id.as_str() == "fc_7ad94742b335"),
-            "live provisional fc_* ids must be folded away"
+            !ids.iter()
+                .any(|id| id == "fc_1a365818d5b6" || id == "fc_7ad94742b335"),
+            "live provisional fc_* ids folded away; ids: {ids:?}"
         );
 
-        let fco_rows: Vec<_> = rows
+        let fco: Vec<_> = rows
             .iter()
             .filter(|r| matches!(r.kind, ItemKind::FunctionCallOutput { .. }))
             .collect();
         assert_eq!(
-            fco_rows.len(),
+            fco.len(),
             1,
-            "D30 fold must leave exactly one function_call_output row; on-disk ids: {:?}",
-            rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>()
+            "one function_call_output after fold; ids: {ids:?}"
         );
         assert_eq!(
-            fco_rows[0].id.as_str(),
+            fco[0].id.as_str(),
             "fco_7bd2ed51b55d42748c92428c30c8fdd1",
-            "/items canonical fco_* id must win the fold"
+            "/items canonical fco_* id wins the fold"
         );
         assert!(
-            !rows.iter().any(|r| r.id.as_str() == "fco_a51bcc02b848"),
-            "live provisional fco_* id must be folded away"
+            !ids.iter().any(|id| id == "fco_a51bcc02b848"),
+            "live provisional fco_* id folded away; ids: {ids:?}"
         );
     }
 }
