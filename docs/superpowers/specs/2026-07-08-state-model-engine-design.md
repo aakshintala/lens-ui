@@ -467,6 +467,169 @@ supersedes an earlier decision it says so, and the change is listed in §7.1.
 
 ---
 
+### 2.4 P3-3b grilling refinements (2026-07-11) — D24–D31
+
+Resolved in a grilling pass over P3-3 *recovery semantics* (Bucket A) + the
+*scaffold-id / tech-debt* cleanups (Bucket C), before writing the P3-3b plan.
+Three live probes against **omnigent 0.5.1** (`08285468`) settled the open
+behavioral unknowns (appendix at the end of this section). **These materially
+revise §13.1 Table A/B and D17/D18** — where a refinement supersedes an earlier
+decision it says so; app-arch amendments are listed in §7.1.
+
+**Scope.** P3-3b = **Bucket A** (recovery semantics) + **Bucket C** (scaffold-id
+double-commit + C2–C5 tech-debt). **Bucket B** (viewport/render) is a *separate*
+plan standing up a new `lens-ui` crate/cluster — grilled separately.
+
+- **D24 — Park = the actor EXITS (not "keep actor + state resident").
+  (Supersedes §13.1 Table A "park — keep actor resident" for all three park
+  reasons.)** On a park-triggering terminal `Disconnected{reason}` the actor emits
+  a **terminal `Parked{reason}` outcome and returns**, freeing thread + reader +
+  connection — symmetric with sleep (which also exits). Sleep flushes
+  `lifecycle=Slept` (intentional quiescence); park keeps `lifecycle=Active` (RAM
+  park-reason recorded, eligible for user-gated reconnect). **This dissolves the
+  "parked-feeder drain / outcome-channel wedge" deferral entirely** — with no live
+  reader while parked, no channel fills, so no drain machinery is needed. Safe
+  because D19 forward catch-up re-derives the transcript from disk on reconnect, so
+  any live events dropped while parked are re-fetched. Edits freshly-merged P3-3a
+  (the commands-only parked loop) — rides the MANDATORY cross-family review seam.
+
+- **D25 — ONE recovery mechanism: user-gated `reconnect` = respawn-from-disk;
+  nothing is auto-terminal. (Supersedes §13.1 Table A `Forbidden`/`NotFound`
+  hard-stop and the auto-retry framing.)** No auto-retry, no exponential backoff,
+  no `tick(now)` eligibility timer — the transient case already recovers inside
+  `lens-client`'s internal reader backoff (park = it already gave up), so a
+  scheduler-level retry is pure noise. **Every** non-sleep stop — `Unauthorized`,
+  `RetriesExhausted`, `SessionFailed`, *and* a genuine `Forbidden`/`NotFound` on
+  attach — rests the session **Disconnected** (actor exited, zero RAM) and always
+  offers user-triggered **Reconnect** = the existing `FleetScheduler::wake` respawn
+  primitive. Each reconnect **re-tests reality** (re-open stream + forward
+  catch-up). `reason` is **advisory only** — it shapes the UI message + an optional
+  secondary verb ("Start new"); it never removes Reconnect. The only genuinely
+  terminal state is user-chosen archive/delete (transcript retained). Scheduler
+  grows only: a `parked: HashMap<SessionId, ParkReason>` (for UI display) + the
+  user-triggered `reconnect(session_id)` entry; deterministic park→reconnect
+  round-trip test (injected `Clock`, mock `Reopen`), mirroring D21's wake test; no
+  wall-clock driver (deferred §9-runtime/UI).
+
+- **D26 — Slept is a persisted lifecycle; Parked/Disconnected is a RAM-only
+  re-testable fault. Re-read live server status on attach.** `SessionLifecycle`
+  stays `{Active, Slept}`. **Slept** persists — an intentional, quiescence-gated,
+  durable decision with a server-side effect (`stop_session`), cold across app
+  restart, auto-wake-safe. **Parked/Disconnected does NOT persist** — the park
+  reason is inherently stale across a restart, so it is re-tested on attach; a
+  parked session's persisted lifecycle is just `Active`. **Probe-confirmed:** a
+  `failed` server session resets to `idle` on a server restart (runtime property,
+  not durable), so **`reconnect`/respawn MUST refresh live `status` from
+  `GET /session` (or stream chrome), never trust a pre-disconnect status.**
+  (Server-side, `stop_session` drives `status=failed` too, so **server-`failed`
+  == runnerless == Lens-agnostic** — the server can't tell Slept from Parked;
+  that is *why* Lens owns the lifecycle field.)
+
+- **D27 — No silent send-text drop; three distinct send-failure fates
+  (D-0 + refinement). (Supersedes §13.1 Table B "roll back the bubble" as a
+  silent removal.)** Bug: on a definite failure `rollback_pending` DELETES the
+  bubble (the sole in-engine home of the typed text) and emits
+  `SendFailed{lens_pending_id, error}` — **id+error but NOT content** → text
+  dropped, relying on an implicit UI draft memory (contradicts "never silently
+  drop send text"). Fix — every "didn't land" outcome carries the content, and
+  the three fates get **distinct** signals:
+  - **Definite fail** (rollback: `Network`/`403`/`404`/other-4xx): remove the
+    bubble, emit `SendFailed{lens_pending_id, content, error}` /
+    `SendDenied{lens_pending_id, content, reason}` → UI **restores to composer
+    immediately** (no ambiguity, no dedup).
+  - **Held / maybe-landed** (keep: `5xx`/`401`/`ContractMismatch`/`Parse`): bubble
+    **stays**, emit at most a soft `SendPending`/retrying status (**no** content,
+    **no** restore — else double-display).
+  - **Later-lost** (discovered on reconnect, D28): `SendLost{lens_pending_id,
+    content}` → UI restores.
+  **503 `runner_unavailable`** (heal-on-send with no online host — probe-found)
+  is `Server 5xx → ServerTransient`, which already does NOT `rolls_back_send`, so
+  the engine keeps the bubble (retry-not-dead); refinement is UX-advisory only.
+
+- **D28 — Held-bubble landed-detection = content-match, conservative-landed bias,
+  FIFO dup-match (D-a). Produces the deferred `SendLost`.** On reconnect, for each
+  held bubble (both server ids `None`, content `C`): (1) matches a user-message
+  item in the **catch-up delta** (bounded to the gap, NOT full history) ⇒ *landed*
+  ⇒ drop; (2) matches the snapshot `pending_inputs[]` ⇒ *landed-pending* ⇒ stamp
+  `server_pending_id`, keep; (3) neither ⇒ *lost* ⇒ `SendLost` ⇒ restore.
+  **Bias: only drop on a confident match; ambiguity ⇒ `SendLost`/restore** —
+  silent-drop is a contract-violating data loss; a false-lost is a *visible,
+  user-gated* duplicate. Duplicate content ⇒ FIFO count-match within the content
+  group (match `min(N,M)` oldest-first, `SendLost` the rest); frontier-anchoring
+  deferred. Runs actor-side post-catch-up — the "actor-side item re-derivation"
+  the `SendLost` TODO required. **Runs on the in-actor stream reconnect (Path 1,
+  `pending_user` RAM-intact)** — where it earns its keep. The robust fix (an
+  omnigent **client-message-id** echoed into `pending_inputs` + the item) is a
+  deferred contract feature-request.
+
+- **D29 — Build NO persistence for held-text survival; defer to the `lens-ui`
+  composer-draft layer (arch B). `pending_user` stays RAM-only (upholds
+  D-P2-5/6).** Two reconnect paths: **Path 1** in-actor stream reconnect (actor
+  stays alive, `pending_user` RAM-intact — D28 runs, common case, no carry) vs
+  **Path 2** park→respawn (actor exited, `pending_user` lost). Neither
+  carry-via-`Parked`-reseed **nor** disk-persist is built: disk-persist would put
+  client-optimistic intent into the server-mirror store (violates D-P2-5/6's
+  principle — the store mirrors server-authoritative state only). **Long-term
+  (arch B):** the composer owns durable unconfirmed-text; the engine is a stateless
+  reconciler. The UI-supplied set flows **DOWN** the spawn boundary into
+  `SessionState.pending_user` (the existing port — `spawn_actor` already takes full
+  state; **no dependency inversion — the engine never names `lens-ui`**); the
+  verdict flows **UP** by outcome emission (favor a fail-safe **"landed→clear"**
+  verdict — a missed signal then *keeps* the draft). **Guardrails P3-3b must honor
+  (non-foreclosure):** the held-set is a *spawn input* (seed before autonomous
+  catch-up/prune), and the outcome enum must not preclude a future "landed→clear".
+  **B-layer requirements (lens-ui plan):** persist draft synchronously at
+  send-time; session-keyed store; lazy per-session reconciliation on warm; relies
+  on D23 append-only immutability. **Documented gap:** held text is lost only in
+  the intersection *(held error)* ∧ *(park→respawn, not Path 1)* ∧ *(actually
+  lost)*, and only until `lens-ui` ships.
+
+- **D30 — Scaffold-id double-commit: dedup at PERSIST (canonical store),
+  UNIFORM, no harness branch (C1). Implements the D23 hazard fix.** Scaffold
+  harnesses mint a fresh **store id** on persist ≠ the live SSE id (native =
+  live==store); Lens commits live (D20/D23) under the live id AND catches up
+  `/items` (store id) → **two disk rows** + a **poisoned cursor**
+  (`/items?after=<live fc_* id>` is unknown to the server). Fix = one reconcile
+  with a **key precedence `id → call_id`** (no content-stamp — see probe): every
+  live commit lands **provisional**; catch-up reconciles each store item vs
+  resident provisional rows, rewrites live→store id, **preserves ordinal**, clears
+  provisional. Native ⇒ `id`-match (no-op); scaffold tools ⇒ `call_id`-match;
+  **scaffold messages ⇒ `id`-match** (probe: message live-id == store id — messages
+  do NOT split, only tools do). **Cursor** = newest **reconciled (non-provisional)**
+  id — never a live id (dissolves the poisoned cursor for native + scaffold). Cost:
+  a healthy native session re-fetches from last-reconciled forward on reconnect
+  (idempotent `id`-match, bounded); opportunistic-promotion optimization deferred.
+  Rejected: dedup-at-render (B) — dirties the canonical disk store, doubles scaffold
+  storage, defers to `lens-ui`, and still needs the cursor fix. *(Adjacent, already
+  handled: an assistant message's `output_text.delta`s carry no id; the
+  delta-bubble→`output_item.done` id association is a within-live-stream `StreamScratch`
+  close, existing reduce — plan verifies it keys correctly, not new design.)*
+
+- **D31 — C2–C5 tech-debt.** **C2 `frontier()`-Err fail-closed** (park/skip commits
+  on a disk-read error, not guess-`0`-then-`UNIQUE`-collide — rides C1's
+  frontier→store-frontier rewrite). **C3 catch-up recursion→iteration** (the
+  `invoke_catchup_and_replay`→`replay_buffered_batch`→`finish_reconnected_catchup`
+  cycle nests a frame per buffered `Reconnected`; convert to a while-loop — rides
+  C1's catch-up rewrite). **C4 `RunCtx` arg-bundling** (5× `too_many_arguments`;
+  mechanical, delegate composer; cleans the C1 diff). **C5 fuller N1
+  command-ordering** — **DEFER** (no concrete driver beyond P3-3a's fixed Sleep
+  case).
+
+**Live-verify appendix (omnigent 0.5.1, 2026-07-11).** (1) A `failed` session is
+**not terminal and never 404s** on re-attach — `GET /session`, `GET /items`,
+`GET /stream` all 200; the transcript is durable; the **next user `message` POST
+re-provisions a fresh runner** (`failed→running→idle`) → UX verb = "Disconnected,
+resumable in place"; no "Start new" needed. (2) The **stream carries no transcript
+snapshot, ever** (chrome-only, even idle) — independent wire-confirmation of D19.
+(3) `failed` **resets to `idle` on a server restart** (runtime property; transcript
+byte-identical across restart) ⇒ D26 re-read-status-on-attach. (4) **Organic
+failure == `stop_session`** at the re-attach/heal layer (indistinguishable). (5)
+Heal-on-send is **host-gated**: `503 runner_unavailable` if no online host ⇒ D27
+retry-not-dead. (6) **Scaffold messages do NOT split** (live id == store `msg_*`;
+persist-then-emit), only tools do ⇒ D30 needs no content-stamp.
+
+---
+
 ## 3. Workspace layout
 
 ```
@@ -819,6 +982,26 @@ deliberately when the P3 plan is written so the design source stays the truth.
 - **app-arch §6 (D23):** the wake-lag parenthetical drops the false "compaction
   rewrote history, items edited" — committed items are immutable; the real lag is
   *new items committed while sleeping* (forward catch-up).
+
+**From D24–D31 (§2.4, P3-3b — 2026-07-11):** *(applied to app-arch this session)*
+
+- **app-arch §3.5 + §13.1 Table A (D24–D26):** park = actor **exits** (Disconnected
+  resting state, `lifecycle` stays `Active`, RAM-only reason); **all** reasons
+  (incl. 403/404) rest Disconnected with one **user-gated Reconnect = respawn**;
+  **nothing auto-terminal**; re-read live `status` on attach. **Applied** (§3.5
+  transition + "Amended 2026-07-11" note; §13.1 "P3-3b amendments" block).
+- **app-arch §13.1 Table B (D27):** send-failure outcomes carry `content`
+  (`SendFailed`/`SendDenied`) → restore-to-composer; held emits soft pending (no
+  restore); command-path 403/404 no longer §9-escalate; 503 = keep+retry.
+  **Applied** (§13.1 "P3-3b amendments" block). Supersedes the P3-2 "Send while
+  parked rejected" refinement (moot — no resident parked actor).
+- **app-arch §4.1 / §6.2 (D30):** durable dedup is a **`id → call_id`** precedence
+  with a **provisional** flag + store-frontier cursor (scaffold tools split, messages
+  do not). *(Not yet edited into §4.1's "Identity, ordering, dedup" bullet — the
+  P3-3b plan carries the precise wording; flagged here.)*
+- **§13.1 `last_task_error`:** the `SessionFailed` "surface `last_task_error`" row
+  stands, but the type-ambiguity residual (memory `plan4-pre-consumer-hardening`)
+  is resolved when the reducer consumes it.
 
 ### 7.2 New dependencies / cross-crate touches (from D13)
 

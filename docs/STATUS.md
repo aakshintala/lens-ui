@@ -9,6 +9,11 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Open threads & next up
 
+- **▶ NEXT (2026-07-11): `writing-plans` for state-model P3-3b, then execute** — grill CLOSED,
+  decisions locked in **spec §2.4 D24–D31**, app-arch amended. Do this in a NEW session. See the
+  2026-07-11 Recent entry + `docs/handoffs/2026-07-11-state-model-p3-3b-grilling.md` + memory
+  `state-model-p3-3b-grilling`. (Bucket B viewport = a separate later plan / new `lens-ui` crate.)
+
 - **lens-client benchmarks: DONE** (2026-06-27, composer-2.5 build + free codex
   cross-family review → 4 Important + 1 Nit, all applied). Closes the MANDATORY
   perf-doc gap. Two categories, split by gate-ability:
@@ -284,6 +289,30 @@ and roll older "Recent" pointers off this page as they age.
   status + harness-provider icon set.
 
 ## Recent
+
+- **2026-07-11** — **state-model P3-3b GRILLED & CLOSED → spec amended; next = `writing-plans` +
+  execute (NEW session).** Full grilling pass over **Bucket A** (recovery semantics) + **Bucket C**
+  (scaffold-id + tech-debt). All decisions locked in **spec §2.4 D24–D31** (SSOT); app-arch §3.5 +
+  §13.1 amended (P3-3b amendment blocks). **Bucket B** (viewport/render) carved into its own future
+  plan = a NEW `lens-ui` crate/cluster. **Recovery model:** park = actor **EXITS** (Disconnected
+  resting state, `lifecycle` stays `Active`, RAM-only reason — dissolves the feeder-wedge); **ONE
+  user-gated `reconnect` = respawn** (no auto-retry); **nothing auto-terminal** (even 403/404
+  re-test on reconnect); **Slept persisted / Parked = RAM fault**; re-read live status on attach.
+  **Send-recovery:** D-0 no silent text drop (3 fates: definite→`SendFailed{content}` restore,
+  held→soft-pending, lost→`SendLost{content}`); D-a held landed-detection = content-match +
+  conservative-landed bias + FIFO dup-match (runs on the in-actor reconnect); D-b build **no**
+  survival persistence, defer park→respawn held-survival to the `lens-ui` composer-draft layer
+  (**arch B**: composer owns durability, feeds the engine DOWN the spawn port, engine never names
+  lens-ui). **Scaffold-id (C1):** dedup at **PERSIST**, **uniform `id → call_id`** + provisional
+  flag + store-frontier cursor (no content-stamp). C2 frontier-fail-closed / C3 catch-up→iteration /
+  C4 arg-bundling = DO; C5 = DEFER. **3 omnigent 0.5.1 live probes** settled the unknowns:
+  `failed` = resumable-in-place (never 404s, heals on next send, resets to `idle` on restart),
+  organic-crash == `stop_session`, 503 host-gated, and **messages do NOT split** (id-match, no
+  content-stamp). **Deferred:** `lens-ui` composer-draft layer (arch B), an omnigent
+  **client-message-id** contract feature-request, Bucket B viewport.
+  Handoff: [`docs/handoffs/2026-07-11-state-model-p3-3b-grilling.md`](./handoffs/2026-07-11-state-model-p3-3b-grilling.md);
+  memory `state-model-p3-3b-grilling`. **NEXT: `writing-plans` for P3-3b from spec §2.4, then execute
+  subagent-driven** (composer per task + cross-family seam review on the D24/D27/D30 subtractive seams).
 
 - **2026-07-10** — **state-model P3-3a (lifecycle core) EXECUTED & COMPLETE — merged to `main`.**
   8-task subagent-driven plan executed (composer-2.5 author + Opus per-task + **grok-4.5 seam

@@ -437,9 +437,22 @@ focus / pin / resume ─▶ ACTIVE
 quiesced ≥10min & not pinned & no pending-elicit & no terminal activity
     ─▶ SLEPT     (best-effort stop_session; dim card; stop actor; flush; free RAM)
 
+any non-sleep stop (Unauthorized / RetriesExhausted / SessionFailed / 403 / 404)
+    ─▶ DISCONNECTED  (park = actor EXITS; lifecycle STAYS Active; RAM-only park reason;
+                      nothing auto-terminal — D24/D25/D26, spec §2.4)
+user Reconnect ─▶ ACTIVE  (respawn-from-disk = FleetScheduler::wake; re-open stream +
+                           forward catch-up; RE-READ live status; re-tests reality)
+
 user archives ─▶ ARCHIVED  (PATCH server archived=true; hide from default board/list)
 user deletes  ─▶ DELETED   (DELETE server-side; local tombstone)
 ```
+
+> **Amended 2026-07-11 (P3-3b grilling, spec §2.4 D24–D26).** Park is now a
+> Disconnected resting state where the **actor exits** (not "keep actor
+> resident") — recovery is a single **user-gated Reconnect = respawn**, no
+> auto-retry; **nothing is auto-terminal** (even 403/404 rest as Disconnected and
+> re-test on Reconnect); the disconnect reason is **advisory, RAM-only, not
+> persisted**. Supersedes the §13.1 Table A rows below.
 
 ---
 
@@ -1356,6 +1369,32 @@ down the stream):
   registry-removal / tombstone for these, but the P3-2 command path only rolls back +
   `SendFailed`; the stream's own terminal `Disconnected(Forbidden/NotFound)` drives the
   Table A stop today.
+
+**P3-3b amendments (2026-07-11, grilling — spec §2.4 D24–D27; supersede the above):**
+
+- **Table A → all reasons rest as DISCONNECTED; the actor EXITS (D24/D25).** Park
+  no longer keeps the actor resident — it emits terminal `Parked{reason}` and
+  returns (frees thread/reader/connection; dissolves the feeder-wedge). `Unauthorized`,
+  `RetriesExhausted`, `SessionFailed`, **and** `Forbidden`/`NotFound` all rest the
+  session **Disconnected** (`lifecycle` stays `Active`, RAM-only reason) with a single
+  **user-gated Reconnect = respawn**. **Nothing is auto-terminal** — each Reconnect
+  re-tests reality (a genuine 403/404 simply re-fails). No auto-retry/backoff (the
+  transient case recovers inside `lens-client`'s reader backoff; park = it gave up).
+  `SessionFailed` is **resumable in place** (live-verified: never 404s; heals on the
+  next user `message` POST) — no "Start new" needed. **Re-read live `status` on
+  attach** (a `failed` session resets to `idle` across a server restart).
+- **Table B → no silent send-text drop; three fates (D27).** The rollback rows
+  (`Network`/`403`/`404`/other-4xx) still remove the bubble but now emit
+  `SendFailed{content,…}` / `SendDenied{content,…}` → **UI restores to composer**
+  (no silent drop). Keep rows (`5xx`/`401`/`ContractMismatch`/`Parse`) leave the
+  bubble and emit a soft pending status (no content, no restore). `503
+  runner_unavailable` (heal-with-no-host) = `ServerTransient` → keep + retry, not
+  dead. Command-path `403`/`404` **no longer escalate to §9 removal/tombstone** —
+  they rest as Disconnected (D25), same as the stream path.
+- **`Send while parked` (P3-2) is moot** — there is no resident parked actor to
+  reject a send; a Disconnected session has no actor. Held-bubble retention +
+  landed-vs-lost is now the D28 reconnect reconciler (`SendLost`), running on the
+  in-actor reconnect (Path 1).
 
 ### 13.2 Downstream contracts (the seams)
 
