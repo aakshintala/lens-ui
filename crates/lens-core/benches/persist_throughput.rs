@@ -66,7 +66,7 @@ fn bench_transcript(c: &mut Criterion) {
             },
             |(dir, store)| {
                 for (ord, it) in items.iter().enumerate() {
-                    store.upsert_item(ord as i64, it).unwrap();
+                    store.upsert_item(ord as i64, it, false).unwrap();
                 }
                 let loaded = store.load_items().unwrap();
                 // Hand everything back so teardown — SQLite close, tempdir file

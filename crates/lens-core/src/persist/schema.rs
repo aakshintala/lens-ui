@@ -2,7 +2,7 @@
 //! a STABLE, DENORMALIZED read contract (§6.1) — Bridge reads these tables.
 
 /// Bumped only on a breaking schema change; gates per-file migration (§6.3).
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2; // provisional + call_id columns (D30)
 
 /// `lens.db` — control plane (one file). `meta` is created by `db::open_db`.
 /// P2 additions vs §6.2 sketch: `cost_json` (D-P2-2), `terminal_pending` (D-P2-3).
@@ -69,15 +69,17 @@ CREATE TABLE IF NOT EXISTS cost_samples (
 /// carries `connection_id` + `session_id` so the file is self-describing (§6.2).
 pub const TRANSCRIPT_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS items (
-  item_id    TEXT NOT NULL,
-  live_seq   INTEGER,
-  ordinal    INTEGER NOT NULL,
-  kind       TEXT NOT NULL,
-  payload    TEXT NOT NULL,
-  agent      TEXT,
-  depth      INTEGER NOT NULL DEFAULT 0,
-  turn       INTEGER NOT NULL DEFAULT 0,
-  created_at INTEGER NOT NULL,
+  item_id     TEXT NOT NULL,
+  live_seq    INTEGER,
+  ordinal     INTEGER NOT NULL,
+  kind        TEXT NOT NULL,
+  payload     TEXT NOT NULL,
+  agent       TEXT,
+  depth       INTEGER NOT NULL DEFAULT 0,
+  turn        INTEGER NOT NULL DEFAULT 0,
+  created_at  INTEGER NOT NULL,
+  provisional INTEGER NOT NULL DEFAULT 0,
+  call_id     TEXT,
   PRIMARY KEY (item_id),
   UNIQUE (ordinal)
 );

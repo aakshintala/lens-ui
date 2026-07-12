@@ -295,7 +295,7 @@ mod tests {
                 }],
             },
         };
-        transcript.upsert_item(ordinal, &item).unwrap();
+        transcript.upsert_item(ordinal, &item, false).unwrap();
     }
 
     fn item_list_from_messages(ids: &[&str], has_more: bool) -> ItemList {

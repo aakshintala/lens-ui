@@ -8,7 +8,7 @@ pub mod map;
 pub mod schema;
 pub mod transcript;
 
-use crate::domain::ids::{ConnectionId, SessionId};
+use crate::domain::ids::{CallId, ConnectionId, ItemId, SessionId};
 use crate::domain::item::Item;
 use crate::domain::session::SessionState;
 use thiserror::Error;
@@ -117,6 +117,20 @@ pub trait ControlStore {
     ) -> Result<Vec<(i64, f64)>>;
 }
 
+/// D30 reconcile key: `id` match for messages; `call_id` match for scaffold tool rows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveKey {
+    pub id: ItemId,
+    pub call_id: Option<CallId>,
+}
+
+/// Result of folding a catch-up `/items` row into a resident provisional row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReconcileOutcome {
+    Folded { ordinal: i64 },
+    NoMatch,
+}
+
 /// Per-session transcript role (one file per `(connection, session)`). D-P2-1.
 pub trait TranscriptStore {
     fn mode(&self) -> StoreMode;
@@ -125,14 +139,22 @@ pub trait TranscriptStore {
     /// Write-through one finalized item at `ordinal`. Returns the ordinal actually
     /// stored (via `RETURNING`); on id conflict with preserved ordinal, the returned
     /// value may differ from the requested `ordinal` (D20 re-fire path).
-    fn upsert_item(&self, ordinal: i64, item: &Item) -> Result<i64>;
+    /// Live commits pass `provisional = true`; catch-up appends pass `false`.
+    fn upsert_item(&self, ordinal: i64, item: &Item, provisional: bool) -> Result<i64>;
     /// All items ordered by `ordinal`. A row that fails to decode is skipped
     /// (recorded in `Loaded::skipped`), never aborting the whole transcript load.
     fn load_items(&self) -> Result<Loaded<Item>>;
     /// Make the file match server truth by `item_id`: upsert each at `ordinal =
     /// index`, delete rows whose id is absent (§6.3 reconcile-by-id).
     fn reconcile(&self, items: &[Item]) -> Result<()>;
-    /// Newest persisted item: `(max ordinal, its item_id)`, or `None` when empty.
-    /// Seeds the actor's `next_ordinal` and the D19 forward-catch-up `after` cursor.
-    fn frontier(&self) -> Result<Option<(i64, crate::domain::ids::ItemId)>>;
+    /// Newest **non-provisional** `(ordinal, item_id)` — sole `/items?after=` cursor.
+    fn store_frontier(&self) -> Result<Option<(i64, ItemId)>>;
+    /// `MAX(ordinal) + 1` over **all** rows (provisional included) — append seed.
+    fn next_ordinal_seed(&self) -> Result<i64>;
+    /// Fold a catch-up row into a resident provisional row keyed by `live_key`.
+    fn reconcile_store_item(
+        &self,
+        store_item: &Item,
+        live_key: &LiveKey,
+    ) -> Result<ReconcileOutcome>;
 }

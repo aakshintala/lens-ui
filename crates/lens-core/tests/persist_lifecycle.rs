@@ -41,7 +41,7 @@ fn transcript_survives_close_and_reopen() {
     let sid = SessionId::new("conv_1");
     {
         let s = SqliteTranscriptStore::open(&path, &conn, &sid).unwrap();
-        s.upsert_item(0, &msg("item_1")).unwrap();
+        s.upsert_item(0, &msg("item_1"), false).unwrap();
         // store dropped here — file closed.
     }
     let s = SqliteTranscriptStore::open(&path, &conn, &sid).unwrap();
@@ -78,7 +78,7 @@ fn future_schema_version_refuses_writes_on_both_stores() {
         SqliteTranscriptStore::open(&tpath, &ConnectionId::new("c"), &SessionId::new("s")).unwrap();
     assert_eq!(ts.mode(), StoreMode::ReadOnlyDegraded);
     assert!(ts.load_items().is_ok());
-    assert!(ts.upsert_item(0, &msg("x")).is_err());
+    assert!(ts.upsert_item(0, &msg("x"), false).is_err());
 }
 
 fn bump_version(path: &std::path::Path) {

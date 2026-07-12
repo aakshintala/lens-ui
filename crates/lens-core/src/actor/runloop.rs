@@ -8,9 +8,9 @@ use crate::actor::transport::{ActorTransport, ParkReason};
 use crate::clock::Clock;
 use crate::domain::SessionState;
 use crate::domain::controls::PendingUserMessage;
-use crate::domain::item::{BlockContext, Item};
-use crate::domain::scalars::SessionLifecycle;
-use crate::persist::{ControlStore, TranscriptStore};
+use crate::domain::item::{BlockContext, Item, ItemKind};
+use crate::domain::scalars::{Role, SessionLifecycle};
+use crate::persist::{ControlStore, LiveKey, ReconcileOutcome, TranscriptStore};
 use crate::reduce::map_wire_item;
 use crate::reduce::{StreamUpdate, Updates, reduce};
 use crossbeam_channel::{Receiver, Select};
@@ -186,6 +186,7 @@ enum CatchupResult {
     CaughtUp {
         buffered_events: Vec<ServerStreamEvent>,
         deferred_commands: Vec<SessionCommand>,
+        catchup_new_user_contents: Vec<(String, i64)>,
     },
     Aborted,
 }
@@ -206,15 +207,38 @@ fn wire_to_domain_item(wire: &WireItem, clock: &dyn Clock) -> Option<Item> {
     })
 }
 
-/// Catch-up upsert: advance `next_ordinal` only on a fresh insert at the passed ordinal
-/// (same discipline as `commit_terminal_prefix`).
+/// D30 reconcile key for a store `/items` row: `call_id` only on tool splits.
+fn live_key_for_store_item(item: &Item) -> LiveKey {
+    let call_id = match &item.kind {
+        ItemKind::FunctionCall { call_id, .. } | ItemKind::FunctionCallOutput { call_id, .. } => {
+            Some(call_id.clone())
+        }
+        _ => None,
+    };
+    LiveKey {
+        id: item.id.clone(),
+        call_id,
+    }
+}
+
+fn user_message_text(item: &Item) -> Option<&str> {
+    match &item.kind {
+        ItemKind::Message {
+            role: Role::User,
+            content,
+        } => content.first().and_then(|b| b.text.as_deref()),
+        _ => None,
+    }
+}
+
+/// Catch-up upsert: advance `next_ordinal` only on a fresh insert at the passed ordinal.
 fn upsert_catchup_item(
     stores: &ActorStores,
     next_ordinal: &mut i64,
     item: &Item,
     ring: &mut OutcomeRing,
 ) -> bool {
-    match stores.transcript.upsert_item(*next_ordinal, item) {
+    match stores.transcript.upsert_item(*next_ordinal, item, false) {
         Ok(stored_ord) => {
             let requested = *next_ordinal;
             if stored_ord == requested {
@@ -248,14 +272,19 @@ fn run_catchup(
     ring: &mut OutcomeRing,
     clock: &dyn Clock,
 ) -> CatchupResult {
-    let mut after = stores
-        .transcript
-        .frontier()
-        .ok()
-        .flatten()
-        .map(|(_, id)| id.to_string());
+    let mut after = match stores.transcript.store_frontier() {
+        Ok(v) => v.map(|(_, id)| id.to_string()),
+        Err(e) => {
+            ring.push(ActorOutcome::PersistError {
+                where_: "transcript.store_frontier",
+                message: e.to_string(),
+            });
+            return CatchupResult::Aborted;
+        }
+    };
     let mut buffered_events = Vec::new();
     let mut deferred_commands = Vec::new();
+    let mut catchup_new_user_contents = Vec::new();
 
     loop {
         while let Ok(ev) = events.try_recv() {
@@ -287,10 +316,30 @@ fn run_catchup(
 
         let mut wrote_any = false;
         for wire in list.items() {
-            if let Some(domain) = wire_to_domain_item(wire, clock)
-                && upsert_catchup_item(stores, next_ordinal, &domain, ring)
-            {
-                wrote_any = true;
+            if let Some(domain) = wire_to_domain_item(wire, clock) {
+                let live_key = live_key_for_store_item(&domain);
+                match stores.transcript.reconcile_store_item(&domain, &live_key) {
+                    Ok(ReconcileOutcome::Folded { ordinal }) => {
+                        *next_ordinal = (*next_ordinal).max(ordinal + 1);
+                        wrote_any = true;
+                    }
+                    Ok(ReconcileOutcome::NoMatch) => {
+                        if upsert_catchup_item(stores, next_ordinal, &domain, ring) {
+                            wrote_any = true;
+                            if let Some(text) = user_message_text(&domain) {
+                                catchup_new_user_contents
+                                    .push((text.to_string(), domain.created_at));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        ring.push(ActorOutcome::PersistError {
+                            where_: "transcript.reconcile_store_item",
+                            message: e.to_string(),
+                        });
+                        return CatchupResult::Aborted;
+                    }
+                }
             }
             after = Some(wire.id().to_string());
         }
@@ -312,6 +361,7 @@ fn run_catchup(
     CatchupResult::CaughtUp {
         buffered_events,
         deferred_commands,
+        catchup_new_user_contents,
     }
 }
 
@@ -635,6 +685,7 @@ fn finish_reconnected_catchup(
     reconcile_in_flight: &mut bool,
     send_seq: &mut u64,
     emit_transport: bool,
+    catchup_accum: &mut Vec<(String, i64)>,
 ) -> LoopControl {
     if !needs_catchup {
         return LoopControl::Continue;
@@ -653,6 +704,7 @@ fn finish_reconnected_catchup(
         reconcile_in_flight,
         send_seq,
         emit_transport,
+        catchup_accum,
     ) == LoopControl::Break
     {
         return LoopControl::Break;
@@ -679,6 +731,7 @@ fn replay_buffered_batch(
     transport: &mut ActorTransport,
     reconcile_in_flight: &mut bool,
     send_seq: &mut u64,
+    catchup_accum: &mut Vec<(String, i64)>,
 ) -> LoopControl {
     let mut batch = reduce(state, &buffered_events[0], clock);
     for ev in &buffered_events[1..] {
@@ -716,6 +769,7 @@ fn replay_buffered_batch(
         reconcile_in_flight,
         send_seq,
         true,
+        catchup_accum,
     )
 }
 
@@ -756,6 +810,7 @@ fn process_main_loop_event(
     transport: &mut ActorTransport,
     reconcile_in_flight: &mut bool,
     send_seq: &mut u64,
+    catchup_accum: &mut Vec<(String, i64)>,
 ) -> LoopControl {
     let mut batch = reduce(state, &event, clock);
     while let Ok(next) = events.try_recv() {
@@ -795,6 +850,7 @@ fn process_main_loop_event(
         reconcile_in_flight,
         send_seq,
         true,
+        catchup_accum,
     )
 }
 
@@ -813,6 +869,7 @@ fn invoke_catchup_and_replay(
     reconcile_in_flight: &mut bool,
     send_seq: &mut u64,
     emit_transport: bool,
+    catchup_accum: &mut Vec<(String, i64)>,
 ) -> LoopControl {
     if !begin_catchup_reconcile(reconcile_in_flight, output, *transport, emit_transport) {
         return LoopControl::Break;
@@ -837,7 +894,9 @@ fn invoke_catchup_and_replay(
         CatchupResult::CaughtUp {
             buffered_events,
             deferred_commands,
+            catchup_new_user_contents,
         } => {
+            catchup_accum.extend(catchup_new_user_contents);
             if !buffered_events.is_empty()
                 && replay_buffered_batch(
                     &buffered_events,
@@ -853,6 +912,7 @@ fn invoke_catchup_and_replay(
                     transport,
                     reconcile_in_flight,
                     send_seq,
+                    catchup_accum,
                 ) == LoopControl::Break
             {
                 return LoopControl::Break;
@@ -900,20 +960,23 @@ fn run(
         .max()
         .unwrap_or(0);
     let mut ring = OutcomeRing::with_cap(64);
-    // TODO(P3-3b, scaffold-id): frontier seeds next_ordinal by item_id; scaffold fc_* vs store-native id reconciliation is deferred.
-    let mut next_ordinal: i64 = match stores.transcript.frontier() {
-        Ok(Some((o, _))) => o + 1,
-        Ok(None) => 0,
+    let mut next_ordinal: i64 = match stores.transcript.next_ordinal_seed() {
+        Ok(seed) => seed,
         Err(e) => {
             ring.push(ActorOutcome::PersistError {
-                where_: "transcript.frontier",
+                where_: "transcript.next_ordinal_seed",
                 message: e.to_string(),
             });
-            0
+            drain_outcome_ring(&mut ring, &output.outcomes);
+            let _ = output.outcomes.send_blocking(ActorOutcome::Parked {
+                reason: ParkReason::SessionFailed,
+            });
+            return;
         }
     };
     let mut transport = ActorTransport::Connected;
     let mut reconcile_in_flight = false;
+    let mut catchup_accum = Vec::new();
 
     if invoke_catchup_and_replay(
         api.as_ref(),
@@ -929,6 +992,7 @@ fn run(
         &mut reconcile_in_flight,
         &mut send_seq,
         false, // pre-loop spawn catch-up: no TransportChanged — Sleep cannot race yet
+        &mut catchup_accum,
     ) == LoopControl::Break
     {
         return;
@@ -976,6 +1040,7 @@ fn run(
                         &mut transport,
                         &mut reconcile_in_flight,
                         &mut send_seq,
+                        &mut catchup_accum,
                     ) == LoopControl::Break
                     {
                         break;
@@ -1069,8 +1134,8 @@ fn commit_terminal_prefix(
         if !front.kind.is_terminal() {
             break;
         }
-        // TODO(P3-3b, scaffold-id): scaffold fc_* ids may double-commit vs store-native ids.
-        match stores.transcript.upsert_item(*next_ordinal, front) {
+        // D30: live commits land provisional until catch-up folds store ids.
+        match stores.transcript.upsert_item(*next_ordinal, front, true) {
             Ok(stored_ord) => {
                 let requested = *next_ordinal;
                 state.items.remove(0);
@@ -1301,7 +1366,12 @@ mod tests {
             Ok((ConnectionId::new("conn_1"), SessionId::new("conv_1")))
         }
 
-        fn upsert_item(&self, _ordinal: i64, _item: &Item) -> crate::persist::Result<i64> {
+        fn upsert_item(
+            &self,
+            _ordinal: i64,
+            _item: &Item,
+            _provisional: bool,
+        ) -> crate::persist::Result<i64> {
             Err(PersistError::ReadOnly)
         }
 
@@ -1316,8 +1386,20 @@ mod tests {
             Ok(())
         }
 
-        fn frontier(&self) -> crate::persist::Result<Option<(i64, ItemId)>> {
+        fn store_frontier(&self) -> crate::persist::Result<Option<(i64, ItemId)>> {
             Ok(None)
+        }
+
+        fn next_ordinal_seed(&self) -> crate::persist::Result<i64> {
+            Ok(0)
+        }
+
+        fn reconcile_store_item(
+            &self,
+            _store_item: &Item,
+            _live_key: &crate::persist::LiveKey,
+        ) -> crate::persist::Result<crate::persist::ReconcileOutcome> {
+            Err(PersistError::ReadOnly)
         }
     }
 
@@ -3622,7 +3704,7 @@ mod tests {
                 }],
             },
         };
-        transcript.upsert_item(ordinal, &item).unwrap();
+        transcript.upsert_item(ordinal, &item, false).unwrap();
     }
 
     fn item_list_from_messages(ids: &[&str], has_more: bool) -> ItemList {
@@ -3653,7 +3735,7 @@ mod tests {
             seed_message_item(&*stores.transcript, ord, id, id);
         }
         assert_eq!(
-            stores.transcript.frontier().unwrap(),
+            stores.transcript.store_frontier().unwrap(),
             Some((2, ItemId::new("item_2")))
         );
 
@@ -3727,7 +3809,7 @@ mod tests {
         seed_connection(&stores);
         seed_message_item(&*stores.transcript, 0, "item_0", "item_0");
         assert_eq!(
-            stores.transcript.frontier().unwrap(),
+            stores.transcript.store_frontier().unwrap(),
             Some((0, ItemId::new("item_0")))
         );
 
