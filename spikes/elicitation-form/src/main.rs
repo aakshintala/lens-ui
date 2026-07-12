@@ -1,3 +1,6 @@
+#![allow(dead_code)]
+#![allow(unused_variables)]
+
 mod app;
 mod ask_user_question;
 mod elicitation_card;

@@ -1,6 +1,6 @@
 //! Elicitation card discriminator (probe 6 composition).
 
-use gpui::{AppContext as _, Entity, IntoElement, ParentElement, Styled, Window, div, prelude::*};
+use gpui::{AppContext as _, Entity, IntoElement, ParentElement, Styled, Window, div};
 use gpui_component::{
     button::{Button, ButtonVariants as _},
     text::TextView,

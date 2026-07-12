@@ -16,19 +16,19 @@ pub enum BackendChoice {
 
 impl BackendChoice {
     pub fn parse() -> Self {
-        if let Ok(env) = std::env::var("TV_BACKEND") {
-            if env.eq_ignore_ascii_case("b") {
-                return Self::B;
-            }
+        if let Ok(env) = std::env::var("TV_BACKEND")
+            && env.eq_ignore_ascii_case("b")
+        {
+            return Self::B;
         }
         for arg in std::env::args().skip(1) {
             if arg.eq_ignore_ascii_case("--backend=b") {
                 return Self::B;
             }
-            if let Some(v) = arg.strip_prefix("--backend=") {
-                if v.eq_ignore_ascii_case("b") {
-                    return Self::B;
-                }
+            if let Some(v) = arg.strip_prefix("--backend=")
+                && v.eq_ignore_ascii_case("b")
+            {
+                return Self::B;
             }
         }
         Self::A
@@ -197,11 +197,11 @@ impl Backend {
     }
 
     pub fn on_frame_start(&mut self) {
-        if let Self::B(b) = self {
-            if b.pending_scroll_bottom {
-                b.scroll_to_bottom();
-                b.pending_scroll_bottom = false;
-            }
+        if let Self::B(b) = self
+            && b.pending_scroll_bottom
+        {
+            b.scroll_to_bottom();
+            b.pending_scroll_bottom = false;
         }
     }
 

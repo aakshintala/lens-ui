@@ -1,3 +1,6 @@
+#![allow(dead_code)]
+#![allow(unused_variables)]
+
 mod anchor;
 mod app;
 mod backend;
@@ -19,10 +22,10 @@ fn parse_n() -> usize {
     for arg in std::env::args().skip(1) {
         if let Some(v) = arg.strip_prefix("--n=") {
             n = v.parse().unwrap_or(200);
-        } else if let Ok(v) = arg.parse::<usize>() {
-            if arg.chars().all(|c| c.is_ascii_digit()) {
-                n = v;
-            }
+        } else if let Ok(v) = arg.parse::<usize>()
+            && arg.chars().all(|c| c.is_ascii_digit())
+        {
+            n = v;
         }
     }
     n

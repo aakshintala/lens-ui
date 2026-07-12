@@ -149,20 +149,20 @@ impl BackendB {
         }
         drop(heights);
         self.item_sizes = Self::sizes_from_heights(&self.item_heights.borrow());
-        if let Some(id) = self.store.id_at(ix) {
-            if let Some(entity) = self.store.entity(id) {
-                let h = self.item_heights.borrow()[ix];
-                entity.update(cx, |state, _| state.measured_height = Some(h));
-            }
+        if let Some(id) = self.store.id_at(ix)
+            && let Some(entity) = self.store.entity(id)
+        {
+            let h = self.item_heights.borrow()[ix];
+            entity.update(cx, |state, _| state.measured_height = Some(h));
         }
     }
 
     pub fn invalidate_last_row_height(&mut self, cx: &mut App) {
         let last = self.item_count().saturating_sub(1);
-        if let Some(id) = self.store.id_at(last) {
-            if let Some(entity) = self.store.entity(id) {
-                entity.update(cx, |state, _| state.measured_height = None);
-            }
+        if let Some(id) = self.store.id_at(last)
+            && let Some(entity) = self.store.entity(id)
+        {
+            entity.update(cx, |state, _| state.measured_height = None);
         }
         self.resync_heights(cx);
     }

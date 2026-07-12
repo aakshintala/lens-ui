@@ -104,7 +104,7 @@ impl Fixture {
 }
 
 fn row_kind_at(ix: usize) -> RowKind {
-    if ix % 25 == 0 {
+    if ix.is_multiple_of(25) {
         match (ix / 25) % 3 {
             0 => RowKind::CodeBlock,
             1 => RowKind::ImagePlaceholder,

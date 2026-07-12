@@ -92,10 +92,10 @@ impl SchemaForm {
                     .collect();
                 let delegate = SearchableVec::new(items);
                 let mut initial: Option<IndexPath> = None;
-                if let Some(Value::String(s)) = &f.default_value {
-                    if let Some(ix) = variants.iter().position(|v| v == s) {
-                        initial = Some(IndexPath::default().row(ix));
-                    }
+                if let Some(Value::String(s)) = &f.default_value
+                    && let Some(ix) = variants.iter().position(|v| v == s)
+                {
+                    initial = Some(IndexPath::default().row(ix));
                 }
                 let select = cx.new(|cx| SelectState::new(delegate, initial, window, cx));
                 FieldWidget::Enum { select }
@@ -116,10 +116,10 @@ impl SchemaForm {
     }
 
     pub fn set_bool(&mut self, key: &str, value: bool) {
-        if let Some(field) = self.fields.iter_mut().find(|f| f.key == key) {
-            if let FieldWidget::Bool { value: ref mut v } = field.widget {
-                *v = value;
-            }
+        if let Some(field) = self.fields.iter_mut().find(|f| f.key == key)
+            && let FieldWidget::Bool { value: ref mut v } = field.widget
+        {
+            *v = value;
         }
     }
 
@@ -245,10 +245,10 @@ impl SchemaForm {
                             .label(key.clone())
                             .on_click(move |new_checked, _, cx| {
                                 ent.update(cx, |form, _| {
-                                    if let Some(f) = form.fields.get_mut(ix) {
-                                        if let FieldWidget::Bool { value } = &mut f.widget {
-                                            *value = *new_checked;
-                                        }
+                                    if let Some(f) = form.fields.get_mut(ix)
+                                        && let FieldWidget::Bool { value } = &mut f.widget
+                                    {
+                                        *value = *new_checked;
                                     }
                                 });
                             })

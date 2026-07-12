@@ -493,11 +493,11 @@ impl HarnessView {
     fn poll_scroll_b(&mut self) {
         if let Backend::B(b) = &mut self.backend {
             let y = b.scroll_handle.offset().y;
-            if let Some(prev) = self.last_scroll_y {
-                if y > prev + px(1.) {
-                    self.probes.set_follow_mode(FollowMode::Paused);
-                    b.follow_bottom = false;
-                }
+            if let Some(prev) = self.last_scroll_y
+                && y > prev + px(1.)
+            {
+                self.probes.set_follow_mode(FollowMode::Paused);
+                b.follow_bottom = false;
             }
             self.last_scroll_y = Some(y);
             if b.is_at_bottom() {

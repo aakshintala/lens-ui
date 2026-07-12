@@ -30,10 +30,10 @@ pub struct Question {
 }
 
 pub fn question_key(q: &Question) -> String {
-    if let Some(id) = &q.id {
-        if !id.is_empty() {
-            return id.clone();
-        }
+    if let Some(id) = &q.id
+        && !id.is_empty()
+    {
+        return id.clone();
     }
     q.question.clone()
 }
@@ -117,10 +117,11 @@ impl AskUserQuestionForm {
 
         if q.multi_select {
             let mut selected: Vec<String> = st.multi_selection.iter().cloned().collect();
-            if st.custom_selected && !custom_value.is_empty() {
-                if !selected.iter().any(|s| s == &custom_value) {
-                    selected.push(custom_value);
-                }
+            if st.custom_selected
+                && !custom_value.is_empty()
+                && !selected.iter().any(|s| s == &custom_value)
+            {
+                selected.push(custom_value);
             }
             selected.sort();
             if selected.is_empty() {
