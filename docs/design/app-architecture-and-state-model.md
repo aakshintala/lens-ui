@@ -496,6 +496,23 @@ Responsibilities:
   no `sequence_number`); `seq` is an SSE-only live-overlap dedup hint, not a
   storage key. Dedup against hydrated/disk items by `id` so a reconnect or wake
   never double-inserts.
+- **Scaffold-id dedup at persist (D30, spec §2.4).** Scaffold harnesses mint a
+  *fresh* store id on persist that differs from the live SSE id (native harnesses
+  keep them equal), so a live-committed item and its later `GET /items` copy are
+  two rows under two ids unless folded. Lens commits every live item **provisional**
+  (a `provisional` flag on the transcript row) and, during catch-up, reconciles each
+  `/items` row against resident provisional rows by the precedence key **`id → call_id`**:
+  a native/message row folds by same **`id`** (no-op, clears provisional); a scaffold
+  **tool** row folds by same **`call_id`** — rewriting the provisional row's id to the
+  store id, **preserving its ordinal**, clearing the flag. `call_id` is present iff the
+  item is a `FunctionCall` **or** `FunctionCallOutput` (the only kinds that split; the
+  fold is **kind-scoped** so an output never folds into a call), so both write a
+  dedicated `call_id` column on provisional commit. The catch-up cursor pages from a
+  **store-frontier** = newest **non-provisional** id (never after a live/provisional id,
+  which the server wouldn't know); the append cursor seeds from `MAX(ordinal)+1` over
+  **all** rows (provisional included, since they hold ordinal slots) — the two cursors
+  are distinct. A folded id-match is **not** a new landing; only rows that reconcile
+  `NoMatch` and append as new store rows count as genuine new content (feeds D28).
 - **Session-field folds** — `session.status`, `session.usage`,
   `session.todos`, `session.model`, `session.model_options`,
   `session.reasoning_effort`, `session.collaboration_mode`, `session.skills`,
@@ -743,11 +760,19 @@ CREATE TABLE items (
   depth        INTEGER NOT NULL DEFAULT 0,   -- BlockContext.depth
   turn         INTEGER NOT NULL DEFAULT 0,   -- BlockContext.turn
   created_at   INTEGER NOT NULL,        -- Item.created_at, epoch millis (§2.3; injected clock)
+  provisional  INTEGER NOT NULL DEFAULT 0,  -- D30: 1 = live-committed, awaiting /items reconcile;
+                                        --   store-frontier ignores provisional rows; cleared on fold
+  call_id      TEXT,                    -- D30: dedicated fold key, set iff FunctionCall/Output
   PRIMARY KEY (item_id),
   UNIQUE (ordinal)
 );
 -- transcript file also carries: CREATE TABLE meta (key, value) with
 --   schema_version, connection_id, session_id  (self-describing for Bridge).
+-- SCHEMA_VERSION is 2 (was 1): the `provisional`/`call_id` columns are added to
+-- existing v1 files by an idempotent `PRAGMA table_info`-gated `ALTER TABLE ADD
+-- COLUMN` run on every ReadWrite open (open_db UPGRADES a v<current file, it does
+-- not degrade it to read-only; `CREATE TABLE IF NOT EXISTS` won't add columns). The
+-- control-plane `lens.db` shares SCHEMA_VERSION but needs no migration (no new columns).
 
 -- ══ back to lens.db ═════════════════════════════════════════════════════════
 -- Cost time-series for the time-windowed global readout (decision I). Lens
@@ -1321,6 +1346,12 @@ on a command it is one failed call that need not tear down the session.
 
 **Table A — terminal `Disconnected { reason }` (stream path) → actor lifecycle:**
 
+> ⚠️ **SUPERSEDED by the "P3-3b amendments" block below (D24/D25).** As built, park
+> ≠ "keep actor resident" and there is no "stop → remove" split — **all five reasons
+> emit terminal `Parked{reason}`, the actor EXITS, and recovery is a single user-gated
+> Reconnect = respawn.** The rows below are retained for the reason→UI mapping only; read
+> the "actor action" column through the amendment block.
+
 | `DisconnectReason` | actor action | UI |
 |---|---|---|
 | `Unauthorized` (401) | **park** — close stream, keep actor + state resident | prompt re-auth; do not drop session |
@@ -1358,6 +1389,9 @@ down the stream):
   POST — it returns `CommandOutcome::SendRejected`. A parked stream can't reconcile the
   send, so fabricating a bubble would strand it. (Only `Parked` rejects; `Reconnecting`/
   `Connected` sends proceed.)
+  > ⚠️ **SUPERSEDED (D24/D27): `CommandOutcome::SendRejected` is DELETED.** Park-as-exit
+  > means there is no resident parked actor to reject a send (a Disconnected session has no
+  > actor), so this whole bullet is moot — see the "P3-3b amendments" block below.
 - **Held bubbles are retained across reconnect, not dropped.** A Table B "keep" bubble
   (POST failed without stamping an id ⇒ both `server_pending_id` and `store_item_id`
   `None`) is **retained** on `SnapshotRestored` reconcile — it is neither landed nor
@@ -1395,6 +1429,26 @@ down the stream):
   reject a send; a Disconnected session has no actor. Held-bubble retention +
   landed-vs-lost is now the D28 reconnect reconciler (`SendLost`), running on the
   in-actor reconnect (Path 1).
+
+**P3-3b as-built deltas (2026-07-12, execution — two facts the grilling plan lacked):**
+
+- **D28 is UNIQUENESS-ONLY; the temporal lower-bound was dropped.** The planned
+  "unique **+ temporal**" held-landed match needed each catch-up user row's server
+  `created_at`, but omnigent 0.5.1 `/items` rows carry **no per-item timestamp**
+  (verified live — only session-level `created_at` exists). So the match is
+  two-sided **uniqueness** only (exactly one held bubble *and* exactly one slot with
+  the content); ambiguity → keep-unstamped (path 1) or `SendLost` (path 2/3, visible),
+  never a wrong stamp. Path 2's silent drop-as-landed is **kept** (not flipped to
+  always-`SendLost`) because the per-episode + store-frontier bound already narrows the
+  catch-up delta to *this* disconnect's new rows, and always-`SendLost` would guarantee a
+  duplicate on every successful landing. **Accepted residual:** a rare unrelated-identical
+  message landing in the same window → silent drop; the robust fix is the deferred
+  omnigent **client-message-id**. (Same class as a `PendingInput` with `content: null` →
+  it can't be content-matched → `SendLost` fallthrough.)
+- **D26 re-read status is returned, not discarded.** `FleetScheduler::reconnect`
+  returns `Result<Option<SessionStatus>, _>` (the re-read live status; `None` = fetch
+  failed, respawn proceeds anyway per D25). `lens-drive` is its first consumer (prints
+  `live_status`); the T1 test asserts it, so the D26 re-read is verified, not dead.
 
 ### 13.2 Downstream contracts (the seams)
 
