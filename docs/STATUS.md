@@ -25,13 +25,29 @@ and roll older "Recent" pointers off this page as they age.
     successful landing). Accepted narrow residual → deferred client-message-id. Rationale +
     grok's independent agreement in memory `state-model-p3-3b-contract-gaps`; as-built doc in
     app-arch §13.1 "P3-3b as-built deltas".
-  - **DEFERRED:** live-verify riders needing a driven turn (lens-drive SMOKE passed against a
-    live parked session; full park-induction riders need the omnigent host daemon); the omnigent
-    **client-message-id** contract request; `lens-ui` Bucket B viewport.
-  - **PRE-EXISTING (not P3-3b):** `cargo clippy --workspace --all-targets -D warnings` is red on
-    the gpui spike crates (`transcript-virtual`/`elicitation-form` — unused vars/dead code;
-    elicitation-form untouched by this branch, no lens-core dep). Quiet the lints or delete the
-    spent spikes. Full detail: `.superpowers/sdd/progress.md` + memory `state-model-p3-3b-executed`.
+  - **✅ LIVE-VERIFY RIDERS DONE (2026-07-12 follow-up):** driven live against omnigent 0.5.1 via
+    `lens-drive` + a headless host daemon. **D24 park=exit** (server-stop → RetriesExhausted →
+    `Parked{retries_exhausted}` → actor thread exits); **D26 live-status re-read** on reconnect
+    (`{"kind":"reconnect","live_status":"idle"}`); **forward catch-up** + on-disk persistence
+    (10 `/items` rows, provisional=0); **D27 SendPending** via a fault-injection proxy (503 on
+    `POST …/events` → `SendPending`, held bubble retained, content preserved). **D30 tool-fold**
+    captured live (real billable claude-sdk shell turn; two-id fold `fc_7ad9`→canonical `fc_9bb8`
+    proven on disk) → golden fixtures `crates/lens-core/tests/fixtures/d30/` + **2 hermetic
+    replay tests** (store-layer `d30_golden_reconcile_folds_tool_call` + end-to-end
+    `d30_golden_end_to_end_attach_turn_reconnect_fold`). gpt-5.5 review caught a false-green +
+    race in the first cut; fixed. **lens-core now 191 tests.**
+  - **⚠ NEW FINDING (2026-07-12): D28 Ambiguity-B unstamped-hold can linger (narrow zombie).**
+    The path-1 genuine-ambiguity branch (`reconcile.rs:109`, two identical-content
+    `pending_inputs`) keeps a bubble unstamped "re-evaluated next reconnect" — but the LIVE path
+    never resolves a both-ids-`None` held bubble (`reconcile_consumed` is content:None-inert;
+    Signal B retains). So with no further reconnect it lingers as a visible duplicate. Narrow
+    preconditions; SAME fix as the D28 residual (client-message-id). Detail in memory
+    `state-model-p3-3b-contract-gaps` #5.
+  - **DEFERRED (still open):** the omnigent **client-message-id** contract request (robust fix for
+    both the D28 residual + Ambiguity-B + D30 heuristic content-match); `lens-ui` Bucket B viewport.
+  - **✅ CLIPPY DEBT FIXED (2026-07-12):** the gpui spike crates are clippy-clean (`97dcabd`), and
+    `AGENTS.md` now pins the gate to **workspace-wide** `cargo clippy --workspace --all-targets
+    -- -D warnings` with a clean-before-push + fix-red-before-start rule (`1b75dd0`).
 
 - **▶ NEXT: `lens-ui` (Bucket B viewport)** — first rendering consumer of the §13.2 seams
   (StreamUpdate/SessionCommand/ActorOutcome), incl. the arch-B composer-owns-durability draft.
