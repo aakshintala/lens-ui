@@ -62,7 +62,7 @@
   - `ParkReason` = `{ Unauthorized, SessionFailed, RetriesExhausted, Forbidden, NotFound }`.
   - `ActorOutcome::Parked { reason: ParkReason }` — the sole terminal disconnect outcome (was 3 park-sets + `StoppedRemoved` + `StoppedTombstone`).
   - `SessionApi::fetch_status(&self, id: &SessionId) -> Result<SessionStatus, ClientError>` (wraps `Sessions::get`; returns `SessionStatus::{Idle,Running,Failed}`).
-  - `FleetScheduler::reconnect(&mut self, conn, session_id, events, updates, stores, clock, api) -> Result<(), FleetSchedulerError>` — re-reads live status via `api.fetch_status`, then respawns via the same disk-load path as `wake`.
+  - `FleetScheduler::reconnect(&mut self, conn, session_id, events, updates, stores, clock, api) -> Result<Option<SessionStatus>, FleetSchedulerError>` — re-reads live status via `api.fetch_status`, respawns via the same disk-load path as `wake`, and **returns the re-read status so a caller can observe/shape it** (`None` = fetch failed, respawned anyway). The value must ESCAPE `reconnect` — dropping it into `_live_status` makes D26 both dead weight and untested. lens-drive is the first consumer (prints it); lens-ui consumes the same return later.
   - `FleetScheduler::mark_parked(&mut self, session_id: &SessionId, reason: ParkReason)` — **the atomic park-bookkeeping entry (R2-5).** Called when the caller drains an `ActorOutcome::Parked{reason}`: it **removes+joins the exited handle from the registry AND records `parked[id]=reason` in one step**, so a subsequent `reconnect` never races an `AlreadyRunning` against a dead-but-not-yet-reaped actor. Do NOT leave "caller does `take_handle` then `parked.insert`" as two separate caller steps — that's the race codex found.
   - `FleetScheduler::parked: HashMap<SessionId, ParkReason>` + `FleetScheduler::park_reason(&self, id) -> Option<ParkReason>`.
 - Consumes: `Sessions::get`/`SessionStatus` (lens-client, already exists); `spawn_actor`, `ControlStore::load_session` (existing).
@@ -107,15 +107,16 @@ pub fn reconnect(
     stores: ActorStores,
     clock: Box<dyn Clock + Send>,
     api: Box<dyn SessionApi + Send>,
-) -> Result<(), FleetSchedulerError> {
+) -> Result<Option<SessionStatus>, FleetSchedulerError> {
     if self.registry.contains_key(session_id) {
         return Err(FleetSchedulerError::AlreadyRunning);
     }
     // D26: re-test reality. A `failed` server session resets to `idle` across a
-    // server restart; never trust a pre-disconnect status. We fetch it so a caller
-    // (UI) can shape the reconnect message, but the respawn proceeds regardless —
-    // nothing is auto-terminal (D25). A fetch error is itself a park reason, not a hard stop.
-    let _live_status = api.fetch_status(session_id).ok(); // advisory; respawn regardless
+    // server restart; never trust a pre-disconnect status. We fetch it and RETURN it
+    // so a caller (lens-drive today, lens-ui later) can shape the reconnect message,
+    // but the respawn proceeds regardless — nothing is auto-terminal (D25). A fetch
+    // error is NOT a hard stop; it becomes `None` (honest "couldn't confirm").
+    let live_status = api.fetch_status(session_id).ok(); // observed + returned; respawn regardless
     let state =
         crate::persist::ControlStore::load_session(stores.control.as_ref(), conn, session_id)
             .map_err(|e| FleetSchedulerError::Persist(e.to_string()))?
@@ -124,7 +125,7 @@ pub fn reconnect(
     let handle = spawn_actor(state, events, updates, stores, clock, api);
     self.parked.remove(session_id);
     self.registry.insert(session_id.clone(), handle);
-    Ok(())
+    Ok(live_status)
 }
 ```
 
@@ -174,9 +175,12 @@ fn park_then_reconnect_respawns_and_refreshes_status() {
     let (_ev_tx, ev_rx) = crossbeam_channel::bounded(64);
     let (up_tx, up_rx) = async_channel::bounded(64);
     let mut scheduler = FleetScheduler::new();
-    scheduler
+    let live = scheduler
         .reconnect(&conn, &sid, ev_rx, up_tx, stores, test_clock(), api)
         .expect("reconnect respawns from Active disk");
+    // D26: the returned status PROVES the re-read happened (not a false-green — a
+    // discarded status would let the mock return anything and still pass).
+    assert_eq!(live, Some(SessionStatus::Idle), "reconnect re-reads + returns live status");
     assert!(scheduler.is_running(&sid));
     assert!(scheduler.park_reason(&sid).is_none(), "reconnect clears park reason");
 
@@ -305,6 +309,7 @@ Built here (after T1/T2 lock the final `ActorOutcome`/`CommandOutcome` shapes) s
 **Interfaces:**
 - Consumes: `lens_core::actor::{spawn_actor, ActorHandle, ActorStores, SessionCommand}`, `ActorOutcome`, `StreamUpdate`; `lens_client` (connection + `Sessions` + stream); `lens_core::persist::{SqliteControlStore, SqliteTranscriptStore}`.
 - CLI (keep tiny): `lens-drive --base-url <url> --session <conv_id> [--script <path>]`. Reads newline commands from `--script` or stdin: `send <text>`, `sleep`, `reconnect`, `stop`, `snapshot` (dump current SessionState). Emits **one JSON object per line** to stdout: `{"kind":"outcome","outcome":<ActorOutcome-as-json>}` and `{"kind":"state","state":<compact SessionState>}`.
+- **The `reconnect` command consumes `FleetScheduler::reconnect`'s returned `Option<SessionStatus>` (D26)** — prints `{"kind":"reconnect","live_status":<status|null>}`. This is what makes D26 exercised, not dead weight; it is the first consumer of the re-read status. **Serialization:** if `SessionStatus` doesn't derive `Serialize`, map it to a `&str` (`idle`/`running`/`failed`) — a one-liner; confirm this at scaffold time, don't discover it mid-wire.
 
 **Bright line (put in README + a top-of-file comment):** lens-drive **dumps state as JSON, it never renders**. No markdown, no transcript layout, no virtualization. The moment it grows a rendering concern, that work belongs to `lens-ui`, not here. It is a second consumer of the §13.2 seam contracts (`StreamUpdate`/`SessionCommand`/`ActorOutcome`) — its value is proving those seams are drivable from outside the actor, and giving a repeatable harness for the live-verify riders.
 
@@ -319,7 +324,7 @@ git add crates/lens-drive Cargo.toml
 git commit -m "feat(lens-drive): headless JSON-lines actor driver (dumps state, never renders)"
 ```
 - [ ] **Step 7: Cross-family review** (grok-4.5). Focus: no rendering creep; clean seam consumption; connect/resolve duplication is deliberate not accidental.
-- [ ] **Step 8: D24/D27 live-verify riders through lens-drive.** Drive a real session: induce a park (e.g. `stop_session` out-of-band → `Disconnected`) and confirm the actor exits + `Parked` line appears + a scripted `reconnect` respawns and catches up; issue a send during a server blip and confirm `SendPending` retention. Record findings in the T7 memory update.
+- [ ] **Step 8: D24/D26/D27 live-verify riders through lens-drive.** Drive a real session: induce a park (e.g. `stop_session` out-of-band → `Disconnected`) and confirm the actor exits + `Parked` line appears + a scripted `reconnect` respawns and catches up + **its `reconnect` line reports the real server `live_status` (D26 exercised against a live server, not just the mock)**; issue a send during a server blip and confirm `SendPending` retention. Record findings in the T7 memory update.
 
 ---
 
@@ -431,7 +436,7 @@ fn reconcile_store_item(&self, store_item: &Item, live_key: &LiveKey) -> Result<
 // ) ORDER BY ordinal LIMIT 1     -- match the DEDICATED call_id column, not a JSON extract.
 ```
 
-**F2 plumbing (consumed by T6):** the catch-up fetch loop (`run_catchup`, runloop.rs:230-305) upserts items straight to disk and today returns only `buffered_events`/`deferred_commands` (`CatchupResult`, runloop.rs:175-179) — **the fetched item bodies are not retained**. T5 extends the catch-up path to accumulate `Vec<String>` of **user-message texts from rows that reconciled `NoMatch` and were appended as NEW store rows** (a folded id-match is NOT a new landing — F3). Accumulate across all iterated catch-up rounds (C3). This vector is D28's `catchup_user_contents` input; without it T6 cannot run.
+**F2 plumbing (consumed by T6):** the catch-up fetch loop (`run_catchup`, runloop.rs:230-305) upserts items straight to disk and today returns only `buffered_events`/`deferred_commands` (`CatchupResult`, runloop.rs:175-179) — **the fetched item bodies are not retained**. T5 extends the catch-up path to accumulate **`Vec<(String, i64)>` = `(user-message text, created_at)`** from rows that reconciled `NoMatch` and were appended as NEW store rows (a folded id-match is NOT a new landing — F3). **Carry `created_at`, not just the text** — T6's temporal lower-bound (a held send can only have landed *after* it was typed) needs each delta row's timestamp; a `Vec<String>` here forces a T6-boundary rework. Accumulate across all iterated catch-up rounds (C3). This vector is D28's `catchup_new_user_contents` input; without it T6 cannot run.
 
 **C2/C3/C4 ride this diff — SEPARATE COMMITS (F7):**
 - **C2 (frontier Err fail-closed):** runloop.rs:923-932 currently guesses `0` on a `frontier()` error → risks a `UNIQUE(ordinal)` collision. Change to: on `Err` from `next_ordinal_seed`/`store_frontier`, emit `PersistError` and **park** (`ActorOutcome::Parked` + return, per D24) — do not spawn with a guessed cursor.
@@ -473,7 +478,7 @@ git commit -am "refactor(state-model): C4 RunCtx arg-bundling"
 - Produces:
   - `PendingInput { pending_id: String, content: Option<String> }` — **+content** (F4). Shape-tolerant (`Option`, `#[serde(default)]`) — the wire field is `additionalProperties:true`; model it now that D28 consumes it.
   - `reconcile_held_landed(pending, snapshot_pending_inputs, catchup_new_user_contents) -> Vec<LostSend>` where `LostSend = { lens_pending_id: String, content: String }`.
-- Consumes: `state.pending_user`; the snapshot's `pending_inputs` (see the **R2-1 data-path note below** — it is NOT available at the hook site today); and **only the user-message texts of catch-up rows that reconciled `NoMatch` and were appended** (the T5/F2 accumulator — NOT the full fetched set, NOT folded rows).
+- Consumes: `state.pending_user`; the snapshot's `pending_inputs` (see the **R2-1 data-path note below** — it is NOT available at the hook site today); and **the `(text, created_at)` pairs of catch-up rows that reconciled `NoMatch` and were appended** (the T5/F2 accumulator, `Vec<(String, i64)>` — NOT the full fetched set, NOT folded rows). The `created_at` is required for the temporal lower-bound below.
 
 **R2-1 — the snapshot `pending_inputs` must be plumbed to the hook site (round-2 finding 1).** `fold_snapshot` (reduce/snapshot.rs:72-81) consumes the snapshot and emits only the marker `StreamUpdate::SnapshotRestored` — the `pending_inputs[].content` is discarded during reduce, so it is NOT resident at the catch-up finish site. Fix: **widen `StreamUpdate::SnapshotRestored` to carry `Vec<PendingInput>`** (the snapshot's pending inputs), or capture them in `apply_reduced_batch` before `reduce` drops them. Path 1 cannot stamp without this. (This is the same materialize-before-it's-gone class as F2 — I introduced it when adding path 1.) Add a runloop test where path 1 stamping requires the plumbed `content`.
 
@@ -505,13 +510,15 @@ The wire carries per-input `content`; once `PendingInput` is widened, all three 
 pub fn reconcile_held_landed(
     pending: &mut Vec<PendingUserMessage>,
     snapshot_pending_inputs: &[PendingInput], // widened: carries content
-    catchup_new_user_contents: &[String],     // NoMatch-appended user texts only (F3)
+    catchup_new_user_contents: &[(String, i64)], // (text, created_at); NoMatch-appended only (F3)
 ) -> Vec<LostSend> {
     // UNIQUE + TEMPORAL match (round-2). Walk `pending` in FIFO order:
     //   held bubble C (created_at = t):
-    //     path1: if EXACTLY ONE pending_input has content==C (unique) → stamp its
-    //            pending_id, consume it, KEEP. If >1 candidate/collision → leave
-    //            unstamped + KEEP (ambiguous; re-evaluated next reconnect).
+    //     path1: uniqueness is TWO-SIDED — stamp only if EXACTLY ONE held bubble has
+    //            content==C AND EXACTLY ONE pending_input has content==C. Then stamp
+    //            its pending_id, consume it, KEEP. If >1 on EITHER side (two bubbles /
+    //            one slot, or one bubble / two slots) → leave unstamped + KEEP
+    //            (ambiguous; re-evaluated next reconnect). Tests (e) + (h) pin both sides.
     //     path2: else if EXACTLY ONE unconsumed delta slot has content==C AND that
     //            row's created_at >= t (temporal) → consume it, DROP (landed).
     //            If ambiguous/none → fall through.
@@ -524,7 +531,7 @@ pub fn reconcile_held_landed(
 
 - [ ] **Step 1: Widen `PendingInput`** (sessions.rs) — add `content: Option<String>` with `#[serde(default)]`; update the doc comment (was "add when a consumer needs it" — now it does). Add a deserialize test: a `pending_inputs` fixture with `content` populates the field; one without leaves `None`. Full green bar for `-p lens-client`. **Cross-family review this contract-surface change** (touches hardened lens-client — memory `lens-client-foundation-gotchas`).
 - [ ] **Step 2: Plumb snapshot `pending_inputs` to the hook site (R2-1)** — widen `StreamUpdate::SnapshotRestored` to carry `Vec<PendingInput>` (or capture in `apply_reduced_batch` before `reduce`); update `fold_snapshot` (reduce/snapshot.rs) + all `SnapshotRestored` match sites (runloop.rs:533, tests). Verify the existing `detailed_mode_emits_rebased_after_snapshot_restored` test still passes. Commit this plumbing separately (it's a `StreamUpdate` contract change — cross-family review).
-- [ ] **Step 3: Write failing reconcile tests** (reconcile.rs tests): (a) `held_matching_unique_pending_input_is_stamped_and_kept` — held "hi" (t=100), `pending_inputs=[{p9,"hi"}]`, delta `[]` → empty `lost`, bubble kept with `server_pending_id==Some("p9")`; (b) `held_landed_in_catchup_delta_dropped` — held "hi" (t=100), inputs `[]`, delta `[("hi", created_at=200)]` → empty `lost`, bubble gone; (c) `held_absent_everywhere_is_lost`; (d) `path1_precedes_path2`; (e) **`duplicate_pending_input_content_left_unstamped`** — two `pending_inputs` both "hi", one held "hi" → NOT stamped (ambiguous), kept, empty `lost`; (f) **`temporal_screens_older_gap_message`** — held "hi" (t=200), delta `[("hi", created_at=100)]` → the older row does NOT count as a landing → `SendLost` (t=100 < 200); (g) `stamped_bubble_untouched`.
+- [ ] **Step 3: Write failing reconcile tests** (reconcile.rs tests): (a) `held_matching_unique_pending_input_is_stamped_and_kept` — held "hi" (t=100), `pending_inputs=[{p9,"hi"}]`, delta `[]` → empty `lost`, bubble kept with `server_pending_id==Some("p9")`; (b) `held_landed_in_catchup_delta_dropped` — held "hi" (t=100), inputs `[]`, delta `[("hi", created_at=200)]` → empty `lost`, bubble gone; (c) `held_absent_everywhere_is_lost`; (d) `path1_precedes_path2`; (e) **`duplicate_pending_input_content_left_unstamped`** — two `pending_inputs` both "hi", one held "hi" → NOT stamped (ambiguous), kept, empty `lost`; (f) **`temporal_screens_older_gap_message`** — held "hi" (t=200), delta `[("hi", created_at=100)]` → the older row does NOT count as a landing → `SendLost` (t=100 < 200); (g) `stamped_bubble_untouched`; (h) **`duplicate_held_bubbles_one_unique_input_none_stamped`** (the mirror of (e) — the two-bubbles/one-slot direction) — TWO held "hi" bubbles, exactly ONE `pending_input` "hi" → uniqueness guard requires exactly one bubble AND one slot, so **neither** is stamped, both kept, empty `lost`. This pins the consume-slot guard against an off-by-one that (e) alone can't catch.
 - [ ] **Step 4: Run — expect FAIL.** `cargo test -p lens-core reconcile_held -- --nocapture`.
 - [ ] **Step 5: Implement `reconcile_held_landed` + `LostSend` + the `user_text` helper** per the unique+temporal algorithm. (Requires the T5/F2 accumulator to carry each row's `created_at`, not just its text — thread that through.)
 - [ ] **Step 6: Run — expect PASS** (unit level).
