@@ -9,15 +9,33 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Open threads & next up
 
-- **▶ NEXT (2026-07-12): EXECUTE state-model P3-3b** — plan WRITTEN + double cross-family reviewed
-  (grok round 1 → 10 findings, gpt-5.5/codex round 2 → 5 more, all folded). Plan is
-  `docs/superpowers/plans/2026-07-12-state-model-p3-3b.md` (SSOT for execution; §2.4 D24–D31 =
-  decisions SSOT). Execute in a NEW session via `subagent-driven-development`: composer-2.5 per
-  task, grok cross-family review each MANDATORY seam. **Task order:** T1 (D24 park=exit + D25/26
-  reconnect) → T2 (D27 send 3-fate) → T4 (`lens-drive` binary) → T5 (D30 scaffold-id + C2/C3/C4)
-  → T6 (D28 held-reconcile) → T7 (docs incl. app-arch §4.1/§6.2 D30 amendment + spec §2.4 D28
-  FIFO→unique+temporal correction + memory). See `docs/handoffs/2026-07-12-state-model-p3-3b-execution.md`.
-  (Bucket B viewport / `lens-ui` crate = separate later plan.)
+- **✅ DONE (2026-07-12): state-model P3-3b EXECUTED + merged to `main`** (branch
+  `state-model-p3-3b`, 16 commits, base 02d6d96; **push deferred — user call**). All 6 code/doc
+  tasks landed via `subagent-driven-development` (composer-2.5 author, grok-4.5 seam review each,
+  gpt-5.5/codex whole-branch final pass). Shipped: D24 park=actor-exit + D25/D26 user-gated
+  reconnect (`FleetScheduler::reconnect` returns `Option<SessionStatus>`, exited-only reap); D27
+  send 3-fate split (SendRejected deleted); `crates/lens-drive` headless driver; D30 scaffold-id
+  dedup at persist (provisional flag, dual cursor, kind-scoped id→call_id fold, real ALTER
+  migration) + C2/C3/C4; D28 held-landed reconcile. **lens-core 189 tests + lens-client 150,
+  product-crate gates green.**
+  - **⚠ AS-BUILT DEVIATION needing your eyes — D28 is UNIQUENESS-ONLY, temporal bound DROPPED.**
+    Discovered mid-execution: omnigent `/items` rows carry **no per-item timestamp** (verified
+    live), so the planned temporal screen is unimplementable. Path-2 silent drop-as-landed is
+    KEPT (per-episode+frontier bounds the residual; always-SendLost would duplicate every
+    successful landing). Accepted narrow residual → deferred client-message-id. Rationale +
+    grok's independent agreement in memory `state-model-p3-3b-contract-gaps`; as-built doc in
+    app-arch §13.1 "P3-3b as-built deltas".
+  - **DEFERRED:** live-verify riders needing a driven turn (lens-drive SMOKE passed against a
+    live parked session; full park-induction riders need the omnigent host daemon); the omnigent
+    **client-message-id** contract request; `lens-ui` Bucket B viewport.
+  - **PRE-EXISTING (not P3-3b):** `cargo clippy --workspace --all-targets -D warnings` is red on
+    the gpui spike crates (`transcript-virtual`/`elicitation-form` — unused vars/dead code;
+    elicitation-form untouched by this branch, no lens-core dep). Quiet the lints or delete the
+    spent spikes. Full detail: `.superpowers/sdd/progress.md` + memory `state-model-p3-3b-executed`.
+
+- **▶ NEXT: `lens-ui` (Bucket B viewport)** — first rendering consumer of the §13.2 seams
+  (StreamUpdate/SessionCommand/ActorOutcome), incl. the arch-B composer-owns-durability draft.
+  lens-drive is the headless precedent proving the seams are drivable.
 
 - **lens-client benchmarks: DONE** (2026-06-27, composer-2.5 build + free codex
   cross-family review → 4 Important + 1 Nit, all applied). Closes the MANDATORY
