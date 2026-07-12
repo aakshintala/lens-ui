@@ -37,7 +37,7 @@ impl FleetScheduler {
     }
 
     /// Respawn a session actor from disk control scalars. `spawn_actor` seeds
-    /// `next_ordinal` from `transcript.frontier()` and runs forward catch-up.
+    /// `next_ordinal` from `transcript.next_ordinal_seed()` and runs forward catch-up.
     /// The registry retains ownership of the handle until `take_handle`.
     #[allow(clippy::too_many_arguments)]
     pub fn wake(

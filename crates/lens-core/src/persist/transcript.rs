@@ -200,11 +200,14 @@ impl SqliteTranscriptStore {
     ) -> Result<Option<i64>> {
         tx.query_row(
             "SELECT ordinal FROM items WHERE provisional = 1 AND (
-               item_id = ?1 OR (?2 IS NOT NULL AND call_id = ?2)
+               item_id = ?1 OR (
+                 ?2 IS NOT NULL AND call_id = ?2 AND kind = ?3
+               )
              ) ORDER BY ordinal LIMIT 1",
             rusqlite::params![
                 live_key.id.as_str(),
                 live_key.call_id.as_ref().map(|c| c.as_str()),
+                live_key.scaffold_kind,
             ],
             |r| r.get(0),
         )
@@ -295,7 +298,8 @@ impl TranscriptStore for SqliteTranscriptStore {
                             [ord],
                         )?;
                         tx.execute(
-                            "UPDATE items SET kind = ?1, payload = ?2 WHERE item_id = ?3",
+                            "UPDATE items SET kind = ?1, payload = ?2, provisional = 0
+                               WHERE item_id = ?3",
                             rusqlite::params![
                                 item_kind_token(&store_item.kind),
                                 json_string(&store_item.kind)?,
@@ -446,6 +450,24 @@ CREATE TABLE IF NOT EXISTS items (
         }
     }
 
+    fn function_call_output(id: &str, call_id: &str, output: &str) -> Item {
+        Item {
+            id: ItemId::new(id),
+            seq: Some(1),
+            ctx: BlockContext {
+                agent: None,
+                depth: 0,
+                turn: 0,
+            },
+            created_at: 1_700_000_000_000,
+            kind: ItemKind::FunctionCallOutput {
+                call_id: CallId::new(call_id),
+                output: output.into(),
+                arguments: json!({}),
+            },
+        }
+    }
+
     fn store(dir: &std::path::Path) -> SqliteTranscriptStore {
         SqliteTranscriptStore::open(
             &dir.join("conv_1.db"),
@@ -561,6 +583,7 @@ CREATE TABLE IF NOT EXISTS items (
         let live_key = LiveKey {
             id: store_row.id.clone(),
             call_id: Some(CallId::new("call_1")),
+            scaffold_kind: Some("function_call"),
         };
         let outcome = s.reconcile_store_item(&store_row, &live_key).unwrap();
         assert_eq!(outcome, ReconcileOutcome::Folded { ordinal: 5 });
@@ -582,10 +605,62 @@ CREATE TABLE IF NOT EXISTS items (
         let live_key = LiveKey {
             id: store_row.id.clone(),
             call_id: None,
+            scaffold_kind: None,
         };
         let outcome = s.reconcile_store_item(&store_row, &live_key).unwrap();
         assert_eq!(outcome, ReconcileOutcome::Folded { ordinal: 0 });
         assert_eq!(provisional_flag(&s, "msg_1"), 0);
+    }
+
+    #[test]
+    fn reconcile_fco_folds_by_call_id_into_provisional_fco() {
+        let d = tempdir().unwrap();
+        let s = store(d.path());
+        s.upsert_item(
+            5,
+            &function_call_output("fco_live", "call_1", "live out"),
+            true,
+        )
+        .unwrap();
+
+        let store_row = function_call_output("fco_store", "call_1", "store out");
+        let live_key = LiveKey {
+            id: store_row.id.clone(),
+            call_id: Some(CallId::new("call_1")),
+            scaffold_kind: Some("function_call_output"),
+        };
+        let outcome = s.reconcile_store_item(&store_row, &live_key).unwrap();
+        assert_eq!(outcome, ReconcileOutcome::Folded { ordinal: 5 });
+
+        let rows = s.load_items().unwrap().rows;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id.as_str(), "fco_store");
+        assert_eq!(provisional_flag(&s, "fco_store"), 0);
+    }
+
+    #[test]
+    fn reconcile_fco_does_not_fold_into_provisional_function_call() {
+        let d = tempdir().unwrap();
+        let s = store(d.path());
+        s.upsert_item(5, &function_call("fc_live", "call_1"), true)
+            .unwrap();
+
+        let store_row = function_call_output("fco_store", "call_1", "tool output");
+        let live_key = LiveKey {
+            id: store_row.id.clone(),
+            call_id: Some(CallId::new("call_1")),
+            scaffold_kind: Some("function_call_output"),
+        };
+        let outcome = s.reconcile_store_item(&store_row, &live_key).unwrap();
+        assert_eq!(outcome, ReconcileOutcome::NoMatch);
+
+        let rows = s.load_items().unwrap().rows;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id.as_str(), "fc_live");
+        match &rows[0].kind {
+            ItemKind::FunctionCall { .. } => {}
+            other => panic!("expected FunctionCall, got {other:?}"),
+        }
     }
 
     #[test]
@@ -600,6 +675,7 @@ CREATE TABLE IF NOT EXISTS items (
         let live_key = LiveKey {
             id: store_row.id.clone(),
             call_id: Some(CallId::new("call_1")),
+            scaffold_kind: Some("function_call"),
         };
         let outcome = s.reconcile_store_item(&store_row, &live_key).unwrap();
         assert_eq!(outcome, ReconcileOutcome::Folded { ordinal: 0 });

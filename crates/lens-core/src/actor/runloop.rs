@@ -10,6 +10,7 @@ use crate::domain::SessionState;
 use crate::domain::controls::PendingUserMessage;
 use crate::domain::item::{BlockContext, Item, ItemKind};
 use crate::domain::scalars::{Role, SessionLifecycle};
+use crate::persist::map::item_kind_token;
 use crate::persist::{ControlStore, LiveKey, ReconcileOutcome, TranscriptStore};
 use crate::reduce::map_wire_item;
 use crate::reduce::{StreamUpdate, Updates, reduce};
@@ -244,18 +245,31 @@ fn live_key_for_store_item(item: &Item) -> LiveKey {
         }
         _ => None,
     };
+    let scaffold_kind = if call_id.is_some() {
+        Some(item_kind_token(&item.kind))
+    } else {
+        None
+    };
     LiveKey {
         id: item.id.clone(),
         call_id,
+        scaffold_kind,
     }
 }
 
-fn user_message_text(item: &Item) -> Option<&str> {
+fn user_message_text(item: &Item) -> Option<String> {
     match &item.kind {
         ItemKind::Message {
             role: Role::User,
             content,
-        } => content.first().and_then(|b| b.text.as_deref()),
+        } => {
+            let text: String = content
+                .iter()
+                .filter(|b| b.kind == "input_text" || b.kind == "output_text")
+                .filter_map(|b| b.text.as_deref())
+                .collect();
+            if text.is_empty() { None } else { Some(text) }
+        }
         _ => None,
     }
 }
@@ -308,6 +322,10 @@ fn run_catchup(
                 where_: "transcript.store_frontier",
                 message: e.to_string(),
             });
+            drain_outcome_ring(ring, &output.outcomes);
+            let _ = output.outcomes.send_blocking(ActorOutcome::Parked {
+                reason: ParkReason::SessionFailed,
+            });
             return CatchupResult::Aborted;
         }
     };
@@ -356,8 +374,7 @@ fn run_catchup(
                         if upsert_catchup_item(stores, next_ordinal, &domain, ring) {
                             wrote_any = true;
                             if let Some(text) = user_message_text(&domain) {
-                                catchup_new_user_contents
-                                    .push((text.to_string(), domain.created_at));
+                                catchup_new_user_contents.push((text, domain.created_at));
                             }
                         }
                     }
@@ -365,6 +382,10 @@ fn run_catchup(
                         ring.push(ActorOutcome::PersistError {
                             where_: "transcript.reconcile_store_item",
                             message: e.to_string(),
+                        });
+                        drain_outcome_ring(ring, &output.outcomes);
+                        let _ = output.outcomes.send_blocking(ActorOutcome::Parked {
+                            reason: ParkReason::SessionFailed,
                         });
                         return CatchupResult::Aborted;
                     }
@@ -778,13 +799,15 @@ fn process_main_loop_event(ctx: &mut RunCtx<'_>, event: ServerStreamEvent) -> Lo
 }
 
 fn invoke_catchup_and_replay(ctx: &mut RunCtx<'_>, emit_transport: bool) -> LoopControl {
+    ctx.catchup_accum.clear();
     let mut frame_stack: Vec<CatchupFrame> = Vec::new();
+    let mut current_emit_transport = emit_transport;
     'catchup: loop {
         if !begin_catchup_reconcile(
             ctx.reconcile_in_flight,
             ctx.output,
             *ctx.transport,
-            emit_transport,
+            current_emit_transport,
         ) {
             return LoopControl::Break;
         }
@@ -803,7 +826,7 @@ fn invoke_catchup_and_replay(ctx: &mut RunCtx<'_>, emit_transport: bool) -> Loop
             ctx.reconcile_in_flight,
             ctx.output,
             *ctx.transport,
-            emit_transport,
+            current_emit_transport,
         ) {
             return LoopControl::Break;
         }
@@ -826,6 +849,7 @@ fn invoke_catchup_and_replay(ctx: &mut RunCtx<'_>, emit_transport: bool) -> Loop
                             deferred_commands,
                             defer_transcript_commit: replay.defer_transcript_commit,
                         });
+                        current_emit_transport = true;
                         continue 'catchup;
                     }
                     if replay.defer_transcript_commit

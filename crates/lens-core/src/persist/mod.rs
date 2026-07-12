@@ -117,11 +117,13 @@ pub trait ControlStore {
     ) -> Result<Vec<(i64, f64)>>;
 }
 
-/// D30 reconcile key: `id` match for messages; `call_id` match for scaffold tool rows.
+/// D30 reconcile key: `id` match for messages; `call_id` + kind match for scaffold tool rows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiveKey {
     pub id: ItemId,
     pub call_id: Option<CallId>,
+    /// `items.kind` token when folding scaffold rows by `call_id` (FC vs FCO are distinct).
+    pub scaffold_kind: Option<&'static str>,
 }
 
 /// Result of folding a catch-up `/items` row into a resident provisional row.
