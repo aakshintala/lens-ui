@@ -3357,6 +3357,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "lens-drive"
+version = "0.1.0"
+dependencies = [
+ "async-channel 2.5.0",
+ "crossbeam-channel",
+ "lens-client",
+ "lens-core",
+ "serde_json",
+ "url",
+]
+
+[[package]]
 name = "lens-store"
 version = "0.1.0"
 dependencies = [
