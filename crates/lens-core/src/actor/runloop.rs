@@ -93,6 +93,23 @@ struct ActorOutput {
     mode: OutputMode,
 }
 
+/// Thread-local actor run state shared across catch-up and main-loop paths (C4).
+struct RunCtx<'a> {
+    api: &'a dyn SessionApi,
+    stores: &'a ActorStores,
+    state: &'a mut SessionState,
+    events: &'a Receiver<ServerStreamEvent>,
+    commands: &'a Receiver<SessionCommand>,
+    output: &'a mut ActorOutput,
+    ring: &'a mut OutcomeRing,
+    clock: &'a dyn Clock,
+    next_ordinal: &'a mut i64,
+    transport: &'a mut ActorTransport,
+    reconcile_in_flight: &'a mut bool,
+    send_seq: &'a mut u64,
+    catchup_accum: &'a mut Vec<(String, i64)>,
+}
+
 /// Spawn the actor thread in `Detailed` mode (Task 5 API). Summary channel is
 /// created internally and dropped — never emitted to in Detailed mode.
 pub fn spawn_actor(
@@ -581,23 +598,21 @@ fn handle_command(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn apply_reduced_batch(
+    ctx: &mut RunCtx<'_>,
     batch: Updates,
-    state: &mut SessionState,
-    stores: &ActorStores,
-    output: &mut ActorOutput,
-    ring: &mut OutcomeRing,
-    clock: &dyn Clock,
-    next_ordinal: &mut i64,
-    transport: &mut ActorTransport,
-    reconcile_in_flight: &mut bool,
     defer_transcript_commit: bool,
 ) -> (LoopControl, bool) {
-    persist_scalars(stores, state, &batch, clock.now_millis(), ring);
+    persist_scalars(
+        ctx.stores,
+        ctx.state,
+        &batch,
+        ctx.clock.now_millis(),
+        ctx.ring,
+    );
     let mut batch = batch;
     if !defer_transcript_commit
-        && let Some(ord) = commit_terminal_prefix(stores, state, next_ordinal, ring)
+        && let Some(ord) = commit_terminal_prefix(ctx.stores, ctx.state, ctx.next_ordinal, ctx.ring)
     {
         batch.push(StreamUpdate::TranscriptAdvanced {
             committed_ordinal: ord,
@@ -611,36 +626,38 @@ fn apply_reduced_batch(
         .iter()
         .any(|u| matches!(u, StreamUpdate::Reconnecting { .. }));
     let saw_reconnected = batch.iter().any(|u| matches!(u, StreamUpdate::Reconnected));
-    match output.mode {
+    match ctx.output.mode {
         OutputMode::Detailed => {
             let had_snapshot = batch
                 .iter()
                 .any(|u| matches!(u, StreamUpdate::SnapshotRestored));
             for u in coalesce(batch) {
-                if output.updates.send_blocking(u).is_err() {
+                if ctx.output.updates.send_blocking(u).is_err() {
                     return (LoopControl::Break, false);
                 }
             }
             if had_snapshot
-                && output
+                && ctx
+                    .output
                     .updates
-                    .send_blocking(StreamUpdate::Rebased(scalars_baseline(state)))
+                    .send_blocking(StreamUpdate::Rebased(scalars_baseline(ctx.state)))
                     .is_err()
             {
                 return (LoopControl::Break, false);
             }
         }
         OutputMode::Summary => {
-            if output
+            if ctx
+                .output
                 .summaries
-                .send_blocking(SummaryUpdate::from_state(state))
+                .send_blocking(SummaryUpdate::from_state(ctx.state))
                 .is_err()
             {
-                ring.push(ActorOutcome::SummaryConsumerGone);
+                ctx.ring.push(ActorOutcome::SummaryConsumerGone);
             }
         }
     }
-    drain_outcome_ring(ring, &output.outcomes);
+    drain_outcome_ring(ctx.ring, &ctx.output.outcomes);
     if let Some(reason) = disconnect_reason {
         let park = match reason {
             DisconnectReason::Unauthorized => ParkReason::Unauthorized,
@@ -649,21 +666,22 @@ fn apply_reduced_batch(
             DisconnectReason::Forbidden => ParkReason::Forbidden,
             DisconnectReason::NotFound => ParkReason::NotFound,
         };
-        *reconcile_in_flight = false;
-        let _ = output
+        *ctx.reconcile_in_flight = false;
+        let _ = ctx
+            .output
             .outcomes
             .send_blocking(ActorOutcome::Parked { reason: park });
         return (LoopControl::Break, false);
     }
     if disconnect_reason.is_none() && saw_reconnecting {
-        *transport = ActorTransport::Reconnecting;
-        *reconcile_in_flight = true;
-        if !emit_transport_changed(output, *transport, *reconcile_in_flight) {
+        *ctx.transport = ActorTransport::Reconnecting;
+        *ctx.reconcile_in_flight = true;
+        if !emit_transport_changed(ctx.output, *ctx.transport, *ctx.reconcile_in_flight) {
             return (LoopControl::Break, false);
         }
     }
     if disconnect_reason.is_none() && saw_reconnected {
-        *transport = ActorTransport::Connected;
+        *ctx.transport = ActorTransport::Connected;
     }
     (
         LoopControl::Continue,
@@ -680,83 +698,41 @@ fn reconnected_defer_commit(batch: &Updates) -> bool {
 }
 
 /// Shared Reconnected path: catch-up (if needed), then commit deferred live tail.
-#[allow(clippy::too_many_arguments)]
 fn finish_reconnected_catchup(
+    ctx: &mut RunCtx<'_>,
     needs_catchup: bool,
     defer_transcript_commit: bool,
-    api: &dyn SessionApi,
-    stores: &ActorStores,
-    state: &mut SessionState,
-    events: &Receiver<ServerStreamEvent>,
-    commands: &Receiver<SessionCommand>,
-    output: &mut ActorOutput,
-    ring: &mut OutcomeRing,
-    clock: &dyn Clock,
-    next_ordinal: &mut i64,
-    transport: &mut ActorTransport,
-    reconcile_in_flight: &mut bool,
-    send_seq: &mut u64,
     emit_transport: bool,
-    catchup_accum: &mut Vec<(String, i64)>,
 ) -> LoopControl {
     if !needs_catchup {
         return LoopControl::Continue;
     }
-    if invoke_catchup_and_replay(
-        api,
-        stores,
-        state,
-        events,
-        commands,
-        output,
-        ring,
-        clock,
-        next_ordinal,
-        transport,
-        reconcile_in_flight,
-        send_seq,
-        emit_transport,
-        catchup_accum,
-    ) == LoopControl::Break
-    {
+    if invoke_catchup_and_replay(ctx, emit_transport) == LoopControl::Break {
         return LoopControl::Break;
     }
     if defer_transcript_commit {
-        return finish_deferred_transcript_commit(stores, state, next_ordinal, ring, output);
+        return finish_deferred_transcript_commit(
+            ctx.stores,
+            ctx.state,
+            ctx.next_ordinal,
+            ctx.ring,
+            ctx.output,
+        );
     }
     LoopControl::Continue
 }
 
 /// Reduce a buffered event slice; caller owns nested catch-up iteration (C3).
-#[allow(clippy::too_many_arguments)]
 fn replay_buffered_batch(
+    ctx: &mut RunCtx<'_>,
     buffered_events: &[ServerStreamEvent],
-    stores: &ActorStores,
-    state: &mut SessionState,
-    output: &mut ActorOutput,
-    ring: &mut OutcomeRing,
-    clock: &dyn Clock,
-    next_ordinal: &mut i64,
-    transport: &mut ActorTransport,
-    reconcile_in_flight: &mut bool,
 ) -> ReplayBatchResult {
-    let mut batch = reduce(state, &buffered_events[0], clock);
+    let mut batch = reduce(ctx.state, &buffered_events[0], ctx.clock);
     for ev in &buffered_events[1..] {
-        batch.extend(reduce(state, ev, clock));
+        batch.extend(reduce(ctx.state, ev, ctx.clock));
     }
     let defer_transcript_commit = reconnected_defer_commit(&batch);
-    let (ctrl, needs_catchup) = apply_reduced_batch(
-        batch,
-        state,
-        stores,
-        output,
-        ring,
-        clock,
-        next_ordinal,
-        transport,
-        reconcile_in_flight,
-        defer_transcript_commit,
-    );
+    let (ctrl, needs_catchup) = apply_reduced_batch(ctx, batch, defer_transcript_commit);
     ReplayBatchResult {
         control: ctrl,
         defer_transcript_commit,
@@ -786,102 +762,52 @@ fn finish_deferred_transcript_commit(
     LoopControl::Continue
 }
 
-#[allow(clippy::too_many_arguments)]
-fn process_main_loop_event(
-    event: ServerStreamEvent,
-    events: &Receiver<ServerStreamEvent>,
-    commands: &Receiver<SessionCommand>,
-    api: &dyn SessionApi,
-    state: &mut SessionState,
-    stores: &ActorStores,
-    output: &mut ActorOutput,
-    ring: &mut OutcomeRing,
-    clock: &dyn Clock,
-    next_ordinal: &mut i64,
-    transport: &mut ActorTransport,
-    reconcile_in_flight: &mut bool,
-    send_seq: &mut u64,
-    catchup_accum: &mut Vec<(String, i64)>,
-) -> LoopControl {
-    let mut batch = reduce(state, &event, clock);
-    while let Ok(next) = events.try_recv() {
-        batch.extend(reduce(state, &next, clock));
+fn process_main_loop_event(ctx: &mut RunCtx<'_>, event: ServerStreamEvent) -> LoopControl {
+    let mut batch = reduce(ctx.state, &event, ctx.clock);
+    while let Ok(next) = ctx.events.try_recv() {
+        batch.extend(reduce(ctx.state, &next, ctx.clock));
     }
     // D19: live follow-ons in the same greedy-drained batch must not commit before catch-up.
     let defer_transcript_commit = reconnected_defer_commit(&batch);
 
-    let (ctrl, needs_catchup) = apply_reduced_batch(
-        batch,
-        state,
-        stores,
-        output,
-        ring,
-        clock,
-        next_ordinal,
-        transport,
-        reconcile_in_flight,
-        defer_transcript_commit,
-    );
+    let (ctrl, needs_catchup) = apply_reduced_batch(ctx, batch, defer_transcript_commit);
     if ctrl == LoopControl::Break {
         return LoopControl::Break;
     }
-    finish_reconnected_catchup(
-        needs_catchup,
-        defer_transcript_commit,
-        api,
-        stores,
-        state,
-        events,
-        commands,
-        output,
-        ring,
-        clock,
-        next_ordinal,
-        transport,
-        reconcile_in_flight,
-        send_seq,
-        true,
-        catchup_accum,
-    )
+    finish_reconnected_catchup(ctx, needs_catchup, defer_transcript_commit, true)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn invoke_catchup_and_replay(
-    api: &dyn SessionApi,
-    stores: &ActorStores,
-    state: &mut SessionState,
-    events: &Receiver<ServerStreamEvent>,
-    commands: &Receiver<SessionCommand>,
-    output: &mut ActorOutput,
-    ring: &mut OutcomeRing,
-    clock: &dyn Clock,
-    next_ordinal: &mut i64,
-    transport: &mut ActorTransport,
-    reconcile_in_flight: &mut bool,
-    send_seq: &mut u64,
-    emit_transport: bool,
-    catchup_accum: &mut Vec<(String, i64)>,
-) -> LoopControl {
+fn invoke_catchup_and_replay(ctx: &mut RunCtx<'_>, emit_transport: bool) -> LoopControl {
     let mut frame_stack: Vec<CatchupFrame> = Vec::new();
     'catchup: loop {
-        if !begin_catchup_reconcile(reconcile_in_flight, output, *transport, emit_transport) {
+        if !begin_catchup_reconcile(
+            ctx.reconcile_in_flight,
+            ctx.output,
+            *ctx.transport,
+            emit_transport,
+        ) {
             return LoopControl::Break;
         }
         let catchup = run_catchup(
-            api,
-            stores,
-            state,
-            next_ordinal,
-            events,
-            commands,
-            output,
-            ring,
-            clock,
+            ctx.api,
+            ctx.stores,
+            ctx.state,
+            ctx.next_ordinal,
+            ctx.events,
+            ctx.commands,
+            ctx.output,
+            ctx.ring,
+            ctx.clock,
         );
-        if !end_catchup_reconcile(reconcile_in_flight, output, *transport, emit_transport) {
+        if !end_catchup_reconcile(
+            ctx.reconcile_in_flight,
+            ctx.output,
+            *ctx.transport,
+            emit_transport,
+        ) {
             return LoopControl::Break;
         }
-        drain_outcome_ring(ring, &output.outcomes);
+        drain_outcome_ring(ctx.ring, &ctx.output.outcomes);
         match catchup {
             CatchupResult::Aborted => return LoopControl::Break,
             CatchupResult::CaughtUp {
@@ -889,19 +815,9 @@ fn invoke_catchup_and_replay(
                 deferred_commands,
                 catchup_new_user_contents,
             } => {
-                catchup_accum.extend(catchup_new_user_contents);
+                ctx.catchup_accum.extend(catchup_new_user_contents);
                 if !buffered_events.is_empty() {
-                    let replay = replay_buffered_batch(
-                        &buffered_events,
-                        stores,
-                        state,
-                        output,
-                        ring,
-                        clock,
-                        next_ordinal,
-                        transport,
-                        reconcile_in_flight,
-                    );
+                    let replay = replay_buffered_batch(ctx, &buffered_events);
                     if replay.control == LoopControl::Break {
                         return LoopControl::Break;
                     }
@@ -914,11 +830,11 @@ fn invoke_catchup_and_replay(
                     }
                     if replay.defer_transcript_commit
                         && finish_deferred_transcript_commit(
-                            stores,
-                            state,
-                            next_ordinal,
-                            ring,
-                            output,
+                            ctx.stores,
+                            ctx.state,
+                            ctx.next_ordinal,
+                            ctx.ring,
+                            ctx.output,
                         ) == LoopControl::Break
                     {
                         return LoopControl::Break;
@@ -927,15 +843,15 @@ fn invoke_catchup_and_replay(
                 for cmd in deferred_commands {
                     if handle_command(
                         cmd,
-                        state,
-                        stores,
-                        output,
-                        ring,
-                        clock,
-                        api,
-                        transport,
-                        *reconcile_in_flight,
-                        send_seq,
+                        ctx.state,
+                        ctx.stores,
+                        ctx.output,
+                        ctx.ring,
+                        ctx.clock,
+                        ctx.api,
+                        ctx.transport,
+                        *ctx.reconcile_in_flight,
+                        ctx.send_seq,
                     ) == LoopControl::Break
                     {
                         return LoopControl::Break;
@@ -947,23 +863,28 @@ fn invoke_catchup_and_replay(
     }
     while let Some(frame) = frame_stack.pop() {
         if frame.defer_transcript_commit
-            && finish_deferred_transcript_commit(stores, state, next_ordinal, ring, output)
-                == LoopControl::Break
+            && finish_deferred_transcript_commit(
+                ctx.stores,
+                ctx.state,
+                ctx.next_ordinal,
+                ctx.ring,
+                ctx.output,
+            ) == LoopControl::Break
         {
             return LoopControl::Break;
         }
         for cmd in frame.deferred_commands {
             if handle_command(
                 cmd,
-                state,
-                stores,
-                output,
-                ring,
-                clock,
-                api,
-                transport,
-                *reconcile_in_flight,
-                send_seq,
+                ctx.state,
+                ctx.stores,
+                ctx.output,
+                ctx.ring,
+                ctx.clock,
+                ctx.api,
+                ctx.transport,
+                *ctx.reconcile_in_flight,
+                ctx.send_seq,
             ) == LoopControl::Break
             {
                 return LoopControl::Break;
@@ -1011,24 +932,24 @@ fn run(
     let mut transport = ActorTransport::Connected;
     let mut reconcile_in_flight = false;
     let mut catchup_accum = Vec::new();
+    let mut ctx = RunCtx {
+        api: api.as_ref(),
+        stores: &stores,
+        state: &mut state,
+        events: &events,
+        commands: &commands,
+        output: &mut output,
+        ring: &mut ring,
+        clock: clock.as_ref(),
+        next_ordinal: &mut next_ordinal,
+        transport: &mut transport,
+        reconcile_in_flight: &mut reconcile_in_flight,
+        send_seq: &mut send_seq,
+        catchup_accum: &mut catchup_accum,
+    };
 
-    if invoke_catchup_and_replay(
-        api.as_ref(),
-        &stores,
-        &mut state,
-        &events,
-        &commands,
-        &mut output,
-        &mut ring,
-        clock.as_ref(),
-        &mut next_ordinal,
-        &mut transport,
-        &mut reconcile_in_flight,
-        &mut send_seq,
-        false, // pre-loop spawn catch-up: no TransportChanged — Sleep cannot race yet
-        &mut catchup_accum,
-    ) == LoopControl::Break
-    {
+    if invoke_catchup_and_replay(&mut ctx, false) == LoopControl::Break {
+        // pre-loop spawn catch-up: no TransportChanged — Sleep cannot race yet
         return;
     }
 
@@ -1042,15 +963,15 @@ fn run(
                 Ok(cmd) => {
                     if handle_command(
                         cmd,
-                        &mut state,
-                        &stores,
-                        &mut output,
-                        &mut ring,
-                        clock.as_ref(),
-                        api.as_ref(),
-                        &transport,
-                        reconcile_in_flight,
-                        &mut send_seq,
+                        ctx.state,
+                        ctx.stores,
+                        ctx.output,
+                        ctx.ring,
+                        ctx.clock,
+                        ctx.api,
+                        ctx.transport,
+                        *ctx.reconcile_in_flight,
+                        ctx.send_seq,
                     ) == LoopControl::Break
                     {
                         break;
@@ -1060,23 +981,7 @@ fn run(
             },
             i if i == ev_idx => match oper.recv(&events) {
                 Ok(event) => {
-                    if process_main_loop_event(
-                        event,
-                        &events,
-                        &commands,
-                        api.as_ref(),
-                        &mut state,
-                        &stores,
-                        &mut output,
-                        &mut ring,
-                        clock.as_ref(),
-                        &mut next_ordinal,
-                        &mut transport,
-                        &mut reconcile_in_flight,
-                        &mut send_seq,
-                        &mut catchup_accum,
-                    ) == LoopControl::Break
-                    {
+                    if process_main_loop_event(&mut ctx, event) == LoopControl::Break {
                         break;
                     }
                 }
