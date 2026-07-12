@@ -84,8 +84,8 @@ async fn stream_scratch_row(weak: &WeakEntity<HarnessView>, wcx: &mut AsyncWindo
 
 fn print_handoff_upsert(before: HandoffSnapshot, after: HandoffSnapshot) {
     let entity_ok = before.entity_id == after.entity_id;
-    let md_ok = after.markdown_init_count <= before.markdown_init_count
-        && after.markdown_init_count <= 1;
+    let md_ok =
+        after.markdown_init_count <= before.markdown_init_count && after.markdown_init_count <= 1;
     let scroll_ok = after.bottom_pinned();
     if entity_ok && md_ok && scroll_ok {
         println!("HANDOFF_UPSERT: PASS");
