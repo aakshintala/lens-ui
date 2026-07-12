@@ -373,7 +373,11 @@ fn run_catchup(
                     where_: "catchup.fetch_items",
                     message: e.to_string(),
                 });
-                break;
+                drain_outcome_ring(ring, &output.outcomes);
+                let _ = output.outcomes.send_blocking(ActorOutcome::Parked {
+                    reason: ParkReason::SessionFailed,
+                });
+                return CatchupResult::Aborted;
             }
         };
 
@@ -605,8 +609,8 @@ fn handle_command(
                         if !emit_pending_user(output, state) {
                             return LoopControl::Break;
                         }
-                        // Denied (Auth403) vs Failed (Network/404/other-4xx): both remove the bubble
-                        // and restore to composer; Denied carries the server reason.
+                        // Denied (Auth403) vs Failed (Network/404): both remove the bubble and restore
+                        // to composer; Denied carries the server reason (other 4xx → Denied).
                         let outcome = match m {
                             Mapped::LostAccess | Mapped::Denied => CommandOutcome::SendDenied {
                                 lens_pending_id,
@@ -665,12 +669,14 @@ fn apply_reduced_batch(
     let saw_reconnected = batch.iter().any(|u| matches!(u, StreamUpdate::Reconnected));
     if saw_reconnecting {
         ctx.snapshot_pending_inputs.clear();
+        ctx.catchup_accum.clear();
     }
     if let Some(inputs) = batch.iter().rev().find_map(|u| match u {
         StreamUpdate::SnapshotRestored(inputs) => Some(inputs.clone()),
         _ => None,
     }) {
         ctx.snapshot_pending_inputs.clear();
+        ctx.catchup_accum.clear();
         ctx.snapshot_pending_inputs.extend(inputs);
     }
     match ctx.output.mode {
@@ -3212,6 +3218,105 @@ mod tests {
         }
     }
 
+    /// `send_event` always fails with `send_err`; `fetch_items` gates like [`GateFetchMock`].
+    struct FailSendGateFetchMock {
+        script: Mutex<VecDeque<Result<ItemList, ClientError>>>,
+        fetch_count: Mutex<u32>,
+        block_on_fetch: u32,
+        entered_tx: std::sync::mpsc::Sender<u32>,
+        release_rx: std::sync::mpsc::Receiver<()>,
+        send_status: u16,
+    }
+
+    impl FailSendGateFetchMock {
+        #[allow(clippy::type_complexity)]
+        fn with_script(
+            send_status: u16,
+            script: VecDeque<Result<ItemList, ClientError>>,
+            block_on_fetch: u32,
+        ) -> (
+            Box<dyn SessionApi + Send>,
+            std::sync::mpsc::Receiver<u32>,
+            std::sync::mpsc::Sender<()>,
+        ) {
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            (
+                Box::new(Self {
+                    script: Mutex::new(script),
+                    fetch_count: Mutex::new(0),
+                    block_on_fetch,
+                    entered_tx,
+                    release_rx,
+                    send_status,
+                }),
+                entered_rx,
+                release_tx,
+            )
+        }
+    }
+
+    impl SessionApi for FailSendGateFetchMock {
+        fn send_event(
+            &self,
+            _id: &SessionId,
+            _evt: &SessionEventInput,
+        ) -> Result<SendEventAck, ClientError> {
+            Err(ClientError::Server {
+                status: self.send_status,
+                body: serde_json::json!({}),
+            })
+        }
+
+        fn fetch_items(
+            &self,
+            _id: &SessionId,
+            _page: &lens_client::sessions::ItemsPage,
+        ) -> Result<ItemList, ClientError> {
+            let n = {
+                let mut c = self.fetch_count.lock().unwrap();
+                *c += 1;
+                *c
+            };
+            let _ = self.entered_tx.send(n);
+            if n == self.block_on_fetch {
+                self.release_rx
+                    .recv()
+                    .expect("test must release blocked fetch");
+            }
+            self.script
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Ok(empty_item_list()))
+        }
+
+        fn fetch_status(&self, _id: &SessionId) -> Result<SessionStatus, ClientError> {
+            Ok(SessionStatus::Idle)
+        }
+    }
+
+    fn expect_parked_session_failed(handle: &ActorHandle) {
+        loop {
+            match handle.outcomes.recv_blocking().unwrap() {
+                ActorOutcome::Parked {
+                    reason: ParkReason::SessionFailed,
+                } => return,
+                ActorOutcome::PersistError { .. } | ActorOutcome::TransportChanged { .. } => {}
+                other => panic!("expected Parked(SessionFailed), got {other:?}"),
+            }
+        }
+    }
+
+    fn drain_outcomes_without_send_lost(handle: &ActorHandle) {
+        while let Ok(outcome) = handle.outcomes.try_recv() {
+            assert!(
+                !matches!(outcome, ActorOutcome::SendLost { .. }),
+                "must not emit SendLost on aborted catch-up: {outcome:?}"
+            );
+        }
+    }
+
     /// Mock whose `send_event` blocks until the test sends on `release_tx`.
     struct BlockingMockApi {
         entered_tx: std::sync::mpsc::Sender<()>,
@@ -3690,14 +3795,8 @@ mod tests {
             "mid-reconcile"
         );
         assert!(
-            !is_quiesced(
-                &s,
-                &ActorTransport::Parked {
-                    reason: ParkReason::Unauthorized
-                },
-                false
-            ),
-            "parked is not quiesced"
+            !is_quiesced(&s, &ActorTransport::Reconnecting, false),
+            "reconnecting is not quiesced"
         );
         let mut busy = fresh_state();
         busy.status = SessionStatusValue::Running;
@@ -4342,6 +4441,169 @@ mod tests {
             "actor must survive and keep processing events"
         );
 
+        handle.stop_and_join();
+    }
+
+    #[test]
+    fn catchup_fetch_items_err_parks_without_send_lost_or_deferred_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(dir.path());
+        seed_connection(&stores);
+
+        let has_more_empty = serde_json::from_str(r#"{"data":[],"has_more":true}"#)
+            .expect("empty page with has_more");
+        let (api, fetch_done_rx, release_fetch2) = FailSendGateFetchMock::with_script(
+            503,
+            VecDeque::from([
+                Ok(empty_item_list()),
+                Ok(has_more_empty),
+                Err(ClientError::Server {
+                    status: 500,
+                    body: serde_json::json!({}),
+                }),
+            ]),
+            2,
+        );
+
+        let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, up_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+
+        assert_eq!(
+            fetch_done_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("spawn catch-up fetch"),
+            1
+        );
+
+        handle
+            .commands
+            .send(SessionCommand::Send {
+                text: "gone".into(),
+                model_override: None,
+            })
+            .unwrap();
+        let held = expect_pending_user_changed(&up_rx);
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].content, "gone");
+        let _ = handle.outcomes.recv_blocking();
+
+        ev_tx
+            .send(ServerStreamEvent::Reconnected { gap: None })
+            .unwrap();
+
+        assert_eq!(
+            fetch_done_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("reconnect catch-up must block on fetch #2"),
+            2
+        );
+        ev_tx
+            .send(parse_response(
+                "response.output_item.done",
+                r#"{"item":{"id":"item_live","type":"message","role":"assistant","content":[{"type":"output_text","text":"live"}]}}"#,
+            ))
+            .unwrap();
+        release_fetch2.send(()).expect("release blocked fetch");
+
+        expect_parked_session_failed(&handle);
+        drain_outcomes_without_send_lost(&handle);
+        handle.join_without_stop();
+
+        let reopened = SqliteTranscriptStore::open(
+            &dir.path().join("conv_1.db"),
+            &ConnectionId::new("conn_1"),
+            &SessionId::new("conv_1"),
+        )
+        .unwrap();
+        let rows = reopened.load_items().unwrap().rows;
+        let ids: Vec<_> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            !ids.contains(&"item_live"),
+            "deferred live tail must not commit after fetch_items Err"
+        );
+    }
+
+    #[test]
+    fn nested_reconnect_catchup_accum_scoped_per_episode() {
+        let _dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(_dir.path());
+        seed_connection(&stores);
+
+        let ep_a_hi = item_list_from_user_messages(&[("item_ep_a", "hi")], true);
+        let has_more_empty = serde_json::from_str(r#"{"data":[],"has_more":true}"#)
+            .expect("empty page with has_more");
+        let (api, fetch_done_rx, release_fetch3) = FailSendGateFetchMock::with_script(
+            503,
+            VecDeque::from([
+                Ok(empty_item_list()),
+                Ok(ep_a_hi),
+                Ok(has_more_empty),
+                Ok(empty_item_list()),
+                Ok(empty_item_list()),
+            ]),
+            3,
+        );
+
+        let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, up_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+
+        assert_eq!(
+            fetch_done_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("spawn catch-up fetch"),
+            1
+        );
+
+        handle
+            .commands
+            .send(SessionCommand::Send {
+                text: "hi".into(),
+                model_override: None,
+            })
+            .unwrap();
+        let held = expect_pending_user_changed(&up_rx);
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].content, "hi");
+        let _ = handle.outcomes.recv_blocking();
+
+        ev_tx
+            .send(ServerStreamEvent::Reconnected { gap: None })
+            .unwrap();
+
+        assert_eq!(
+            fetch_done_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("episode-A catch-up page 1"),
+            2
+        );
+        assert_eq!(
+            fetch_done_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("episode-A catch-up must block on fetch #3"),
+            3
+        );
+
+        let snap = snapshot_fixture(serde_json::json!({
+            "id": "conv_1",
+            "status": "running",
+            "agent_id": "ag_9",
+            "created_at": 1_700_000_000,
+            "pending_inputs": [],
+            "items": []
+        }));
+        ev_tx
+            .send(ServerStreamEvent::SnapshotRestored(Box::new(snap)))
+            .unwrap();
+        ev_tx
+            .send(ServerStreamEvent::Reconnected { gap: None })
+            .unwrap();
+        release_fetch3.send(()).expect("release blocked fetch");
+
+        expect_send_lost(&handle, "hi");
+        let cleared = recv_pending_user_changed_or_none(&up_rx).expect("held bubble cleared");
+        assert!(cleared.is_empty());
         handle.stop_and_join();
     }
 }

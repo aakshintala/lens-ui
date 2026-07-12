@@ -4,10 +4,6 @@
 pub enum ActorTransport {
     Connected,
     Reconnecting,
-    /// Recoverable terminal — the actor is exiting; recovery is a fresh respawn.
-    Parked {
-        reason: ParkReason,
-    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

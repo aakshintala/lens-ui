@@ -785,6 +785,5 @@ fn transport_str(transport: ActorTransport) -> String {
     match transport {
         ActorTransport::Connected => "connected".into(),
         ActorTransport::Reconnecting => "reconnecting".into(),
-        ActorTransport::Parked { reason } => format!("parked:{}", park_reason_str(reason)),
     }
 }
