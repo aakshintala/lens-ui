@@ -1,0 +1,87 @@
+event: session.heartbeat
+data: {"sequence_number": null, "type": "session.heartbeat", "server_time": null}
+
+event: session.changed_files.invalidated
+data: {"sequence_number": null, "type": "session.changed_files.invalidated", "session_id": "conv_0c5f615af67c4644bf872b5324e7d8bd", "environment_id": "default"}
+
+event: session.presence
+data: {"sequence_number": null, "type": "session.presence", "conversation_id": "conv_0c5f615af67c4644bf872b5324e7d8bd", "viewers": []}
+
+event: session.skills
+data: {"sequence_number": null, "type": "session.skills", "conversation_id": "conv_0c5f615af67c4644bf872b5324e7d8bd"}
+
+event: session.terminal_pending
+data: {"sequence_number": null, "type": "session.terminal_pending", "conversation_id": "conv_0c5f615af67c4644bf872b5324e7d8bd", "pending": true}
+
+event: session.terminal_pending
+data: {"sequence_number": null, "type": "session.terminal_pending", "conversation_id": "conv_0c5f615af67c4644bf872b5324e7d8bd", "pending": false}
+
+event: session.resource.created
+data: {"sequence_number": null, "type": "session.resource.created", "resource": {"id": "terminal_tui_main", "object": "session.resource", "type": "terminal", "session_id": "conv_0c5f615af67c4644bf872b5324e7d8bd", "name": "tui:main", "metadata": {"terminal_name": "tui", "session_key": "main", "running": true, "tmux_socket": "/var/folders/dq/_c83wftd34g281_1002c_gl00000gn/T/omnigent-terminal-ayjd_4kc/tmux.sock", "tmux_target": "main", "terminal_transport": "control"}, "environment": "env_terminal_tui_main"}}
+
+event: session.terminal_pending
+data: {"sequence_number": null, "type": "session.terminal_pending", "conversation_id": "conv_0c5f615af67c4644bf872b5324e7d8bd", "pending": false}
+
+event: session.input.consumed
+data: {"sequence_number": null, "type": "session.input.consumed", "data": {"item_id": "msg_1918567161824cd4be74b1bae04f5b07", "type": "message", "data": {"role": "user", "content": [{"text": "Use the Bash tool to run exactly this command and nothing else: echo LENS_D30_MARKER . Do not run any other command. Then reply with just the word: done", "type": "input_text"}], "agent": null}, "created_by": null, "cleared_pending_id": null}}
+
+event: session.status
+data: {"sequence_number": null, "type": "session.status", "conversation_id": "conv_0c5f615af67c4644bf872b5324e7d8bd", "status": "running", "response_id": null, "error": null, "background_task_count": null}
+
+event: response.in_progress
+data: {"sequence_number": 1, "type": "response.in_progress", "response": {"id": "resp_9ec93d1907064f058848a7f5", "object": "response", "status": "in_progress", "model": "claude-sdk", "created_at": 1783877000, "completed_at": null, "output": [], "background": false, "store": true, "usage": null, "previous_response_id": null, "conversation": null, "instructions": null, "reasoning": null, "error": null, "incomplete_details": null}}
+
+event: response.output_text.delta
+data: {"sequence_number": 3, "type": "response.output_text.delta", "delta": "I", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 4, "type": "response.output_text.delta", "delta": "'ll run exactly that command.", "message_id": null, "index": null, "final": null}
+
+event: response.output_item.done
+data: {"sequence_number": 5, "type": "response.output_item.done", "item": {"id": "fc_1a365818d5b6", "type": "function_call", "status": "in_progress", "name": "sys_os_shell", "arguments": "{\"command\": \"echo LENS_D30_MARKER\"}", "call_id": "toolu_013u7owVfBjDQpv6ourvP6DY", "agent": "resp_9ec93d1907064f058848a7f5"}}
+
+event: session.changed_files.invalidated
+data: {"sequence_number": null, "type": "session.changed_files.invalidated", "session_id": "conv_0c5f615af67c4644bf872b5324e7d8bd", "environment_id": "default"}
+
+event: response.output_item.done
+data: {"sequence_number": null, "type": "response.output_item.done", "item": {"id": "msg_f6bac737d81e4fe4aebd48ad654cdbdc", "response_id": "resp_9ec93d1907064f058848a7f5", "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": "I'll run exactly that command."}], "model": "claude-sdk"}}
+
+event: response.output_item.done
+data: {"sequence_number": 7, "type": "response.output_item.done", "item": {"id": "fc_7ad94742b335", "type": "function_call", "status": "completed", "name": "sys_os_shell", "arguments": "{\"command\": \"echo LENS_D30_MARKER\"}", "call_id": "toolu_013u7owVfBjDQpv6ourvP6DY", "agent": "claude-sdk"}}
+
+event: response.output_item.done
+data: {"sequence_number": 8, "type": "response.output_item.done", "item": {"id": "fco_a51bcc02b848", "type": "function_call_output", "call_id": "toolu_013u7owVfBjDQpv6ourvP6DY", "output": "{\"stdout\": \"LENS_D30_MARKER\\n\", \"stderr\": \"\", \"exit_code\": 0, \"timed_out\": false, \"shell\": \"/bin/bash\", \"cwd\": \"/Users/aakshintala/work/lens\"}", "arguments": "{\"command\": \"echo LENS_D30_MARKER\"}", "status": "completed", "response_id": "resp_9ec93d1907064f058848a7f5"}}
+
+event: response.output_text.delta
+data: {"sequence_number": 9, "type": "response.output_text.delta", "delta": "done", "message_id": null, "index": null, "final": null}
+
+event: response.output_item.done
+data: {"sequence_number": null, "type": "response.output_item.done", "item": {"id": "msg_e3f5b38a41514e2b95a3da835f243baa", "response_id": "resp_9ec93d1907064f058848a7f5", "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": "done"}], "model": "claude-sdk"}}
+
+event: session.usage
+data: {"sequence_number": null, "type": "session.usage", "conversation_id": "conv_0c5f615af67c4644bf872b5324e7d8bd", "context_tokens": null, "context_window": null, "total_cost_usd": 0.46532525, "usage_by_model": {"claude-opus-4-8": {"input_tokens": 14, "output_tokens": 216, "total_tokens": 230, "cache_read_input_tokens": 62923, "cache_creation_input_tokens": 68543, "total_cost_usd": 0.46532525}}}
+
+event: response.completed
+data: {"sequence_number": 11, "type": "response.completed", "response": {"id": "resp_9ec93d1907064f058848a7f5", "object": "response", "status": "completed", "model": "claude-sdk", "created_at": 1783877010, "completed_at": null, "output": [], "background": false, "store": true, "usage": {"input_tokens": 4, "output_tokens": 86, "output_tokens_details": {"reasoning_tokens": 0}, "total_tokens": 90, "context_tokens": 19518, "cache_read_input_tokens": 19349, "cache_creation_input_tokens": 19516, "model": "claude-opus-4-8", "cost_usd": null}, "previous_response_id": null, "conversation": null, "instructions": null, "reasoning": null, "error": null, "incomplete_details": null}}
+
+event: session.status
+data: {"sequence_number": null, "type": "session.status", "conversation_id": "conv_0c5f615af67c4644bf872b5324e7d8bd", "status": "idle", "response_id": null, "error": null, "background_task_count": null}
+
+event: session.heartbeat
+data: {"sequence_number": null, "type": "session.heartbeat", "server_time": null}
+
+event: session.heartbeat
+data: {"sequence_number": null, "type": "session.heartbeat", "server_time": null}
+
+event: session.heartbeat
+data: {"sequence_number": null, "type": "session.heartbeat", "server_time": null}
+
+event: session.heartbeat
+data: {"sequence_number": null, "type": "session.heartbeat", "server_time": null}
+
+event: session.heartbeat
+data: {"sequence_number": null, "type": "session.heartbeat", "server_time": null}
+
+event: session.heartbeat
+data: {"sequence_number": null, "type": "session.heartbeat", "server_time": null}
+

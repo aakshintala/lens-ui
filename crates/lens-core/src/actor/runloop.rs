@@ -1204,6 +1204,7 @@ mod tests {
     use lens_client::sessions::{ItemList, SendEventAck, SessionEventInput, SessionStatus};
     use lens_client::stream::{
         DisconnectReason, ServerStreamEvent, SessionEvent, SessionStatusValue as WireStatus,
+        decode_all,
     };
     use smallvec::smallvec;
     use std::collections::VecDeque;
@@ -4605,5 +4606,116 @@ mod tests {
         let cleared = recv_pending_user_changed_or_none(&up_rx).expect("held bubble cleared");
         assert!(cleared.is_empty());
         handle.stop_and_join();
+    }
+
+    fn item_provisional_flag(db_path: &Path, item_id: &str) -> i64 {
+        let conn = rusqlite::Connection::open(db_path).expect("open transcript db");
+        conn.query_row(
+            "SELECT provisional FROM items WHERE item_id = ?1",
+            [item_id],
+            |r| r.get(0),
+        )
+        .unwrap_or_else(|e| panic!("provisional lookup for {item_id}: {e}"))
+    }
+
+    #[test]
+    fn d30_golden_tool_fold_replays_live_0_5_1_capture() {
+        // Golden fixtures: tests/fixtures/d30/tool_fold.{stream.sse,items.json}.
+        // Captured 2026-07-12 from omnigent 0.5.1 (source HEAD 08285468).
+        let dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(dir.path());
+        seed_connection(&stores);
+
+        let items: ItemList = serde_json::from_str(include_str!(
+            "../../tests/fixtures/d30/tool_fold.items.json"
+        ))
+        .expect("golden /items JSON");
+        let (api, _mock) =
+            MockApi::with_fetch_script(VecDeque::from([Ok(empty_item_list()), Ok(items)]));
+
+        let (ev_tx, ev_rx) = crossbeam_channel::bounded(1);
+        let (up_tx, up_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+
+        for ev in decode_all(include_bytes!(
+            "../../tests/fixtures/d30/tool_fold.stream.sse"
+        )) {
+            ev_tx.send(ev).unwrap();
+        }
+        while up_rx.try_recv().is_ok() {}
+
+        ev_tx
+            .send(ServerStreamEvent::Reconnected { gap: None })
+            .unwrap();
+
+        let mut saw_catchup = false;
+        while let Ok(u) = up_rx.recv_blocking() {
+            if matches!(u, StreamUpdate::TranscriptAdvanced { .. }) {
+                saw_catchup = true;
+                break;
+            }
+        }
+        assert!(
+            saw_catchup,
+            "Reconnected catch-up must emit TranscriptAdvanced watermarks"
+        );
+        handle.stop_and_join();
+        while up_rx.try_recv().is_ok() {}
+
+        let db_path = dir.path().join("conv_1.db");
+        let reopened = SqliteTranscriptStore::open(
+            &db_path,
+            &ConnectionId::new("conn_1"),
+            &SessionId::new("conv_1"),
+        )
+        .unwrap();
+        let rows = reopened.load_items().unwrap().rows;
+
+        let fc_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| matches!(r.kind, ItemKind::FunctionCall { .. }))
+            .collect();
+        assert_eq!(
+            fc_rows.len(),
+            1,
+            "D30 fold must leave exactly one function_call row; on-disk ids: {:?}",
+            rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            fc_rows[0].id.as_str(),
+            "fc_9bb8ae52357c40a2a2f696e37b81d681",
+            "/items canonical fc_* id must win the fold"
+        );
+        assert_eq!(
+            item_provisional_flag(&db_path, "fc_9bb8ae52357c40a2a2f696e37b81d681"),
+            0,
+            "folded function_call must be durable (provisional=0)"
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.id.as_str() == "fc_1a365818d5b6" || r.id.as_str() == "fc_7ad94742b335"),
+            "live provisional fc_* ids must be folded away"
+        );
+
+        let fco_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| matches!(r.kind, ItemKind::FunctionCallOutput { .. }))
+            .collect();
+        assert_eq!(
+            fco_rows.len(),
+            1,
+            "D30 fold must leave exactly one function_call_output row; on-disk ids: {:?}",
+            rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            fco_rows[0].id.as_str(),
+            "fco_7bd2ed51b55d42748c92428c30c8fdd1",
+            "/items canonical fco_* id must win the fold"
+        );
+        assert!(
+            !rows.iter().any(|r| r.id.as_str() == "fco_a51bcc02b848"),
+            "live provisional fco_* id must be folded away"
+        );
     }
 }
