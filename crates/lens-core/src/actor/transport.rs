@@ -4,7 +4,7 @@
 pub enum ActorTransport {
     Connected,
     Reconnecting,
-    /// Recoverable terminal — actor + state resident; awaiting re-auth / user retry.
+    /// Recoverable terminal — the actor is exiting; recovery is a fresh respawn.
     Parked {
         reason: ParkReason,
     },
@@ -15,4 +15,6 @@ pub enum ParkReason {
     Unauthorized,
     SessionFailed,
     RetriesExhausted,
+    Forbidden,
+    NotFound,
 }

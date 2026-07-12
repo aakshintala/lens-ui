@@ -5,6 +5,8 @@ use crate::actor::transport::{ActorTransport, ParkReason};
 use lens_client::error::ClientError;
 use std::collections::VecDeque;
 
+/// Unified actor → foreground outcome channel. `Parked` is the sole terminal
+/// disconnect outcome — the actor thread exits and recovery is a fresh respawn.
 #[derive(Clone, Debug)]
 pub enum ActorOutcome {
     Command(CommandOutcome),
@@ -19,8 +21,6 @@ pub enum ActorOutcome {
     Parked {
         reason: ParkReason,
     },
-    StoppedRemoved,
-    StoppedTombstone,
     /// D21: in-loop sleep succeeded — lifecycle flushed `Slept`, actor stopping.
     Slept,
     /// D21: sleep declined — session not quiescent; actor continues.
@@ -33,9 +33,10 @@ pub enum ActorOutcome {
     /// bubbles (a message that actually arrived would show "send lost"). Do NOT emit
     /// this from a naive diff — leave the variant defined and unproduced until the
     /// actor-side item re-derivation lands.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // deferred until D28 held-bubble reconciler lands
     SendLost {
         lens_pending_id: String,
+        content: String,
     },
 }
 

@@ -67,11 +67,16 @@ impl ActorHandle {
             .expect("actor thread panicked or was poisoned");
     }
 
-    #[cfg(test)]
-    pub fn join_without_stop(self) {
+    /// Block until an actor that exited on its own (park terminal) is joined.
+    pub fn join_exited(self) {
         self.join
             .join()
             .expect("actor thread panicked or was poisoned");
+    }
+
+    #[cfg(test)]
+    pub fn join_without_stop(self) {
+        self.join_exited();
     }
 }
 
@@ -409,87 +414,79 @@ fn handle_command(
             text,
             model_override,
         } => {
-            if matches!(transport, ActorTransport::Parked { .. }) {
-                let _ = output.outcomes.send_blocking(ActorOutcome::Command(
-                    CommandOutcome::SendRejected {
-                        reason: "session parked — awaiting re-auth/retry".into(),
-                    },
-                ));
-            } else {
-                *send_seq += 1;
-                let lens_pending_id = format!("lens_pend_{send_seq}");
-                state.pending_user.push(PendingUserMessage {
-                    pending_id: lens_pending_id.clone(),
-                    server_pending_id: None,
-                    store_item_id: None,
-                    content: text.clone(),
-                    created_at: clock.now_millis(),
-                });
-                if !emit_pending_user(output, state) {
-                    return LoopControl::Break;
-                }
+            *send_seq += 1;
+            let lens_pending_id = format!("lens_pend_{send_seq}");
+            state.pending_user.push(PendingUserMessage {
+                pending_id: lens_pending_id.clone(),
+                server_pending_id: None,
+                store_item_id: None,
+                content: text.clone(),
+                created_at: clock.now_millis(),
+            });
+            if !emit_pending_user(output, state) {
+                return LoopControl::Break;
+            }
 
-                let evt = SessionEventInput::Message {
-                    content: vec![serde_json::json!({"type":"input_text","text": text})],
-                    model_override,
-                    tools: None,
-                };
-                match api.send_event(&state.id, &evt) {
-                    Ok(ack) if ack.denied => {
+            let evt = SessionEventInput::Message {
+                content: vec![serde_json::json!({"type":"input_text","text": text})],
+                model_override,
+                tools: None,
+            };
+            match api.send_event(&state.id, &evt) {
+                Ok(ack) if ack.denied => {
+                    rollback_pending(state, &lens_pending_id);
+                    if !emit_pending_user(output, state) {
+                        return LoopControl::Break;
+                    }
+                    let _ = output.outcomes.send_blocking(ActorOutcome::Command(
+                        CommandOutcome::SendDenied {
+                            lens_pending_id,
+                            reason: ack.reason,
+                        },
+                    ));
+                }
+                Ok(ack) => {
+                    let p = state
+                        .pending_user
+                        .iter_mut()
+                        .find(|p| p.pending_id == lens_pending_id)
+                        .expect("optimistic bubble present for stamp");
+                    // Stamp whichever id is present — NEVER branch on harness/native.
+                    p.server_pending_id = ack.pending_id.clone();
+                    p.store_item_id = ack.item_id.clone();
+                    if !emit_pending_user(output, state) {
+                        return LoopControl::Break;
+                    }
+                    let _ = output.outcomes.send_blocking(ActorOutcome::Command(
+                        CommandOutcome::SendAccepted {
+                            lens_pending_id,
+                            ack,
+                        },
+                    ));
+                }
+                Err(e) => {
+                    let m = map_client_error(&e);
+                    // Table B (§13.1) rollback: NetworkTransient, LostAccess,
+                    // Tombstone, Denied — send definitively won't land.
+                    // Hold bubble: ReAuth (401), ServerTransient (5xx),
+                    // WrongVersion, DecodeDrift — reached server or reconcile pending.
+                    // TODO(§9/P3-3): command-path LostAccess (Auth403) / Tombstone
+                    // (NotFound) should escalate to registry removal / tombstone per
+                    // design §13.1 Table B. Deferred — the stream's own terminal
+                    // Disconnected(Forbidden/NotFound) drives Table A stop today;
+                    // the command path only rolls back + SendFailed for now.
+                    if m.rolls_back_send() {
                         rollback_pending(state, &lens_pending_id);
                         if !emit_pending_user(output, state) {
                             return LoopControl::Break;
                         }
-                        let _ = output.outcomes.send_blocking(ActorOutcome::Command(
-                            CommandOutcome::SendDenied {
-                                lens_pending_id,
-                                reason: ack.reason,
-                            },
-                        ));
                     }
-                    Ok(ack) => {
-                        let p = state
-                            .pending_user
-                            .iter_mut()
-                            .find(|p| p.pending_id == lens_pending_id)
-                            .expect("optimistic bubble present for stamp");
-                        // Stamp whichever id is present — NEVER branch on harness/native.
-                        p.server_pending_id = ack.pending_id.clone();
-                        p.store_item_id = ack.item_id.clone();
-                        if !emit_pending_user(output, state) {
-                            return LoopControl::Break;
-                        }
-                        let _ = output.outcomes.send_blocking(ActorOutcome::Command(
-                            CommandOutcome::SendAccepted {
-                                lens_pending_id,
-                                ack,
-                            },
-                        ));
-                    }
-                    Err(e) => {
-                        let m = map_client_error(&e);
-                        // Table B (§13.1) rollback: NetworkTransient, LostAccess,
-                        // Tombstone, Denied — send definitively won't land.
-                        // Hold bubble: ReAuth (401), ServerTransient (5xx),
-                        // WrongVersion, DecodeDrift — reached server or reconcile pending.
-                        // TODO(§9/P3-3): command-path LostAccess (Auth403) / Tombstone
-                        // (NotFound) should escalate to registry removal / tombstone per
-                        // design §13.1 Table B. Deferred — the stream's own terminal
-                        // Disconnected(Forbidden/NotFound) drives Table A stop today;
-                        // the command path only rolls back + SendFailed for now.
-                        if m.rolls_back_send() {
-                            rollback_pending(state, &lens_pending_id);
-                            if !emit_pending_user(output, state) {
-                                return LoopControl::Break;
-                            }
-                        }
-                        let _ = output.outcomes.send_blocking(ActorOutcome::Command(
-                            CommandOutcome::SendFailed {
-                                lens_pending_id,
-                                error: e.to_string(),
-                            },
-                        ));
-                    }
+                    let _ = output.outcomes.send_blocking(ActorOutcome::Command(
+                        CommandOutcome::SendFailed {
+                            lens_pending_id,
+                            error: e.to_string(),
+                        },
+                    ));
                 }
             }
             LoopControl::Continue
@@ -508,7 +505,6 @@ fn apply_reduced_batch(
     next_ordinal: &mut i64,
     transport: &mut ActorTransport,
     reconcile_in_flight: &mut bool,
-    parked: &mut bool,
     defer_transcript_commit: bool,
 ) -> (LoopControl, bool) {
     persist_scalars(stores, state, &batch, clock.now_millis(), ring);
@@ -559,48 +555,18 @@ fn apply_reduced_batch(
     }
     drain_outcome_ring(ring, &output.outcomes);
     if let Some(reason) = disconnect_reason {
-        match reason {
-            DisconnectReason::Unauthorized => {
-                *transport = ActorTransport::Parked {
-                    reason: ParkReason::Unauthorized,
-                };
-                *reconcile_in_flight = false;
-                let _ = output.outcomes.send_blocking(ActorOutcome::Parked {
-                    reason: ParkReason::Unauthorized,
-                });
-                *parked = true;
-            }
-            DisconnectReason::SessionFailed => {
-                *transport = ActorTransport::Parked {
-                    reason: ParkReason::SessionFailed,
-                };
-                *reconcile_in_flight = false;
-                let _ = output.outcomes.send_blocking(ActorOutcome::Parked {
-                    reason: ParkReason::SessionFailed,
-                });
-                *parked = true;
-            }
-            DisconnectReason::RetriesExhausted => {
-                *transport = ActorTransport::Parked {
-                    reason: ParkReason::RetriesExhausted,
-                };
-                *reconcile_in_flight = false;
-                let _ = output.outcomes.send_blocking(ActorOutcome::Parked {
-                    reason: ParkReason::RetriesExhausted,
-                });
-                *parked = true;
-            }
-            DisconnectReason::Forbidden => {
-                let _ = output.outcomes.send_blocking(ActorOutcome::StoppedRemoved);
-                return (LoopControl::Break, false);
-            }
-            DisconnectReason::NotFound => {
-                let _ = output
-                    .outcomes
-                    .send_blocking(ActorOutcome::StoppedTombstone);
-                return (LoopControl::Break, false);
-            }
-        }
+        let park = match reason {
+            DisconnectReason::Unauthorized => ParkReason::Unauthorized,
+            DisconnectReason::SessionFailed => ParkReason::SessionFailed,
+            DisconnectReason::RetriesExhausted => ParkReason::RetriesExhausted,
+            DisconnectReason::Forbidden => ParkReason::Forbidden,
+            DisconnectReason::NotFound => ParkReason::NotFound,
+        };
+        *reconcile_in_flight = false;
+        let _ = output
+            .outcomes
+            .send_blocking(ActorOutcome::Parked { reason: park });
+        return (LoopControl::Break, false);
     }
     if disconnect_reason.is_none() && saw_reconnecting {
         *transport = ActorTransport::Reconnecting;
@@ -642,7 +608,6 @@ fn finish_reconnected_catchup(
     next_ordinal: &mut i64,
     transport: &mut ActorTransport,
     reconcile_in_flight: &mut bool,
-    parked: &mut bool,
     send_seq: &mut u64,
     emit_transport: bool,
 ) -> LoopControl {
@@ -661,7 +626,6 @@ fn finish_reconnected_catchup(
         next_ordinal,
         transport,
         reconcile_in_flight,
-        parked,
         send_seq,
         emit_transport,
     ) == LoopControl::Break
@@ -689,7 +653,6 @@ fn replay_buffered_batch(
     next_ordinal: &mut i64,
     transport: &mut ActorTransport,
     reconcile_in_flight: &mut bool,
-    parked: &mut bool,
     send_seq: &mut u64,
 ) -> LoopControl {
     let mut batch = reduce(state, &buffered_events[0], clock);
@@ -707,7 +670,6 @@ fn replay_buffered_batch(
         next_ordinal,
         transport,
         reconcile_in_flight,
-        parked,
         defer_transcript_commit,
     );
     if ctrl == LoopControl::Break {
@@ -727,7 +689,6 @@ fn replay_buffered_batch(
         next_ordinal,
         transport,
         reconcile_in_flight,
-        parked,
         send_seq,
         true,
     )
@@ -769,7 +730,6 @@ fn process_main_loop_event(
     next_ordinal: &mut i64,
     transport: &mut ActorTransport,
     reconcile_in_flight: &mut bool,
-    parked: &mut bool,
     send_seq: &mut u64,
 ) -> LoopControl {
     let mut batch = reduce(state, &event, clock);
@@ -789,7 +749,6 @@ fn process_main_loop_event(
         next_ordinal,
         transport,
         reconcile_in_flight,
-        parked,
         defer_transcript_commit,
     );
     if ctrl == LoopControl::Break {
@@ -809,7 +768,6 @@ fn process_main_loop_event(
         next_ordinal,
         transport,
         reconcile_in_flight,
-        parked,
         send_seq,
         true,
     )
@@ -828,7 +786,6 @@ fn invoke_catchup_and_replay(
     next_ordinal: &mut i64,
     transport: &mut ActorTransport,
     reconcile_in_flight: &mut bool,
-    parked: &mut bool,
     send_seq: &mut u64,
     emit_transport: bool,
 ) -> LoopControl {
@@ -870,7 +827,6 @@ fn invoke_catchup_and_replay(
                     next_ordinal,
                     transport,
                     reconcile_in_flight,
-                    parked,
                     send_seq,
                 ) == LoopControl::Break
             {
@@ -933,7 +889,6 @@ fn run(
     };
     let mut transport = ActorTransport::Connected;
     let mut reconcile_in_flight = false;
-    let mut parked = false;
 
     if invoke_catchup_and_replay(
         api.as_ref(),
@@ -947,7 +902,6 @@ fn run(
         &mut next_ordinal,
         &mut transport,
         &mut reconcile_in_flight,
-        &mut parked,
         &mut send_seq,
         false, // pre-loop spawn catch-up: no TransportChanged — Sleep cannot race yet
     ) == LoopControl::Break
@@ -957,11 +911,7 @@ fn run(
 
     loop {
         let mut sel = Select::new();
-        let ev_idx = if parked {
-            None
-        } else {
-            Some(sel.recv(&events))
-        };
+        let ev_idx = sel.recv(&events);
         let cmd_idx = sel.recv(&commands);
         let oper = sel.select();
         match oper.index() {
@@ -985,7 +935,7 @@ fn run(
                 }
                 Err(_) => break,
             },
-            i if ev_idx == Some(i) => match oper.recv(&events) {
+            i if i == ev_idx => match oper.recv(&events) {
                 Ok(event) => {
                     if process_main_loop_event(
                         event,
@@ -1000,7 +950,6 @@ fn run(
                         &mut next_ordinal,
                         &mut transport,
                         &mut reconcile_in_flight,
-                        &mut parked,
                         &mut send_seq,
                     ) == LoopControl::Break
                     {
@@ -1155,7 +1104,7 @@ mod tests {
     };
     use crate::reduce::testutil::{fresh_state, parse_response, snapshot_fixture};
     use lens_client::error::ClientError;
-    use lens_client::sessions::{ItemList, SendEventAck, SessionEventInput};
+    use lens_client::sessions::{ItemList, SendEventAck, SessionEventInput, SessionStatus};
     use lens_client::stream::{
         DisconnectReason, ServerStreamEvent, SessionEvent, SessionStatusValue as WireStatus,
     };
@@ -1172,6 +1121,7 @@ mod tests {
     struct MockApi {
         send_script: Mutex<VecDeque<Result<SendEventAck, ClientError>>>,
         fetch_script: Mutex<VecDeque<Result<ItemList, ClientError>>>,
+        status_script: Mutex<VecDeque<Result<SessionStatus, ClientError>>>,
         last_evt: Mutex<Option<SessionEventInput>>,
     }
 
@@ -1184,6 +1134,7 @@ mod tests {
             let mock = Arc::new(Self {
                 send_script: Mutex::new(VecDeque::from([Ok(ack)])),
                 fetch_script: Mutex::new(VecDeque::new()),
+                status_script: Mutex::new(VecDeque::new()),
                 last_evt: Mutex::new(None),
             });
             (Box::new(Arc::clone(&mock)), mock)
@@ -1195,6 +1146,7 @@ mod tests {
             let mock = Arc::new(Self {
                 send_script: Mutex::new(VecDeque::new()),
                 fetch_script: Mutex::new(fetch_script),
+                status_script: Mutex::new(VecDeque::new()),
                 last_evt: Mutex::new(None),
             });
             (Box::new(Arc::clone(&mock)), mock)
@@ -1204,6 +1156,7 @@ mod tests {
             let mock = Arc::new(Self {
                 send_script: Mutex::new(VecDeque::from([Err(err)])),
                 fetch_script: Mutex::new(VecDeque::new()),
+                status_script: Mutex::new(VecDeque::new()),
                 last_evt: Mutex::new(None),
             });
             (Box::new(Arc::clone(&mock)), mock)
@@ -1239,6 +1192,14 @@ mod tests {
                 .pop_front()
                 .unwrap_or(Ok(empty_item_list()))
         }
+
+        fn fetch_status(&self, _id: &SessionId) -> Result<SessionStatus, ClientError> {
+            self.status_script
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Ok(SessionStatus::Idle))
+        }
     }
 
     struct PanicApi;
@@ -1258,6 +1219,10 @@ mod tests {
             _page: &lens_client::sessions::ItemsPage,
         ) -> Result<ItemList, ClientError> {
             Ok(empty_item_list())
+        }
+
+        fn fetch_status(&self, _id: &SessionId) -> Result<SessionStatus, ClientError> {
+            Ok(SessionStatus::Idle)
         }
     }
 
@@ -2529,7 +2494,40 @@ mod tests {
     }
 
     #[test]
-    fn disconnect_unauthorized_parks_actor_still_accepts_stop() {
+    fn terminal_disconnect_exits_actor() {
+        let _dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(_dir.path());
+        seed_connection(&stores);
+
+        let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, _up_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(
+            fresh_state(),
+            ev_rx,
+            up_tx,
+            stores,
+            test_clock(),
+            noop_api(),
+        );
+
+        ev_tx
+            .send(ServerStreamEvent::Disconnected {
+                reason: DisconnectReason::Unauthorized,
+            })
+            .unwrap();
+
+        match handle.outcomes.recv_blocking().unwrap() {
+            ActorOutcome::Parked {
+                reason: ParkReason::Unauthorized,
+            } => {}
+            other => panic!("expected Parked Unauthorized, got {other:?}"),
+        }
+
+        handle.join_without_stop();
+    }
+
+    #[test]
+    fn disconnect_unauthorized_parks_and_exits() {
         let _dir = tempfile::tempdir().unwrap();
         let stores = test_stores(_dir.path());
         seed_connection(&stores);
@@ -2563,24 +2561,7 @@ mod tests {
             StreamUpdate::Disconnected(DisconnectReason::Unauthorized)
         ));
 
-        // Drain park disconnect delta — baseline before post-park event.
-        let mut updates_at_park = Vec::new();
-        while let Ok(u) = up_rx.try_recv() {
-            updates_at_park.push(u);
-        }
-
-        ev_tx.send(status_running_event()).unwrap();
-        handle.stop_and_join();
-
-        // Post-park event must be dropped, not merely delayed.
-        let mut updates_after_park = Vec::new();
-        while let Ok(u) = up_rx.try_recv() {
-            updates_after_park.push(u);
-        }
-        assert!(
-            updates_after_park.is_empty(),
-            "parked actor must drop further events (got {updates_after_park:?})"
-        );
+        handle.join_without_stop();
     }
 
     #[test]
@@ -2618,7 +2599,7 @@ mod tests {
             StreamUpdate::Disconnected(DisconnectReason::SessionFailed)
         ));
 
-        handle.stop_and_join();
+        handle.join_without_stop();
     }
 
     #[test]
@@ -2656,63 +2637,7 @@ mod tests {
             StreamUpdate::Disconnected(DisconnectReason::RetriesExhausted)
         ));
 
-        handle.stop_and_join();
-    }
-
-    #[test]
-    fn send_while_parked_is_rejected_no_bubble() {
-        let _dir = tempfile::tempdir().unwrap();
-        let stores = test_stores(_dir.path());
-        seed_connection(&stores);
-
-        let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, up_rx) = async_channel::bounded(64);
-        let handle = spawn_actor(
-            fresh_state(),
-            ev_rx,
-            up_tx,
-            stores,
-            test_clock(),
-            noop_api(),
-        );
-
-        ev_tx
-            .send(ServerStreamEvent::Disconnected {
-                reason: DisconnectReason::Unauthorized,
-            })
-            .unwrap();
-
-        match handle.outcomes.recv_blocking().unwrap() {
-            ActorOutcome::Parked {
-                reason: ParkReason::Unauthorized,
-            } => {}
-            other => panic!("expected Parked Unauthorized, got {other:?}"),
-        }
-
-        let _ = up_rx.recv_blocking().unwrap();
-        while up_rx.try_recv().is_ok() {}
-
-        handle
-            .commands
-            .send(SessionCommand::Send {
-                text: "must not land".into(),
-                model_override: None,
-            })
-            .unwrap();
-
-        assert!(
-            up_rx.try_recv().is_err(),
-            "parked Send must not emit PendingUserChanged"
-        );
-
-        match handle.outcomes.recv_blocking().unwrap() {
-            ActorOutcome::Command(CommandOutcome::SendRejected { reason }) => {
-                assert!(reason.contains("parked"));
-            }
-            other => panic!("expected SendRejected, got {other:?}"),
-        }
-
-        handle.stop_and_join();
+        handle.join_without_stop();
     }
 
     #[test]
@@ -2748,8 +2673,10 @@ mod tests {
             other => panic!("expected PersistError first, got {other:?}"),
         }
         match handle.outcomes.recv_blocking().unwrap() {
-            ActorOutcome::StoppedRemoved => {}
-            other => panic!("expected StoppedRemoved after PersistError, got {other:?}"),
+            ActorOutcome::Parked {
+                reason: ParkReason::Forbidden,
+            } => {}
+            other => panic!("expected Parked Forbidden after PersistError, got {other:?}"),
         }
         assert!(
             handle.outcomes.try_recv().is_err(),
@@ -2783,8 +2710,10 @@ mod tests {
             .unwrap();
 
         match handle.outcomes.recv_blocking().unwrap() {
-            ActorOutcome::StoppedRemoved => {}
-            other => panic!("expected StoppedRemoved, got {other:?}"),
+            ActorOutcome::Parked {
+                reason: ParkReason::Forbidden,
+            } => {}
+            other => panic!("expected Parked Forbidden, got {other:?}"),
         }
 
         handle.join_without_stop();
@@ -2814,8 +2743,10 @@ mod tests {
             .unwrap();
 
         match handle.outcomes.recv_blocking().unwrap() {
-            ActorOutcome::StoppedTombstone => {}
-            other => panic!("expected StoppedTombstone, got {other:?}"),
+            ActorOutcome::Parked {
+                reason: ParkReason::NotFound,
+            } => {}
+            other => panic!("expected Parked NotFound, got {other:?}"),
         }
 
         handle.join_without_stop();
@@ -2962,17 +2893,7 @@ mod tests {
             "batch must still emit Disconnected to foreground (got {stream_updates:?})"
         );
 
-        ev_tx.send(status_running_event()).unwrap();
-        handle.stop_and_join();
-
-        let mut post_park = Vec::new();
-        while let Ok(u) = up_rx.try_recv() {
-            post_park.push(u);
-        }
-        assert!(
-            post_park.is_empty(),
-            "parked actor must drop post-park events (got {post_park:?})"
-        );
+        handle.join_without_stop();
     }
 
     /// `fetch_items` blocks on the Nth call until released; signals each completed fetch.
@@ -3052,6 +2973,10 @@ mod tests {
                 .pop_front()
                 .unwrap_or(Ok(empty_item_list()))
         }
+
+        fn fetch_status(&self, _id: &SessionId) -> Result<SessionStatus, ClientError> {
+            Ok(SessionStatus::Idle)
+        }
     }
 
     /// Mock whose `send_event` blocks until the test sends on `release_tx`.
@@ -3099,6 +3024,10 @@ mod tests {
             _page: &lens_client::sessions::ItemsPage,
         ) -> Result<ItemList, ClientError> {
             Ok(empty_item_list())
+        }
+
+        fn fetch_status(&self, _id: &SessionId) -> Result<SessionStatus, ClientError> {
+            Ok(SessionStatus::Idle)
         }
     }
 

@@ -3,17 +3,20 @@
 
 use crate::actor::api::SessionApi;
 use crate::actor::runloop::{ActorHandle, ActorStores, SessionCommand, spawn_actor};
+use crate::actor::transport::ParkReason;
 use crate::clock::Clock;
 use crate::domain::ids::{ConnectionId, SessionId};
 use crate::domain::scalars::SessionLifecycle;
 use crate::reduce::StreamUpdate;
 use crossbeam_channel::Receiver;
+use lens_client::sessions::SessionStatus;
 use lens_client::stream::ServerStreamEvent;
 use std::collections::HashMap;
 
 /// Thin registry for running session actors — §9 policy hooks land later.
 pub struct FleetScheduler {
     registry: HashMap<SessionId, ActorHandle>,
+    parked: HashMap<SessionId, ParkReason>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,6 +32,7 @@ impl FleetScheduler {
     pub fn new() -> Self {
         Self {
             registry: HashMap::new(),
+            parked: HashMap::new(),
         }
     }
 
@@ -62,6 +66,51 @@ impl FleetScheduler {
         let handle = spawn_actor(state, events, updates, stores, clock, api);
         self.registry.insert(session_id.clone(), handle);
         Ok(())
+    }
+
+    /// Respawn a disconnected session from disk without flipping lifecycle.
+    /// Re-reads live server status (D26) and returns it; respawn proceeds regardless.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reconnect(
+        &mut self,
+        conn: &ConnectionId,
+        session_id: &SessionId,
+        events: Receiver<ServerStreamEvent>,
+        updates: async_channel::Sender<StreamUpdate>,
+        stores: ActorStores,
+        clock: Box<dyn Clock + Send>,
+        api: Box<dyn SessionApi + Send>,
+    ) -> Result<Option<SessionStatus>, FleetSchedulerError> {
+        if self.registry.contains_key(session_id) {
+            return Err(FleetSchedulerError::AlreadyRunning);
+        }
+        // D26: re-test reality. A `failed` server session resets to `idle` across a
+        // server restart; never trust a pre-disconnect status. We fetch it and RETURN it
+        // so a caller (lens-drive today, lens-ui later) can shape the reconnect message,
+        // but the respawn proceeds regardless — nothing is auto-terminal (D25). A fetch
+        // error is NOT a hard stop; it becomes `None` (honest "couldn't confirm").
+        let live_status = api.fetch_status(session_id).ok();
+        let state =
+            crate::persist::ControlStore::load_session(stores.control.as_ref(), conn, session_id)
+                .map_err(|e| FleetSchedulerError::Persist(e.to_string()))?
+                .ok_or(FleetSchedulerError::SessionNotFound)?;
+        // lifecycle already Active for a Disconnected session — no flip.
+        let handle = spawn_actor(state, events, updates, stores, clock, api);
+        self.parked.remove(session_id);
+        self.registry.insert(session_id.clone(), handle);
+        Ok(live_status)
+    }
+
+    /// Atomic park bookkeeping: reap the exited handle and record the park reason (R2-5).
+    pub fn mark_parked(&mut self, session_id: &SessionId, reason: ParkReason) {
+        if let Some(handle) = self.registry.remove(session_id) {
+            handle.join_exited();
+        }
+        self.parked.insert(session_id.clone(), reason);
+    }
+
+    pub fn park_reason(&self, id: &SessionId) -> Option<ParkReason> {
+        self.parked.get(id).copied()
     }
 
     /// Borrow a registered handle to send commands or read outcome/bridge channels.
@@ -110,7 +159,7 @@ mod tests {
     };
     use crate::reduce::testutil::fresh_state;
     use lens_client::error::ClientError;
-    use lens_client::sessions::{ItemList, SendEventAck, SessionEventInput};
+    use lens_client::sessions::{ItemList, SendEventAck, SessionEventInput, SessionStatus};
     use std::collections::VecDeque;
     use std::path::Path;
     use std::sync::{Arc, Mutex};
@@ -122,6 +171,7 @@ mod tests {
     struct MockApi {
         send_script: Mutex<VecDeque<Result<SendEventAck, ClientError>>>,
         fetch_script: Mutex<VecDeque<Result<ItemList, ClientError>>>,
+        status_script: Mutex<VecDeque<Result<SessionStatus, ClientError>>>,
     }
 
     fn empty_item_list() -> ItemList {
@@ -136,6 +186,19 @@ mod tests {
             let mock = Arc::new(Self {
                 send_script: Mutex::new(send_script),
                 fetch_script: Mutex::new(fetch_script),
+                status_script: Mutex::new(VecDeque::new()),
+            });
+            (Box::new(Arc::clone(&mock)), mock)
+        }
+
+        fn with_status(
+            status_script: VecDeque<Result<SessionStatus, ClientError>>,
+            fetch_script: VecDeque<Result<ItemList, ClientError>>,
+        ) -> (Box<dyn SessionApi + Send>, Arc<MockApi>) {
+            let mock = Arc::new(Self {
+                send_script: Mutex::new(VecDeque::new()),
+                fetch_script: Mutex::new(fetch_script),
+                status_script: Mutex::new(status_script),
             });
             (Box::new(Arc::clone(&mock)), mock)
         }
@@ -164,6 +227,14 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .unwrap_or(Ok(empty_item_list()))
+        }
+
+        fn fetch_status(&self, _id: &SessionId) -> Result<SessionStatus, ClientError> {
+            self.status_script
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Ok(SessionStatus::Idle))
         }
     }
 
@@ -391,5 +462,73 @@ mod tests {
             .take_handle(&sid)
             .expect("still registered")
             .stop_and_join();
+    }
+
+    #[test]
+    fn park_then_reconnect_respawns_and_refreshes_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(dir.path());
+        seed_connection(&stores);
+        // Seed an ACTIVE (not Slept) session with a small transcript — a Disconnected
+        // session's persisted lifecycle is Active (D26).
+        let mut state = fresh_state();
+        state.lifecycle = SessionLifecycle::Active;
+        stores
+            .control
+            .upsert_session(&state, 1_700_000_000_000)
+            .unwrap();
+        for (id, ord) in [("item_0", 0), ("item_1", 1)] {
+            seed_message_item(&*stores.transcript, ord, id, id);
+        }
+
+        let conn = ConnectionId::new("conn_1");
+        let sid = SessionId::new("conv_1");
+
+        // fetch_status returns idle (a `failed` session that healed across restart);
+        // fetch_items returns the forward tail.
+        let tail = item_list_from_messages(&["item_2"], false);
+        let (api, _mock) = MockApi::with_status(
+            VecDeque::from([Ok(SessionStatus::Idle)]),
+            VecDeque::from([Ok(tail)]),
+        );
+
+        let (_ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, up_rx) = async_channel::bounded(64);
+        let mut scheduler = FleetScheduler::new();
+        let live = scheduler
+            .reconnect(&conn, &sid, ev_rx, up_tx, stores, test_clock(), api)
+            .expect("reconnect respawns from Active disk");
+        // D26: the returned status PROVES the re-read happened (not a false-green — a
+        // discarded status would let the mock return anything and still pass).
+        assert_eq!(
+            live,
+            Some(SessionStatus::Idle),
+            "reconnect re-reads + returns live status"
+        );
+        assert!(scheduler.is_running(&sid));
+        assert!(
+            scheduler.park_reason(&sid).is_none(),
+            "reconnect clears park reason"
+        );
+
+        // Forward catch-up materializes the tail past frontier 1.
+        let mut saw_tail = false;
+        while let Ok(u) = up_rx.recv_blocking() {
+            if matches!(
+                u,
+                StreamUpdate::TranscriptAdvanced {
+                    committed_ordinal: 2
+                }
+            ) {
+                saw_tail = true;
+                break;
+            }
+        }
+        assert!(
+            saw_tail,
+            "reconnect runs forward catch-up from disk frontier"
+        );
+
+        scheduler.take_handle(&sid).unwrap().stop_and_join();
     }
 }
