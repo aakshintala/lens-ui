@@ -18,10 +18,10 @@ use lens_client::sessions::{GetOpts, SessionSnapshot, SessionStatus};
 use lens_client::stream::EventStream;
 use lens_client::{Auth, Client, Connection};
 use lens_core::actor::{
-    ActorOutcome, ActorStores, ClientSessionApi, CommandOutcome, FleetScheduler,
+    ActorOutcome, ActorStores, ActorTransport, ClientSessionApi, CommandOutcome, FleetScheduler,
     FleetSchedulerError, ParkReason, SessionCommand,
 };
-use lens_core::clock::{Clock, ManualClock};
+use lens_core::clock::Clock;
 use lens_core::domain::ids::AgentId;
 use lens_core::domain::scalars::SessionStatusValue;
 use lens_core::domain::session::SessionState;
@@ -67,7 +67,32 @@ impl SnapshotGate {
 }
 
 struct StreamBridge {
-    _forwarder: JoinHandle<()>,
+    stream: Arc<EventStream>,
+    forwarder: Option<JoinHandle<()>>,
+}
+
+impl StreamBridge {
+    fn shutdown(&mut self) {
+        self.stream.stop();
+        if let Some(h) = self.forwarder.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Drop for StreamBridge {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// Live wall clock for the driver — reads `SystemTime` on each call.
+struct WallClock;
+
+impl Clock for WallClock {
+    fn now_millis(&self) -> i64 {
+        wall_clock_millis()
+    }
 }
 
 fn main() {
@@ -207,8 +232,10 @@ fn start_stream_bridge(
 ) {
     const EVENT_CHANNEL_BOUND: usize = 1024;
     let (events_tx, events_rx) = crossbeam_channel::bounded(EVENT_CHANNEL_BOUND);
+    let stream = Arc::new(stream);
+    let reader = Arc::clone(&stream);
     let forwarder = thread::spawn(move || {
-        while let Some(ev) = stream.recv() {
+        while let Some(ev) = reader.recv() {
             if events_tx.send(ev).is_err() {
                 break;
             }
@@ -216,7 +243,8 @@ fn start_stream_bridge(
     });
     (
         StreamBridge {
-            _forwarder: forwarder,
+            stream,
+            forwarder: Some(forwarder),
         },
         events_rx,
     )
@@ -251,9 +279,9 @@ fn reconnect_command(
     data_dir: &Path,
     scheduler: &Arc<std::sync::Mutex<FleetScheduler>>,
     updates_tx: async_channel::Sender<StreamUpdate>,
-    old_bridge: StreamBridge,
+    mut old_bridge: StreamBridge,
 ) -> Result<StreamBridge, String> {
-    drop(old_bridge);
+    old_bridge.shutdown();
     let stream = client
         .sessions()
         .stream(session_id)
@@ -331,16 +359,33 @@ fn snapshot_command(
 fn stop_command(
     scheduler: &Arc<std::sync::Mutex<FleetScheduler>>,
     session_id: &SessionId,
-    bridge: StreamBridge,
+    mut bridge: StreamBridge,
 ) -> Result<(), String> {
-    drop(bridge);
+    bridge.shutdown();
     let mut sched = scheduler
         .lock()
         .map_err(|e| format!("scheduler lock: {e}"))?;
     if let Some(handle) = sched.take_handle(session_id) {
-        handle.stop_and_join();
+        let _ = handle.commands.send(SessionCommand::Stop);
+        while let Ok(outcome) = handle.outcomes.recv_blocking() {
+            process_outcome(&outcome, scheduler, session_id);
+        }
+        handle.join_exited();
     }
     Ok(())
+}
+
+fn process_outcome(
+    outcome: &ActorOutcome,
+    scheduler: &Arc<std::sync::Mutex<FleetScheduler>>,
+    session_id: &SessionId,
+) {
+    if let ActorOutcome::Parked { reason } = outcome
+        && let Ok(mut sched) = scheduler.lock()
+    {
+        sched.mark_parked(session_id, *reason);
+    }
+    print_outcome_line(outcome);
 }
 
 fn drain_outcomes(
@@ -369,12 +414,7 @@ fn drain_outcomes(
                 }
             }
         };
-        if let ActorOutcome::Parked { reason } = &outcome
-            && let Ok(mut sched) = scheduler.lock()
-        {
-            sched.mark_parked(session_id, *reason);
-        }
-        print_outcome_line(&outcome);
+        process_outcome(&outcome, scheduler, session_id);
     }
 }
 
@@ -385,12 +425,16 @@ fn drain_updates(
 ) {
     while !stop.load(Ordering::Relaxed) {
         match rx.try_recv() {
-            Ok(update) => {
-                if let StreamUpdate::Rebased(state) = update {
+            Ok(update) => match update {
+                StreamUpdate::Rebased(state) => {
                     print_state_line(&state);
                     gate.signal_if_waiting();
                 }
-            }
+                StreamUpdate::TranscriptAdvanced { committed_ordinal } => {
+                    print_transcript_advanced_line(committed_ordinal)
+                }
+                _ => {}
+            },
             Err(async_channel::TryRecvError::Empty) => {
                 thread::sleep(Duration::from_millis(50));
             }
@@ -511,7 +555,7 @@ fn wall_clock_millis() -> i64 {
 }
 
 fn make_clock() -> Box<dyn Clock + Send> {
-    Box::new(ManualClock::new(wall_clock_millis()))
+    Box::new(WallClock)
 }
 
 fn actor_api(conn: &Connection) -> Result<Box<ClientSessionApi>, String> {
@@ -626,6 +670,14 @@ fn print_outcome_line(outcome: &ActorOutcome) {
     emit_line(&line);
 }
 
+fn print_transcript_advanced_line(committed_ordinal: i64) {
+    let line = json!({
+        "kind": "transcript_advanced",
+        "committed_ordinal": committed_ordinal,
+    });
+    emit_line(&line);
+}
+
 fn print_state_line(state: &SessionState) {
     let line = json!({
         "kind": "state",
@@ -654,7 +706,7 @@ fn actor_outcome_json(outcome: &ActorOutcome) -> Value {
             reconcile_in_flight,
         } => json!({
             "variant": "TransportChanged",
-            "transport": format!("{transport:?}"),
+            "transport": transport_str(*transport),
             "reconcile_in_flight": reconcile_in_flight,
         }),
         ActorOutcome::Parked { reason } => json!({
@@ -726,5 +778,13 @@ fn park_reason_str(reason: ParkReason) -> &'static str {
         ParkReason::RetriesExhausted => "retries_exhausted",
         ParkReason::Forbidden => "forbidden",
         ParkReason::NotFound => "not_found",
+    }
+}
+
+fn transport_str(transport: ActorTransport) -> String {
+    match transport {
+        ActorTransport::Connected => "connected".into(),
+        ActorTransport::Reconnecting => "reconnecting".into(),
+        ActorTransport::Parked { reason } => format!("parked:{}", park_reason_str(reason)),
     }
 }
