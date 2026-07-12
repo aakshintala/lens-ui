@@ -50,6 +50,10 @@ fn count_held_with_content(bubbles: &[PendingUserMessage], content: &str) -> usi
 /// **Residual:** a rare unrelated identical message landing in the same disconnect window
 /// can still be silently dropped on path 2 (unique content match without idempotency key).
 /// Robust fix deferred to omnigent client-message-id.
+///
+/// A `PendingInput` with `content: None` cannot be content-matched in path 1 — the
+/// still-queued native input falls through to path 3 SendLost (possible duplicate-on-restore);
+/// positional/FIFO stamping was rejected (binds wrong `pending_id`).
 pub fn reconcile_held_landed(
     pending: &mut Vec<PendingUserMessage>,
     snapshot_pending_inputs: &[PendingInput],
@@ -62,6 +66,15 @@ pub fn reconcile_held_landed(
 
     let mut remaining = std::mem::take(pending);
     let mut output = Vec::with_capacity(remaining.len());
+    let mut initial_held_by_content: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for bubble in &remaining {
+        if is_held(bubble) {
+            *initial_held_by_content
+                .entry(bubble.content.clone())
+                .or_default() += 1;
+        }
+    }
 
     while let Some(bubble) = remaining.first().cloned() {
         remaining.remove(0);
@@ -92,8 +105,8 @@ pub fn reconcile_held_landed(
             continue;
         }
 
-        // Ambiguity on either side for path 1 → keep unstamped (re-evaluated next reconnect).
-        if held_count > 1 || avail_input_indices.len() > 1 {
+        // Path 1 genuine ambiguity → keep unstamped (re-evaluated next reconnect).
+        if avail_input_indices.len() > 1 || (held_count > 1 && !avail_input_indices.is_empty()) {
             output.push(bubble);
             continue;
         }
@@ -105,8 +118,8 @@ pub fn reconcile_held_landed(
             .map(|(i, _)| i)
             .collect();
 
-        // Path 2: unique delta → silent drop (landed).
-        if avail_delta_indices.len() == 1 {
+        // Path 2: two-sided unique match → silent drop (landed).
+        if initial_held_by_content.get(c).copied() == Some(1) && avail_delta_indices.len() == 1 {
             consumed_deltas[avail_delta_indices[0]] = true;
             continue;
         }
@@ -429,5 +442,28 @@ mod tests {
         assert!(lost.is_empty());
         assert_eq!(pending.len(), 2);
         assert!(pending.iter().all(|b| b.server_pending_id.is_none()));
+    }
+
+    #[test]
+    fn duplicate_held_no_inputs_no_delta_both_send_lost() {
+        let mut pending = vec![
+            bubble("l1", None, None, "hi"),
+            bubble("l2", None, None, "hi"),
+        ];
+        let lost = reconcile_held_landed(&mut pending, &[], &[]);
+        assert_eq!(lost.len(), 2);
+        assert!(lost.iter().all(|l| l.content == "hi"));
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn duplicate_held_one_unique_delta_both_send_lost() {
+        let mut pending = vec![
+            bubble("l1", None, None, "hi"),
+            bubble("l2", None, None, "hi"),
+        ];
+        let lost = reconcile_held_landed(&mut pending, &[], &[("hi".into(), 200)]);
+        assert_eq!(lost.len(), 2);
+        assert!(pending.is_empty());
     }
 }

@@ -663,6 +663,9 @@ fn apply_reduced_batch(
         .iter()
         .any(|u| matches!(u, StreamUpdate::Reconnecting { .. }));
     let saw_reconnected = batch.iter().any(|u| matches!(u, StreamUpdate::Reconnected));
+    if saw_reconnecting {
+        ctx.snapshot_pending_inputs.clear();
+    }
     if let Some(inputs) = batch.iter().rev().find_map(|u| match u {
         StreamUpdate::SnapshotRestored(inputs) => Some(inputs.clone()),
         _ => None,
@@ -942,8 +945,11 @@ fn invoke_catchup_and_replay(
             }
         }
     }
-    if held_reconcile && apply_held_reconcile(ctx) == LoopControl::Break {
-        return LoopControl::Break;
+    if held_reconcile {
+        if apply_held_reconcile(ctx) == LoopControl::Break {
+            return LoopControl::Break;
+        }
+        ctx.snapshot_pending_inputs.clear();
     }
     LoopControl::Continue
 }
@@ -1330,7 +1336,11 @@ mod tests {
         loop {
             match up_rx.recv_blocking().unwrap() {
                 StreamUpdate::PendingUserChanged(v) => return Some(v),
-                StreamUpdate::Reconnected | StreamUpdate::TranscriptAdvanced { .. } => {}
+                StreamUpdate::Reconnected
+                | StreamUpdate::Reconnecting { .. }
+                | StreamUpdate::TranscriptAdvanced { .. }
+                | StreamUpdate::SnapshotRestored(_)
+                | StreamUpdate::Rebased(_) => {}
                 other => {
                     panic!("unexpected update while waiting for PendingUserChanged: {other:?}")
                 }
@@ -3794,6 +3804,28 @@ mod tests {
         (Box::new(Arc::clone(&mock)), mock)
     }
 
+    fn mock_fail_n_with_fetch(
+        status: u16,
+        send_count: usize,
+        fetch_script: VecDeque<Result<ItemList, ClientError>>,
+    ) -> (Box<dyn SessionApi + Send>, Arc<MockApi>) {
+        let send_script: VecDeque<_> = (0..send_count)
+            .map(|_| {
+                Err(ClientError::Server {
+                    status,
+                    body: serde_json::json!({}),
+                })
+            })
+            .collect();
+        let mock = Arc::new(MockApi {
+            send_script: Mutex::new(send_script),
+            fetch_script: Mutex::new(fetch_script),
+            status_script: Mutex::new(VecDeque::new()),
+            last_evt: Mutex::new(None),
+        });
+        (Box::new(Arc::clone(&mock)), mock)
+    }
+
     fn expect_send_lost(handle: &ActorHandle, content: &str) {
         loop {
             match handle.outcomes.recv_blocking().unwrap() {
@@ -3885,6 +3917,151 @@ mod tests {
         expect_send_lost(&handle, "lost send");
         let cleared = recv_pending_user_changed_or_none(&up_rx).expect("cleared pending_user");
         assert!(cleared.is_empty());
+        handle.stop_and_join();
+    }
+
+    #[test]
+    fn held_reconnect_stamps_from_plumbed_snapshot_pending_input_content() {
+        let _dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(_dir.path());
+        seed_connection(&stores);
+
+        let (api, _mock) = mock_fail_with_fetch(
+            ClientError::Server {
+                status: 503,
+                body: serde_json::json!({}),
+            },
+            VecDeque::from([Ok(empty_item_list()), Ok(empty_item_list())]),
+        );
+
+        let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, up_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+
+        handle
+            .commands
+            .send(SessionCommand::Send {
+                text: "stamp me".into(),
+                model_override: None,
+            })
+            .unwrap();
+        let held = expect_pending_user_changed(&up_rx);
+        assert_eq!(held.len(), 1);
+        assert!(held[0].server_pending_id.is_none());
+        let _ = handle.outcomes.recv_blocking();
+
+        let snap = snapshot_fixture(serde_json::json!({
+            "id": "conv_1",
+            "status": "running",
+            "agent_id": "ag_9",
+            "created_at": 1_700_000_000,
+            "pending_inputs": [{"pending_id": "p9", "content": "stamp me"}],
+            "items": []
+        }));
+        ev_tx
+            .send(ServerStreamEvent::SnapshotRestored(Box::new(snap)))
+            .unwrap();
+        while let Ok(u) = up_rx.try_recv() {
+            let _ = u;
+        }
+
+        ev_tx
+            .send(ServerStreamEvent::Reconnected { gap: None })
+            .unwrap();
+
+        let stamped = recv_pending_user_changed_or_none(&up_rx).expect("stamped pending_user");
+        assert_eq!(stamped.len(), 1);
+        assert_eq!(stamped[0].server_pending_id.as_deref(), Some("p9"));
+        assert_eq!(stamped[0].content, "stamp me");
+        handle.stop_and_join();
+    }
+
+    #[test]
+    fn held_reconnect_without_fresh_snapshot_does_not_stamp_from_prior_episode() {
+        let _dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(_dir.path());
+        seed_connection(&stores);
+
+        let (api, _mock) = mock_fail_n_with_fetch(
+            503,
+            2,
+            VecDeque::from([
+                Ok(empty_item_list()),
+                Ok(empty_item_list()),
+                Ok(empty_item_list()),
+            ]),
+        );
+
+        let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, up_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+
+        handle
+            .commands
+            .send(SessionCommand::Send {
+                text: "stale".into(),
+                model_override: None,
+            })
+            .unwrap();
+        let _ = expect_pending_user_changed(&up_rx);
+        let _ = handle.outcomes.recv_blocking();
+
+        let snap = snapshot_fixture(serde_json::json!({
+            "id": "conv_1",
+            "status": "running",
+            "agent_id": "ag_9",
+            "created_at": 1_700_000_000,
+            "pending_inputs": [{"pending_id": "p_stale", "content": "stale"}],
+            "items": []
+        }));
+        ev_tx
+            .send(ServerStreamEvent::SnapshotRestored(Box::new(snap)))
+            .unwrap();
+        ev_tx
+            .send(ServerStreamEvent::Reconnected { gap: None })
+            .unwrap();
+
+        let stamped = recv_pending_user_changed_or_none(&up_rx).expect("first episode stamp");
+        assert_eq!(stamped[0].server_pending_id.as_deref(), Some("p_stale"));
+        while handle.outcomes.try_recv().is_ok() {}
+
+        handle
+            .commands
+            .send(SessionCommand::Send {
+                text: "stale".into(),
+                model_override: None,
+            })
+            .unwrap();
+        let held2 = expect_pending_user_changed(&up_rx);
+        let new_held = held2
+            .iter()
+            .find(|b| b.pending_id == "lens_pend_2")
+            .expect("second held bubble");
+        assert!(new_held.server_pending_id.is_none());
+        let _ = handle.outcomes.recv_blocking();
+
+        ev_tx
+            .send(ServerStreamEvent::Reconnected { gap: None })
+            .unwrap();
+
+        loop {
+            match handle.outcomes.recv_blocking().unwrap() {
+                ActorOutcome::SendLost {
+                    lens_pending_id,
+                    content,
+                } => {
+                    assert_eq!(lens_pending_id, "lens_pend_2");
+                    assert_eq!(content, "stale");
+                    break;
+                }
+                ActorOutcome::TransportChanged { .. } => {}
+                other => panic!("expected SendLost for lens_pend_2, got {other:?}"),
+            }
+        }
+        let after = recv_pending_user_changed_or_none(&up_rx).expect("after ep2 reconcile");
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].pending_id, "lens_pend_1");
+        assert_eq!(after[0].server_pending_id.as_deref(), Some("p_stale"));
         handle.stop_and_join();
     }
 
