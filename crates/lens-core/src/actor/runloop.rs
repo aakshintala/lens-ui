@@ -67,6 +67,11 @@ impl ActorHandle {
             .expect("actor thread panicked or was poisoned");
     }
 
+    /// True when the actor thread has finished (park terminal or stop).
+    pub(crate) fn is_exited(&self) -> bool {
+        self.join.is_finished()
+    }
+
     /// Block until an actor that exited on its own (park terminal) is joined.
     pub fn join_exited(self) {
         self.join

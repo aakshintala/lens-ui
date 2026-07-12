@@ -81,8 +81,13 @@ impl FleetScheduler {
         clock: Box<dyn Clock + Send>,
         api: Box<dyn SessionApi + Send>,
     ) -> Result<Option<SessionStatus>, FleetSchedulerError> {
-        if self.registry.contains_key(session_id) {
-            return Err(FleetSchedulerError::AlreadyRunning);
+        if let Some(handle) = self.registry.remove(session_id) {
+            if handle.is_exited() {
+                handle.join_exited();
+            } else {
+                self.registry.insert(session_id.clone(), handle);
+                return Err(FleetSchedulerError::AlreadyRunning);
+            }
         }
         // D26: re-test reality. A `failed` server session resets to `idle` across a
         // server restart; never trust a pre-disconnect status. We fetch it and RETURN it
@@ -160,6 +165,7 @@ mod tests {
     use crate::reduce::testutil::fresh_state;
     use lens_client::error::ClientError;
     use lens_client::sessions::{ItemList, SendEventAck, SessionEventInput, SessionStatus};
+    use lens_client::stream::{DisconnectReason, ServerStreamEvent};
     use std::collections::VecDeque;
     use std::path::Path;
     use std::sync::{Arc, Mutex};
@@ -302,6 +308,15 @@ mod tests {
             "has_more": has_more,
         }))
         .expect("item list fixture")
+    }
+
+    fn seed_active_session(stores: &ActorStores) {
+        let mut state = fresh_state();
+        state.lifecycle = SessionLifecycle::Active;
+        stores
+            .control
+            .upsert_session(&state, 1_700_000_000_000)
+            .unwrap();
     }
 
     fn seed_slept_session(stores: &ActorStores) {
@@ -469,14 +484,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let stores = test_stores(dir.path());
         seed_connection(&stores);
-        // Seed an ACTIVE (not Slept) session with a small transcript — a Disconnected
-        // session's persisted lifecycle is Active (D26).
-        let mut state = fresh_state();
-        state.lifecycle = SessionLifecycle::Active;
-        stores
-            .control
-            .upsert_session(&state, 1_700_000_000_000)
-            .unwrap();
+        seed_active_session(&stores);
         for (id, ord) in [("item_0", 0), ("item_1", 1)] {
             seed_message_item(&*stores.transcript, ord, id, id);
         }
@@ -495,6 +503,12 @@ mod tests {
         let (_ev_tx, ev_rx) = crossbeam_channel::bounded(64);
         let (up_tx, up_rx) = async_channel::bounded(64);
         let mut scheduler = FleetScheduler::new();
+        scheduler.mark_parked(&sid, ParkReason::Unauthorized);
+        assert_eq!(
+            scheduler.park_reason(&sid),
+            Some(ParkReason::Unauthorized),
+            "precondition: park reason set before reconnect"
+        );
         let live = scheduler
             .reconnect(&conn, &sid, ev_rx, up_tx, stores, test_clock(), api)
             .expect("reconnect respawns from Active disk");
@@ -527,6 +541,178 @@ mod tests {
         assert!(
             saw_tail,
             "reconnect runs forward catch-up from disk frontier"
+        );
+
+        scheduler.take_handle(&sid).unwrap().stop_and_join();
+    }
+
+    #[test]
+    fn mark_parked_then_reconnect_clears_park_reason_and_respawns() {
+        let dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(dir.path());
+        seed_connection(&stores);
+        seed_active_session(&stores);
+
+        let conn = ConnectionId::new("conn_1");
+        let sid = SessionId::new("conv_1");
+
+        let (api, _mock) =
+            MockApi::with_status(VecDeque::new(), VecDeque::from([Ok(empty_item_list())]));
+
+        let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, _up_rx) = async_channel::bounded(64);
+        let mut scheduler = FleetScheduler::new();
+        scheduler
+            .wake(&conn, &sid, ev_rx, up_tx.clone(), stores, test_clock(), api)
+            .expect("wake");
+
+        ev_tx
+            .send(ServerStreamEvent::Disconnected {
+                reason: DisconnectReason::Unauthorized,
+            })
+            .unwrap();
+
+        let parked_reason = match scheduler
+            .handle(&sid)
+            .expect("handle registered")
+            .outcomes
+            .recv_blocking()
+            .unwrap()
+        {
+            ActorOutcome::Parked { reason } => reason,
+            other => panic!("expected Parked, got {other:?}"),
+        };
+        scheduler.mark_parked(&sid, parked_reason);
+        assert_eq!(
+            scheduler.park_reason(&sid),
+            Some(ParkReason::Unauthorized),
+            "mark_parked records reason"
+        );
+        assert!(
+            !scheduler.is_running(&sid),
+            "mark_parked reaps exited handle from registry"
+        );
+
+        let stores2 = test_stores(dir.path());
+        let (api2, _mock2) = MockApi::with_status(
+            VecDeque::from([Ok(SessionStatus::Idle)]),
+            VecDeque::from([Ok(empty_item_list())]),
+        );
+        let (_ev_tx2, ev_rx2) = crossbeam_channel::bounded(64);
+        let live = scheduler
+            .reconnect(&conn, &sid, ev_rx2, up_tx, stores2, test_clock(), api2)
+            .expect("reconnect after mark_parked");
+        assert_eq!(live, Some(SessionStatus::Idle));
+        assert!(
+            scheduler.park_reason(&sid).is_none(),
+            "reconnect clears park reason after mark_parked"
+        );
+        assert!(scheduler.is_running(&sid), "reconnect respawns actor");
+
+        scheduler.take_handle(&sid).unwrap().stop_and_join();
+    }
+
+    #[test]
+    fn early_reconnect_before_parked_drain_reaps_exited_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(dir.path());
+        seed_connection(&stores);
+        seed_active_session(&stores);
+
+        let conn = ConnectionId::new("conn_1");
+        let sid = SessionId::new("conv_1");
+
+        let (api, _mock) =
+            MockApi::with_status(VecDeque::new(), VecDeque::from([Ok(empty_item_list())]));
+
+        let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, _up_rx) = async_channel::bounded(64);
+        let mut scheduler = FleetScheduler::new();
+        scheduler
+            .wake(&conn, &sid, ev_rx, up_tx.clone(), stores, test_clock(), api)
+            .expect("wake");
+
+        ev_tx
+            .send(ServerStreamEvent::Disconnected {
+                reason: DisconnectReason::Unauthorized,
+            })
+            .unwrap();
+
+        match scheduler
+            .handle(&sid)
+            .expect("handle still registered")
+            .outcomes
+            .recv_blocking()
+            .unwrap()
+        {
+            ActorOutcome::Parked { .. } => {}
+            other => panic!("expected Parked, got {other:?}"),
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if scheduler.handle(&sid).is_some_and(|h| h.is_exited()) {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(
+            scheduler.is_running(&sid),
+            "exited handle still registered before mark_parked drain"
+        );
+        assert!(
+            scheduler.handle(&sid).unwrap().is_exited(),
+            "actor thread finished before reconnect"
+        );
+
+        let stores2 = test_stores(dir.path());
+        let (api2, _mock2) = MockApi::with_status(
+            VecDeque::from([Ok(SessionStatus::Idle)]),
+            VecDeque::from([Ok(empty_item_list())]),
+        );
+        let (_ev_tx2, ev_rx2) = crossbeam_channel::bounded(64);
+        scheduler
+            .reconnect(&conn, &sid, ev_rx2, up_tx, stores2, test_clock(), api2)
+            .expect("early reconnect must not wedge on exited handle");
+        assert!(
+            scheduler.is_running(&sid),
+            "reconnect respawns after reaping exited handle"
+        );
+        assert!(
+            scheduler.park_reason(&sid).is_none(),
+            "reconnect clears stale park bookkeeping"
+        );
+
+        scheduler.take_handle(&sid).unwrap().stop_and_join();
+    }
+
+    #[test]
+    fn reconnect_fetch_status_error_still_respawns() {
+        let dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(dir.path());
+        seed_connection(&stores);
+        seed_active_session(&stores);
+
+        let conn = ConnectionId::new("conn_1");
+        let sid = SessionId::new("conv_1");
+
+        let (api, _mock) = MockApi::with_status(
+            VecDeque::from([Err(ClientError::network_for_test())]),
+            VecDeque::from([Ok(empty_item_list())]),
+        );
+
+        let (_ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (up_tx, _up_rx) = async_channel::bounded(64);
+        let mut scheduler = FleetScheduler::new();
+        let live = scheduler
+            .reconnect(&conn, &sid, ev_rx, up_tx, stores, test_clock(), api)
+            .expect("reconnect proceeds despite fetch_status error");
+        assert_eq!(
+            live, None,
+            "fetch_status Err becomes None (D25: not auto-terminal)"
+        );
+        assert!(
+            scheduler.is_running(&sid),
+            "respawn still happens when status fetch fails"
         );
 
         scheduler.take_handle(&sid).unwrap().stop_and_join();
