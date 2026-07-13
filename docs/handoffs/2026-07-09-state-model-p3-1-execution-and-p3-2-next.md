@@ -47,7 +47,7 @@
 
 ## P3-2 scope — command semantics (D16 + D18)
 
-Authoritative spec: **`docs/superpowers/specs/2026-07-08-state-model-engine-design.md`
+Authoritative spec: **`docs/specs/2026-07-08-state-model-engine-design.md`
 §2.2 (D16, D18), §7 (commands), §13.1**. No P3-2 plan exists yet.
 
 ### D16 — optimistic-send reconcile keyed by server ack ids (spec lines 210–231)

@@ -9,7 +9,7 @@ that primitive, purpose-built for chat logs.
 **Mechanism:** native `list()` (Backend A), **not** gpui-component's
 `v_virtual_list` (Backend B, which fails the scroll-anchoring/bottom family).
 
-Design: `docs/superpowers/specs/2026-07-07-transcript-virtualization-spike-design.md`.
+Design: `docs/specs/2026-07-07-transcript-virtualization-spike-design.md`.
 Harness (throwaway): `spikes/transcript-virtual/` (+ `NOTES.md` = raw discovery log).
 
 ---

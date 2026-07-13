@@ -10,7 +10,7 @@ Foundation plan. This is an execution handoff, not a design doc.
 2. `docs/adr/0001-omnigent-contract-pinning.md` — why we're frozen at a commit; don't `git pull` the sibling omnigent checkout by reflex.
 3. `docs/design/typed-client.md` — the **contract** (what the crate does). Ground truth.
 4. `docs/design/typed-client-implementation.md` — the **build decisions** (D1–D4) layered on top.
-5. `docs/superpowers/plans/2026-06-25-lens-client-foundation.md` — the plan to execute (6 TDD tasks).
+5. `docs/plans/2026-06-25-lens-client-foundation.md` — the plan to execute (6 TDD tasks).
 
 ## Execution protocol (chosen)
 

@@ -3,7 +3,7 @@
 **Date:** 2026-06-26
 **Branch:** `feat/lens-client-streaming`
 **Commits:** `087ef6f..8a7bb2e` (5 tasks + 2 live-caught fixes + 1 review fix)
-**Plan:** [`2026-06-26-lens-client-plan3c-contract-drift.md`](../superpowers/plans/2026-06-26-lens-client-plan3c-contract-drift.md)
+**Plan:** [`2026-06-26-lens-client-plan3c-contract-drift.md`](../plans/2026-06-26-lens-client-plan3c-contract-drift.md)
 **Mode:** subagent-driven (composer-2.5 build + Opus per-task review + one consolidated gpt-5.5 cross-family review)
 
 ## What shipped

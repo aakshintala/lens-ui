@@ -16,7 +16,7 @@
 - **Every task ends green** on `xtask gate` (or, mid-task, the crate's `cargo test` + `cargo clippy --all-targets -- -D warnings`).
 - **TDD**: failing test → run-it-fails → minimal impl → run-it-passes → commit. One logical change per commit.
 - **Cross-family review is MANDATORY on Tasks 3, 4, 5** — author with `cursor-delegate`/composer-2.5, review with **grok-4.5 via `cursor-delegate`** (a family other than the author). Tasks 3 (actor mutation of merged P3-1 code), 4 (temporal catch-up loop), and 5 (subtractive edit to the hardened `lens-client` crate) are the seams.
-- **Spec SSOT:** `docs/superpowers/specs/2026-07-08-state-model-engine-design.md` §2.3 (D19–D23). Where this plan and the spec disagree, the spec wins — surface the conflict.
+- **Spec SSOT:** `docs/specs/2026-07-08-state-model-engine-design.md` §2.3 (D19–D23). Where this plan and the spec disagree, the spec wins — surface the conflict.
 - **`i64` ordinal stays** — negative/anchored ordinals (D22 never-seen-huge scroll-back) must remain representable; nothing here may foreclose a negative-ordinal prepend.
 
 ---

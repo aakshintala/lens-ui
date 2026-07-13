@@ -14,7 +14,7 @@ Ground truth used: omnigent `0.3.0.dev0` (`36b2a11c`); golden captures at
 
 ## What shipped (Plan 3b-2a — done)
 
-Plan: `docs/superpowers/plans/2026-06-26-lens-client-plan3b2a-reconnect-reads.md`.
+Plan: `docs/plans/2026-06-26-lens-client-plan3b2a-reconnect-reads.md`.
 Subagent-driven: composer-2.5 build (4 tasks, each red→green→commit), one
 consolidated gpt-5.5 cross-family review at the end.
 
@@ -86,7 +86,7 @@ Resolve A vs B, record it (ADR-style) in `docs/design/typed-client-implementatio
 ---
 
 ## Pointers
-- Plan (3b-2a): `docs/superpowers/plans/2026-06-26-lens-client-plan3b2a-reconnect-reads.md`
+- Plan (3b-2a): `docs/plans/2026-06-26-lens-client-plan3b2a-reconnect-reads.md`
 - Design §7 (reconnect/wake protocol) + §7a (ordering): `docs/design/typed-client-implementation.md`
 - State model §6.3 (reconcile-by-id / wake): `docs/design/app-architecture-and-state-model.md`
 - Captures: `docs/spikes/captures/2026-06-26-sse/`

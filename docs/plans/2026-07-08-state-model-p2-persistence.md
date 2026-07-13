@@ -25,7 +25,7 @@
 
 ## Global Constraints
 
-- **Design source of truth:** `docs/design/app-architecture-and-state-model.md` §6 (LOCKED) + spec `docs/superpowers/specs/2026-07-08-state-model-engine-design.md` §4 "P2".
+- **Design source of truth:** `docs/design/app-architecture-and-state-model.md` §6 (LOCKED) + spec `docs/specs/2026-07-08-state-model-engine-design.md` §4 "P2".
 - **`lens-core` has NO gpui dependency.** No threads, no actor in P2 — blocking storage primitives only.
 - **The UI never panics** (AGENTS.md MANDATORY): every load path is total over decodable disk data. Corrupt/unknown-shape rows degrade (skip-with-log-shape / read-only-degraded), never `panic!`/`unwrap` on stored data. `expect`/`unwrap` is allowed **only** on our own in-memory serialization of our own enums (documented invariants), never on bytes read back from disk.
 - **Schema is a portable, denormalized Bridge read contract** (§6.1): standard SQL types, JSON payloads in `TEXT` columns that map to Postgres `jsonb`, text ids, epoch integer timestamps, a stable `items.kind` enum vocabulary, denormalized `BlockContext` columns (`agent`/`depth`/`turn`). No SQLite-only feature on the critical path.
@@ -1752,6 +1752,6 @@ git commit -m "test(lens-core): P2 task 7 — degraded-write + lifecycle gate + 
 
 ## Execution Handoff
 
-Plan complete and saved to `docs/superpowers/plans/2026-07-08-state-model-p2-persistence.md`.
+Plan complete and saved to `docs/plans/2026-07-08-state-model-p2-persistence.md`.
 
 **Before build:** one Opus review of this plan (decisions block D-P2-1..9 primarily), per the branch review workflow. Then subagent-driven build (composer-2.5 per task) with an Opus review between tasks and a consolidated Opus end-of-branch review, then ff-merge to main + push (solo-project integration workflow).

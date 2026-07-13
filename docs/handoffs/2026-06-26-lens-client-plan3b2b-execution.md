@@ -3,7 +3,7 @@
 **Date:** 2026-06-26
 **Branch:** `feat/lens-client-streaming`
 **Commits:** `3d4048b..6d4dde3`
-**Plan:** [`2026-06-26-lens-client-plan3b2b-reconnect-state-machine.md`](../superpowers/plans/2026-06-26-lens-client-plan3b2b-reconnect-state-machine.md)
+**Plan:** [`2026-06-26-lens-client-plan3b2b-reconnect-state-machine.md`](../plans/2026-06-26-lens-client-plan3b2b-reconnect-state-machine.md)
 **Protocol:** subagent-driven — composer-2.5 build per task (red→green→commit),
 Opus controller per-task review, one consolidated gpt-5.5 cross-family review at
 the end. Full task-by-task ledger in `.superpowers/sdd/progress.md` (section

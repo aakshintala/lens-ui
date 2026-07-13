@@ -8,7 +8,7 @@ LOCKED design docs are amended. **Nothing is blocking.** Start a **fresh session
 run `writing-plans` for **P3-3a** from spec §2.3, then execute subagent-driven (same
 shape as P3-1/P3-2).
 
-- **Spec (SSOT):** `docs/superpowers/specs/2026-07-08-state-model-engine-design.md`
+- **Spec (SSOT):** `docs/specs/2026-07-08-state-model-engine-design.md`
   **§2.3 (D19–D22)** — authoritative. Also §4 P3 (slice note), §7.1 (amendment tracking).
 - **Amended design docs:** `app-architecture-and-state-model.md` (§3.4, §4.1, §6.3, §8),
   `typed-client.md` (§7 + Bootstrap). All carry dated `2026-07-10, P3-3a` amendment blocks.

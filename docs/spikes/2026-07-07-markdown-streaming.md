@@ -7,8 +7,8 @@ module behaviors make the *unmodified* dep streaming-hostile, all fixable by
 **Gate outcome:** the gpui lock **holds** — better-supported than before, with a
 precisely-scoped residual (patch three spots in a vendored module).
 
-Design: `docs/superpowers/specs/2026-07-07-markdown-streaming-spike-design.md`.
-Plan: `docs/superpowers/plans/2026-07-07-markdown-streaming-spike.md`.
+Design: `docs/specs/2026-07-07-markdown-streaming-spike-design.md`.
+Plan: `docs/plans/2026-07-07-markdown-streaming-spike.md`.
 Harness (throwaway): `spikes/markdown-stream/` (+ `NOTES.md` = raw discovery log).
 
 ---

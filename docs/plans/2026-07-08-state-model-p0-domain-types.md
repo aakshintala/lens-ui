@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- **Design source of truth:** `docs/design/app-architecture-and-state-model.md` §2 (LOCKED) + spec `docs/superpowers/specs/2026-07-08-state-model-engine-design.md` §4 "P0".
+- **Design source of truth:** `docs/design/app-architecture-and-state-model.md` §2 (LOCKED) + spec `docs/specs/2026-07-08-state-model-engine-design.md` §4 "P0".
 - **`lens-core` has NO gpui dependency** — framework touch-points live in the future `lens-store` crate (spec D1/§3).
 - **No logic in P0** — pure data + serde only. No threads, no SQLite, no reducer.
 - **Production lint bar:** the crate opts into `lints.workspace = true` (workspace denies `unsafe_code`, `unused_must_use`, clippy `all`). Zero warnings.

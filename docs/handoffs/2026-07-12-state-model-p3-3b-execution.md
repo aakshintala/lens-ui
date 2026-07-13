@@ -8,9 +8,9 @@ folded. No open design questions. Next session: EXECUTE it** via
 each MANDATORY seam. Do NOT re-plan or re-review at the plan level (two independent passes already
 converged); the per-task seam reviews are the remaining quality gate.
 
-- **Plan (execution SSOT):** `docs/superpowers/plans/2026-07-12-state-model-p3-3b.md`.
+- **Plan (execution SSOT):** `docs/plans/2026-07-12-state-model-p3-3b.md`.
   Read it top to bottom — the "Pre-build review ledger" (2 tables) lists all 15 folded findings.
-- **Decisions SSOT:** spec `docs/superpowers/specs/2026-07-08-state-model-engine-design.md`
+- **Decisions SSOT:** spec `docs/specs/2026-07-08-state-model-engine-design.md`
   §2.4 (D24–D31) + live-verify appendix. App-arch amended: §3.5, §13.1.
 - **Grill memory:** `state-model-p3-3b-grilling`. This session's memory:
   `state-model-p3-3b-planning` (the review-caught corrections).

@@ -7,9 +7,9 @@ green, D17 live-verify PASSED. The session lifecycle core ships: disk-canonical 
 actor-owned forward `/items` catch-up, transport-only reader, command sleep/wake, skeletal
 `FleetScheduler`. **Next session: grill + plan P3-3b.**
 
-- **Plan executed:** `docs/superpowers/plans/2026-07-10-state-model-p3-3a-lifecycle-core.md`
+- **Plan executed:** `docs/plans/2026-07-10-state-model-p3-3a-lifecycle-core.md`
   (8 tasks, all `- [x]`).
-- **Spec SSOT:** `docs/superpowers/specs/2026-07-08-state-model-engine-design.md` §2.3 (D19–D23).
+- **Spec SSOT:** `docs/specs/2026-07-08-state-model-engine-design.md` §2.3 (D19–D23).
 - **Execution ledger (as-built, per-task + every review/fix wave):** `.superpowers/sdd/progress.md`
   — the P3-3a section is the authoritative blow-by-blow.
 - **Memory:** `state-model-p3-3a-executed` (the golden-byte dual-id gotcha + as-built decisions).

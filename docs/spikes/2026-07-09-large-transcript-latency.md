@@ -10,7 +10,7 @@ expected envelopes (sub-ms and ~4.9 ms respectively). Everything else in P3-3
 (sleep flush, wake disk-paint, reconnect reconcile) can be built on the two
 prototyped primitives below.
 
-Design source: `docs/superpowers/specs/2026-07-08-state-model-engine-design.md`
+Design source: `docs/specs/2026-07-08-state-model-engine-design.md`
 (§2.1 **D11** byte-windowed transcript, **D12** this spike; §4 "P3 → Task 0").
 Harness (throwaway): `spikes/large-transcript/` (outside the lint wall; generated
 `.db` gitignored, ~515 MiB).

@@ -19,7 +19,7 @@
 
 ## Global Constraints
 
-- **Design source of truth:** `docs/design/app-architecture-and-state-model.md` §4 (LOCKED) + spec `docs/superpowers/specs/2026-07-08-state-model-engine-design.md` §4 "P1".
+- **Design source of truth:** `docs/design/app-architecture-and-state-model.md` §4 (LOCKED) + spec `docs/specs/2026-07-08-state-model-engine-design.md` §4 "P1".
 - **`lens-core` has NO gpui dependency.** No threads, no SQLite in P1 — pure logic only.
 - **`reduce()` is pure and deterministic** (§4.1 "does no I/O"): every timestamp comes from the injected `Clock`, never a direct wall-clock read. Replay the same event sequence under the same clock twice ⇒ **identical** `SessionState`. This is the P1 gate.
 - **The UI never panics** (AGENTS.md MANDATORY): the reducer is total over every `ServerStreamEvent` arm; unmodeled/degraded shapes fold to a marker or a catch-all item, never `panic!`/`unwrap` on external data.

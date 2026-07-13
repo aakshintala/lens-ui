@@ -6,9 +6,9 @@ The P3-2 plan is **written, cross-family reviewed, committed, and execution-read
 Start a **fresh session**, read the plan, and execute it subagent-driven (same shape
 as P3-1). Nothing is blocking.
 
-- **Plan:** `docs/superpowers/plans/2026-07-09-state-model-p3-2-command-semantics.md`
+- **Plan:** `docs/plans/2026-07-09-state-model-p3-2-command-semantics.md`
   (commit `bc3082d`, on `main`, **not pushed**). 10 TDD tasks.
-- **Spec (SSOT):** `docs/superpowers/specs/2026-07-08-state-model-engine-design.md`
+- **Spec (SSOT):** `docs/specs/2026-07-08-state-model-engine-design.md`
   §2.2 (D16, D18), §7, §13.1. Design-doc §13.1 (`docs/design/app-architecture-and-state-model.md`
   L1190–1237) is **already amended** with Tables A/B — Task 9 verifies, does not rewrite.
 - **P3-1 foundation** this builds on: merged `1096a8c..f7c9a64`; the actor lives in

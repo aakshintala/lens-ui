@@ -12,11 +12,11 @@
 
 | Source | What it locks |
 | --- | --- |
-| Spec `docs/superpowers/specs/2026-07-08-state-model-engine-design.md` §2.2 D16 (≈L210–231), D18 (≈L260–282); §4 P3(b) (≈L433–470); §7.1 §13.1 amendment row | Authoritative D16/D18 decisions |
+| Spec `docs/specs/2026-07-08-state-model-engine-design.md` §2.2 D16 (≈L210–231), D18 (≈L260–282); §4 P3(b) (≈L433–470); §7.1 §13.1 amendment row | Authoritative D16/D18 decisions |
 | Design doc `docs/design/app-architecture-and-state-model.md` §13.1 (≈L1190–1238) | Already-amended two-table wording (verify, don't silently re-decide) |
 | Handoff `docs/handoffs/2026-07-09-state-model-p3-1-execution-and-p3-2-next.md` | Scope, file touchpoints, P3-3 ordering, deferred M2/M1/Nit |
 | Ledger `.superpowers/sdd/progress.md` ("STATE-MODEL P3-1") | What exists; deferred items in detail |
-| P3-1 plan `docs/superpowers/plans/2026-07-09-state-model-p3-1-actor-foundation.md` | Format template + foundation contracts this plan extends |
+| P3-1 plan `docs/plans/2026-07-09-state-model-p3-1-actor-foundation.md` | Format template + foundation contracts this plan extends |
 
 **Fresh finding (2026-07-09, not yet in committed docs — supersedes the handoff's open D16 live-verify rider):** Verified live against omnigent 0.4.0 (pinned commit `31669e1b`) and by reading `server/routes/sessions.py:19368-19379` (bare dict return, no `response_model` coercion):
 

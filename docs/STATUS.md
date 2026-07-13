@@ -67,7 +67,7 @@ and roll older "Recent" pointers off this page as they age.
     `live-tests`, informational/not-gated): REST p50/p90, send-ack→first-frame,
     inter-frame-gap-vs-parse ratio. Needs a live server + idle session.
   - Baseline detail + bench gotchas in memory `lens-client-benchmarks`. Plan:
-    `docs/superpowers/plans/2026-06-27-lens-client-benchmarks.md`. **Follow-up:** grow
+    `docs/plans/2026-06-27-lens-client-benchmarks.md`. **Follow-up:** grow
     the golden corpus with longer sessions / a real Lens work pass (current ~22KB is
     thin); benches load any corpus file via `include_bytes!`. WS + state/render benches
     deferred to those paths. CI regression gate deferred (no CI yet).
@@ -121,7 +121,7 @@ and roll older "Recent" pointers off this page as they age.
   2. **Split by stability** — reader-thread + reconnect plumbing is already de-risked (transport
      spike: subscribe-first + mid-stream-drop recovery), build confidently; gate only the
      semantic event union on the captures. **Plan 3a written** (2026-06-26,
-     [`docs/superpowers/plans/2026-06-26-lens-client-plan3a-sse-transport.md`](./superpowers/plans/2026-06-26-lens-client-plan3a-sse-transport.md)):
+     [`docs/plans/2026-06-26-lens-client-plan3a-sse-transport.md`](./plans/2026-06-26-lens-client-plan3a-sse-transport.md)):
      6 tasks — pure SSE frame parser, `ServerStreamEvent` taxonomy from bytes (incl. the 3
      capture corrections), reader-thread/`EventStream` bridge, schema-derived variants flagged.
      Normalization (§7a) + no-replay reconnect (§7) = Plan 3b; contract-drift CI = Plan 3c.
@@ -142,7 +142,7 @@ and roll older "Recent" pointers off this page as they age.
        `Sessions::items()` + the session snapshot read, both deferred from 2a–2e — folded into 3b-2).
      - **Plan 3b-1 EXECUTED & COMPLETE** (2026-06-26, subagent-driven: composer-2.5 build +
        per-task cross-family review gpt-5.5; `2f9a46e..3b39412`, 4 tasks + 1 fix wave;
-       [`plan`](./superpowers/plans/2026-06-26-lens-client-plan3b1-normalization.md)). A pure
+       [`plan`](./plans/2026-06-26-lens-client-plan3b1-normalization.md)). A pure
        `stream::normalize::Normalizer` threaded into the reader thread: **`OutputItemDone` re-fire
        suppression** (key `(kind, call_id, status)` — **literal-duplicate only**, so the captured
        `function_call` `in_progress`→`completed` pair is preserved; §7a's "exactly once" wording
@@ -171,7 +171,7 @@ and roll older "Recent" pointers off this page as they age.
        app-arch §13.1, server-lifecycle §9.2). 3b-2 plan can be written from these.
      - **Plan 3b-2a EXECUTED & COMPLETE** (2026-06-26, subagent-driven: composer-2.5 build +
        one consolidated gpt-5.5 cross-family review; commits `1360819..2ff93c3`, 4 tasks + plan
-       edit + 1 review fix; [`plan`](./superpowers/plans/2026-06-26-lens-client-plan3b2a-reconnect-reads.md),
+       edit + 1 review fix; [`plan`](./plans/2026-06-26-lens-client-plan3b2a-reconnect-reads.md),
        [`handoff`](./handoffs/2026-06-26-lens-client-plan3b2a-execution.md)). The two typed reconnect
        *read* surfaces, byte-grounded from the golden captures: completed the `stream::Item` union
        (`ResourceEvent` variant, `id` on `Other`, total `Item::id()` accessor) so `/items` is
@@ -192,7 +192,7 @@ and roll older "Recent" pointers off this page as they age.
        recorded in typed-client §7 (decision block + step 4/6 ordering `Reconnected`→`SnapshotRestored`
        →history + synthetic-markers-bypass-normalization seam) and app-arch §4.1 (reducer
        `SnapshotRestored` fold = scalar restore only, no transcript side-effects). **Plan written:**
-       [`plan`](./superpowers/plans/2026-06-26-lens-client-plan3b2b-reconnect-state-machine.md) — 7 TDD
+       [`plan`](./plans/2026-06-26-lens-client-plan3b2b-reconnect-state-machine.md) — 7 TDD
        tasks (synthetic variants → `Normalizer::reset_seen_items` → frame seq-peek → `reconnect` module
        `Reopen`-trait/`HttpReopener`/backoff/items-replay → state machine in reader → wire
        `Sessions::stream` → docs). The `Reopen` trait makes the state machine unit-testable with a
@@ -202,7 +202,7 @@ and roll older "Recent" pointers off this page as they age.
      - **Plan 3b-2b EXECUTED & COMPLETE** (2026-06-26, subagent-driven: composer-2.5 build + Opus
        per-task review + one consolidated gpt-5.5 cross-family review; commits `3d4048b..6d4dde3`,
        6 code tasks + 1 review fix wave + xtask fmt housekeeping + docs;
-       [`plan`](./superpowers/plans/2026-06-26-lens-client-plan3b2b-reconnect-state-machine.md),
+       [`plan`](./plans/2026-06-26-lens-client-plan3b2b-reconnect-state-machine.md),
        [`handoff`](./handoffs/2026-06-26-lens-client-plan3b2b-execution.md)). The §7 no-replay
        reconnect state machine lives in `stream::reader`, generic over a `Reopen` capability
        (unit-testable with a scripted mock — no server). On a drop it backs off
@@ -225,7 +225,7 @@ and roll older "Recent" pointers off this page as they age.
   3. **Contract-drift CI (outstanding B6): DONE** (Plan 3c, 2026-06-26, subagent-driven:
      composer-2.5 build + Opus per-task review + one consolidated gpt-5.5 cross-family review;
      commits `087ef6f..8a7bb2e`, 5 tasks + 2 live-caught fixes + 1 review fix;
-     [`plan`](./superpowers/plans/2026-06-26-lens-client-plan3c-contract-drift.md)). The passive
+     [`plan`](./plans/2026-06-26-lens-client-plan3c-contract-drift.md)). The passive
      alarm, three layers by what each needs: **`xtask drift`** (`cargo run -p xtask -- drift` —
      semantic path-set + SSE discriminator/member-shape diff vs sibling pin, `/hooks/*`-excluded
      per ADR-0001; green vs identical sibling, red vs synthetic fixture); **offline `taxonomy_drift`
@@ -436,7 +436,7 @@ and roll older "Recent" pointers off this page as they age.
 - **2026-07-10** — **state-model P3-3a PLAN WRITTEN + 5 design decisions locked + D19
   source-verified against omnigent `31669e1b` (Opus, this session).** Ran `writing-plans`
   for P3-3a from spec §2.3 (D19–D23) → **8-task subagent-driven plan**
-  ([`docs/superpowers/plans/2026-07-10-state-model-p3-3a-lifecycle-core.md`](./superpowers/plans/2026-07-10-state-model-p3-3a-lifecycle-core.md)),
+  ([`docs/plans/2026-07-10-state-model-p3-3a-lifecycle-core.md`](./plans/2026-07-10-state-model-p3-3a-lifecycle-core.md)),
   regrouped from the spec's flat 7 into: (1) D15 `created_at` + **delete vestigial
   `last_seen_seq`**; (2) pure `is_quiesced`/`transient_work_outstanding`; **(3)[GROK]**
   actor item-lifecycle D20+D23 (commit-terminal-prefix + `TranscriptAdvanced` watermark +
@@ -545,7 +545,7 @@ and roll older "Recent" pointers off this page as they age.
   403/404 §9 escalation, parked-feeder drain policy, outcome-channel wedge).
 
 - **2026-07-09** — **state-model P3-2 PLANNED + D16 live-verify rider RESOLVED.** Plan
-  `docs/superpowers/plans/2026-07-09-state-model-p3-2-command-semantics.md` (`bc3082d`,
+  `docs/plans/2026-07-09-state-model-p3-2-command-semantics.md` (`bc3082d`,
   10 TDD tasks). **Authored by grok-4.5-xhigh** (cursor-delegate, model-eval experiment),
   **reviewed by Opus cross-family** with every claim verified against the tree — satisfies
   the MANDATORY diversity rule (grok = non-Claude author). Grok independently found **two
@@ -605,7 +605,7 @@ and roll older "Recent" pointers off this page as they age.
   reconcile bounded-tail, never full history**; blocking dep = lift `GET /items` tail
   pagination (deferred from 3b-2b) in P3-3. D11 byte-window premise held. Paged-load
   SQL shapes captured. **P3-1 plan written** (`28b73ab`,
-  `docs/superpowers/plans/2026-07-09-state-model-p3-1-actor-foundation.md`, 7 TDD
+  `docs/plans/2026-07-09-state-model-p3-1-actor-foundation.md`, 7 TDD
   tasks; grounded in real gpui-0.2.2 bridge API + reader.rs + P1/P2 surfaces; scratch
   representation decided `ScratchChanged(Arc<StreamScratch>)`+coalesce). Tasks 1 & 5
   are the MANDATORY cross-family-review seams (lens-client channel swap; run-loop).
@@ -627,10 +627,10 @@ and roll older "Recent" pointers off this page as they age.
   skips. Codex caught both benches charging teardown to the timed body (fixed) +
   overstated reduce comment; the gate caught its own unformatted code + a dead import.
   **P3-1: DONE & merged 2026-07-09** (see the entry above; plan
-  `docs/superpowers/plans/2026-07-09-state-model-p3-1-actor-foundation.md` fully executed).
+  `docs/plans/2026-07-09-state-model-p3-1-actor-foundation.md` fully executed).
 - **2026-07-09** — **state-model P3 GRILLING — CLOSED (session 2).** The 4 open
   branches resolved as **D15–D18** in new
-  [`spec §2.2`](./superpowers/specs/2026-07-08-state-model-engine-design.md)
+  [`spec §2.2`](./specs/2026-07-08-state-model-engine-design.md)
   (+§7.1 §13.1-amendment row + §4 P3 batched live-verify gate); memory
   `state-model-p3-grilling`. **Spec still UNCOMMITTED (working tree only).**
   **D15** `created_at` = first-non-zero-wins upsert guard **+** a found P1 defect
@@ -676,7 +676,7 @@ and roll older "Recent" pointers off this page as they age.
   **read-only-degraded**, never a hard open failure). **79 tests** (77 unit + 2
   integration), clippy `-D warnings` + fmt clean, `generated.rs`/lens-client untouched;
   `persist_throughput` bench ~13.7ms/(200 upserts+load), I/O-bound. Plan:
-  [`docs/superpowers/plans/2026-07-08-state-model-p2-persistence.md`](./superpowers/plans/2026-07-08-state-model-p2-persistence.md).
+  [`docs/plans/2026-07-08-state-model-p2-persistence.md`](./plans/2026-07-08-state-model-p2-persistence.md).
   **Reviews:** plan Opus pre-build review (SHIP-WITH-FIXES → 9 findings `REVIEW#n`
   applied incl. 2 §6.3-contract bugs: corrupt-version hard-Err on open; WAL/DDL mutating
   a file before the version gate — column-mapping + reconcile SQL verified correct);
@@ -713,7 +713,7 @@ and roll older "Recent" pointers off this page as they age.
   reconnect; `AgentChanged` transcript marker (synthesized `from`); §4.3 render transforms.
   **`StreamUpdate` drafted** (D6 — ratified at the P3 skeleton). **64 tests, clippy/fmt
   clean, `generated.rs` untouched; bench ~1.36µs/full-turn.** Plan:
-  [`docs/superpowers/plans/2026-07-08-state-model-p1-reducer.md`](./superpowers/plans/2026-07-08-state-model-p1-reducer.md).
+  [`docs/plans/2026-07-08-state-model-p1-reducer.md`](./plans/2026-07-08-state-model-p1-reducer.md).
   **Reviews:** plan cross-family-reviewed BEFORE build (codex/gpt-5.5, 12 findings incl.
   2 Critical — turn-bump order, clock-based synthetic-id collision — applied); consolidated
   end-of-branch **Opus + gpt-5.5 dual read** → 1 fix wave (7 items: collision-probing
@@ -745,7 +745,7 @@ and roll older "Recent" pointers off this page as they age.
   enriched `ModelUsage` to the wire-faithful shape (cache buckets + per-model
   `total_cost_usd`, all optional — was dropping spend/cache data), and flagged a
   **P1 blocker** (below). Plan:
-  [`docs/superpowers/plans/2026-07-08-state-model-p0-domain-types.md`](./superpowers/plans/2026-07-08-state-model-p0-domain-types.md).
+  [`docs/plans/2026-07-08-state-model-p0-domain-types.md`](./plans/2026-07-08-state-model-p0-domain-types.md).
   **P1 handoff notes (in the plan):** (1) `lens_client::stream::PresenceViewer`
   wrapper exposes only `user_id` — drops `joined_at`/`idle` the generated contract
   carries, so P1 can't fill the domain `PresenceViewer` from `ServerStreamEvent::Presence`

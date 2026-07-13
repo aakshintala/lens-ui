@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust (workspace), `rusqlite` (bundled, WAL), `crossbeam-channel` (actor `Select`), `async-channel` (bridge), `lens-client` (pinned omnigent 0.5.1 contract), `serde_json` (lens-drive I/O).
 
-**Decisions SSOT:** `docs/superpowers/specs/2026-07-08-state-model-engine-design.md` §2.4 (D24–D31) + the live-verify appendix. App-arch amended sections: `docs/design/app-architecture-and-state-model.md` §3.5, §13.1.
+**Decisions SSOT:** `docs/specs/2026-07-08-state-model-engine-design.md` §2.4 (D24–D31) + the live-verify appendix. App-arch amended sections: `docs/design/app-architecture-and-state-model.md` §3.5, §13.1.
 
 ## Global Constraints
 

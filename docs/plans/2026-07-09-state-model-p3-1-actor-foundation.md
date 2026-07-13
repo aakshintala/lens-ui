@@ -18,7 +18,7 @@
 - **No foreground blocking** — every network/disk I/O runs on the actor's OS thread or a gpui background executor; the foreground only does copy-assignment `apply` + `cx.notify()`. (AGENTS.md MANDATORY)
 - **Benchmark-or-it's-not-done** on hot paths — `StreamUpdate::apply` cost is measured. The 120fps/90fps-regression contract applies to the foreground apply path. (spec §5)
 - **MANDATORY cross-family review** at the lens-client touch (Task 1) and the actor run-loop (Task 5) — temporal/stateful code, `[[composer-delegation-profile]]`. Mind Cursor-credit spend (`[[review-spend-policy]]`) — consolidate where cheap.
-- Authoritative decisions: spec `docs/superpowers/specs/2026-07-08-state-model-engine-design.md` §2.1 (D8–D14) and §2.2 (D15–D18). This plan implements the **P3 foundation subset**: D8, D9, D10, D13 + the walking skeleton (D7). Commands (D16, §7), lifecycle/quiesce/sleep/wake (D17, §3), and error-mapping (D18, §13.1) are **P3-2/P3-3** and out of scope here.
+- Authoritative decisions: spec `docs/specs/2026-07-08-state-model-engine-design.md` §2.1 (D8–D14) and §2.2 (D15–D18). This plan implements the **P3 foundation subset**: D8, D9, D10, D13 + the walking skeleton (D7). Commands (D16, §7), lifecycle/quiesce/sleep/wake (D17, §3), and error-mapping (D18, §13.1) are **P3-2/P3-3** and out of scope here.
 
 ---
 

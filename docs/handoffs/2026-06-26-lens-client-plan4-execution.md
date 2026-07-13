@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-26
 **Branch:** `feat/lens-client-hardening` (base `3dfadd9`, off main `8a5a8b3`) → `8fe4dd5`
-**Plan:** [`plan4`](../superpowers/plans/2026-06-26-lens-client-plan4-pre-consumer-hardening.md)
+**Plan:** [`plan4`](../plans/2026-06-26-lens-client-plan4-pre-consumer-hardening.md)
 **Ledger:** `.superpowers/sdd/progress.md` (PLAN 4 section)
 
 ## What & why

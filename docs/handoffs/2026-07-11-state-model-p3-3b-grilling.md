@@ -8,7 +8,7 @@ locked in **spec §2.4 (D24–D31)** — that block is the **SSOT for the plan**
 settled the behavioral unknowns. **Next session: `writing-plans` from spec §2.4, then
 execute subagent-driven.** Do NOT re-grill — go straight to planning.
 
-- **Decisions SSOT:** `docs/superpowers/specs/2026-07-08-state-model-engine-design.md`
+- **Decisions SSOT:** `docs/specs/2026-07-08-state-model-engine-design.md`
   **§2.4 (D24–D31)** + the live-verify appendix + §7.1 amendment list.
 - **Design source (amended):** `docs/design/app-architecture-and-state-model.md`
   §3.5 (Disconnected transition) + §13.1 (P3-3b amendment block).

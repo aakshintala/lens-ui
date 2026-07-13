@@ -10,7 +10,7 @@ item** — is **retired**.
 `Select` / `Radio` / `Checkbox`) driven from a runtime-parsed schema; no fork, no
 custom widget toolkit, no extra dep beyond the one the markdown spike already took.
 
-Design: `docs/superpowers/specs/2026-07-08-elicitation-form-spike-design.md`.
+Design: `docs/specs/2026-07-08-elicitation-form-spike-design.md`.
 Harness (throwaway): `spikes/elicitation-form/` (+ `NOTES.md` = gpui-component API
 discovery log).
 
