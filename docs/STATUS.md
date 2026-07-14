@@ -9,6 +9,13 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Open threads & next up
 
+- **📋 SPEC-GAPS backlog (2026-07-13):** nine independent, un-specced/partial
+  subsystems parked in [`SPEC-GAPS.md`](./SPEC-GAPS.md) — app release/signing/update,
+  omnigent bundling, Lens observability, secrets lifecycle, TUI-native harness toggle,
+  first-run product UX, settings surface, data lifecycle, multi-machine identity. Each
+  gets its own spec→plan cycle; pick one to brainstorm. (TUI decision recorded: per-session
+  rendered-stream ↔ raw-TUI toggle.)
+
 - **✅ DONE (2026-07-12): state-model P3-3b EXECUTED + merged to `main`** (branch
   `state-model-p3-3b`, 16 commits, base 02d6d96; **push deferred — user call**). All 6 code/doc
   tasks landed via `subagent-driven-development` (composer-2.5 author, grok-4.5 seam review each,
