@@ -548,7 +548,11 @@ deep-focus hides chat + boards and maximizes the working area.
 (board + focused side pane) vs. detachable per-session windows (⌘N for
 multi-monitor + ⤢ detach to its own window). **Resolved: both** — gpui is
 multi-window native; any destination or session can ⤢ detach to its own window
-(shell §3, §7).
+(shell §3, §7). **Detach = *move*, not clone: a conversation is shown in ≤1
+window at a time** — navigating to an already-open (detached) conversation
+**raises its existing window** (single-instance-per-document) rather than opening
+a second view. This keeps one conversation to one live surface (no cross-window
+contention over the same session; relied on by the TUI-native toggle spec §6).
 
 **H. Bridge — the collapsed surface. (owned by state model + application
 shell)** **Resolved.** Bridge collapses the fleet-wide actionable queue and the

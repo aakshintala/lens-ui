@@ -32,7 +32,11 @@ Ordering below is by "blocks shipping Lens to a second human" (roughly).
    multi-user` (README) resolves the *posture*, not the credential storage
    lifecycle.
 
-5. **TUI-native harness handling** — reading **(A)**: `claude-native` /
+5. **TUI-native harness handling** — ✅ **SPEC WRITTEN 2026-07-14**
+   ([`docs/specs/2026-07-14-tui-native-toggle-design.md`](specs/2026-07-14-tui-native-toggle-design.md),
+   commit `bf72ea3`; brainstormed → live spike → dual cross-family review →
+   reworked). Blocked on build deps (Plan 7 terminal WS client + `lens-ui`
+   viewport). Original gap framing below. — reading **(A)**: `claude-native` /
    `cursor-native` are PTY/TUI-only and **fold reasoning** into `output_text`
    (memory `live-event-recapture-findings`), so they can't produce a clean
    rendered reasoning stream. **Decision (2026-07-13):** the focused chat for a

@@ -138,7 +138,9 @@ a single **main area** that the rail routes.
 - There is **no separate right icon-rail** — launchers live on the working-area
   tab bar (§8.1). Multi-window: any destination or session can **⤢ detach** to
   its own window (decision G); a detached window is just another state-model
-  subscriber.
+  subscriber. **Detach *moves* a conversation** — it is shown in **≤1 window**;
+  navigating to an already-detached conversation **raises its window** rather than
+  cloning it (single-instance-per-document).
 
 ---
 

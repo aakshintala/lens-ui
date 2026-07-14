@@ -11,10 +11,9 @@ and roll older "Recent" pointers off this page as they age.
 
 - **📋 SPEC-GAPS backlog (2026-07-13):** nine independent, un-specced/partial
   subsystems parked in [`SPEC-GAPS.md`](./SPEC-GAPS.md) — app release/signing/update,
-  omnigent bundling, Lens observability, secrets lifecycle, TUI-native harness toggle,
-  first-run product UX, settings surface, data lifecycle, multi-machine identity. Each
-  gets its own spec→plan cycle; pick one to brainstorm. (TUI decision recorded: per-session
-  rendered-stream ↔ raw-TUI toggle.)
+  omnigent bundling, Lens observability, secrets lifecycle, ~~TUI-native harness toggle~~
+  (**#5 now spec'd, see below**), first-run product UX, settings surface, data lifecycle,
+  multi-machine identity. Each gets its own spec→plan cycle; **8 gaps remain** un-specced.
 
 - **✅ DONE (2026-07-12): state-model P3-3b EXECUTED + merged to `main`** (branch
   `state-model-p3-3b`, 16 commits, base 02d6d96; **push deferred — user call**). All 6 code/doc
@@ -335,6 +334,36 @@ and roll older "Recent" pointers off this page as they age.
   status + harness-provider icon set.
 
 ## Recent
+
+- **2026-07-14** — **TUI-native harness toggle SPEC WRITTEN + committed** (`bf72ea3`,
+  docs-only, **not pushed**; SPEC-GAPS #5 closed). Full brainstorm → **live spike** →
+  **dual cross-family review** → rework → commit, all this session.
+  [`spec`](./specs/2026-07-14-tui-native-toggle-design.md) ·
+  [`spike`](./spikes/2026-07-14-tui-native-elicitation.md). **Feature:** per-session
+  toggle in the focused chat column between the rendered stream and the harness's raw TUI
+  (the existing §9.4 agent-terminal) for TUI-native harnesses — intent (c) *both watch and
+  type*. **Spike (live claude-native on 0.5.1)** settled the load-bearing unknowns:
+  prompts are **dual-surface in parallel** (F1); web-resolve is a **dead-end for the
+  mode-change class** (`ExitPlanMode "run in auto mode"` — structurally TUI-only, F2);
+  **generic permissions round-trip fine** (F3); external approval can **destabilize the
+  harness mode → transient loop** (F4). Also confirmed the **transcript-forwarder** keeps
+  Lens's state coherent regardless of input surface (composer and TUI are the *same* input
+  path via `tmux send-keys`). **Locked decisions:** full interaction mode-swap; **typed
+  elicitation routing** `Terminal|LensCard|OwnerRequired` with **per-harness suppression**
+  (claude-native verified; others safe-default keep-card); hybrid **capability + tri-state
+  readiness** detection (via `terminal_pending`); switch-agent **view rule + epoch fence +
+  `/clear` `session.superseded` handling**; **runtime-only window-local view** (one
+  conversation ≤1 window); lazy-attach warm-while-open; **harness-tier graceful
+  degradation** (SDK-driven = first-class, `-native` = best-effort, bounded by forwarder
+  maturity). **Review (grok-4.5 ship-with-fixes + gpt-5.6/codex needs-rework)** caught 3
+  shared Criticals — non-owner mode-change deadlock, multi-window dual-surface, badge with
+  no data source — all folded; codex additionally caught the `/clear` supersession gap.
+  **Decision G tightened** across capability-map §0.7 SSOT + README row + shell §7:
+  **detach = move, a conversation is shown in ≤1 window** (raise-don't-clone). **Ahead of
+  build deps** — consumes Plan 7 (terminal WS client, still deferred) + docks into the
+  `lens-ui` viewport (the actual NEXT-up); plan it when those exist. **Handed to permissions
+  spec:** `OwnerRequired` resolution path + Bridge cross-surface arbitration + the
+  mode-change dead-end (SPEC-GAPS cross-spec risks). **NEXT remains `lens-ui` (Bucket B).**
 
 - **2026-07-11** — **state-model P3-3b GRILLED & CLOSED → spec amended; next = `writing-plans` +
   execute (NEW session).** Full grilling pass over **Bucket A** (recovery semantics) + **Bucket C**
