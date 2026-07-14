@@ -71,6 +71,20 @@ Ordering below is by "blocks shipping Lens to a second human" (roughly).
    the same remote omnigent: independent replicas, or any Lens-side sync? Decide
    the posture even if the answer is "independent, no sync."
 
+## Parked contract dependencies (omnigent-side asks)
+
+- **LSP-proxy endpoint — gates any IDE-grade (band-3) file editing** (recorded
+  2026-07-14, framework §4.4). The File-tab editor is scoped to a "comfortable
+  editor" (top of band 2b: highlight/find-replace/multi-cursor/fold, all local).
+  Band-3 intelligence (completions, diagnostics, go-to-def) is **blocked, not
+  deferred-by-effort**: Lens is a pure REST/SSE/WS client and the worktree lives
+  on the omnigent host, so a language server would have to run host-side with an
+  LSP-proxy protocol over the wire — which omnigent does not expose. Unblocking
+  band 3 needs **either** an omnigent LSP-proxy contract (sibling to the
+  `client-message-id` ask) **or** a deliberate break of the pure-client boundary
+  to run local language servers against *local-only* worktrees. Both are separate,
+  larger decisions; neither is an editor-widget problem. Not scheduled.
+
 ## Cross-spec risks discovered during design
 
 - **Permissions spec — mode-change elicitations are TUI-only for native harnesses**

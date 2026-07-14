@@ -335,6 +335,25 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Recent
 
+- **2026-07-14** — **Editor tier DECIDED (framework §4.4) — docs-only, not pushed.**
+  Resolved the long-stubbed "raw file tab" (shell §8.5). **The File-tab editor targets
+  the top of a "comfortable editor" tier (band 2b: highlight, line numbers,
+  find/replace, multi-cursor, folding — all computed from file bytes); no LSP/IDE
+  intelligence.** Key reframe: band-3 intelligence (completions/diagnostics/go-to-def)
+  is **blocked by the omnigent contract, not by editor-widget effort** — Lens is a pure
+  REST/SSE/WS client, the worktree lives on the omnigent host, and omnigent exposes no
+  LSP-proxy endpoint, so there's no language server to talk to; the 2b/3 boundary
+  coincides exactly with the local-compute / needs-a-server line, making top-of-2b the
+  *correct* target, not a compromise. **Build:** vendor-and-patch `gpui-component`'s
+  Apache-2.0 code input (same play as §4.1 markdown), in-repo, **no separate library**
+  (YAGNI); **Zed's `crates/editor` ruled out** (GPL-3.0, ~40k LOC coupled to
+  `language`/`project`/LSP = forking Zed; consistent with §3 crates.io-default). Write
+  path = workspace §3 `PUT`/`PATCH`. **Parked:** band-3 needs an omnigent LSP-proxy
+  contract (sibling to `client-message-id`) or a pure-client-boundary break for
+  local-only worktrees — recorded in `SPEC-GAPS.md` "Parked contract dependencies", not
+  scheduled. Edits: framework §4.4 (SSOT) + §4 intro + §5 seams row; workspace §3; shell
+  §8.5; SPEC-GAPS. Memory `editor-tier-decision`. **No build impact on NEXT (`lens-ui`).**
+
 - **2026-07-14** — **TUI-native harness toggle SPEC WRITTEN + committed** (`bf72ea3`,
   docs-only, **not pushed**; SPEC-GAPS #5 closed). Full brainstorm → **live spike** →
   **dual cross-family review** → rework → commit, all this session.

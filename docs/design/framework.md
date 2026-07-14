@@ -174,7 +174,11 @@ The recon retired the terminal/diff/board risk. Markdown (§4.1) — including i
 §4.1c/d variable-height virtualization sub-item — the transcript virtualization
 (§4.1c/d), and the JSON-Schema form renderer (§4.3) are **all now spiked and
 resolved**. **No load-bearing framework residual remains.** (Historical spike
-detail retained in the subsections below.)
+detail retained in the subsections below.) The one remaining *widget* residual —
+the **editable code surface** (§4.4, the File-tab editor) — is **scoped, not
+spiked**, and is explicitly **not lock-gating**: it does not reopen the
+gpui-vs-React decision because both substrates hit the identical remote-file /
+no-LSP wall (§4.4). It is a product-scope decision, not a framework-lock spike.
 
 ### 4.1 Markdown rendering (the lock-gating spike item)
 
@@ -330,6 +334,60 @@ to the approval page (permissions §3).
   — confirmed idiom across both Arbor and Paneflow (drag clamping, container
   sizing).
 
+### 4.4 Editable code surface — the File tab (DECIDED 2026-07-14, scoped not spiked)
+
+The File-tab editor (shell §8.5, the "raw file tab"; capability map "file tree +
+editor") was never specified beyond a stub. There is no Monaco/CodeMirror/Zed
+equivalent shipped by gpui, which raised the question of whether Lens must adopt
+Zed's editor stack. **Decision: target the top of a "comfortable editor" tier,
+build it in-repo by vendor-and-patch, and do not build language-server
+machinery.** Rationale below; this subsection is the SSOT.
+
+**Capability bands (where the cost cliff actually is):**
+
+| Band | Capabilities | Computed from | Needs the server? |
+|---|---|---|---|
+| **2a — editing core** | rope buffer, cursors, multi-cursor, selection, undo/redo, viewport virtualization, IME/keyboard/mouse | file bytes | No |
+| **2b — comfortable** | tree-sitter highlight, bracket match, auto-indent/close, find/replace, line numbers, folding, soft-wrap | file bytes | No |
+| **3 — IDE intelligence** | LSP completions, diagnostics, hover, go-to-def, find-refs, rename/refactor, signature help | a **language server** | **Yes** |
+
+**Target = top of band 2b.** Not a compromise — a forced boundary. **Lens is a
+pure REST/SSE/WS client (AGENTS.md); it never touches the filesystem directly.**
+File contents arrive over the env-scoped `filesystem/{relative_path}` endpoints
+(workspace §3) and the worktree lives on the omnigent *host* — often a remote
+managed sandbox. Band-3 language intelligence therefore needs a language server
+running **where the files are (the host)** plus an **LSP-proxy protocol over the
+wire**, and **omnigent exposes no such endpoint**. So band 3 is blocked by the
+contract, **not by editor-widget effort** — no matter how capable the widget, you
+cannot light up completions/diagnostics/go-to-def against a worktree the server
+won't proxy an LSP for. The 2b/3 line coincides exactly with the
+local-computation / needs-a-server line, which is why top-of-2b is the *correct*
+target rather than a partial one. The user's real IDE, one alt-tab away on the
+same worktree, is the band-3 escape hatch.
+
+**Build approach — vendor-and-patch, in-repo, no separate library.**
+`gpui-component` 0.5.1 ships an **editable code input** (tree-sitter highlight,
+line numbers) under Apache-2.0 — the *same vendor-and-patch play already
+validated for its markdown module* (§4.1). Plan: vendor that input, spike how far
+it reaches against the band-2b list, and build custom internals **only for the
+specific gaps** — not a from-scratch buffer/layout/shaping engine. Do **not**
+spin this out as a general-purpose "Monaco-in-Rust" library: that is
+speculative-generality scope (API design, docs, versioning) that serves no Lens
+goal; extract a crate only if a concrete reuse case ever earns it. Zed's
+`crates/editor` is an **architecture reference only** (rope + display-map +
+multi-buffer) — **GPL-3.0, ~40k LOC coupled to `language`/`project`/`multi_buffer`
+/LSP**, i.e. effectively forking Zed; ruled out, consistent with §3 (crates.io
+default, forking is a one-way door) and §4.1's "Zed crates = reference-only (GPL)."
+
+**Write path** is not a widget concern: edits persist via workspace §3 verbs —
+`PUT {content}` (full-file write) / `PATCH {old_text,new_text}` (search-replace).
+
+**Parked dependency (band 3, if ever wanted):** an omnigent-side **LSP-proxy
+contract** (a contract request, sibling to the deferred `client-message-id` ask)
+— or a deliberate decision to break the pure-client boundary and run local
+language servers against *local* worktrees only. Both are separate, larger calls;
+recorded in `SPEC-GAPS.md`, not scheduled. Neither is an editor-widget problem.
+
 ---
 
 ## 5. Framework-specific seams the other specs reference
@@ -344,6 +402,7 @@ Each spec has a "framework divergence" section. What each one owns vs. here:
 | transcript §19 | Progressive re-render (stable-identity in-place diff); markdown library; virtualization | §4.1 markdown spike; **virtualization SPIKED 2026-07-08 → native gpui `list()`** (variable-height, `ListAlignment::Bottom`) satisfies all four §16 contracts — `uniform_list` was the wrong primitive, `list()` is the right one (§4.1c/d verdict) |
 | workspace §9 | Terminal widget | §2.2 — `alacritty_terminal` + `portable-pty`, Arbor template (MIT) |
 | workspace §4 | Diff widget | §2.3 — `imara-diff` + `syntect` cached, Arbor template (MIT) |
+| workspace §3 / shell §8.5 | File-tab editing (data + container) | §4.4 — editable code surface, **top of band 2b** (highlight/find-replace/multi-cursor/fold; no LSP — blocked by omnigent's no-LSP-proxy contract); vendor-and-patch `gpui-component` code input, in-repo |
 | permissions | (form renderer uses gpui-component inputs; a bounded flat-primitive schema→inputs mapper + structured-payload cards) | §4.3 form spike **SPIKED 2026-07-08 → GO** (6/6) — runtime schema→`gpui-component` inputs → valid flat `ElicitationResult.content`; discriminated surface, not an arbitrary renderer |
 | sub-agent topology | (no special widgets — rail/tree uses gpui list primitives) | — |
 | server lifecycle | (no widgets — backend) | — |

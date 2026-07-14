@@ -441,8 +441,11 @@ lets you rip through many files against a stable result list (§9.3).
 
 ### 8.5 Routing
 
-A tray **Change → Review** (scrolled to the hunk); **Files / ⌘P → Editor** (raw
-file tab). Source-control folds into Review + the Changes tray — there is no
+A tray **Change → Review** (scrolled to the hunk); **Files / ⌘P → Editor** (a
+File tab — a **"comfortable editor," top of band 2b**: highlight, find/replace,
+multi-cursor, folding; **no LSP/IDE intelligence**, which omnigent's contract
+can't feed anyway. Tier + build owned by framework §4.4; edit-write path by
+workspace §3). Source-control folds into Review + the Changes tray — there is no
 separate ⑂ icon.
 
 ---
