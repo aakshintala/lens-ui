@@ -90,13 +90,22 @@ executor is the implementation.
 
 ### 2.2 Terminal widget
 
-`alacritty_terminal` (Zed's fork) + `portable-pty`. Bytes → bump a
-`generation` counter → on render walk the grid → shape text (cached) → paint
-quads+runs in a `canvas()` element. Arbor's `arbor-terminal-emulator/` is
-the template (MIT — copyable into Lens with attribution).
+**Resolved 2026-07-14:** Ghostty VT, through a narrow audited port of the
+Apache-2.0 `gpui-ghostty` terminal implementation — **not**
+`alacritty_terminal`/`portable-pty`. Ghostty owns VT parsing, terminal state,
+input encoding, scrollback, and damage tracking; GPUI owns the native Canvas
+renderer. The omnigent server owns the PTY, so Lens needs an authenticated
+terminal WS attach client rather than a local PTY.
 
-Lens's terminal surface (workspace doc §9) uses this pattern. The ring
-buffer (workspace doc §9.2) is a Lens-local addition layered on top.
+The port is Lens-owned, deliberately narrow, and provenance-pinned; it is not
+a Git subtree or an independent terminal workspace. Before code enters Lens,
+the terminal adoption audit records the exact `gpui-ghostty`/Ghostty/GPUI/Zig
+inputs, licenses, FFI safety, version delta, and each module's
+adopt/adapt/exclude disposition. The GPUI tab renders only coalesced immutable
+engine updates: terminal byte processing, I/O, and lock waits never run on the
+foreground thread. The retained Lens-local terminal state is the bounded
+reconnect tail described in workspace doc §9.2; it cannot restore output the
+server did not replay.
 
 ### 2.3 Diff widget
 
@@ -342,7 +351,7 @@ Each spec has a "framework divergence" section. What each one owns vs. here:
 | state model §14 | State primitive (gpui `Entity::observe` vs alternative store); the channel→UI crossing (`cx.spawn` + entity update) | gpui's per-entity notify + `cx.spawn` is the foreground replica implementation |
 | application shell §17 | The board (ordinal-slot responsive reflow vs a free-form canvas) | §2.4 of this doc — confirmed ordinal board is *simpler*, not harder, in gpui |
 | transcript §19 | Progressive re-render (stable-identity in-place diff); markdown library; virtualization | §4.1 markdown spike; **virtualization SPIKED 2026-07-08 → native gpui `list()`** (variable-height, `ListAlignment::Bottom`) satisfies all four §16 contracts — `uniform_list` was the wrong primitive, `list()` is the right one (§4.1c/d verdict) |
-| workspace §9 | Terminal widget | §2.2 — `alacritty_terminal` + `portable-pty`, Arbor template (MIT) |
+| workspace §9 | Terminal widget | §2.2 — audited narrow Ghostty-VT/GPUI port, omnigent WS attach, and Lens-owned reconnect state |
 | workspace §4 | Diff widget | §2.3 — `imara-diff` + `syntect` cached, Arbor template (MIT) |
 | permissions | (form renderer uses gpui-component inputs; a bounded flat-primitive schema→inputs mapper + structured-payload cards) | §4.3 form spike **SPIKED 2026-07-08 → GO** (6/6) — runtime schema→`gpui-component` inputs → valid flat `ElicitationResult.content`; discriminated surface, not an arbitrary renderer |
 | sub-agent topology | (no special widgets — rail/tree uses gpui list primitives) | — |

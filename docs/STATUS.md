@@ -9,6 +9,15 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Open threads & next up
 
+- **▶ ACTIVE: shared terminal workstream (2026-07-14):** user-approved design
+  in [`specs/2026-07-14-terminal-workstream-design.md`](./specs/2026-07-14-terminal-workstream-design.md).
+  Deliver a standalone, renderable GPUI terminal tab backed by the real
+  omnigent terminal WS attach path — ready for `lens-ui` to host, but not
+  integrated into it. The initial plan gate is a thorough, attribution-aware
+  audit of the narrow `gpui-ghostty`/Ghostty-VT port (FFI, GPUI version delta,
+  reproducible Zig/source pin, behavior tests, and perf); native-harness
+  rendered-stream/raw-TUI toggle remains a separate spec.
+
 - **📋 SPEC-GAPS backlog (2026-07-13):** nine independent, un-specced/partial
   subsystems parked in [`SPEC-GAPS.md`](./SPEC-GAPS.md) — app release/signing/update,
   omnigent bundling, Lens observability, secrets lifecycle, TUI-native harness toggle,
