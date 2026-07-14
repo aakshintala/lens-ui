@@ -50,6 +50,14 @@ Ordering below is by "blocks shipping Lens to a second human" (roughly).
 7. **Settings / preferences surface** — the STATUS "Tunables" (auto-sleep
    threshold, poll cadence, ring-buffer size, transcript truncation tiers,
    `cost_samples` cadence) have no UI home. Where the user sees/changes them.
+   - **Known requirement — TUI-by-default global** (from the TUI-native toggle
+     spec, 2026-07-13): a global preference "prefer the raw TUI when a harness
+     offers one." The TUI-native toggle spec deliberately keeps per-session
+     current-view as *runtime-only* (always initializes to rendered); the durable
+     "I live in the TUI" default lives here as a global, not per-session disk
+     persistence. When honored, a fresh session materialization of a TUI-native
+     harness initializes to TUI (riding the same `starting TUI…` pending state)
+     instead of rendered.
 
 8. **Data lifecycle / migration** — the two-tier SQLite store has a
    schema-version degrade path, but no app-level story for data location, backup,
@@ -58,3 +66,17 @@ Ordering below is by "blocks shipping Lens to a second human" (roughly).
 9. **Multi-machine identity** — two Lens instances (laptop + desktop) pointing at
    the same remote omnigent: independent replicas, or any Lens-side sync? Decide
    the posture even if the answer is "independent, no sync."
+
+## Cross-spec risks discovered during design
+
+- **Permissions spec — mode-change elicitations are TUI-only for native harnesses**
+  (found 2026-07-14 spike, `docs/spikes/2026-07-14-tui-native-elicitation.md`).
+  For `claude-native`, generic tool permissions round-trip fine from Lens's
+  rendered `/resolve` path, but the **mode-change class** (e.g. `ExitPlanMode`
+  "run in auto mode") **cannot be resolved from the API** — it structurally
+  requires the harness TUI. The existing `permissions-and-elicitations.md` spec
+  must (a) detect this class and route the user to the TUI toggle (or offer only
+  round-trippable options) instead of a dead-end approve button, and (b) treat
+  approval as pending until `elicitation_resolved`, never optimistic. Candidate
+  omnigent bug report (like the client-message-id ask). The TUI-native toggle is
+  the escape hatch this relies on.
