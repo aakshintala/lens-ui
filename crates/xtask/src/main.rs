@@ -106,10 +106,7 @@ fn main() -> Result<()> {
         "codegen" => codegen(),
         "drift" => drift(std::env::args().skip(2)),
         "gate" => gate(),
-        "terminal-provenance" => terminal_provenance_cmd(std::env::args().skip(2)),
-        other => bail!(
-            "unknown xtask command: {other:?} (expected: codegen | drift | gate | terminal-provenance)"
-        ),
+        other => bail!("unknown xtask command: {other:?} (expected: codegen | drift | gate)"),
     }
 }
 
@@ -370,26 +367,6 @@ fn gate() -> Result<()> {
 fn read_json(path: &std::path::Path) -> Result<serde_json::Value> {
     let raw = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))
-}
-
-fn terminal_provenance_cmd(mut args: impl Iterator<Item = String>) -> Result<()> {
-    let mut root = None;
-    let mut upstream = None;
-    while let Some(a) = args.next() {
-        match a.as_str() {
-            "--root" => root = Some(PathBuf::from(args.next().context("--root needs a path")?)),
-            "--upstream" => {
-                upstream = Some(PathBuf::from(
-                    args.next().context("--upstream needs a path")?,
-                ))
-            }
-            other => bail!("unknown terminal-provenance arg: {other}"),
-        }
-    }
-    xtask::terminal_provenance::run_terminal_provenance(
-        &root.context("missing --root")?,
-        upstream.as_deref(),
-    )
 }
 
 #[cfg(test)]

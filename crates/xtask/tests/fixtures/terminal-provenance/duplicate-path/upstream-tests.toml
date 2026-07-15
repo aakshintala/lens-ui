@@ -1,3 +1,0 @@
-[[test]]
-path = "crates/ghostty_vt/tests/smoke.rs"
-relevant = true
