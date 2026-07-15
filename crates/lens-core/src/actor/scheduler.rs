@@ -3,7 +3,9 @@
 
 use crate::actor::api::SessionApi;
 use crate::actor::feed::ActorFeed;
-use crate::actor::runloop::{ActorHandle, ActorStores, SessionCommand, spawn_actor};
+use crate::actor::runloop::{
+    ActorHandle, ActorStores, OutputMode, SessionCommand, spawn_actor_dual,
+};
 use crate::actor::transport::ParkReason;
 use crate::clock::Clock;
 use crate::domain::ids::{ConnectionId, SessionId};
@@ -36,7 +38,7 @@ impl FleetScheduler {
         }
     }
 
-    /// Respawn a session actor from disk control scalars. `spawn_actor` seeds
+    /// Respawn a session actor from disk control scalars. `spawn_actor_dual` seeds
     /// `next_ordinal` from `transcript.next_ordinal_seed()` and runs forward catch-up.
     /// The registry retains ownership of the handle until `take_handle`.
     #[allow(clippy::too_many_arguments)]
@@ -46,6 +48,7 @@ impl FleetScheduler {
         session_id: &SessionId,
         events: Receiver<ServerStreamEvent>,
         feed: async_channel::Sender<ActorFeed>,
+        initial_mode: OutputMode,
         stores: ActorStores,
         clock: Box<dyn Clock + Send>,
         api: Box<dyn SessionApi + Send>,
@@ -63,7 +66,7 @@ impl FleetScheduler {
             .control
             .upsert_session(&state, now)
             .map_err(|e| FleetSchedulerError::Persist(e.to_string()))?;
-        let handle = spawn_actor(state, events, feed, stores, clock, api);
+        let handle = spawn_actor_dual(state, events, feed, initial_mode, stores, clock, api);
         self.registry.insert(session_id.clone(), handle);
         Ok(())
     }
@@ -77,6 +80,7 @@ impl FleetScheduler {
         session_id: &SessionId,
         events: Receiver<ServerStreamEvent>,
         feed: async_channel::Sender<ActorFeed>,
+        initial_mode: OutputMode,
         stores: ActorStores,
         clock: Box<dyn Clock + Send>,
         api: Box<dyn SessionApi + Send>,
@@ -100,7 +104,7 @@ impl FleetScheduler {
                 .map_err(|e| FleetSchedulerError::Persist(e.to_string()))?
                 .ok_or(FleetSchedulerError::SessionNotFound)?;
         // lifecycle already Active for a Disconnected session — no flip.
-        let handle = spawn_actor(state, events, feed, stores, clock, api);
+        let handle = spawn_actor_dual(state, events, feed, initial_mode, stores, clock, api);
         self.parked.remove(session_id);
         self.registry.insert(session_id.clone(), handle);
         Ok(live_status)
@@ -162,7 +166,9 @@ impl Default for FleetScheduler {
 mod tests {
     use super::*;
     use crate::actor::api::SessionApi;
+    use crate::actor::feed::ActorFeed;
     use crate::actor::outcome::ActorOutcome;
+    use crate::actor::runloop::OutputMode;
     use crate::clock::ManualClock;
     use crate::domain::item::{BlockContext, ContentBlock, Item, ItemKind};
     use crate::domain::scalars::{Role, SessionLifecycle};
@@ -341,6 +347,67 @@ mod tests {
         }
     }
 
+    fn status_running_event() -> ServerStreamEvent {
+        use lens_client::stream::{SessionEvent, SessionStatusValue as WireStatus};
+        ServerStreamEvent::Session(SessionEvent::Status {
+            status: WireStatus::Running,
+            response_id: None,
+            background_task_count: None,
+        })
+    }
+
+    #[test]
+    fn wake_in_summary_emits_summary_not_summary_consumer_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(dir.path());
+        seed_connection(&stores);
+        seed_active_session(&stores);
+
+        let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (feed_tx, feed_rx) = async_channel::bounded(64);
+        let conn = ConnectionId::new("conn_1");
+        let sid = SessionId::new("conv_1");
+        let mut scheduler = FleetScheduler::new();
+
+        let (api, _mock) =
+            MockApi::with_scripts(VecDeque::new(), VecDeque::from([Ok(empty_item_list())]));
+
+        scheduler
+            .wake(
+                &conn,
+                &sid,
+                ev_rx,
+                feed_tx,
+                OutputMode::Summary,
+                stores,
+                test_clock(),
+                api,
+            )
+            .expect("wake in Summary");
+
+        // Pre-Task-4: no seed yet — drive a live status event so Summary mode emits.
+        // Post-Task-4: the first frame may be the seed; either is ActorFeed::Summary
+        // and must NOT be accompanied by SummaryConsumerGone.
+        ev_tx.send(status_running_event()).unwrap();
+
+        let frame = feed_rx.recv_blocking().expect("summary frame");
+        assert!(
+            matches!(frame, ActorFeed::Summary(_)),
+            "spawn-in-Summary must emit Summary, got {frame:?}"
+        );
+
+        let handle = scheduler.handle(&sid).expect("running");
+        assert!(
+            !matches!(
+                handle.outcomes.try_recv(),
+                Ok(crate::actor::ActorOutcome::SummaryConsumerGone)
+            ),
+            "live Summary consumer must not observe SummaryConsumerGone"
+        );
+
+        scheduler.take_handle(&sid).expect("handle").stop_and_join();
+    }
+
     #[test]
     fn wake_roundtrip_sleep_cycle() {
         let dir = tempfile::tempdir().unwrap();
@@ -366,7 +433,16 @@ mod tests {
 
         let mut scheduler = FleetScheduler::new();
         scheduler
-            .wake(&conn, &sid, ev_rx, feed_tx, stores, test_clock(), api)
+            .wake(
+                &conn,
+                &sid,
+                ev_rx,
+                feed_tx,
+                OutputMode::Detailed,
+                stores,
+                test_clock(),
+                api,
+            )
             .expect("wake from slept disk");
         assert!(
             scheduler.is_running(&sid),
@@ -470,7 +546,16 @@ mod tests {
 
         let mut scheduler = FleetScheduler::new();
         scheduler
-            .wake(&conn, &sid, ev_rx, feed_tx, stores, test_clock(), api)
+            .wake(
+                &conn,
+                &sid,
+                ev_rx,
+                feed_tx,
+                OutputMode::Detailed,
+                stores,
+                test_clock(),
+                api,
+            )
             .expect("first wake");
         assert!(scheduler.is_running(&sid));
 
@@ -478,7 +563,16 @@ mod tests {
         let (feed_tx2, _feed_rx2) = async_channel::bounded(64);
         let stores2 = test_stores(dir.path());
         let (api2, _mock2) = MockApi::with_scripts(VecDeque::new(), VecDeque::new());
-        let err = scheduler.wake(&conn, &sid, ev_rx2, feed_tx2, stores2, test_clock(), api2);
+        let err = scheduler.wake(
+            &conn,
+            &sid,
+            ev_rx2,
+            feed_tx2,
+            OutputMode::Detailed,
+            stores2,
+            test_clock(),
+            api2,
+        );
         assert_eq!(err, Err(FleetSchedulerError::AlreadyRunning));
 
         scheduler
@@ -518,7 +612,16 @@ mod tests {
             "precondition: park reason set before reconnect"
         );
         let live = scheduler
-            .reconnect(&conn, &sid, ev_rx, feed_tx, stores, test_clock(), api)
+            .reconnect(
+                &conn,
+                &sid,
+                ev_rx,
+                feed_tx,
+                OutputMode::Detailed,
+                stores,
+                test_clock(),
+                api,
+            )
             .expect("reconnect respawns from Active disk");
         // D26: the returned status PROVES the re-read happened (not a false-green — a
         // discarded status would let the mock return anything and still pass).
@@ -576,6 +679,7 @@ mod tests {
                 &sid,
                 ev_rx,
                 feed_tx.clone(),
+                OutputMode::Detailed,
                 stores,
                 test_clock(),
                 api,
@@ -623,7 +727,16 @@ mod tests {
         );
         let (_ev_tx2, ev_rx2) = crossbeam_channel::bounded(64);
         let live = scheduler
-            .reconnect(&conn, &sid, ev_rx2, feed_tx, stores2, test_clock(), api2)
+            .reconnect(
+                &conn,
+                &sid,
+                ev_rx2,
+                feed_tx,
+                OutputMode::Detailed,
+                stores2,
+                test_clock(),
+                api2,
+            )
             .expect("reconnect after mark_parked");
         assert_eq!(live, Some(SessionStatus::Idle));
         assert!(
@@ -657,6 +770,7 @@ mod tests {
                 &sid,
                 ev_rx,
                 feed_tx.clone(),
+                OutputMode::Detailed,
                 stores,
                 test_clock(),
                 api,
@@ -702,7 +816,16 @@ mod tests {
         );
         let (_ev_tx2, ev_rx2) = crossbeam_channel::bounded(64);
         scheduler
-            .reconnect(&conn, &sid, ev_rx2, feed_tx, stores2, test_clock(), api2)
+            .reconnect(
+                &conn,
+                &sid,
+                ev_rx2,
+                feed_tx,
+                OutputMode::Detailed,
+                stores2,
+                test_clock(),
+                api2,
+            )
             .expect("early reconnect must not wedge on exited handle");
         assert!(
             scheduler.is_running(&sid),
@@ -738,6 +861,7 @@ mod tests {
                 &sid,
                 ev_rx,
                 feed_tx.clone(),
+                OutputMode::Detailed,
                 stores,
                 test_clock(),
                 api,
@@ -766,7 +890,16 @@ mod tests {
         );
         let (_ev_tx2, ev_rx2) = crossbeam_channel::bounded(64);
         scheduler
-            .reconnect(&conn, &sid, ev_rx2, feed_tx, stores2, test_clock(), api2)
+            .reconnect(
+                &conn,
+                &sid,
+                ev_rx2,
+                feed_tx,
+                OutputMode::Detailed,
+                stores2,
+                test_clock(),
+                api2,
+            )
             .expect("early reconnect respawns live actor");
 
         // Stale drain contract: late mark_parked must not wedge or re-stamp.
@@ -807,7 +940,16 @@ mod tests {
         let (feed_tx, _feed_rx) = async_channel::bounded(64);
         let mut scheduler = FleetScheduler::new();
         let live = scheduler
-            .reconnect(&conn, &sid, ev_rx, feed_tx, stores, test_clock(), api)
+            .reconnect(
+                &conn,
+                &sid,
+                ev_rx,
+                feed_tx,
+                OutputMode::Detailed,
+                stores,
+                test_clock(),
+                api,
+            )
             .expect("reconnect proceeds despite fetch_status error");
         assert_eq!(
             live, None,

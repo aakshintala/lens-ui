@@ -266,7 +266,16 @@ fn attach_actor(
     let api = actor_api(conn)?;
     let clock = make_clock();
     scheduler
-        .reconnect(&conn.id, session_id, events, feed_tx, stores, clock, api)
+        .reconnect(
+            &conn.id,
+            session_id,
+            events,
+            feed_tx,
+            lens_core::actor::OutputMode::Detailed,
+            stores,
+            clock,
+            api,
+        )
         .map_err(scheduler_err)?;
     Ok(bridge)
 }
@@ -294,7 +303,16 @@ fn reconnect_command(
             .lock()
             .map_err(|e| format!("scheduler lock: {e}"))?;
         sched
-            .reconnect(&conn.id, session_id, events, feed_tx, stores, clock, api)
+            .reconnect(
+                &conn.id,
+                session_id,
+                events,
+                feed_tx,
+                lens_core::actor::OutputMode::Detailed,
+                stores,
+                clock,
+                api,
+            )
             .map_err(scheduler_err)?
     };
     print_reconnect_line(live);
