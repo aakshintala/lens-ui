@@ -2600,7 +2600,7 @@ mod tests {
 
         // Actor survives — still processes events after a network rollback.
         ev_tx.send(status_running_event()).unwrap();
-        assert!(feed_rx.recv_blocking().is_ok());
+        let _ = recv_detailed(&feed_rx);
         handle.stop_and_join();
     }
 
@@ -3667,7 +3667,7 @@ mod tests {
         let handle = spawn_actor(fresh_state(), ev_rx, feed_tx, stores, test_clock(), api);
 
         ev_tx.send(status_running_event()).unwrap();
-        let _ = feed_rx.recv_blocking().expect("running status delta");
+        let _ = recv_detailed(&feed_rx);
 
         handle
             .commands
@@ -3704,7 +3704,7 @@ mod tests {
 
         // Stream stays alive — further events and Stop still work.
         ev_tx.send(status_running_event()).unwrap();
-        assert!(feed_rx.recv_blocking().is_ok());
+        let _ = recv_detailed(&feed_rx);
         handle.stop_and_join();
 
         // Network fail while running: rollback but no stream teardown.
@@ -4035,10 +4035,7 @@ mod tests {
         );
 
         ev_tx.send(status_running_event()).unwrap();
-        assert!(
-            feed_rx.recv_blocking().is_ok(),
-            "actor must survive and process events"
-        );
+        let _ = recv_detailed(&feed_rx);
 
         let control = SqliteControlStore::open(&db_path).unwrap();
         let loaded = control.list_sessions(&ConnectionId::new("conn_1")).unwrap();
@@ -4075,7 +4072,7 @@ mod tests {
         );
 
         ev_tx.send(status_running_event()).unwrap();
-        assert!(feed_rx.recv_blocking().is_ok());
+        let _ = recv_detailed(&feed_rx);
         handle.stop_and_join();
     }
 
@@ -4744,10 +4741,7 @@ mod tests {
         );
 
         ev_tx.send(status_running_event()).unwrap();
-        assert!(
-            feed_rx.recv_blocking().is_ok(),
-            "actor must survive and keep processing events"
-        );
+        let _ = recv_detailed(&feed_rx);
 
         handle.stop_and_join();
     }
