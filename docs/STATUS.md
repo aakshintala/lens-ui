@@ -28,13 +28,29 @@ and roll older "Recent" pointers off this page as they age.
     (safe `Terminal`/`vt_write`/`RenderState`/`Cell`/scrollback), pinning Ghostty dev in `build.rs`.
     **VERIFIED:** builds on macOS 26.6 w/ patched `zig@0.15` in 33s, 29 tests pass, example drives a
     real terminal. **Model = VENDOR libghostty-rs + BUILD FROM SOURCE** (patched zig prereq;
-    `GHOSTTY_SOURCE_DIR`→pinned vendored Ghostty; ~33s cached build) — NOT a shim, NOT a source port,
-    NOT prebuilt (no CI yet; prebuilt = flip-a-switch later). gpui-ghostty = reference only. WP0's
-    provenance apparatus collapses to **dependency vetting** (pin libghostty-rs + Ghostty commit +
-    vendored-source hash + license closure). Tasks 1–4 artifacts are for the dead model → discard.
-  - **NEXT:** design/plan the new build (vendor the 2 crates + pinned Ghostty source into the
-    workspace, wire the zig build + PATH, verify Lens builds it) → then the **GPUI render layer +
-    omnigent PTY-attach** on the safe API. GPUI 0.2.2 + omnigent pins unchanged.
+    ~25-33s cached build) — NOT a shim, NOT a source port, NOT prebuilt (no CI yet; prebuilt =
+    flip-a-switch later). gpui-ghostty = reference only. WP0's provenance apparatus collapses to
+    **dependency vetting** (pin libghostty-rs + Ghostty commit + license closure).
+  - **✅ MECHANICAL EXECUTION DONE (2026-07-15, this session)** — commits `ae1f385`/`014f9a9`/`e155230`
+    on `terminal-ws` (unpushed):
+    - **Task 2 — vendored + wired + link-proven.** `vendor/libghostty-rs/` (2 crates @ `46a9d2ac`,
+      684K); the Ghostty source is **crates-only, NOT vendored** — reversed the "pinned vendored
+      Ghostty source tree" plan: its ~57-152M tree is the same large-artifact-before-CI anti-pattern
+      we reject for a prebuilt `.a`, so the pin stays in `build.rs` (`a887df42`, blobless fetch,
+      cached) and a `GHOSTTY_SOURCE_DIR` vendor is deferred to the **same CI trigger** as prebuilt.
+      Wiring: crates **EXCLUDED** (not member) → Cargo cap-lints them (clippy `--workspace -D warnings`
+      stays clean); `.cargo/config.toml` `ZIG`→keg-only `zig@0.15` + a 1-line `build.rs` patch. Proof:
+      `spikes/libghostty-link` (bytes→cell); from-source build re-verified post-`cargo clean` (24.94s).
+      Provenance + patch list: `vendor/libghostty-rs/README.md`. Memory [[terminal-vt-vendored-executed]].
+    - **Task 1 — dead WP0 apparatus removed.** xtask terminal-provenance CLI/lib/tests/fixtures +
+      toml/thiserror/sha2 deps; `vendor/gpui-ghostty-e3025981/`; generate-terminal-adoption.sh; WP0
+      plan+review docs. codegen/drift/gate intact (`cargo test -p xtask` 2/2).
+    - **Docs superseded** — banners on the source-port design + roadmap (VT-adoption + `--workspace`
+      gate lines flagged dead; model-independent parts still hold).
+  - **NEXT (design pass, tasks 3-4):** brainstorm→plan the **GPUI render layer** (grid→paint on
+    `RenderState`/`Row`/`Cell`) + **omnigent PTY-attach** (WS bytes↔`vt_write`/`on_pty_write`) on the
+    safe API. A terminal grid ≠ scrolling transcript — verify the virtualization/markdown spike
+    learnings transfer before locking the render contract. GPUI 0.2.2 + omnigent pins unchanged.
 
 - **📋 SPEC-GAPS backlog (2026-07-13):** nine independent, un-specced/partial
   subsystems parked in [`SPEC-GAPS.md`](./SPEC-GAPS.md) — app release/signing/update,

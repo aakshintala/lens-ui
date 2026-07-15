@@ -1,5 +1,13 @@
 # Handoff — Terminal VT via libghostty-rs (2026-07-15)
 
+> **✅ UPDATE (2026-07-15, later same-day session): Tasks 1 + 2 + the doc-supersede
+> are DONE** — commits `ae1f385`/`014f9a9`/`e155230` on `terminal-ws` (unpushed).
+> **One reversal:** the Ghostty source is **crates-only, NOT vendored** (its ~57-152M
+> tree deferred to the CI trigger; pin stays in `build.rs`). Wiring notes (EXCLUDE-not-
+> member for cap-lints, `ZIG` override) in memory [[terminal-vt-vendored-executed]] +
+> `vendor/libghostty-rs/README.md`. **Remaining = Tasks 3-4 (the design pass).** Current
+> SSOT is `docs/STATUS.md`; the checklist below is retained as historical record.
+
 Resume artifact for the shared terminal workstream after this session's architecture pivot.
 Read memories `[[terminal-vt-adoption-model]]` + `[[zig-ghostty-macos26-scissor]]` first — they hold the full decision rationale. This doc is the "start executing" checklist.
 
