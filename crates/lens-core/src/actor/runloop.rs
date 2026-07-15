@@ -1955,7 +1955,8 @@ mod tests {
                 r#"{"item":{"id":"item_b","type":"message","role":"assistant","content":[{"type":"output_text","text":"b"}]}}"#,
             ))
             .unwrap();
-        while let Ok(ActorFeed::Detailed(u)) = feed_rx.recv_blocking() {
+        loop {
+            let u = recv_detailed(&feed_rx);
             if matches!(
                 u,
                 StreamUpdate::TranscriptAdvanced {
@@ -2002,7 +2003,8 @@ mod tests {
                 r#"{"item":{"id":"item_c","type":"message","role":"assistant","content":[{"type":"output_text","text":"c"}]}}"#,
             ))
             .unwrap();
-        while let Ok(ActorFeed::Detailed(u)) = feed_rx.recv_blocking() {
+        loop {
+            let u = recv_detailed(&feed_rx);
             if matches!(
                 u,
                 StreamUpdate::TranscriptAdvanced {
@@ -4213,7 +4215,8 @@ mod tests {
         let handle = spawn_actor(fresh_state(), ev_rx, feed_tx, stores, test_clock(), api);
 
         let mut saw_catchup_watermark = false;
-        while let Ok(ActorFeed::Detailed(u)) = feed_rx.recv_blocking() {
+        loop {
+            let u = recv_detailed(&feed_rx);
             if matches!(
                 u,
                 StreamUpdate::TranscriptAdvanced {
@@ -4291,7 +4294,8 @@ mod tests {
             ))
             .unwrap();
 
-        while let Ok(ActorFeed::Detailed(u)) = feed_rx.recv_blocking() {
+        loop {
+            let u = recv_detailed(&feed_rx);
             if matches!(
                 u,
                 StreamUpdate::TranscriptAdvanced {
@@ -4374,7 +4378,8 @@ mod tests {
             .unwrap();
         release_fetch2.send(()).expect("release blocked fetch");
 
-        while let Ok(ActorFeed::Detailed(u)) = feed_rx.recv_blocking() {
+        loop {
+            let u = recv_detailed(&feed_rx);
             if matches!(
                 u,
                 StreamUpdate::TranscriptAdvanced {
