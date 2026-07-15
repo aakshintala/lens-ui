@@ -48,7 +48,7 @@ Ordering below is by "blocks shipping Lens to a second human" (roughly).
    connect your first omnigent") is unspecified.
 
 7. **Settings / preferences surface** — the STATUS "Tunables" (auto-sleep
-   threshold, poll cadence, ring-buffer size, transcript truncation tiers,
+   threshold, poll cadence, terminal scrollback/fleet-memory budgets, transcript truncation tiers,
    `cost_samples` cadence) have no UI home. Where the user sees/changes them.
 
 8. **Data lifecycle / migration** — the two-tier SQLite store has a
@@ -58,3 +58,54 @@ Ordering below is by "blocks shipping Lens to a second human" (roughly).
 9. **Multi-machine identity** — two Lens instances (laptop + desktop) pointing at
    the same remote omnigent: independent replicas, or any Lens-side sync? Decide
    the posture even if the answer is "independent, no sync."
+
+---
+
+## Cross-repo seams (agreements to keep in sync, not backlog)
+
+- **lens-ui ↔ lens-terminal integration seam** *(agreed 2026-07-14 during a grill
+  of the lens-ui shell-skeleton design; recorded on both sides).* Direction is
+  **lens-ui depends on lens-terminal** and *hosts* its tab — lens-ui is
+  deliberately **not** a dependency of this workstream (§ this doc, "lens-ui is
+  not a dependency"). Consequences both docs commit to:
+  - **lens-terminal exports the constructor**
+    `open(TerminalTarget, Arc<Client>, TerminalOpenOptions, cx) -> Entity<TerminalTab>`
+    and public `TerminalTarget::{Existing { session_id, terminal_id },
+    OpenOrCreate { session_id, key }}` plus
+    `AccessIntent::{Automatic, ReadOnly}`. These values leak no Ghostty or
+    transport types. `open` returns immediately in `Starting` and builds its
+    own `TerminalAttachment` asynchronously.
+  - **lens-ui owns routing and policy**: it chooses the logical target, resolves
+    `ConnectionId → Arc<Client>`, supplies access intent/preferences, calls
+    `open(...)`, and **wraps** the returned `Entity<TerminalTab>` in a lens-ui
+    `ContentTab` adapter (lens-terminal cannot implement lens-ui's `ContentTab`
+    because there is no dependency edge that way). It performs no terminal
+    REST/WS work.
+  - The host seam is one typed inbound `TerminalHostEvent` stream and one typed
+    outbound `TerminalEvent` stream. Presentation updates atomically expose
+    identity/reported title, lifecycle, effective access, and progress. Host
+    requests cover user-gesture URL opens, permissioned OSC 52 clipboard writes,
+    and background notifications. `TerminalTab::focus_handle(cx)` is direct,
+    not a callback. There is no generic `RequestClose`.
+  - Native `/clear` has no public terminal-transfer operation. `lens-ui` handles
+    public `session.superseded`, then sends the typed supersession host event so
+    the tab reattaches the same terminal under the target session. Lens never
+    calls omnigent's schema-hidden internal transfer route.
+  - lens-ui does **not** publish any attach type. An earlier lens-ui
+    `SessionAttach { …, attach: TerminalAttachCapability }` sketch was **dropped**
+    (wrong shape: no such capability exists, and it omitted `TerminalId`/access
+    mode). If the `open(...)`/target shape changes here, update lens-ui §5.2.
+
+---
+
+## Upstream contract gaps
+
+- **Immutable terminal generation identity** — omnigent 0.5.1 derives terminal
+  IDs from `(terminal_name, session_key)` and may recreate a few server-owned
+  terminal roles on attach while reusing that ID. It emits another live
+  `session.resource.created` and normally persists a corresponding
+  `ResourceEventData` item for reconnect discovery, but supplies no generation
+  token and persistence is best-effort. Lens preflights GET, consults resource
+  event history, and treats an observed duplicate creation as a replacement,
+  but cannot prove the remaining race away. Omnigent should expose an immutable
+  generation/resource ID (or an equivalent durable replacement discriminator).

@@ -49,7 +49,7 @@ documents, the capability they describe, and their dependencies:
 | `app-architecture-and-state-model.md` | how the typed client feeds the view-model, state store, command flow; the Bridge router; presence/co-viewers; switch-agent & fork flows | the typed client |
 | `application-shell-and-layout.md` | board/home, focused-session window (chat + collapsible working area beside chat, ⌘D deep-focus), resource-rail navigator, global search/nav/palette, app-state chrome, Bridge (native, one rail destination), theme | the state model |
 | `conversation-transcript.md` | the transcript surface, full fidelity; markdown security boundary | the state model |
-| `workspace-and-terminals.md` | one-workspace-per-session ↔ task model; env-scoped fs/diff/search/shell; terminal WS attach + transfer | the state model |
+| `workspace-and-terminals.md` | one-workspace-per-session ↔ task model; env-scoped fs/diff/search/shell; terminal WS attach + lifecycle | the state model |
 | `agent-definition.md` | the net-new vocabulary; 19 harnesses; filesystem YAML; bundle upload clone; live switch-agent | the state model |
 | `permissions-and-elicitations.md` | form/URL elicitations; `/resolve`; target_session_id; the four harness permission/elicitation hooks; per-session sharing (levels 1–3) + policy editor + identity | the state model |
 | `sub-agent-topology.md` | child-session trees with richer summaries; pending-elicitation badges | the state model |
@@ -175,7 +175,7 @@ terminal-scoped envs. This is why the workspace endpoints are environment-scoped
 | `shell` (POST command → stdout/stderr/exit/cwd, one-shot) — env-scoped | ▮sm | quick-command surface (not the terminal pane) |
 | File resources (`POST /resources/files` upload, `GET …/files` list, `GET …/files/{id}`, `GET …/files/{id}/content`) | ▮md | attachments/uploads + multimodal input surface |
 | **`SessionResourceObject`** (`env\|terminal\|file`) — the typed union over `GET /v1/sessions/{id}/resources` + `GET /v1/sessions/{id}/resources/{resource_id}` | ▮md | the **resource model** = workspace-and-terminals doc; the **resource-rail navigator surface** = the application shell doc (per the shell-vs-content split — the shell owns the navigator UI, the workspace doc owns the data model) |
-| **Terminals:** `WS /v1/sessions/{id}/resources/terminals/{terminal_id}/attach` (**the `/v1` prefix IS required** — router mounted with `prefix="/v1"` at `app.py:1635-1642`; binary PTY frames + text `{"type":"resize"}` control + `read_only` query) — read-only by default (`tmux attach -r`), owner-level write attach. **NEW `POST …/terminals/{id}/transfer`** moves a terminal to another session without closing it (live `/clear` rotation). **NEW `DELETE …/terminals/{id}`**. No replay buffer — live attach only. `session.terminal.activity` + new `session.terminal_pending` events. | ▮lg | the terminal surface; reconnect loses scrollback (Lens-side ring buffer per decision §0.7-C); transfer is a new affordance |
+| **Terminals:** `WS /v1/sessions/{id}/resources/terminals/{terminal_id}/attach` (**the `/v1` prefix IS required**; binary PTY frames + text `{"type":"resize"}` control + `read_only`/`transport=pty` query) — read-only requires read access, owner-level write attach. Public REST is list/create/get/delete; there is **no public transfer operation** in pinned 0.5.1. Native `/clear` moves the PTY internally and emits `session.superseded`. No replay/sequence proof; `session.terminal.activity`, `session.terminal_pending`, and resource events provide lifecycle context. | ▮lg | the Ghostty terminal surface; one bounded retained emulator survives brief reconnect, while Sleep releases it; lens-ui owns supersession routing |
 
 ### Agent definition — owned by `agent-definition.md`
 
@@ -492,17 +492,15 @@ topology document owns the semantics.
 
 **C. Terminal model. (owned by workspace & terminals)** tmux-PTY-over-WS attach
 (path: `/v1/sessions/{id}/resources/terminals/{id}/attach` — the `/v1` prefix IS
-required, from the router mount at `app.py:1635-1642`),
-read-only default, transferable to a new session, no replay buffer. Reconnect
-loses scrollback. Options: (i) Lens-side ring buffer for reconnect scrollback
-(purely UI-state, no server-side buffer to lean on); (ii) accept
-reconnect-from-blank + a visible "history unavailable" affordance; (iii)
-hybrid (Lens-side buffer, best-effort beyond it). Also: do shells and
-agent-terminals share one surface or render differently? **Resolved: (i)** — the
-Lens-side ring buffer covers brief reconnects; a deliberate long **Sleep**
-reclaims the PTY (§0.7 lifecycle), so its scrollback is gone by design (terminal-
-aware auto-sleep avoids dropping a terminal you were watching). Shells and
-agent-terminals share one surface, distinguished by the `kind` label.
+required), server-authoritative owner-write/viewer-read-only access, and no
+replay/sequence proof. **Resolved:** Lens requests `transport=pty` and retains
+one bounded Ghostty emulator across brief reconnects; there is no second raw
+byte ring. Every established reconnect gets a possible-gap marker. A deliberate
+**Sleep** releases the engine/full scrollback and retains only a final viewport.
+Shells and agent terminals share the same renderer. Pinned 0.5.1 exposes no
+public terminal transfer; server-driven `/clear` is routed by
+`session.superseded`. `Existing` and `OpenOrCreate` targets never silently mix
+replacement process history.
 
 **D. Framework. (owned by framework)** **Resolved: gpui.** Greenfield removes
 all migration cost, the all-Rust win (the typed client's types flow straight
@@ -602,8 +600,10 @@ grounding:** the **API floor is `LEVEL_EDIT` (2), NOT owner** (the earlier
 Lens UI policy** stricter than the API: the card kebab disables "Switch agent ▸"
 for non-owners and while busy (including a client-preflight of `launching`), and
 hides it for sub-agents — 409 is the server's fallback. The switch resets runner
-resources (open terminals re-attach). The agent definition document owns the
-mechanism; the application shell owns the visual handoff.
+resources: `Existing` terminal tabs detach, while `OpenOrCreate` tabs may wait
+for the exact-key server-created successor and install a fresh emulator. The
+agent definition document owns the mechanism; the application shell owns the
+visual handoff.
 
 ---
 

@@ -103,9 +103,30 @@ the terminal adoption audit records the exact `gpui-ghostty`/Ghostty/GPUI/Zig
 inputs, licenses, FFI safety, version delta, and each module's
 adopt/adapt/exclude disposition. The GPUI tab renders only coalesced immutable
 engine updates: terminal byte processing, I/O, and lock waits never run on the
-foreground thread. The retained Lens-local terminal state is the bounded
-reconnect tail described in workspace doc §9.2; it cannot restore output the
-server did not replay.
+foreground thread.
+
+**Audit result:** the candidate `gpui-ghostty` revision is
+`e3025981c6211dd7db2a825dc364ffb5d342f45e`, with Ghostty submodule
+`6d2dd585a5d87fa745d48188dd096ca6e63014d0`. Its bridge exposes no image state
+through the Zig/C/Rust seam and its GPUI renderer paints text/quads only, so
+inline graphics are deferred. Unsupported APC/DCS sequences are consumed with
+strict bounds and no per-byte log storm; unsupported Unicode image-placeholder
+clusters render blank. Kitty graphics/Unicode placement is the sole future
+parity candidate; Sixel and OSC 1337 remain excluded.
+
+The retained Lens-local state is one bounded Ghostty engine, not a separate raw
+byte ring. Lens requests omnigent `transport=pty`; the server's default control
+transport captures tmux history for xterm.js and could duplicate history if
+fed into the retained engine. The engine preserves screen, selection, cursor,
+and provisional 10 MB (10,000,000-byte) scrollback across brief reconnects, but
+cannot restore output the server did not replay. Deliberate Sleep releases the
+engine and full history, retaining only an immutable final viewport.
+
+The port ships layer-specific release benchmarks for terminal WS codec/queue,
+Ghostty parse/damage/reflow, and GPUI frame timing. Its transport, engine, and
+render layers each implement the gated typed `Inspect` snapshot plus a
+fixed-capacity state-transition diagnostic ring, with no hot-path recording or
+snapshot cost while inspection is disabled.
 
 ### 2.3 Diff widget
 

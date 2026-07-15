@@ -9,14 +9,16 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Open threads & next up
 
-- **▶ ACTIVE: shared terminal workstream (2026-07-14):** user-approved design
+- **▶ ACTIVE: shared terminal workstream (2026-07-14):** grilled and reconciled
+  user-approved design
   in [`specs/2026-07-14-terminal-workstream-design.md`](./specs/2026-07-14-terminal-workstream-design.md).
   Deliver a standalone, renderable GPUI terminal tab backed by the real
   omnigent terminal WS attach path — ready for `lens-ui` to host, but not
-  integrated into it. The initial plan gate is a thorough, attribution-aware
-  audit of the narrow `gpui-ghostty`/Ghostty-VT port (FFI, GPUI version delta,
-  reproducible Zig/source pin, behavior tests, and perf); native-harness
-  rendered-stream/raw-TUI toggle remains a separate spec.
+  integrated into it. The adoption/source audit pinned `gpui-ghostty` + Ghostty,
+  deferred inline graphics, and executable omnigent 0.5.1 verification covered
+  32 focused terminal behaviors. The next step is the implementation plan plus
+  a real external-server E2E sentinel; native-harness rendered-stream/raw-TUI
+  toggle remains a separate spec.
 
 - **📋 SPEC-GAPS backlog (2026-07-13):** nine independent, un-specced/partial
   subsystems parked in [`SPEC-GAPS.md`](./SPEC-GAPS.md) — app release/signing/update,
@@ -337,8 +339,9 @@ and roll older "Recent" pointers off this page as they age.
     memory `elicitation-form-spike-2026-07`. **No load-bearing framework residual
     remains — the framework spike series is closed.**
 - **Tunables for the verification pass:** auto-sleep threshold (~10m), poll cadence
-  (~10s), ring-buffer size (10 MB), transcript truncation tiers, `cost_samples` cadence.
-- **Small undecided UX:** terminal-`transfer` UX, managed-provider selection,
+  (~10s), terminal scrollback (provisional 10 MB + measured fleet budget),
+  transcript truncation tiers, `cost_samples` cadence.
+- **Small undecided UX:** managed-provider selection,
   policy/skill in-app authoring, multi-depth breadcrumb, exact-vs-range version pin.
 - **Build artifact:** render icons are unicode placeholders — ship a real
   status + harness-provider icon set.
