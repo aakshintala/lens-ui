@@ -1748,6 +1748,50 @@ mod tests {
     }
 
     #[test]
+    fn summary_mode_nonempty_catchup_then_seed_preserves_fifo_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(dir.path());
+        seed_connection(&stores);
+        // Frontier on disk so catch-up fetches a nonempty page and emits TranscriptAdvanced.
+        seed_message_item(&*stores.transcript, 0, "item_0", "item_0");
+        assert_eq!(
+            stores.transcript.store_frontier().unwrap(),
+            Some((0, ItemId::new("item_0")))
+        );
+
+        let page = item_list_from_messages(&["item_1"], false);
+        let (api, _mock) = MockApi::with_fetch_script(VecDeque::from([Ok(page)]));
+
+        let (_ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (feed_tx, feed_rx) = async_channel::bounded(64);
+        let handle = spawn_actor_dual(
+            fresh_state(),
+            ev_rx,
+            feed_tx,
+            OutputMode::Summary,
+            stores,
+            test_clock(),
+            api,
+        );
+
+        let first = feed_rx.recv_blocking().expect("catch-up frame");
+        let second = feed_rx.recv_blocking().expect("seed frame");
+        assert!(
+            matches!(
+                first,
+                ActorFeed::Detailed(StreamUpdate::TranscriptAdvanced { .. })
+            ),
+            "first must be catch-up Detailed TranscriptAdvanced, got {first:?}"
+        );
+        assert!(
+            matches!(second, ActorFeed::Summary(_)),
+            "second must be §3.3 Summary seed, got {second:?}"
+        );
+
+        handle.stop_and_join();
+    }
+
+    #[test]
     fn demote_emits_summary_from_state() {
         let _dir = tempfile::tempdir().unwrap();
         let stores = test_stores(_dir.path());
@@ -1770,6 +1814,60 @@ mod tests {
             other => panic!("expected Summary on Demote, got {other:?}"),
         }
         handle.stop_and_join();
+    }
+
+    #[test]
+    fn lagging_consumer_never_applies_stale_summary_after_promote() {
+        let _dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(_dir.path());
+        seed_connection(&stores);
+
+        let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        // Small capacity exercises backpressure on the unified FIFO without timing gates.
+        let (feed_tx, feed_rx) = async_channel::bounded(2);
+        let mut state = fresh_state();
+        state.title = Some("bg".into());
+        let handle = spawn_actor_dual(
+            state,
+            ev_rx,
+            feed_tx,
+            OutputMode::Summary,
+            stores,
+            test_clock(),
+            noop_api(),
+        );
+
+        // Drain seed so the producer can advance on the bounded channel.
+        assert!(
+            matches!(feed_rx.recv_blocking().unwrap(), ActorFeed::Summary(_)),
+            "spawn-in-Summary seeds first"
+        );
+
+        // Enqueue live work, Promote, then a Detailed-visible event — no wall-clock waits.
+        ev_tx.send(status_running_event()).unwrap();
+        ev_tx.send(status_running_event()).unwrap();
+        handle.commands.send(SessionCommand::Promote).unwrap();
+        ev_tx.send(status_running_event()).unwrap();
+
+        // Phase 1: recv_blocking until Rebased; Summary before Rebased is allowed.
+        loop {
+            match feed_rx.recv_blocking().expect("frame before Rebased") {
+                ActorFeed::Summary(_) => {}
+                ActorFeed::Detailed(StreamUpdate::Rebased(_)) => break,
+                other @ ActorFeed::Detailed(_) => {
+                    panic!("unexpected Detailed before Rebased: {other:?}");
+                }
+            }
+        }
+
+        // Phase 2: drain every remaining frame — no Summary may follow Rebased.
+        handle.stop_and_join();
+        while let Ok(frame) = feed_rx.recv_blocking() {
+            assert!(
+                !matches!(frame, ActorFeed::Summary(_)),
+                "lagging Summary must not overtake Promote on the unified FIFO, got {frame:?}"
+            );
+        }
     }
 
     #[test]
@@ -4388,17 +4486,20 @@ mod tests {
             ))
             .unwrap();
 
-        loop {
-            let u = recv_detailed(&feed_rx);
-            if matches!(
-                u,
-                StreamUpdate::TranscriptAdvanced {
-                    committed_ordinal: 3
-                }
-            ) {
+        let mut saw_deferred_commit = false;
+        while let Ok(frame) = feed_rx.recv_blocking() {
+            if let ActorFeed::Detailed(StreamUpdate::TranscriptAdvanced {
+                committed_ordinal: 3,
+            }) = frame
+            {
+                saw_deferred_commit = true;
                 break;
             }
         }
+        assert!(
+            saw_deferred_commit,
+            "finish_deferred_transcript_commit must emit ActorFeed::Detailed(TranscriptAdvanced) on the unified feed"
+        );
 
         handle.stop_and_join();
 
