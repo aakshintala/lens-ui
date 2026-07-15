@@ -387,7 +387,7 @@ mod tests {
 
         // Pre-Task-4: no seed yet — drive a live status event so Summary mode emits.
         // Post-Task-4: the first frame may be the seed; either is ActorFeed::Summary
-        // and must NOT be accompanied by SummaryConsumerGone.
+        // and must NOT be accompanied by FeedConsumerGone.
         ev_tx.send(status_running_event()).unwrap();
 
         let frame = feed_rx.recv_blocking().expect("summary frame");
@@ -400,9 +400,9 @@ mod tests {
         assert!(
             !matches!(
                 handle.outcomes.try_recv(),
-                Ok(crate::actor::ActorOutcome::SummaryConsumerGone)
+                Ok(crate::actor::ActorOutcome::FeedConsumerGone)
             ),
-            "live Summary consumer must not observe SummaryConsumerGone"
+            "live Summary consumer must not observe FeedConsumerGone"
         );
 
         scheduler.take_handle(&sid).expect("handle").stop_and_join();

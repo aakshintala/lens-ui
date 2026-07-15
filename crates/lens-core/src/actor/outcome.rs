@@ -25,7 +25,8 @@ pub enum ActorOutcome {
     Slept,
     /// D21: sleep declined — session not quiescent; actor continues.
     SleepDeclined,
-    SummaryConsumerGone,
+    /// Unified feed receiver dropped — Summary emit failed; actor continues.
+    FeedConsumerGone,
     /// Optimistic bubble confirmed lost after reconnect held reconcile (D28).
     SendLost {
         lens_pending_id: String,

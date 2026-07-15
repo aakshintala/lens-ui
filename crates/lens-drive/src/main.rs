@@ -731,7 +731,7 @@ fn actor_outcome_json(outcome: &ActorOutcome) -> Value {
         }),
         ActorOutcome::Slept => json!({"variant": "Slept"}),
         ActorOutcome::SleepDeclined => json!({"variant": "SleepDeclined"}),
-        ActorOutcome::SummaryConsumerGone => json!({"variant": "SummaryConsumerGone"}),
+        ActorOutcome::FeedConsumerGone => json!({"variant": "FeedConsumerGone"}),
         ActorOutcome::SendLost {
             lens_pending_id,
             content,

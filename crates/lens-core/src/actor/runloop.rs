@@ -722,7 +722,7 @@ fn apply_reduced_batch(
                 ))))
                 .is_err()
             {
-                ctx.ring.push(ActorOutcome::SummaryConsumerGone);
+                ctx.ring.push(ActorOutcome::FeedConsumerGone);
             }
         }
     }
@@ -1045,7 +1045,7 @@ fn run(
 
     // §3.3 seed-on-spawn: a Summary-mode actor emits its initial projection after
     // catch-up so the card has data before the first live event. Seed-fail pushes
-    // SummaryConsumerGone and continues (mirrors the Summary batch emit); it does
+    // FeedConsumerGone and continues (mirrors the Summary batch emit); it does
     // not abort the actor, so Stop still works.
     //
     // Suppressed when startup catch-up already replayed buffered live events: in
@@ -1062,7 +1062,7 @@ fn run(
             ))))
             .is_err()
     {
-        ctx.ring.push(ActorOutcome::SummaryConsumerGone);
+        ctx.ring.push(ActorOutcome::FeedConsumerGone);
         drain_outcome_ring(ctx.ring, &ctx.output.outcomes);
     }
 
@@ -3899,7 +3899,7 @@ mod tests {
 
         handle.stop_and_join();
 
-        // Dropped feed receiver — SummaryConsumerGone on the next Summary emit.
+        // Dropped feed receiver — FeedConsumerGone on the next Summary emit.
         let _dir2 = tempfile::tempdir().unwrap();
         let stores2 = test_stores(_dir2.path());
         seed_connection(&stores2);
@@ -3917,8 +3917,8 @@ mod tests {
         );
         ev_tx2.send(status_running_event()).unwrap();
         match handle2.outcomes.recv_blocking().unwrap() {
-            ActorOutcome::SummaryConsumerGone => {}
-            other => panic!("expected SummaryConsumerGone, got {other:?}"),
+            ActorOutcome::FeedConsumerGone => {}
+            other => panic!("expected FeedConsumerGone, got {other:?}"),
         }
         handle2.commands.send(SessionCommand::Stop).unwrap();
         handle2.stop_and_join();
