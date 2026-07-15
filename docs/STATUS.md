@@ -58,6 +58,18 @@ and roll older "Recent" pointers off this page as they age.
 - **▶ NEXT: `lens-ui` (Bucket B viewport)** — first rendering consumer of the §13.2 seams
   (StreamUpdate/SessionCommand/ActorOutcome), incl. the arch-B composer-owns-durability draft.
   lens-drive is the headless precedent proving the seams are drivable.
+  - **Design: `docs/specs/2026-07-14-lens-ui-shell-skeleton-design.md` — round-3 grill folded
+    (2026-07-15, `f31af5e`, vs gpui + lens-core source).** 7 branches hardened: fixed-size-tile
+    isolation invariant (content-sized cards reflow → sibling repaint), continuous-ack Ready
+    timing, `⌘.` navigation, §6.1 frame-driver caveat, terminal seam locked to the sibling
+    `lens-terminal-ws` workstream (identity-only `open(…,cx)` contract). **⚠ First build step is
+    the §3 lens-core phase (unified `ActorFeed` channel + enrich `SummaryUpdate` +
+    spawn-in-Summary + emit-on-Demote/seed-on-spawn), now a MERGE-GATED milestone** — one-way-door
+    actor change, cross-family+Opus review + `lens-drive` green **before any view code**.
+  - **New cross-spec risk filed (SPEC-GAPS):** `session.superseded` reducer-drop
+    (`folds.rs:136` marker-only discards `target_conversation_id`) blocks the terminal
+    supersession-reattach the sibling workstream delegates to lens-ui — lens-core must surface it;
+    terminal-integration-era, not the skeleton.
 
 - **lens-client benchmarks: DONE** (2026-06-27, composer-2.5 build + free codex
   cross-family review → 4 Important + 1 Nit, all applied). Closes the MANDATORY
