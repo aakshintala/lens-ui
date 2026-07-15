@@ -533,7 +533,9 @@ fn handle_command(
             // instead of freezing on the last Detailed frame (symmetric with Promote).
             if output
                 .feed
-                .send_blocking(ActorFeed::Summary(SummaryUpdate::from_state(state)))
+                .send_blocking(ActorFeed::Summary(Box::new(SummaryUpdate::from_state(
+                    state,
+                ))))
                 .is_err()
             {
                 return LoopControl::Break;
@@ -715,7 +717,9 @@ fn apply_reduced_batch(
             if ctx
                 .output
                 .feed
-                .send_blocking(ActorFeed::Summary(SummaryUpdate::from_state(ctx.state)))
+                .send_blocking(ActorFeed::Summary(Box::new(SummaryUpdate::from_state(
+                    ctx.state,
+                ))))
                 .is_err()
             {
                 ctx.ring.push(ActorOutcome::SummaryConsumerGone);
@@ -1041,7 +1045,9 @@ fn run(
         && ctx
             .output
             .feed
-            .send_blocking(ActorFeed::Summary(SummaryUpdate::from_state(ctx.state)))
+            .send_blocking(ActorFeed::Summary(Box::new(SummaryUpdate::from_state(
+                ctx.state,
+            ))))
             .is_err()
     {
         ctx.ring.push(ActorOutcome::SummaryConsumerGone);
@@ -1097,9 +1103,12 @@ fn emit_pending_user(output: &ActorOutput, state: &SessionState) -> bool {
             )))
             .is_ok(),
         OutputMode::Summary => {
-            let _ = output
-                .feed
-                .send_blocking(ActorFeed::Summary(SummaryUpdate::from_state(state)));
+            let _ =
+                output
+                    .feed
+                    .send_blocking(ActorFeed::Summary(Box::new(SummaryUpdate::from_state(
+                        state,
+                    ))));
             true
         }
     }
@@ -1707,7 +1716,7 @@ mod tests {
         ev_tx.send(status_running_event()).unwrap();
         assert!(matches!(
             feed_rx.recv_blocking().unwrap(),
-            ActorFeed::Summary(SummaryUpdate { .. })
+            ActorFeed::Summary(_)
         ));
         assert!(
             feed_rx.try_recv().is_err(),

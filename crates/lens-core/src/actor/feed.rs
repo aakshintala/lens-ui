@@ -6,7 +6,10 @@ use crate::reduce::StreamUpdate;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ActorFeed {
-    Summary(SummaryUpdate),
+    /// Boxed: `SummaryUpdate` is a wide card-chrome struct, so boxing keeps the
+    /// enum (and the FIFO buffer) lean vs the small `Detailed` variant
+    /// (`StreamUpdate` already boxes/Arc-wraps its large payloads).
+    Summary(Box<SummaryUpdate>),
     Detailed(StreamUpdate),
 }
 
@@ -25,7 +28,7 @@ mod tests {
             SessionId::new("conv"),
             AgentId::new("ag"),
         );
-        let summary = ActorFeed::Summary(SummaryUpdate::from_state(&s));
+        let summary = ActorFeed::Summary(Box::new(SummaryUpdate::from_state(&s)));
         let detailed = ActorFeed::Detailed(StreamUpdate::TranscriptAdvanced {
             committed_ordinal: 0,
         });
