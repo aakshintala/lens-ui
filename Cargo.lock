@@ -7842,8 +7842,12 @@ dependencies = [
  "prettyplease",
  "quote",
  "schemars 0.8.22",
+ "serde",
  "serde_json",
+ "sha2",
  "syn 2.0.118",
+ "thiserror 2.0.18",
+ "toml 0.8.23",
  "typify",
 ]
 

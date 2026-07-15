@@ -1,0 +1,17 @@
+[[wrapper]]
+path = "crates/ghostty_vt/src/lib.rs"
+disposition = "adapt"
+license = "Apache-2.0"
+reason = "FFI-safe VT facade"
+
+[[wrapper]]
+path = "crates/ghostty_vt/tests/smoke.rs"
+disposition = "adopt"
+license = "Apache-2.0"
+reason = "VT corpus (relevant upstream test)"
+
+[[mirror]]
+path = "terminal/Terminal.zig"
+disposition = "adopt"
+license = "MIT"
+reason = "fixture VT compile-closure member"
