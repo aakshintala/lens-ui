@@ -4,12 +4,12 @@
 folded in** (codex/gpt + grok-4.5-xhigh, both vs lens-core source): round 1
 corrected the feed (D10 dual-mode `SummaryUpdate`, not gated `StreamUpdate`);
 round 2 (verify-the-fixes) drove the **unified `ActorFeed` channel** decision and
-the implementation-precision fixes below. **Round 3 (grill)** then **Round 4
-(cross-family review of the round-3 diff — codex/gpt-5.6-sol + grok-4.5-xhigh,
-2026-07-15)** folded in — see Appendix A. Round 4 corrected several of round-3's
-own fixes (continuous-ack Detailed turn-source, ack-reset-on-seed, the wrong
-"mode-exclusive" backpressure claim, read-state semantics). First rendering
-consumer of the state model.
+the implementation-precision fixes below. **Rounds 3 (grill) → 4 → 5
+(cross-family reviews of each diff — codex/gpt-5.6-sol + grok-4.5-xhigh,
+2026-07-15)** folded in — see Appendix A. Round 5's headline: the whole
+focus-ack Ready apparatus (counter/`acked_turn`/continuous-ack/dual-source) was
+**deleted** for a simple **`idle && recent-completion` timestamp** (§3.5) that
+moots the ack findings entirely. First rendering consumer of the state model.
 **Depends on:** `lens-core` (actor/`FleetScheduler`/`SummaryUpdate`/`StreamUpdate`/
 `SessionCommand`/`ActorOutcome`, through P3-3b, live-verified vs omnigent 0.5.1);
 `lens-client` (REST surface incl. `put_read_state` + `viewer_*` read fields);
@@ -68,22 +68,27 @@ actor** (per-session poller); a shared bus would be wrong.
 Four engine changes (each gets cross-family review — they touch the actor):
 
 **Implementation-sequencing gate (hard phase boundary, not soft ordering).**
-The **one-way door is the channel shape — §3.1 + §3.2 only** (merging the two
-senders + the dual-mode spawn signature). *That* pair lands as a
-**separately-reviewed, separately-merged lens-core milestone — cross-family + Opus
-review — BEFORE any lens-ui view code**, because it's Opus-level actor-touching
-work (CLAUDE.md) and reversing the public channel shape later is expensive.
-**§3.3–§3.5 are additive** (seed/emit, enrich `SummaryUpdate`, Ready plumbing) and
-**may land in parallel** with FakeFleet-backed view code — narrowed per review
-(over-gating them needlessly serializes the build).
+The one-way door is the channel shape (§3.1) + the dual-mode spawn (§3.2); the
+**enriched `SummaryUpdate` struct (§3.4)** is a **shared lens-core type** views /
+`FakeFleet` / §6.1 compile against, and the **seed (§3.3)** is what the gate's own
+interleave test needs to be deterministic (re-review-corrected — an earlier
+"§3.3–3.5 all parallel" narrowing was wrong). So the **gate = the lens-core §3
+work, §3.1–§3.4**, landing as a **separately-reviewed, separately-merged milestone
+— cross-family + Opus review — BEFORE any lens-ui view code** (Opus-level,
+actor-touching; reversing the public channel/struct later is expensive). The
+**only truly parallel piece is §3.5**, which is now **pure lens-ui** (RAM
+`last_completed_at` + `status`, no lens-core field) — it can be built against
+`FakeFleet` alongside the gate.
 
 **Gate evidence must exercise Summary mode — `lens-drive` alone does NOT
 (review-corrected).** `lens-drive` is single-session **Detailed-only**, so it
-cannot validate the unified channel's Summary/interleave paths. The §3.1+§3.2
-gate therefore requires **new lens-core tests**: a Summary-mode actor with
-**nonempty startup catch-up** (emits `updates` then `summaries` — the interleave
-that motivates the merge), plus **reconnect / deferred-transcript-commit** on the
-unified channel. `lens-drive` green is necessary but not sufficient.
+cannot validate the unified channel's Summary/interleave paths. The gate therefore
+requires **new lens-core tests**: a Summary-mode actor with **nonempty startup
+catch-up + the §3.3 seed** (emits `updates` then `summaries` — the interleave that
+motivates the merge; note the interleave is *only* deterministic *with* the seed,
+so §3.3 is gate-adjacent, not deferrable), plus **reconnect /
+deferred-transcript-commit** on the unified channel. `lens-drive` green is
+necessary but not sufficient.
 
 ### 3.1 Unified `ActorFeed` channel (the keystone)
 
@@ -110,14 +115,20 @@ precisely because the actor legitimately interleaves the two sub-streams (above)
 this is the real justification (an earlier "production is mode-exclusive → no
 backpressure downside" note was **wrong** and is struck, Appendix A round 4).
 
-**Capacity / backpressure contract.** The feed stays **`bounded(64)`** (today's
-size). The actor uses `send_blocking`, so a lagging poller applies **backpressure
-that is Lens-side and lossless** — the reducer slows, nothing is dropped (correct:
-the actor is our thread, not omnigent). The poller **drains-and-coalesces per
-wakeup** (§4.1), so a mode-transition Summary lands **≤1 coalesced batch behind**
-any Detailed backlog — bounded, never a freeze; §6.1 step 3 exercises this. No
-actor-side latest-wins Summary coalescing now (Summary cadence is coarse ms–s,
-can't fill 64) — the escape hatch *if* profiling ever shows Summary starvation.
+**Capacity / backpressure contract (softened per re-review — the earlier
+"≤1 batch / never freeze / can't fill 64" absolutes were unsupported).** Capacity
+is a **construction choice by the feed's owner (`FleetStore`/`lens-app`)** — the
+actor/scheduler just accept a `Sender`, they don't enforce it (`lens-drive` builds
+`bounded(64)`, `main.rs:127`); **recommend `bounded(64)`**. The actor uses
+`send_blocking`, so a lagging poller applies **backpressure that is Lens-side and
+lossless** — the reducer slows, nothing is dropped (the actor is our thread, not
+omnigent). Under a **sustained Detailed flood the transition Summary is delayed by
+multiple drain cycles, not ≤1** (the poller drains what's `try_recv`-ready per
+wakeup, and the actor can keep the FIFO full) — delayed, never lost; §6.1 step 3
+exercises the lagging case. **The poller must be async-only** (await `recv`, never
+a foreground sync-wait on the actor) so `send_blocking` + the fg executor can't
+deadlock. Actor-side latest-wins Summary coalescing is the escape hatch *if*
+profiling shows Summary starvation — not added now.
 
 **Blast radius (do it now, while small):** `spawn_actor`/`spawn_actor_dual`,
 `FleetScheduler::wake`/`reconnect`, `lens-drive`, and the actor tests that
@@ -148,7 +159,7 @@ With the unified feed these are trivial and **required for a live card**:
   summary projection instead of freezing on the last Detailed frame. (`Promote`
   already emits `Rebased` — symmetric.)
 
-### 3.4 Enrich `SummaryUpdate` + expose the completed-turn counter
+### 3.4 Enrich `SummaryUpdate` for the card chrome
 
 `SummaryUpdate::from_state` (`actor/summary.rs`) copies 6 fields today. Extend the
 struct + function to carry the §6 card chrome. **Correction from review: `Demote`
@@ -160,8 +171,8 @@ field below is available in Summary mode:
   `cumulative_cost`, `context_window` (+ existing `last_total_tokens` → ctx %),
   `sandbox_status`, `git_branch`/`workspace`, `reasoning_effort`; an **activity
   summary** (derived: `todos.activeForm` ▸ in-flight tool ▸ blank).
-- **`last_completed_turn: u32`** — copy `state.stream.turn` (bumped on
-  `response.completed`, `reduce/mod.rs:136`). Drives the Ready wave (§3.5).
+- *(No completed-turn counter — the §3.5 Ready model dropped it; `status` alone,
+  already on `SummaryUpdate`, drives the Ready transition.)*
 - **`harness`** — **not on `SessionState` today** (it lives only on
   `lens-client::SessionSnapshot`). Add a lens-core `SessionState.harness` field
   folded from the snapshot at bootstrap, so `<harness> · <model>` (shell §5.1)
@@ -170,76 +181,45 @@ field below is available in Summary mode:
 
 Cadence stays coarse (ms–s) — D10's scale property holds; no per-token deltas.
 
-### 3.5 Ready wave — warm fast-path echo of read-state (no migration)
+### 3.5 Ready wave — idle-with-a-recent-completion (timestamp, no ack machinery)
 
-"Ready = idle **with an unacknowledged completed turn**." Ready is a **live
-"just finished, look now" nudge, not durable state** — that framing (from the
-grill's cross-family review) resolves what used to be a muddle. The skeleton
-derives it from the warm feed at **turn-completion latency**, with a local ack
-that is the **optimistic echo of the `put_read_state` we write on blur**.
+Ready is a **live "just finished, look now" nudge, not durable state.** The prior
+draft tied it to *focus* (an ack cleared on view), which was both wrong (peeking
+≠ resolving) and the source of an entire ack apparatus (counter, `acked_turn`,
+continuous-ack, dual-mode turn source, seed-reset, freeze timing). All of that is
+**deleted.** The model that survived the grill's re-review:
 
-**Server read-state is a convenience layer, not an authority — and correcting an
-earlier error:** the server's unread is **not** `viewer_unread` alone.
-`viewer_unread` is only the explicit *marked-unread override*; the actual unread
-dot is derived from the **triple** `updated_at > viewer_last_seen && status
-finished` (`openapi.json:3957-3964`). It is also **in-memory and resets on a
-server restart**. So board-v2 cross-device convergence (while the server is up)
-needs all three fields, not `viewer_unread`; and there is **no across-restart
-Ready anywhere** — which is fine, because Ready is ephemeral by design (§ ack
-bullets: a restart/reconnect shows the card's true idle/failed status). **No
-omnigent ask** — nothing is missing; a durable Ready is not a goal. Regimes:
-**warm/live → feed counter (instant, skeleton); cross-device while server-up →
-read-state triple (poll, board-v2).**
+```
+Ready  ==  status == idle  &&  (now − last_completed_at) < READY_DECAY   // default 5 min, tunable
+```
 
-- `SummaryUpdate.last_completed_turn` advances on each turn completion (`=
-  state.stream.turn`). **Why a counter, not a RAM boolean edge:** the feed
-  coalesces bursts (§4.1), so a naive `running→idle` edge-detector can miss the
-  transition; `last_completed_turn > acked` is robust to coalescing. That
-  robustness is the *only* reason it's a counter.
-- **The card's turn counter has TWO sources — bind both** (review-corrected):
-  `last_completed_turn` is a `SummaryUpdate` field, so it only arrives in
-  **Summary** mode. In **Detailed** (focused) mode no `SummaryUpdate` flows —
-  `stream.turn` rides `StreamUpdate::ScratchChanged` (`reduce/mod.rs` emits it on
-  `Completed`, carrying `scratch.turn == stream.turn`; also reseeded on `Rebased`).
-  So the card maintains its turn counter from **`SummaryUpdate.last_completed_turn`
-  (Summary) OR `ScratchChanged.turn`/`Rebased` (Detailed)**. Without the Detailed
-  source, continuous-ack has nothing to advance while focused → the exact bug it
-  exists to kill.
-- `FleetStore` holds a per-card `acked_turn` (RAM).
-  `Ready = status==idle && turn_counter > acked_turn`.
-- **Reset `acked_turn = seed.<turn>` on EVERY seed, not just card creation**
-  (review-corrected). The card outlives the actor: a Parked→reconnect **respawn**
-  re-seeds with `turn=0`, but a persisted `acked_turn` would suppress Ready. So
-  treat every post-spawn seed (birth *and* respawn) as the ack baseline. This also
-  means Ready is **not preserved across a reconnect/server restart** — the card
-  shows its true idle/failed status, which is **correct**: Ready is a live "just
-  finished, look now" nudge, not durable state; the result is still in the
-  transcript. (Do **not** rely on "turn always resets to 0 on spawn":
-  `spawn_actor_dual` preserves a supplied `SessionState.stream.turn`
-  (`runloop.rs:141`); only the persistence-reload + current wake/reconnect paths
-  start at 0. Resetting acked from the *seed value* is robust either way.)
-- **Ack rule = continuous-while-focused, NOT set-once-on-focus.** The focused
-  card keeps `acked_turn == turn_counter` for as long as it is focused — set on
-  Promote **and re-advanced on every completion (via the Detailed `ScratchChanged`
-  source above) while focused**. On Demote it **freezes**. Rationale: acking only
-  on focus leaves turns completed *during* focus un-acked, so the focused card
-  would light **Ready while you watch it** (and stay stale-Ready on blur).
-  Continuous-ack = "`acked_turn` = the last turn you could have seen": a turn
-  completed **while focused** never raises Ready; only a completion **after blur**
-  does. The `Ready` formula is unchanged — only the ack-update rule.
-- **No persisted flag, no migration, no `Promote`-path coupling.**
+- **`last_completed_at`** is stamped **Lens-side by the poller** when it observes a
+  **running→idle transition** (a turn completed). It lives in `FleetStore` RAM on
+  the card. No lens-core field, no counter — status is already on the feed.
+- **Clears itself, no ack:** sending a prompt puts the session **`running`** →
+  Ready is false *by status*; on completion it's **`idle`** again → Ready re-lights.
+  So "respond to it" clears Ready for free. If you never respond, it **decays**
+  after `READY_DECAY`. Focus does **not** clear Ready (a focused card may glow — no
+  harm, no suppression logic).
+- **Survives reconnect for free:** `last_completed_at` is Lens RAM on the card,
+  which outlives an actor respawn — so a brief WS reconnect does **not** drop Ready
+  (the earlier ack model would have). Only a Lens restart or decay clears it.
+- **Coalescing-safe:** the poller compares the card's last-rendered status to the
+  new one, so a coalesced `running→idle` frame is still seen as a transition; a
+  `running→idle→running` collapse stays `running` (correctly not-Ready).
 
-**Forward-compat (cheap) — `put_read_state` on BLUR, not focus** (review-corrected).
-On **Demote**, call `Sessions::put_read_state(id, now, /*unread*/ false)` **on a
-background executor** (`cx.background_spawn` — it is a *blocking* client call,
-never on the gpui thread). Blur is when the local ack freezes, so local and server
-agree by construction (one write per focus-session, coalesced). A focus-time PUT
-would **diverge**: a turn completing after it advances the local ack but not
-server `last_seen`, and the server stores timestamps **verbatim** (`openapi.json`
-read-state: server does not interpret), so the next poll re-marks unread. Reading
-*other* devices' read-state (the triple) is **board-v2**; there it becomes the
-cross-device convergence source (server-up only) and `acked_turn` degrades to a
-pure optimistic-latency shim.
+**Ready is NOT read-state — decoupling a category error.** Two distinct concepts:
+- **Ready (glow)** = *unresolved live work*, Lens-local, decays. Above.
+- **Unread (dot)** = *haven't looked*, server read-state, cleared by **viewing**.
+  The server unread is **not** `viewer_unread` alone (that's only the explicit
+  override) — it's the **triple** `updated_at > viewer_last_seen && status finished`
+  (`openapi.json:3957-3964`), and it's **in-memory (resets on server restart)**.
+
+They no longer interact. `put_read_state` becomes a clean **board-v2** "seen"
+concern (written on **view/focus**, off the gpui thread), independent of Ready;
+board-v2 reads the triple, server-up only. The skeleton wires Ready (above) and
+leaves read-state to board-v2 (a finished session glows Ready briefly *and*
+carries an unread dot until viewed — exactly the web-UI model).
 
 ---
 
@@ -266,19 +246,20 @@ poller patches it from the unified feed, whose **ordering across the mode-switch
 is guaranteed by §3.1**:
 
 - **background / `Summary`:** `ActorFeed::Summary` → copy-assign the enriched
-  scalars (incl. activity + `last_completed_turn`).
+  scalars (incl. activity). On the fold, the poller stamps `last_completed_at` if
+  `status` transitioned `running→idle` (§3.5 Ready).
 - **focused / `Detailed`:** `Promote` emits `Rebased` (scalar reseed), then
   `StreamUpdate` deltas patch the **same** card fields. The focused fold must
   consume not only `StatusChanged`/`UsageChanged`/`ModelChanged` but also
   **`TodosChanged`/`ScratchChanged`** (or the activity line stalls while
-  focused). `TranscriptAdvanced` + streaming-tail route to the full replica —
-  **deferred with the transcript** (focused slot is empty in the skeleton).
+  focused); the same `running→idle` stamp applies off `StatusChanged`.
+  `TranscriptAdvanced` + streaming-tail route to the full replica — **deferred with
+  the transcript** (focused slot is empty in the skeleton).
 - `git_branch`/`workspace` refresh only on `Rebased`/summary snapshots
   (`ResourcesChanged` is a **valueless marker** — no incremental branch delta).
 
 The card renders identically in both modes; the skeleton **proves the mode-switch
-is order-correct** (background Summary → Promote/Detailed → Demote-emits-Summary),
-plus the Ready ack on focus.
+is order-correct** (background Summary → Promote/Detailed → Demote-emits-Summary).
 
 **Routing corrections (vs the enum):** `SnapshotRestored` carries only
 `Vec<PendingInput>` and does **not** seed card scalars (`Rebased` does); `Rebased`
@@ -293,7 +274,7 @@ and cloning its receiver would make *competing* consumers, not a broadcast). It
 also owns:
 
 - the map `(ConnectionId, SessionId) → SessionCard` **at the UI layer** (each a
-  **separate** entity) + `acked_turn` per card;
+  **separate** entity) + `last_completed_at` per card (§3.5 Ready);
 - the board's ordinal slot layout (shell §4.1);
 - **the promote/demote policy** (§9 registry responsibility): the focused session
   is Promoted; all others are spawned/held in `Summary`. The poller is the
@@ -328,11 +309,14 @@ No-cross-invalidation requires **all** of:
    remove the hazard entirely, **pin explicit tile width/height** and absorb every
    variable element **inside** it: the activity line is a **reserved slot** (blank
    when idle, never collapsing), repos render as **exactly one row + a `·+N`
-   overflow badge** (never a row-per-repo), long strings ellipsize (§6). Failed's
-   **Retry** and the §5.4 connection-state takeover are **reserved slots too**, not
-   content that grows the tile. Any full-detail affordance (repo list) is a
-   **floating overlay** (hover tooltip: dirties/repaints the hovered card but does
-   **not reflow siblings**) — never inline expansion, which would resize the tile.
+   overflow badge** (never a row-per-repo), long strings ellipsize (§6). **Failed's
+   `Retry` and the disconnected-state overlay render *within* the fixed tile too**
+   (Retry occupies the footer/activity slot; the connection-state overlay is an
+   in-bounds layer over the tile — never a card-sized region that grows the tile).
+   *(There is no §5.4 in this doc — the shell's §5.4 is a status-**line** takeover,
+   not a card region; corrected per re-review.)* Any full-detail affordance (repo
+   list) is a **floating overlay** (hover tooltip — dirties/repaints the hovered
+   card but does **not reflow siblings**), never inline expansion.
 
 The board/root *will* still re-render on a membership change (ancestor dirty);
 the guarantee is that **unchanged sibling cards do no render/paint work**. (The
@@ -369,8 +353,9 @@ design forwards raw input to the harness — **ESC must reach the harness**, so
 there is **no global ESC→board binding**. Card-click toggle:
 
 - Click a card → focus it (`FleetStore` **Promotes** it, Demotes the previous
-  focus). The focused card's `acked_turn` then **tracks `last_completed_turn`
-  continuously** until blur (§3.5 continuous-ack), freezing on Demote.
+  focus). Focus does **not** clear Ready (§3.5 timestamp model — Ready clears on
+  prompt or decay, not on view). A board-v2 `put_read_state` "seen" write on focus
+  is a *separate* concern (off-thread), not coupled to Ready.
 - In focused state (boards shrunk, **always visible** in the skeleton): click a
   **different** card → switch focus; click the **currently-focused** card → toggle
   back to board (Demote).
@@ -495,8 +480,9 @@ tabs, content persistence.
 The card renders shell §5.1 chrome from the **enriched `SummaryUpdate`** — coarse
 summary, never a transcript: status icon tile + **wave**, `<STATUS>`/`<Title>`,
 `<harness> · <model>`, **activity line**, `📁 repo ⑂ branch`, footer (host pill ·
-`~$spend` cumulative, `—` when `None` · `ctx %` bar), connection-state takeover
-(§5.4).
+`~$spend` cumulative, `—` when `None` · `ctx %` bar), and an in-tile
+connection-state overlay when disconnected (§4.4 — an in-bounds layer, not a
+resize).
 
 **Fixed-tile chrome rules (the §4.4 bounds invariant, made concrete).** The card
 is a **fixed-size tile**; every element occupies a reserved slot so no fold
@@ -508,8 +494,9 @@ changes outer bounds:
   **stable** workspace order — never reorders under a fold) `📁 <repo> ⑂ <branch>`;
   if >1 repo, suffix a compact **`·+N` badge** on the same row. `0` repos → `—`,
   slot still reserved.
-- **Full repo list** — a **hover tooltip** (floating overlay; repaints only the
-  hovered card, never reflows the grid). Not inline, not a per-repo row stack.
+- **Full repo list** — a **hover tooltip** (floating overlay; **does not reflow
+  siblings** — it dirties the hovered card, but no grid reflow). Not inline, not a
+  per-repo row stack.
 - All scalar strings (`<Title>`, model, activity, branch) **ellipsize** within the
   fixed bound.
 
@@ -519,8 +506,9 @@ changes outer bounds:
 > to the focused surfaces. (Shell-doc reconciliation, like the terminal seam.)
 
 **Wave ladder** (shell §5.1) — fully derivable from the enriched feed:
-Needs-input (`needs_attention`), **Ready** (`idle && turn_counter > acked_turn`,
-dual turn-source, §3.5), Working (`running/launching/waiting`), Failed (`status`/
+Needs-input (`needs_attention`), **Ready** (`idle && (now − last_completed_at) <
+READY_DECAY`, §3.5 — no ack/counter), Working (`running/launching/waiting`),
+Failed (`status`/
 `last_task_error`), Slept (lifecycle). Kebab commands wired: Sleep→`Sleep`,
 Send→`Send` — **not Interrupt**.
 
@@ -559,13 +547,12 @@ mounts a **real board + N real card views** in gpui's `TestAppContext` (headless
    then Promote then Detailed frames on the unified feed; assert the card ends on
    the Detailed projection (never regresses to a stale Summary), and blur emits a
    Summary that restores the coarse projection.
-   - **continuous-ack (§3.5) — exercise the Detailed turn-source, not a Summary
-     counter bump:** while focused, complete a turn **via `StreamUpdate::ScratchChanged`
-     (Detailed mode — no `SummaryUpdate` flows while focused)** and assert the card
-     does **not** go Ready; then Demote and complete another turn and assert it
-     **does** go Ready. This catches the real bug (continuous-ack having no
-     Detailed-mode source), which a `last_completed_turn++` (Summary-only) fixture
-     would false-pass.
+   - **Ready decay (§3.5) — timestamp model, no ack:** drive `running→idle`, assert
+     the card goes **Ready** (`last_completed_at` stamped); assert it **stays Ready
+     when focused** (focus does not clear it); assert sending (`→running`) clears
+     Ready **and** a subsequent `idle` re-lights it; assert Ready **clears after
+     `READY_DECAY`** (inject clock) with no status change; assert a simulated
+     reconnect (actor respawn, same card) **does not** drop a within-window Ready.
    - **`⌘.` dispatch (§5.1):** with a terminal-focused tab, fire `⌘.`; assert Demote
      fires **and zero PTY bytes are sent** (the app-level Action wins over the
      terminal key handler).
@@ -595,8 +582,8 @@ fleet-scale is retired only together with **live-verify at N≥10** (§7).
 
 **In:** the §3 lens-core phase (unified `ActorFeed`; scheduler dual-mode plumbing
 + spawn-in-Summary; emit-on-Demote + seed-on-spawn; enrich `SummaryUpdate` incl.
-`harness` field + `last_completed_turn`); Ready via counter (dual turn-source) +
-Lens-local continuous-ack + `put_read_state`-on-**blur** (off-thread);
+`harness` field); **Ready via `idle && recent-completion` timestamp** (RAM
+`last_completed_at`, no counter/ack, decays after `READY_DECAY`=5min);
 `lens-app`/`lens-ui` split; `FleetStore`
 (owns scheduler + promote/demote policy) + per-session poller + the §4.4 isolation
 invariant; board state + enriched card chrome + full wave ladder; focused-state
@@ -625,7 +612,8 @@ the §6.1 acceptance test.
   owned by **board-v2**; skeleton = warm/active only;
 - **inbound** cross-device read-state (`viewer_*` off the poll) — board-v2;
   **multi-connection** — needs the `FleetScheduler` registry re-keyed;
-- persisting `acked_turn` across restarts — refinement.
+- board-v2 read-state details: `viewer_last_seen == null` handling + which
+  statuses count as "finished" for the unread predicate.
 
 ---
 
@@ -633,17 +621,18 @@ the §6.1 acceptance test.
 
 - **Hermetic `lens-ui` tests** over `FakeFleet`: §6.1 assertions (independent
   cards, single-card repaint under `.cached`, mode-switch order-safety), card
-  chrome per feed variant, wave ladder incl. Ready-via-`acked_turn`, command-down.
+  chrome per feed variant, wave ladder incl. **Ready timestamp/decay** (§6.1:
+  lights on `running→idle`, stays under focus, clears on send + re-lights, decays
+  after `READY_DECAY`, survives reconnect), command-down.
 - **lens-core tests** for §3: unified `ActorFeed` ordering preserved across a
-  Promote/Demote transition; **Summary-mode actor with nonempty catch-up emits
-  `updates` then `summaries` on the single FIFO in order** (the interleave that
-  motivates §3.1 — `lens-drive` can't cover it, Detailed-only); reconnect /
+  Promote/Demote transition; **Summary-mode actor with nonempty catch-up + seed
+  emits `updates` then `summaries` on the single FIFO in order** (the interleave
+  that motivates §3.1 — `lens-drive` can't cover it, Detailed-only); reconnect /
   deferred-transcript-commit on the unified channel; emit-on-Demote; seed-on-spawn;
   spawn-in-Summary emits Summary (not `SummaryConsumerGone`); `SummaryUpdate`
-  enrichment; `last_completed_turn` tracks `stream.turn`. **The channel-shape
-  subset (§3.1+§3.2) is the hard merge gate (§3 preamble): green + cross-family/Opus
-  review + `lens-drive` still works, before any lens-ui view code. §3.3–§3.5 tests
-  may land alongside view code.**
+  enrichment. **The lens-core §3 work (§3.1–§3.4) is the hard merge gate (§3
+  preamble): green + cross-family/Opus review + `lens-drive` still works, before
+  any lens-ui view code. §3.5 (pure lens-ui) may land alongside view code.**
 - **Live-verify** (§7) as the acceptance gate.
 - Gate: `cargo clippy --workspace --all-targets -- -D warnings` + `fmt` clean.
 
@@ -771,3 +760,29 @@ yet." All folded in — several correct round-3's *own* fixes:**
   dispatch test (0 PTY bytes). Key kept (ESC=interrupt is the agentic convention).
 - **§5.2 superseded**: don't assert lens-ui observes it — blocked on the lens-core
   `folds.rs` drop (SPEC-GAPS).
+
+**Round 5 (re-review of the round-4 diff + a design step-back, 2026-07-15) —
+codex/gpt-5.6-sol + grok-4.5-xhigh; both said round-4 fixed the direction but left
+contracts incomplete. The step-back mooted most of them:**
+- **Ready wave rebuilt (§3.5) — the big one.** The user challenged *why Ready
+  decays on focus at all*. It shouldn't: focus is a peek, not a resolution. Ready
+  is now `status==idle && (now − last_completed_at) < READY_DECAY` (5 min, RAM
+  `last_completed_at` stamped on `running→idle`). **Deletes the entire ack
+  apparatus** (counter, `acked_turn`, continuous-ack, dual-mode turn source,
+  seed-reset, freeze timing) → re-review findings on all of those (no Detailed
+  turn-source, seed-discriminant, torn seed/ack, freeze-vs-coalesce, reconnect
+  Ready-loss) **no longer apply**. Clears on prompt (→running) or decay; survives
+  reconnect for free (RAM on the card); focus does nothing (a focused card may
+  glow — fine). Drops `last_completed_turn` from §3.4.
+- **Ready ≠ read-state** — decoupled a category error. `put_read_state` is now a
+  standalone board-v2 "seen" concern (write on view), independent of Ready.
+- **§3 gate re-widened to §3.1–§3.4** (the shared struct + the seed the gate's
+  interleave test needs are *not* parallelizable; round-4 over-narrowed). Only
+  §3.5, now **pure lens-ui**, parallelizes.
+- **§3.1 backpressure softened** — `bounded(64)` is a caller construction, not an
+  actor guarantee; "≤1 batch / never freeze / can't fill 64" struck; poller must
+  be async-only (no fg sync-wait) to avoid `send_blocking` deadlock.
+- **Phantom `§5.4` removed** — this doc has no §5.4; Failed `Retry` + the
+  disconnected overlay render *within* the fixed tile.
+- Stale-text sweep (§4.2/§4.3/§5.1/§6/§8/§9 ack references) + board-v2 read-state
+  detail deferrals (`viewer_last_seen==null`, "finished" statuses).
