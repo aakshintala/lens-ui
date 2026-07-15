@@ -1,6 +1,20 @@
 # Shared terminal infrastructure & E2E GPUI terminal tab
 
-**Status:** User-approved design, reconciled after the 2026-07-14 terminal grill
+> **⚠️ SUPERSEDED (2026-07-15) — VT-adoption mechanism only.**
+> This doc's Ghostty story — a "narrow, attributed **port** of gpui-ghostty"
+> gated by a provenance manifest that classifies every candidate file
+> adopt/adapt/exclude — is **dead**. The terminal VT is now a **vendored
+> `libghostty-rs` binding built from source** against a pinned Ghostty dev
+> commit (patched `zig@0.15`). See memories `terminal-vt-adoption-model` +
+> `zig-ghostty-macos26-scissor`, `docs/STATUS.md`, and
+> `docs/handoffs/2026-07-15-terminal-vt-libghostty-rs.md`.
+>
+> The model-**independent** goals here still largely hold (omnigent WS
+> transport, GPUI render/foreground-safety, typed boundaries owner-write /
+> viewer-read-only). A new design pass will supersede this doc in full; until
+> then, treat the VT-adoption sections as historical.
+
+**Status:** SUPERSEDED (see banner) — was: user-approved design, reconciled after the 2026-07-14 terminal grill
 
 ## Goal
 

@@ -1,5 +1,19 @@
 # Shared Terminal Infrastructure Implementation Roadmap
 
+> **⚠️ SUPERSEDED (2026-07-15) — VT-adoption + provenance sequencing is dead.**
+> The "provenance-controlled Ghostty **port**" / "narrow attributed gpui-ghostty
+> port" / "adopt/adapt/exclude every candidate file" / "full provenance manifest
+> before any upstream source enters Lens" packages no longer apply. VT is now a
+> **vendored `libghostty-rs` binding built from source** (pinned Ghostty dev +
+> patched `zig@0.15`); provenance collapsed to ordinary dependency vetting
+> (`vendor/libghostty-rs/README.md`). The `--workspace` gate line is also stale —
+> the real gate is scoped to production crates (vendored crates + spikes opt out).
+> Current model: memories `terminal-vt-adoption-model` +
+> `zig-ghostty-macos26-scissor`, `docs/STATUS.md`, and
+> `docs/handoffs/2026-07-15-terminal-vt-libghostty-rs.md`. The omnigent-transport,
+> GPUI-vertical-slice, and perf/lifecycle-hardening sequencing is model-agnostic
+> and will be re-expressed by a new design pass.
+
 > **For agentic workers:** This roadmap is sequencing authority, not an executable task plan. Before implementing a work package, create and approve its dedicated plan under `docs/plans/`; that plan must require `superpowers:subagent-driven-development` or `superpowers:executing-plans`, use checkbox steps, TDD, exact paths, exact verification, and frequent commits.
 
 **Goal:** Deliver the standalone, host-ready Lens GPUI terminal surface defined by the approved terminal workstream spec, including real omnigent attach/input/output/resize/reconnect behavior.
