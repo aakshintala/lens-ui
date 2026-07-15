@@ -35,9 +35,11 @@ fn activity_summary(s: &SessionState) -> String {
     if let Some(todo) = s.todos.iter().find(|t| t.status == TodoStatus::InProgress) {
         return todo.active_form.clone();
     }
-    for item_id in s.stream.unpaired_calls.values() {
-        if let Some(item) = s.items.iter().find(|i| &i.id == item_id)
-            && let ItemKind::FunctionCall { name, .. } = &item.kind
+    // First-started in-flight tool: scan items in order (deterministic) rather than
+    // iterating unpaired_calls (a HashMap → nondeterministic pick with >1 tool).
+    for item in &s.items {
+        if let ItemKind::FunctionCall { call_id, name, .. } = &item.kind
+            && s.stream.unpaired_calls.contains_key(call_id)
         {
             return name.clone();
         }
@@ -160,6 +162,56 @@ mod tests {
             kind: ItemKind::FunctionCall {
                 call_id,
                 name: "bash".into(),
+                arguments: serde_json::json!({}),
+                status: "in_progress".into(),
+                agent_name: None,
+            },
+        }));
+        assert_eq!(SummaryUpdate::from_state(&s).activity_summary, "bash");
+    }
+
+    #[test]
+    fn activity_summary_is_deterministic_with_two_in_flight_tools() {
+        let mut s = base();
+        let call_id_1 = CallId::new("call_1");
+        let call_id_2 = CallId::new("call_2");
+        let item_id_1 = ItemId::new("fc_1");
+        let item_id_2 = ItemId::new("fc_2");
+        s.stream
+            .unpaired_calls
+            .insert(call_id_1.clone(), item_id_1.clone());
+        s.stream
+            .unpaired_calls
+            .insert(call_id_2.clone(), item_id_2.clone());
+        s.items.push(Arc::new(Item {
+            id: item_id_1,
+            seq: None,
+            ctx: BlockContext {
+                agent: None,
+                depth: 0,
+                turn: 0,
+            },
+            created_at: 1,
+            kind: ItemKind::FunctionCall {
+                call_id: call_id_1,
+                name: "bash".into(),
+                arguments: serde_json::json!({}),
+                status: "in_progress".into(),
+                agent_name: None,
+            },
+        }));
+        s.items.push(Arc::new(Item {
+            id: item_id_2,
+            seq: None,
+            ctx: BlockContext {
+                agent: None,
+                depth: 0,
+                turn: 0,
+            },
+            created_at: 2,
+            kind: ItemKind::FunctionCall {
+                call_id: call_id_2,
+                name: "grep".into(),
                 arguments: serde_json::json!({}),
                 status: "in_progress".into(),
                 agent_name: None,
