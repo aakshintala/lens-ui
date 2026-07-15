@@ -79,9 +79,10 @@ and roll older "Recent" pointers off this page as they age.
     them regardless of mode (intended; the unified FIFO exists to keep them ordered vs Summary frames).
     §3.5 Ready *policy* (seen_turn detector / last_completed_at stamp / per-card decay one-shot /
     focus-suppress) is now Plan 2 lens-ui work, building over §3.4's `last_completed_turn`.
-  - **Deferred Minors (non-blocking):** `activity_summary` first-in-flight-tool iterates a HashMap
-    (nondeterministic for >1 concurrent tool — later tie-break); 6 `.is_ok()` presence-check drains +
-    `SummaryConsumerGone` naming left as-is.
+  - **✅ Final-review Minors all fixed (2026-07-15, merged `abacd6c..43a52df`):** `activity_summary`
+    now scans `items` in order (deterministic, was HashMap-order); 6 `.is_ok()` presence-check drains
+    strengthened to `recv_detailed` (panic-on-Summary); `ActorOutcome::SummaryConsumerGone` renamed
+    `FeedConsumerGone` (unified feed). 202 lens-core tests, workspace gate green.
   - **Design: `docs/specs/2026-07-14-lens-ui-shell-skeleton-design.md` — REVIEW-CLOSED at
     `0ce67ad` (2026-07-15).** Don't re-litigate; the decisions below are settled.
   - **Settled design decisions (see spec §§):** Ready = `idle && (now−last_completed_at)<5min`,
