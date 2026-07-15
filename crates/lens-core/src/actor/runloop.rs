@@ -776,7 +776,7 @@ fn finish_reconnected_catchup(
     if !needs_catchup {
         return LoopControl::Continue;
     }
-    if invoke_catchup_and_replay(ctx, emit_transport, true) == LoopControl::Break {
+    if invoke_catchup_and_replay(ctx, emit_transport, true, &mut false) == LoopControl::Break {
         return LoopControl::Break;
     }
     if defer_transcript_commit {
@@ -850,6 +850,10 @@ fn invoke_catchup_and_replay(
     ctx: &mut RunCtx<'_>,
     emit_transport: bool,
     held_reconcile: bool,
+    // Set true if any buffered live events were replayed (which, in Summary mode,
+    // already emit a Summary). The startup caller uses this to suppress a duplicate
+    // seed; reconnect callers pass a throwaway.
+    replayed_live: &mut bool,
 ) -> LoopControl {
     ctx.catchup_accum.clear();
     let mut frame_stack: Vec<CatchupFrame> = Vec::new();
@@ -892,6 +896,7 @@ fn invoke_catchup_and_replay(
             } => {
                 ctx.catchup_accum.extend(catchup_new_user_contents);
                 if !buffered_events.is_empty() {
+                    *replayed_live = true;
                     let replay = replay_buffered_batch(ctx, &buffered_events);
                     if replay.control == LoopControl::Break {
                         return LoopControl::Break;
@@ -1032,7 +1037,8 @@ fn run(
         snapshot_pending_inputs: &mut snapshot_pending_inputs,
     };
 
-    if invoke_catchup_and_replay(&mut ctx, false, false) == LoopControl::Break {
+    let mut replayed_live = false;
+    if invoke_catchup_and_replay(&mut ctx, false, false, &mut replayed_live) == LoopControl::Break {
         // pre-loop spawn catch-up: no TransportChanged — Sleep cannot race yet
         return;
     }
@@ -1041,7 +1047,13 @@ fn run(
     // catch-up so the card has data before the first live event. Seed-fail pushes
     // SummaryConsumerGone and continues (mirrors the Summary batch emit); it does
     // not abort the actor, so Stop still works.
+    //
+    // Suppressed when startup catch-up already replayed buffered live events: in
+    // Summary mode that replay already emits a Summary, so an unconditional seed
+    // would be a duplicate projection landing AFTER the live frame, violating the
+    // catch-up → seed → live order (codex final-review C1).
     if ctx.output.mode == OutputMode::Summary
+        && !replayed_live
         && ctx
             .output
             .feed
@@ -1798,6 +1810,59 @@ mod tests {
         );
 
         handle.stop_and_join();
+    }
+
+    /// codex final-review C1: when startup catch-up replays a buffered live event
+    /// (which in Summary mode already emits a Summary), the seed must be SUPPRESSED
+    /// so the FIFO is `Detailed(catch-up) → Summary(replayed live)` with no trailing
+    /// duplicate seed. Order stays catch-up → live; no double projection.
+    #[test]
+    fn summary_seed_suppressed_when_startup_replays_buffered_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(dir.path());
+        seed_connection(&stores);
+        // Disk frontier so catch-up fetches a nonempty page and emits TranscriptAdvanced.
+        seed_message_item(&*stores.transcript, 0, "item_0", "item_0");
+
+        let page = item_list_from_messages(&["item_1"], false);
+        let (api, _mock) = MockApi::with_fetch_script(VecDeque::from([Ok(page)]));
+
+        let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        // Queue a live event BEFORE spawn so startup catch-up buffers + replays it.
+        ev_tx.send(status_running_event()).unwrap();
+
+        let (feed_tx, feed_rx) = async_channel::bounded(64);
+        let handle = spawn_actor_dual(
+            fresh_state(),
+            ev_rx,
+            feed_tx,
+            OutputMode::Summary,
+            stores,
+            test_clock(),
+            api,
+        );
+
+        // Order: catch-up Detailed(TranscriptAdvanced) THEN the replayed live Summary.
+        assert!(
+            matches!(
+                feed_rx.recv_blocking().unwrap(),
+                ActorFeed::Detailed(StreamUpdate::TranscriptAdvanced { .. })
+            ),
+            "first frame must be the catch-up watermark"
+        );
+        assert!(
+            matches!(feed_rx.recv_blocking().unwrap(), ActorFeed::Summary(_)),
+            "second frame must be the replayed live Summary"
+        );
+
+        // Seed suppressed: after the actor is quiesced, no duplicate seed Summary remains.
+        handle.stop_and_join();
+        while let Ok(frame) = feed_rx.try_recv() {
+            assert!(
+                !matches!(frame, ActorFeed::Summary(_)),
+                "seed must be suppressed when startup already replayed a live Summary, got {frame:?}"
+            );
+        }
     }
 
     #[test]
@@ -3717,11 +3782,18 @@ mod tests {
             reconnect_delta,
             StreamUpdate::Reconnecting { attempt: 1 }
         ));
-        while let Ok(ActorFeed::Detailed(u)) = feed_rx.try_recv() {
-            assert!(
-                !matches!(u, StreamUpdate::PendingUserChanged(ref v) if v.is_empty()),
-                "bubble must not be cleared before snapshot reconcile"
-            );
+        while let Ok(frame) = feed_rx.try_recv() {
+            match frame {
+                ActorFeed::Detailed(u) => assert!(
+                    !matches!(u, StreamUpdate::PendingUserChanged(ref v) if v.is_empty()),
+                    "bubble must not be cleared before snapshot reconcile"
+                ),
+                // Detailed-mode test: a Summary here would silently end the drain and
+                // let a mis-wrapped clear-frame slip past (codex final-review C2).
+                ActorFeed::Summary(_) => {
+                    panic!("unexpected Summary in a Detailed-mode drain")
+                }
+            }
         }
 
         let snap = snapshot_fixture(serde_json::json!({
@@ -4283,8 +4355,13 @@ mod tests {
         ev_tx
             .send(ServerStreamEvent::SnapshotRestored(Box::new(snap)))
             .unwrap();
-        while let Ok(ActorFeed::Detailed(u)) = feed_rx.try_recv() {
-            let _ = u;
+        while let Ok(frame) = feed_rx.try_recv() {
+            // Detailed-mode setup drain: fail loud on a Summary rather than silently
+            // truncate (codex final-review C2).
+            assert!(
+                matches!(frame, ActorFeed::Detailed(_)),
+                "unexpected Summary in a Detailed-mode setup drain"
+            );
         }
 
         ev_tx
