@@ -4971,7 +4971,17 @@ mod tests {
             }
             match feed_rx.recv_blocking() {
                 Ok(_) => continue,
-                Err(_) => panic!("actor exited before committing the live provisional fc"),
+                // The actor thread can end (feed closes) right after its final commit;
+                // disk is the real invariant, so re-check it before declaring failure
+                // (avoids a parallel-load race where the close is observed before recv).
+                Err(_) => {
+                    assert_eq!(
+                        item_provisional_opt(&db_path, "fc_7ad94742b335"),
+                        Some(1),
+                        "actor exited before committing the live provisional fc"
+                    );
+                    break;
+                }
             }
         }
 
@@ -4986,7 +4996,16 @@ mod tests {
             }
             match feed_rx.recv_blocking() {
                 Ok(_) => continue,
-                Err(_) => panic!("actor exited before the reconnect delta fold landed"),
+                // See the live-commit loop above: the actor can end right after the
+                // fold commit; re-check disk before failing.
+                Err(_) => {
+                    assert_eq!(
+                        item_provisional_opt(&db_path, "fc_9bb8ae52357c40a2a2f696e37b81d681"),
+                        Some(0),
+                        "actor exited before the reconnect delta fold landed"
+                    );
+                    break;
+                }
             }
         }
         handle.stop_and_join();
