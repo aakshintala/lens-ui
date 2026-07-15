@@ -1,0 +1,29 @@
+# Pins for the vendored Ghostty VT binding. Human doc: README.md.
+# No machine verifier (the WP0 xtask terminal-provenance apparatus was removed).
+
+[libghostty_rs]
+remote = "https://github.com/Uzaaft/libghostty-rs"
+commit = "46a9d2ac941ed600cf43c5e6299c8dfd1d3a1ef0"
+tag = "0.2.1"
+spdx = "MIT OR Apache-2.0"
+vendored = true # crates/libghostty-vt + crates/libghostty-vt-sys
+
+[ghostty]
+remote = "https://github.com/ghostty-org/ghostty"
+commit = "a887df42c56f6de86c0fe6da9c4eeca37931e083"
+license = "MIT"
+vendored = false # fetched at build time; pinned in libghostty-vt-sys/build.rs GHOSTTY_COMMIT
+
+[zig]
+version = "0.15.2"
+source = "Homebrew zig@0.15 (patched; ziglang/zig#31658)"
+note = "keg-only; wired via .cargo/config.toml ZIG override"
+
+[deferred]
+# Flip both to the same trigger: when CI lands.
+vendored_ghostty_source = "GHOSTTY_SOURCE_DIR tree (~57-152M) — offline/hermetic build"
+prebuilt_archive = "commit libghostty-vt.a instead of building from source"
+
+[license_note]
+# Upstream declares dual SPDX but ships only MIT text; LICENSE here is that MIT file.
+apache_text_present = false
