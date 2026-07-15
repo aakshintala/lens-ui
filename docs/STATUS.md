@@ -9,16 +9,27 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Open threads & next up
 
-- **▶ ACTIVE: shared terminal workstream (2026-07-14):** grilled and reconciled
-  user-approved design
-  in [`specs/2026-07-14-terminal-workstream-design.md`](./specs/2026-07-14-terminal-workstream-design.md).
-  Deliver a standalone, renderable GPUI terminal tab backed by the real
-  omnigent terminal WS attach path — ready for `lens-ui` to host, but not
-  integrated into it. The adoption/source audit pinned `gpui-ghostty` + Ghostty,
-  deferred inline graphics, and executable omnigent 0.5.1 verification covered
-  32 focused terminal behaviors. The next step is the implementation plan plus
-  a real external-server E2E sentinel; native-harness rendered-stream/raw-TUI
-  toggle remains a separate spec.
+- **▶ ACTIVE: shared terminal workstream — ARCHITECTURE PIVOT 2026-07-15 (needs design redo).**
+  Original design ([`specs/2026-07-14-terminal-workstream-design.md`](./specs/2026-07-14-terminal-workstream-design.md))
+  assumed **porting Ghostty VT source** via the gpui-ghostty wrapper (adopt/adapt/exclude inventory,
+  WP0 provenance gate). **That model is now superseded.** This session:
+  - **WP0 plan revised** through Opus review (B1–B7) + **5 rounds of gpt-5.6-sol** review, committed
+    (`73738d5`); then **executed Tasks 1–4** subagent-driven (composer-2.5 + cross-family):
+    xtask verifier + CLI (17 tests, `db5a0b4`→`354d405`), archive hashes (`d9b2194`), adoption
+    inventory 45+742 (`5bb16ec`). **These are now built on the obsolete model — repurpose/discard.**
+  - **Task 5 (Zig build probe) hit a macOS-26 wall → resolved:** vanilla ziglang.org Zig ≤0.15.2 can't
+    link natively on macOS 26 (Xcode 26 bug, ziglang/zig#31658); the **Homebrew/Nix patched `zig@0.15`
+    (0.15.2)** works. Ghostty **v1.3.1** `lib-vt` builds natively with it. Memory
+    [[zig-ghostty-macos26-scissor]].
+  - **THE PIVOT (memory [[terminal-vt-adoption-model]]):** Ghostty v1.3.1 ships an official
+    `libghostty-vt` C API — but it's **WIP/parsers-only (0 terminal-screen export fns)**; the
+    feed/grid/scrollback surface is Zig-only (`lib_vt.zig`). So the VT is consumed as a **prebuilt
+    thin Zig→C FFI shim over Ghostty v1.3.1 lib_vt, built in CI (patched Zig), vendored as a static
+    lib + hash, bound via a Rust `-sys` crate** — NOT a source port. gpui-ghostty = reference only.
+    WP0 collapses to a small linked-lib provenance (pin + recipe + license + shim + artifact hash).
+  - **NEXT (fresh session):** redo the terminal design/spec on the linked-lib model → new WP plan
+    (CI shim build + vendored lib + `-sys` + provenance) → execute. GPUI 0.2.2 + omnigent pins
+    unchanged (out of scope for this refresh).
 
 - **📋 SPEC-GAPS backlog (2026-07-13):** nine independent, un-specced/partial
   subsystems parked in [`SPEC-GAPS.md`](./SPEC-GAPS.md) — app release/signing/update,
