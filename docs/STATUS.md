@@ -55,17 +55,30 @@ and roll older "Recent" pointers off this page as they age.
     `AGENTS.md` now pins the gate to **workspace-wide** `cargo clippy --workspace --all-targets
     -- -D warnings` with a clean-before-push + fix-red-before-start rule (`1b75dd0`).
 
-- **▶ NEXT: `lens-ui` (Bucket B viewport)** — first rendering consumer of the §13.2 seams
+- **▶ NEXT: `lens-ui` (Bucket B viewport) — DESIGN REVIEW-CLOSED; next = write plans + execute
+  (new session).** First rendering consumer of the §13.2 seams
   (StreamUpdate/SessionCommand/ActorOutcome), incl. the arch-B composer-owns-durability draft.
   lens-drive is the headless precedent proving the seams are drivable.
-  - **Design: `docs/specs/2026-07-14-lens-ui-shell-skeleton-design.md` — round-3 grill folded
-    (2026-07-15, `f31af5e`, vs gpui + lens-core source).** 7 branches hardened: fixed-size-tile
-    isolation invariant (content-sized cards reflow → sibling repaint), continuous-ack Ready
-    timing, `⌘.` navigation, §6.1 frame-driver caveat, terminal seam locked to the sibling
-    `lens-terminal-ws` workstream (identity-only `open(…,cx)` contract). **⚠ First build step is
-    the §3 lens-core phase (unified `ActorFeed` channel + enrich `SummaryUpdate` +
-    spawn-in-Summary + emit-on-Demote/seed-on-spawn), now a MERGE-GATED milestone** — one-way-door
-    actor change, cross-family+Opus review + `lens-drive` green **before any view code**.
+  - **Design: `docs/specs/2026-07-14-lens-ui-shell-skeleton-design.md` — REVIEW-CLOSED at
+    `0ce67ad` (2026-07-15).** Brainstorm + 2 cross-family rounds, then a grill (R3) and **three
+    cross-family diff-reviews (R4/R5/R6, codex/gpt-5.6-sol + grok-4.5-xhigh)** — converged (R6 =
+    one blocker, both families' identical fix, applied). Appendix A has the full disposition. Don't
+    re-litigate; the decisions below are settled.
+  - **⚠ FIRST BUILD STEP = the §3 lens-core phase, a MERGE-GATED milestone (§3.1–§3.4):** unified
+    `ActorFeed` channel (one FIFO replaces `updates`+`summaries` — the actor *does* interleave both,
+    so the merge is required for order), scheduler dual-mode + spawn-in-Summary, emit-on-Demote +
+    seed-on-spawn, enrich `SummaryUpdate` (incl. `harness` field + **`last_completed_turn` kept as
+    the Ready trigger**). One-way-door actor change → **cross-family + Opus review + Summary-mode/
+    catch-up/reconnect tests + `lens-drive` green BEFORE any view code** (lens-drive is Detailed-only,
+    can't validate Summary alone). Only §3.5's Ready *policy* (lens-ui) parallelizes over the struct.
+  - **Settled design decisions (see spec §§):** Ready = `idle && (now−last_completed_at)<5min`,
+    **triggered by the monotonic `last_completed_turn` (NOT a status edge — feed coalesces), per-card
+    decay one-shot notify, glow suppressed on focus** ([[coalescing-feed-monotonic-trigger]]); §4.4
+    fixed-size-tile isolation (pin W×H, 1 repo row + `·+N` + hover tooltip, Retry/disconnect overlay
+    in-bounds); `⌘.` back-to-board (app-level Action over terminal handler; `⌘\` deferred); §6.1
+    acceptance test (targeted notify not `refresh()`; downstream-sibling bounds test); terminal seam
+    = consume `lens-terminal::open(TerminalTarget, client, opts, cx)`, lens-ui adapts (identity-only,
+    locked with sibling `lens-terminal-ws`).
   - **New cross-spec risk filed (SPEC-GAPS):** `session.superseded` reducer-drop
     (`folds.rs:136` marker-only discards `target_conversation_id`) blocks the terminal
     supersession-reattach the sibling workstream delegates to lens-ui — lens-core must surface it;
