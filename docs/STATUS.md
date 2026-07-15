@@ -21,15 +21,20 @@ and roll older "Recent" pointers off this page as they age.
     link natively on macOS 26 (Xcode 26 bug, ziglang/zig#31658); the **Homebrew/Nix patched `zig@0.15`
     (0.15.2)** works. Ghostty **v1.3.1** `lib-vt` builds natively with it. Memory
     [[zig-ghostty-macos26-scissor]].
-  - **THE PIVOT (memory [[terminal-vt-adoption-model]]):** Ghostty v1.3.1 ships an official
-    `libghostty-vt` C API — but it's **WIP/parsers-only (0 terminal-screen export fns)**; the
-    feed/grid/scrollback surface is Zig-only (`lib_vt.zig`). So the VT is consumed as a **prebuilt
-    thin Zig→C FFI shim over Ghostty v1.3.1 lib_vt, built in CI (patched Zig), vendored as a static
-    lib + hash, bound via a Rust `-sys` crate** — NOT a source port. gpui-ghostty = reference only.
-    WP0 collapses to a small linked-lib provenance (pin + recipe + license + shim + artifact hash).
-  - **NEXT (fresh session):** redo the terminal design/spec on the linked-lib model → new WP plan
-    (CI shim build + vendored lib + `-sys` + provenance) → execute. GPUI 0.2.2 + omnigent pins
-    unchanged (out of scope for this refresh).
+  - **DECIDED MODEL (memory [[terminal-vt-adoption-model]]), PROVEN on hardware:** the terminal C API
+    (`terminal.h`/`screen.h`/`render.h`/`grid_ref*.h`) lives ONLY on Ghostty **dev** (release v1.3.1
+    `vt.h`=7 parser headers; dev `a887df42`=29 incl. the full terminal surface). **[libghostty-rs]**
+    (Uzaaft, MIT/Apache) already binds it — `libghostty-vt-sys` (checked-in bindings) + `libghostty-vt`
+    (safe `Terminal`/`vt_write`/`RenderState`/`Cell`/scrollback), pinning Ghostty dev in `build.rs`.
+    **VERIFIED:** builds on macOS 26.6 w/ patched `zig@0.15` in 33s, 29 tests pass, example drives a
+    real terminal. **Model = VENDOR libghostty-rs + BUILD FROM SOURCE** (patched zig prereq;
+    `GHOSTTY_SOURCE_DIR`→pinned vendored Ghostty; ~33s cached build) — NOT a shim, NOT a source port,
+    NOT prebuilt (no CI yet; prebuilt = flip-a-switch later). gpui-ghostty = reference only. WP0's
+    provenance apparatus collapses to **dependency vetting** (pin libghostty-rs + Ghostty commit +
+    vendored-source hash + license closure). Tasks 1–4 artifacts are for the dead model → discard.
+  - **NEXT:** design/plan the new build (vendor the 2 crates + pinned Ghostty source into the
+    workspace, wire the zig build + PATH, verify Lens builds it) → then the **GPUI render layer +
+    omnigent PTY-attach** on the safe API. GPUI 0.2.2 + omnigent pins unchanged.
 
 - **📋 SPEC-GAPS backlog (2026-07-13):** nine independent, un-specced/partial
   subsystems parked in [`SPEC-GAPS.md`](./SPEC-GAPS.md) — app release/signing/update,
