@@ -64,3 +64,40 @@ fn forbidden_adopt_fails() {
             .any(|x| matches!(x, VerifyError::ForbiddenAdopt { .. }))
     );
 }
+
+#[test]
+fn vendor_blank_probe_section_fails() {
+    let e = load_and_verify(&fixture("vendor-blank-probe"), VerificationMode::Vendor).unwrap_err();
+    assert!(
+        e.iter()
+            .any(|x| matches!(x, VerifyError::FixtureMarkerInVendorMode { .. }))
+    );
+}
+
+#[test]
+fn vendor_single_archive_hash_fails() {
+    let e = load_and_verify(&fixture("vendor-one-hash"), VerificationMode::Vendor).unwrap_err();
+    assert!(
+        e.iter()
+            .any(|x| matches!(x, VerifyError::FixtureMarkerInVendorMode { .. }))
+    );
+}
+
+#[test]
+fn vendor_duplicate_archive_name_fails() {
+    let e = load_and_verify(&fixture("vendor-dup-archive"), VerificationMode::Vendor).unwrap_err();
+    assert!(
+        e.iter()
+            .any(|x| matches!(x, VerifyError::FixtureMarkerInVendorMode { .. }))
+    );
+}
+
+#[test]
+fn vendor_wrong_archive_name_fails() {
+    let e =
+        load_and_verify(&fixture("vendor-wrong-archive"), VerificationMode::Vendor).unwrap_err();
+    assert!(
+        e.iter()
+            .any(|x| matches!(x, VerifyError::FixtureMarkerInVendorMode { .. }))
+    );
+}

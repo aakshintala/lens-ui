@@ -223,10 +223,7 @@ pub fn load_and_verify(root: &Path, mode: VerificationMode) -> Result<(), Vec<Ve
         }
     };
 
-    let inventory = match collect_inventory(&adoption, &mut errors) {
-        Some(inv) => inv,
-        None => return Err(errors),
-    };
+    let inventory = collect_inventory(&adoption, &mut errors);
 
     validate_inventory(&provenance, &inventory, mode, &mut errors);
     validate_artifacts(root, &provenance, mode, &mut errors);
@@ -391,17 +388,10 @@ fn validate_sha256_field(value: &str, field: &str, errors: &mut Vec<VerifyError>
     }
 }
 
-fn collect_inventory(adoption: &AdoptionToml, errors: &mut Vec<VerifyError>) -> Option<Inventory> {
+fn collect_inventory(adoption: &AdoptionToml, errors: &mut Vec<VerifyError>) -> Inventory {
     let wrappers = collect_rows(&adoption.wrapper, errors);
     let mirrors = collect_rows(&adoption.mirror, errors);
-    if errors
-        .iter()
-        .any(|e| matches!(e, VerifyError::UnknownDisposition { .. }))
-    {
-        None
-    } else {
-        Some(Inventory { wrappers, mirrors })
-    }
+    Inventory { wrappers, mirrors }
 }
 
 fn collect_rows(raw_rows: &[InventoryRowRaw], errors: &mut Vec<VerifyError>) -> Vec<InventoryRow> {
@@ -555,16 +545,16 @@ fn validate_gpui_reconciliation(
     }
 }
 
-fn parse_build_probe_sections(content: &str) -> HashMap<String, String> {
-    let mut sections = HashMap::new();
+fn parse_build_probe_sections(content: &str) -> HashMap<String, Vec<String>> {
+    let mut sections: HashMap<String, Vec<String>> = HashMap::new();
     let mut current: Option<String> = None;
     let mut body = String::new();
 
-    let flush = |sections: &mut HashMap<String, String>,
+    let flush = |sections: &mut HashMap<String, Vec<String>>,
                  current: &mut Option<String>,
                  body: &mut String| {
         if let Some(name) = current.take() {
-            sections.insert(name, std::mem::take(body));
+            sections.entry(name).or_default().push(std::mem::take(body));
         }
     };
 
@@ -595,19 +585,20 @@ fn validate_build_probe(root: &Path, mode: VerificationMode, errors: &mut Vec<Ve
         }
     };
 
+    if mode == VerificationMode::Vendor && content.contains("FIXTURE") {
+        errors.push(VerifyError::FixtureMarkerInVendorMode {
+            field: BUILD_PROBE_FILE.to_string(),
+        });
+    }
+
     let sections = parse_build_probe_sections(&content);
     for heading in BUILD_PROBE_HEADINGS {
         match sections.get(*heading) {
             None => errors.push(VerifyError::BuildProbeIncomplete {
                 field: (*heading).to_string(),
             }),
-            Some(body) if mode == VerificationMode::Vendor => {
-                if body.contains("FIXTURE") {
-                    errors.push(VerifyError::FixtureMarkerInVendorMode {
-                        field: (*heading).to_string(),
-                    });
-                }
-                if body.trim().is_empty() {
+            Some(bodies) if mode == VerificationMode::Vendor => {
+                if bodies.iter().any(|body| body.trim().is_empty()) {
                     errors.push(VerifyError::FixtureMarkerInVendorMode {
                         field: (*heading).to_string(),
                     });
@@ -707,11 +698,16 @@ fn validate_source_archives(
 }
 
 fn vendor_archive_lines_valid(content: &str) -> bool {
-    let lines: Vec<&str> = content
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect();
+    if content.is_empty() {
+        return false;
+    }
+
+    let body = content.strip_suffix('\n').unwrap_or(content);
+    if body.is_empty() {
+        return false;
+    }
+
+    let lines: Vec<&str> = body.split('\n').collect();
     if lines.len() != 2 {
         return false;
     }
@@ -722,6 +718,9 @@ fn vendor_archive_lines_valid(content: &str) -> bool {
         let Some((hash, name)) = line.split_once("  ") else {
             return false;
         };
+        if hash.len() != 64 || name.is_empty() {
+            return false;
+        }
         if !is_nonzero_sha256(hash) {
             return false;
         }
@@ -844,7 +843,64 @@ mod unit_tests {
         let wrong = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  wrong-one.tar\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  wrong-two.tar\n";
         assert!(!vendor_archive_lines_valid(wrong));
 
-        let good = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  gpui-ghostty-e3025981.tar\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  ghostty-6d2dd585.tar\n";
+        let good = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  gpui-ghostty-e3025981.tar\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  ghostty-6d2dd585.tar";
         assert!(vendor_archive_lines_valid(good));
+        assert!(vendor_archive_lines_valid(&format!("{good}\n")));
+
+        let padded = " aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  gpui-ghostty-e3025981.tar\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  ghostty-6d2dd585.tar\n";
+        assert!(!vendor_archive_lines_valid(padded));
+
+        let extra_blank = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  gpui-ghostty-e3025981.tar\n\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  ghostty-6d2dd585.tar\n";
+        assert!(!vendor_archive_lines_valid(extra_blank));
+    }
+
+    #[test]
+    fn vendor_build_probe_duplicate_heading_blank_fails_even_if_later_nonempty() {
+        let content = "\
+# Build probe
+
+## zig_version
+
+## zig_version
+0.14.1
+
+## bootstrap_sha256
+x
+
+## build_command
+x
+
+## build_exit_code
+x
+
+## object_list
+x
+
+## dependency_list
+x
+
+## compile_closure_path_count
+x
+
+## offline_ziglyph
+x
+
+## renderer_cell_coupling
+x
+
+## artifact_sha256
+x
+
+## license_closure
+x
+
+## raw_log_path
+x
+
+## raw_log_sha256
+x
+";
+        let sections = parse_build_probe_sections(content);
+        assert!(sections["zig_version"].iter().any(|b| b.trim().is_empty()));
     }
 }
