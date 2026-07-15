@@ -55,22 +55,35 @@ and roll older "Recent" pointers off this page as they age.
     `AGENTS.md` now pins the gate to **workspace-wide** `cargo clippy --workspace --all-targets
     -- -D warnings` with a clean-before-push + fix-red-before-start rule (`1b75dd0`).
 
-- **▶ NEXT: `lens-ui` (Bucket B viewport) — DESIGN REVIEW-CLOSED; next = write plans + execute
-  (new session).** First rendering consumer of the §13.2 seams
-  (StreamUpdate/SessionCommand/ActorOutcome), incl. the arch-B composer-owns-durability draft.
-  lens-drive is the headless precedent proving the seams are drivable.
+- **▶ NEXT: `lens-ui` skeleton Plan 2 (§4–§7 + §3.5 Ready policy) — the §3 gate is DONE+merged;
+  write Plan 2 + execute (new session).** First rendering consumer of the §13.2 seams.
+  `lens-drive` is the headless Detailed-only precedent; real live-verify (N≥10 Summary cards +
+  promote/demote) is Plan 2's acceptance (deferred here — lens-drive can't drive the Summary path).
+  - **✅ DONE (2026-07-15): §3 lens-core ActorFeed gate MERGED + pushed to `main`** (`f67e686..7e9a2e7`,
+    10 code commits + plan). The merge-gated one-way-door milestone (§3.1–§3.4): unified `ActorFeed`
+    FIFO (replaces `updates`+`summaries`), scheduler dual-mode + spawn-in-Summary, seed-on-spawn +
+    emit-on-Demote, enriched `SummaryUpdate` (+ `last_completed_turn` + RAM-only `SessionState.harness`
+    snapshot-fold, **no schema migration**). Plan authored by **grok-4.5** (Opus source-verified);
+    executed subagent-driven — composer-2.5 per task + **codex/gpt-5.5 cross-family** seam reviews +
+    **fresh Opus** whole-branch. 201 lens-core lib tests (stable), `clippy --workspace --all-targets
+    -D warnings` clean, `generated.rs` untouched. **Reviews earned their keep:** codex caught a Task-2
+    Critical false-green (silent `while let Detailed` drains) + a Task-4 Important; the final review
+    SPLIT — Opus SHIP vs codex FIX-FIRST — adjudicated against source (C1 seed-duplicate-on-startup-
+    replay FIXED + regression test; C2 partially valid → 2 bare drains hardened, rest safe-by-
+    construction) → codex re-verified clean. **Trust-but-verify** caught a composer mid-task stall
+    (Task 4 → completed inline) + a composer over-claimed flaky-red gate (Task 5 → de-flaked a
+    pre-existing d30 timing race). Plan: `docs/plans/2026-07-15-lens-core-actorfeed-gate.md`; memory
+    [[grok45-as-plan-author]].
+  - **⚠ PLAN 2 ARCH NOTE (carry into the lens-ui poller/card):** a Summary-mode card consumer MUST
+    tolerate occasional `Detailed(TranscriptAdvanced)` watermarks — catch-up + deferred-commit emit
+    them regardless of mode (intended; the unified FIFO exists to keep them ordered vs Summary frames).
+    §3.5 Ready *policy* (seen_turn detector / last_completed_at stamp / per-card decay one-shot /
+    focus-suppress) is now Plan 2 lens-ui work, building over §3.4's `last_completed_turn`.
+  - **Deferred Minors (non-blocking):** `activity_summary` first-in-flight-tool iterates a HashMap
+    (nondeterministic for >1 concurrent tool — later tie-break); 6 `.is_ok()` presence-check drains +
+    `SummaryConsumerGone` naming left as-is.
   - **Design: `docs/specs/2026-07-14-lens-ui-shell-skeleton-design.md` — REVIEW-CLOSED at
-    `0ce67ad` (2026-07-15).** Brainstorm + 2 cross-family rounds, then a grill (R3) and **three
-    cross-family diff-reviews (R4/R5/R6, codex/gpt-5.6-sol + grok-4.5-xhigh)** — converged (R6 =
-    one blocker, both families' identical fix, applied). Appendix A has the full disposition. Don't
-    re-litigate; the decisions below are settled.
-  - **⚠ FIRST BUILD STEP = the §3 lens-core phase, a MERGE-GATED milestone (§3.1–§3.4):** unified
-    `ActorFeed` channel (one FIFO replaces `updates`+`summaries` — the actor *does* interleave both,
-    so the merge is required for order), scheduler dual-mode + spawn-in-Summary, emit-on-Demote +
-    seed-on-spawn, enrich `SummaryUpdate` (incl. `harness` field + **`last_completed_turn` kept as
-    the Ready trigger**). One-way-door actor change → **cross-family + Opus review + Summary-mode/
-    catch-up/reconnect tests + `lens-drive` green BEFORE any view code** (lens-drive is Detailed-only,
-    can't validate Summary alone). Only §3.5's Ready *policy* (lens-ui) parallelizes over the struct.
+    `0ce67ad` (2026-07-15).** Don't re-litigate; the decisions below are settled.
   - **Settled design decisions (see spec §§):** Ready = `idle && (now−last_completed_at)<5min`,
     **triggered by the monotonic `last_completed_turn` (NOT a status edge — feed coalesces), per-card
     decay one-shot notify, glow suppressed on focus** ([[coalescing-feed-monotonic-trigger]]); §4.4
