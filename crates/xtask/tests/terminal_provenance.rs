@@ -66,6 +66,51 @@ fn forbidden_adopt_fails() {
 }
 
 #[test]
+fn cli_rejects_missing_pin_fixture() {
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_xtask"))
+        .args(["terminal-provenance", "--root"])
+        .arg(fixture("missing-pin"))
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(1));
+}
+
+// B7 (R2/R3): the SAME valid fixture passes without --upstream (Fixture mode) but fails with
+// --upstream (Vendor mode), AND the failure output NAMES the Vendor-mode marker — so mode selection,
+// not incidental upstream enumeration, is the proven cause (assert on the variant, not just exit 1).
+#[test]
+fn cli_valid_fixture_passes_fixture_mode_but_fails_vendor_mode() {
+    let ok = std::process::Command::new(env!("CARGO_BIN_EXE_xtask"))
+        .args(["terminal-provenance", "--root"])
+        .arg(fixture("valid"))
+        .output()
+        .unwrap();
+    assert_eq!(
+        ok.status.code(),
+        Some(0),
+        "no --upstream ⇒ Fixture mode ⇒ pass"
+    );
+
+    let vendor = std::process::Command::new(env!("CARGO_BIN_EXE_xtask"))
+        .args(["terminal-provenance", "--root"])
+        .arg(fixture("valid"))
+        .arg("--upstream")
+        .arg(fixture("valid"))
+        .output()
+        .unwrap();
+    assert_eq!(vendor.status.code(), Some(1));
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&vendor.stdout),
+        String::from_utf8_lossy(&vendor.stderr)
+    );
+    assert!(
+        out.contains("FixtureMarkerInVendorMode"),
+        "Vendor mode (not upstream enumeration) must be the proven cause; got:\n{out}"
+    );
+}
+
+#[test]
 fn vendor_blank_probe_section_fails() {
     let e = load_and_verify(&fixture("vendor-blank-probe"), VerificationMode::Vendor).unwrap_err();
     assert!(

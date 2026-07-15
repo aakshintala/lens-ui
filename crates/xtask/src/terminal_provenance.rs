@@ -1,7 +1,8 @@
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
+use std::process::{Command, Stdio};
 
 const EXPECTED_ZIG_VERSION: &str = "0.14.1";
 const EXPECTED_GPUI_STRATEGY: &str = "single_crates_io_0_2_2";
@@ -236,7 +237,6 @@ pub fn load_and_verify(root: &Path, mode: VerificationMode) -> Result<(), Vec<Ve
 
     if mode == VerificationMode::Vendor {
         validate_vendor_locked_pins(&provenance, &mut errors);
-        // TODO(Task 2): recompute git archive SHA-256 from `--upstream` checkout.
         // TODO(Task 5/7): verify committed probe-log `raw_log_sha256` bindings.
     }
 
@@ -829,6 +829,338 @@ fn validate_vendor_locked_pins(provenance: &ProvenanceToml, errors: &mut Vec<Ver
 fn hex_sha256(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// CLI entry: `--upstream` present selects Vendor mode and runs upstream enumeration +
+/// archive recompute in addition to [`load_and_verify`].
+pub fn run_terminal_provenance(root: &Path, upstream: Option<&Path>) -> anyhow::Result<()> {
+    let mode = if upstream.is_some() {
+        VerificationMode::Vendor
+    } else {
+        VerificationMode::Fixture
+    };
+
+    let mut errors = load_and_verify(root, mode).err().unwrap_or_default();
+
+    if let Some(upstream_path) = upstream {
+        errors.extend(validate_upstream_enumeration(root, upstream_path));
+        errors.extend(validate_archive_recompute(root, upstream_path));
+    }
+
+    if errors.is_empty() {
+        println!("terminal-provenance: ok");
+        Ok(())
+    } else {
+        for err in &errors {
+            eprintln!("{err:?}");
+        }
+        anyhow::bail!(
+            "terminal-provenance verification failed ({} error(s))",
+            errors.len()
+        )
+    }
+}
+
+fn normalize_mirror_path(path: &str) -> String {
+    path.strip_prefix("src/").unwrap_or(path).to_string()
+}
+
+fn run_git(cwd: &Path, args: &[&str]) -> Result<String, VerifyError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .map_err(|err| VerifyError::MissingArtifact {
+            path: format!("upstream git spawn: {err}"),
+        })?;
+    if !output.status.success() {
+        return Err(VerifyError::MissingArtifact {
+            path: format!(
+                "upstream git {}: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn git_ls_files(cwd: &Path, pathspec: Option<&str>) -> Result<Vec<String>, VerifyError> {
+    let mut args = vec!["ls-files"];
+    if let Some(spec) = pathspec {
+        args.push(spec);
+    }
+    let stdout = run_git(cwd, &args)?;
+    Ok(stdout
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+fn enumerate_upstream_wrappers(upstream: &Path) -> Result<BTreeSet<String>, VerifyError> {
+    let files = git_ls_files(upstream, None)?;
+    Ok(files
+        .into_iter()
+        .filter(|path| {
+            !path.starts_with("vendor/ghostty")
+                && !path.contains("ghostty_src")
+                && path != ".gitmodules"
+        })
+        .collect())
+}
+
+fn enumerate_upstream_mirrors(upstream: &Path) -> Result<BTreeSet<String>, VerifyError> {
+    let ghostty = upstream.join("vendor/ghostty");
+    if !ghostty.is_dir() {
+        return Err(VerifyError::MissingArtifact {
+            path: format!("upstream: {}", ghostty.display()),
+        });
+    }
+    let files = git_ls_files(&ghostty, Some("src/**"))?;
+    Ok(files
+        .into_iter()
+        .map(|p| normalize_mirror_path(&p))
+        .collect())
+}
+
+fn validate_upstream_enumeration(root: &Path, upstream: &Path) -> Vec<VerifyError> {
+    let mut errors = Vec::new();
+
+    if run_git(upstream, &["rev-parse", "--git-dir"]).is_err() {
+        errors.push(VerifyError::MissingArtifact {
+            path: format!("upstream: {} is not a git checkout", upstream.display()),
+        });
+        return errors;
+    }
+
+    let provenance_path = root.join("provenance.toml");
+    let provenance = match read_toml::<ProvenanceToml>(&provenance_path) {
+        Ok(p) => p,
+        Err(err) => {
+            errors.push(err);
+            return errors;
+        }
+    };
+
+    let adoption_path = root.join("adoption.toml");
+    let adoption = match read_toml::<AdoptionToml>(&adoption_path) {
+        Ok(a) => a,
+        Err(err) => {
+            errors.push(err);
+            return errors;
+        }
+    };
+
+    let inventory = collect_inventory(&adoption, &mut errors);
+
+    let live_wrappers = match enumerate_upstream_wrappers(upstream) {
+        Ok(paths) => paths,
+        Err(err) => {
+            errors.push(err);
+            return errors;
+        }
+    };
+    let adoption_wrappers: BTreeSet<String> = inventory
+        .wrappers
+        .iter()
+        .map(|row| row.path.clone())
+        .collect();
+
+    if let Some(expected) = provenance.wrapper_file_count
+        && live_wrappers.len() != expected
+    {
+        errors.push(VerifyError::WrapperCountMismatch {
+            expected,
+            got: live_wrappers.len(),
+        });
+    }
+    if live_wrappers.len() != adoption_wrappers.len() {
+        errors.push(VerifyError::WrapperCountMismatch {
+            expected: adoption_wrappers.len(),
+            got: live_wrappers.len(),
+        });
+    }
+    for path in adoption_wrappers.difference(&live_wrappers) {
+        errors.push(VerifyError::MissingInventoryPath { path: path.clone() });
+    }
+    for path in live_wrappers.difference(&adoption_wrappers) {
+        errors.push(VerifyError::ExtraInventoryPath { path: path.clone() });
+    }
+
+    let live_mirrors = match enumerate_upstream_mirrors(upstream) {
+        Ok(paths) => paths,
+        Err(err) => {
+            errors.push(err);
+            return errors;
+        }
+    };
+    let adoption_mirrors: BTreeSet<String> = inventory
+        .mirrors
+        .iter()
+        .map(|row| row.path.clone())
+        .collect();
+
+    if let Some(expected) = provenance.mirror_file_count
+        && live_mirrors.len() != expected
+    {
+        errors.push(VerifyError::MirrorCountMismatch {
+            expected,
+            got: live_mirrors.len(),
+        });
+    }
+    if live_mirrors.len() != adoption_mirrors.len() {
+        errors.push(VerifyError::MirrorCountMismatch {
+            expected: adoption_mirrors.len(),
+            got: live_mirrors.len(),
+        });
+    }
+    for path in adoption_mirrors.difference(&live_mirrors) {
+        errors.push(VerifyError::MissingInventoryPath { path: path.clone() });
+    }
+    for path in live_mirrors.difference(&adoption_mirrors) {
+        errors.push(VerifyError::ExtraInventoryPath { path: path.clone() });
+    }
+
+    errors
+}
+
+fn git_archive_sha256(repo: &Path, commit: &str) -> Result<String, VerifyError> {
+    let child = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["archive", "--format=tar", commit])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| VerifyError::MissingArtifact {
+            path: format!("git archive spawn in {}: {err}", repo.display()),
+        })?;
+
+    let output = child
+        .wait_with_output()
+        .map_err(|err| VerifyError::MissingArtifact {
+            path: format!("git archive wait in {}: {err}", repo.display()),
+        })?;
+
+    if !output.status.success() {
+        return Err(VerifyError::MissingArtifact {
+            path: format!(
+                "git archive {commit} in {}: {}",
+                repo.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        });
+    }
+
+    Ok(hex_sha256(&output.stdout))
+}
+
+fn parse_recorded_archive_hashes(content: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let body = content.strip_suffix('\n').unwrap_or(content);
+    for line in body.split('\n').filter(|line| !line.is_empty()) {
+        if let Some((hash, name)) = line.split_once("  ") {
+            out.insert(name.to_string(), hash.to_string());
+        }
+    }
+    out
+}
+
+fn validate_archive_recompute(root: &Path, upstream: &Path) -> Vec<VerifyError> {
+    let mut errors = Vec::new();
+
+    if run_git(upstream, &["rev-parse", "--git-dir"]).is_err() {
+        errors.push(VerifyError::MissingArtifact {
+            path: format!("upstream: {} is not a git checkout", upstream.display()),
+        });
+        return errors;
+    }
+
+    let provenance_path = root.join("provenance.toml");
+    let provenance = match read_toml::<ProvenanceToml>(&provenance_path) {
+        Ok(p) => p,
+        Err(err) => {
+            errors.push(err);
+            return errors;
+        }
+    };
+
+    let archive_file = provenance
+        .archive_hash_file
+        .as_deref()
+        .unwrap_or(DEFAULT_ARCHIVE_HASH_FILE);
+    let archive_path = root.join(archive_file);
+    let recorded = match fs::read_to_string(&archive_path) {
+        Ok(content) => parse_recorded_archive_hashes(&content),
+        Err(_) => {
+            errors.push(VerifyError::MissingArtifact {
+                path: archive_file.to_string(),
+            });
+            return errors;
+        }
+    };
+
+    let gpui_commit = match provenance.gpui_ghostty_commit.as_deref() {
+        Some(commit) if !commit.is_empty() => commit,
+        _ => {
+            errors.push(VerifyError::MissingPin {
+                field: "gpui_ghostty_commit".to_string(),
+            });
+            return errors;
+        }
+    };
+    let ghostty_commit = match provenance.ghostty_commit.as_deref() {
+        Some(commit) if !commit.is_empty() => commit,
+        _ => {
+            errors.push(VerifyError::MissingPin {
+                field: "ghostty_commit".to_string(),
+            });
+            return errors;
+        }
+    };
+
+    let gpui_hash = match git_archive_sha256(upstream, gpui_commit) {
+        Ok(hash) => hash,
+        Err(err) => {
+            errors.push(err);
+            String::new()
+        }
+    };
+    if !gpui_hash.is_empty() {
+        match recorded.get(ARCHIVE_GPUI_NAME) {
+            Some(expected) if *expected == gpui_hash => {}
+            Some(expected) => errors.push(VerifyError::MissingHash {
+                name: format!("{ARCHIVE_GPUI_NAME} (expected {expected}, got {gpui_hash})"),
+            }),
+            None => errors.push(VerifyError::MissingHash {
+                name: ARCHIVE_GPUI_NAME.to_string(),
+            }),
+        }
+    }
+
+    let ghostty_repo = upstream.join("vendor/ghostty");
+    let ghostty_hash = match git_archive_sha256(&ghostty_repo, ghostty_commit) {
+        Ok(hash) => hash,
+        Err(err) => {
+            errors.push(err);
+            String::new()
+        }
+    };
+    if !ghostty_hash.is_empty() {
+        match recorded.get(ARCHIVE_GHOSTTY_NAME) {
+            Some(expected) if *expected == ghostty_hash => {}
+            Some(expected) => errors.push(VerifyError::MissingHash {
+                name: format!("{ARCHIVE_GHOSTTY_NAME} (expected {expected}, got {ghostty_hash})"),
+            }),
+            None => errors.push(VerifyError::MissingHash {
+                name: ARCHIVE_GHOSTTY_NAME.to_string(),
+            }),
+        }
+    }
+
+    errors
 }
 
 #[cfg(test)]
