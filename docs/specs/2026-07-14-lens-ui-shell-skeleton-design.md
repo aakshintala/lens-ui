@@ -4,12 +4,13 @@
 folded in** (codex/gpt + grok-4.5-xhigh, both vs lens-core source): round 1
 corrected the feed (D10 dual-mode `SummaryUpdate`, not gated `StreamUpdate`);
 round 2 (verify-the-fixes) drove the **unified `ActorFeed` channel** decision and
-the implementation-precision fixes below. **Rounds 3 (grill) → 4 → 5
+the implementation-precision fixes below. **Rounds 3 (grill) → 4 → 5 → 6
 (cross-family reviews of each diff — codex/gpt-5.6-sol + grok-4.5-xhigh,
-2026-07-15)** folded in — see Appendix A. Round 5's headline: the whole
-focus-ack Ready apparatus (counter/`acked_turn`/continuous-ack/dual-source) was
-**deleted** for a simple **`idle && recent-completion` timestamp** (§3.5) that
-moots the ack findings entirely. First rendering consumer of the state model.
+2026-07-15)** folded in — see Appendix A. Net on the Ready wave: the focus-ack
+apparatus was **deleted** for an **`idle && recent-completion` timestamp**, then
+round 6 fixed its trigger — stamp on the **monotonic completion counter** (not a
+status edge, which coalescing hides) + a per-card **decay timer**. First rendering
+consumer of the state model.
 **Depends on:** `lens-core` (actor/`FleetScheduler`/`SummaryUpdate`/`StreamUpdate`/
 `SessionCommand`/`ActorOutcome`, through P3-3b, live-verified vs omnigent 0.5.1);
 `lens-client` (REST surface incl. `put_read_state` + `viewer_*` read fields);
@@ -76,19 +77,20 @@ interleave test needs to be deterministic (re-review-corrected — an earlier
 work, §3.1–§3.4**, landing as a **separately-reviewed, separately-merged milestone
 — cross-family + Opus review — BEFORE any lens-ui view code** (Opus-level,
 actor-touching; reversing the public channel/struct later is expensive). The
-**only truly parallel piece is §3.5**, which is now **pure lens-ui** (RAM
-`last_completed_at` + `status`, no lens-core field) — it can be built against
-`FakeFleet` alongside the gate.
+parallel piece is §3.5's **Ready policy** (stamp/decay/render), which is lens-ui
+logic — but it **consumes §3.4's `last_completed_turn`** (its coalesce-safe
+trigger, re-review-corrected), so it builds against `FakeFleet` *after* the §3.4
+struct lands (early in the gate), not against a status-only field.
 
 **Gate evidence must exercise Summary mode — `lens-drive` alone does NOT
 (review-corrected).** `lens-drive` is single-session **Detailed-only**, so it
 cannot validate the unified channel's Summary/interleave paths. The gate therefore
 requires **new lens-core tests**: a Summary-mode actor with **nonempty startup
-catch-up + the §3.3 seed** (emits `updates` then `summaries` — the interleave that
-motivates the merge; note the interleave is *only* deterministic *with* the seed,
-so §3.3 is gate-adjacent, not deferrable), plus **reconnect /
-deferred-transcript-commit** on the unified channel. `lens-drive` green is
-necessary but not sufficient.
+catch-up + the §3.3 seed** emits `ActorFeed::Detailed(…)` (the catch-up
+`TranscriptAdvanced`) **then** `ActorFeed::Summary(…)` on the single FIFO in order
+(the interleave that motivates the merge; deterministic *only with* the seed, so
+§3.3 is gate-adjacent), plus **reconnect / deferred-transcript-commit**.
+`lens-drive` green is necessary but not sufficient.
 
 ### 3.1 Unified `ActorFeed` channel (the keystone)
 
@@ -171,8 +173,10 @@ field below is available in Summary mode:
   `cumulative_cost`, `context_window` (+ existing `last_total_tokens` → ctx %),
   `sandbox_status`, `git_branch`/`workspace`, `reasoning_effort`; an **activity
   summary** (derived: `todos.activeForm` ▸ in-flight tool ▸ blank).
-- *(No completed-turn counter — the §3.5 Ready model dropped it; `status` alone,
-  already on `SummaryUpdate`, drives the Ready transition.)*
+- **`last_completed_turn: u32`** — `state.stream.turn` (bumped on
+  `response.completed`, `reduce/mod.rs:132`). It is the **completion trigger** for
+  §3.5 Ready — a *monotonic* signal that survives feed coalescing (a status edge
+  does not; re-review-corrected). Not an ack; not compared for the Ready decision.
 - **`harness`** — **not on `SessionState` today** (it lives only on
   `lens-client::SessionSnapshot`). Add a lens-core `SessionState.harness` field
   folded from the snapshot at bootstrap, so `<harness> · <model>` (shell §5.1)
@@ -181,32 +185,49 @@ field below is available in Summary mode:
 
 Cadence stays coarse (ms–s) — D10's scale property holds; no per-token deltas.
 
-### 3.5 Ready wave — idle-with-a-recent-completion (timestamp, no ack machinery)
+### 3.5 Ready wave — idle-with-a-recent-completion (timestamp + monotonic trigger)
 
 Ready is a **live "just finished, look now" nudge, not durable state.** The prior
-draft tied it to *focus* (an ack cleared on view), which was both wrong (peeking
-≠ resolving) and the source of an entire ack apparatus (counter, `acked_turn`,
-continuous-ack, dual-mode turn source, seed-reset, freeze timing). All of that is
-**deleted.** The model that survived the grill's re-review:
+draft tied it to *focus* (an ack cleared on view) — wrong (peeking ≠ resolving)
+and the source of an entire ack apparatus (`acked_turn`, continuous-ack, dual-mode
+turn source, seed-reset, freeze timing). All of **that is deleted.** What remains:
 
 ```
 Ready  ==  status == idle  &&  (now − last_completed_at) < READY_DECAY   // default 5 min, tunable
 ```
 
-- **`last_completed_at`** is stamped **Lens-side by the poller** when it observes a
-  **running→idle transition** (a turn completed). It lives in `FleetStore` RAM on
-  the card. No lens-core field, no counter — status is already on the feed.
-- **Clears itself, no ack:** sending a prompt puts the session **`running`** →
-  Ready is false *by status*; on completion it's **`idle`** again → Ready re-lights.
-  So "respond to it" clears Ready for free. If you never respond, it **decays**
-  after `READY_DECAY`. Focus does **not** clear Ready (a focused card may glow — no
-  harm, no suppression logic).
-- **Survives reconnect for free:** `last_completed_at` is Lens RAM on the card,
-  which outlives an actor respawn — so a brief WS reconnect does **not** drop Ready
-  (the earlier ack model would have). Only a Lens restart or decay clears it.
-- **Coalescing-safe:** the poller compares the card's last-rendered status to the
-  new one, so a coalesced `running→idle` frame is still seen as a transition; a
-  `running→idle→running` collapse stays `running` (correctly not-Ready).
+- **Trigger = the monotonic completion counter, NOT a status edge (re-review-corrected).**
+  A `running→idle` status edge is *not* observable through feed coalescing (the
+  actor greedily drains and coalesces; a whole `idle→running→idle` turn can arrive
+  as `idle→idle`, `runloop.rs:702/1166`) *and* isn't semantically "completion"
+  anyway (`response.completed` bumps `stream.turn` independently of status). So the
+  card keeps a `seen_turn` (RAM edge-detector); on a **Summary** fold, **if
+  `SummaryUpdate.last_completed_turn > seen_turn` → stamp `last_completed_at = now`,
+  advance `seen_turn`.** `last_completed_turn` is monotonic, so it survives
+  coalescing and fires for *any* completion path (`waiting→idle`, `launching→idle`,
+  …), which a status edge misses. `seen_turn` is a detector, **never** the Ready
+  criterion (that's the timestamp) — this is *not* the resurrected ack.
+- **`last_completed_at`** lives in `FleetStore` RAM on the card.
+- **Clears itself, no ack:** sending a prompt → session `running` → Ready false *by
+  status*; completion → `idle` → Ready re-lights. If you never respond, it
+  **decays**.
+- **Decay needs a wake, not just a formula (re-review-corrected).** On each stamp,
+  (re)schedule a **per-card one-shot** `cx` timer at `last_completed_at + READY_DECAY`
+  that **notifies ONLY that card entity** (§4.4-safe — never `FleetStore`/board) to
+  re-evaluate Ready; else the glow sticks until unrelated activity. N one-shots at
+  fleet scale is fine.
+- **Focus:** does not clear Ready — but the **Ready glow is suppressed on the
+  currently-focused card** as a pure render check (`is_focused → skip wave`, no
+  state): a card you're deep-reading shouldn't keep pulsing at you. Non-focused
+  cards glow normally.
+- **Reconnect is just another Summary fold:** seed compared via `seen_turn` → stamp
+  iff the counter advanced (gap-work re-lights correctly; no false `running→idle`
+  stamp, no stale-`running` suppression). Survives a brief blip (RAM on the card);
+  a completion *during* a long gap re-stamps on the seed.
+- **Two honest limitations (not bugs):** a session finished **before Lens attached**
+  shows no Ready (seed inits `seen_turn = last_completed_turn`, no completion time
+  to stamp) — the durable signal is board-v2 unread. And skeleton Ready is
+  **live-only**: it decays in `READY_DECAY` with no durable trace until board-v2.
 
 **Ready is NOT read-state — decoupling a category error.** Two distinct concepts:
 - **Ready (glow)** = *unresolved live work*, Lens-local, decays. Above.
@@ -247,14 +268,15 @@ is guaranteed by §3.1**:
 
 - **background / `Summary`:** `ActorFeed::Summary` → copy-assign the enriched
   scalars (incl. activity). On the fold, the poller stamps `last_completed_at` if
-  `status` transitioned `running→idle` (§3.5 Ready).
+  `last_completed_turn > seen_turn` (§3.5 Ready trigger — monotonic, coalesce-safe).
 - **focused / `Detailed`:** `Promote` emits `Rebased` (scalar reseed), then
   `StreamUpdate` deltas patch the **same** card fields. The focused fold must
   consume not only `StatusChanged`/`UsageChanged`/`ModelChanged` but also
-  **`TodosChanged`/`ScratchChanged`** (or the activity line stalls while
-  focused); the same `running→idle` stamp applies off `StatusChanged`.
-  `TranscriptAdvanced` + streaming-tail route to the full replica — **deferred with
-  the transcript** (focused slot is empty in the skeleton).
+  **`TodosChanged`/`ScratchChanged`** (or the activity line stalls while focused).
+  Ready is **not** stamped while focused (glow is suppressed on the focused card
+  anyway, §3.5); a completion-while-focused is picked up by the counter on the
+  next **Summary** fold at Demote. `TranscriptAdvanced` + streaming-tail route to
+  the full replica — **deferred with the transcript** (focused slot is empty).
 - `git_branch`/`workspace` refresh only on `Rebased`/summary snapshots
   (`ResourcesChanged` is a **valueless marker** — no incremental branch delta).
 
@@ -274,7 +296,8 @@ and cloning its receiver would make *competing* consumers, not a broadcast). It
 also owns:
 
 - the map `(ConnectionId, SessionId) → SessionCard` **at the UI layer** (each a
-  **separate** entity) + `last_completed_at` per card (§3.5 Ready);
+  **separate** entity) + per-card `last_completed_at` + `seen_turn` + the decay
+  one-shot handle (§3.5 Ready);
 - the board's ordinal slot layout (shell §4.1);
 - **the promote/demote policy** (§9 registry responsibility): the focused session
   is Promoted; all others are spawned/held in `Summary`. The poller is the
@@ -353,9 +376,10 @@ design forwards raw input to the harness — **ESC must reach the harness**, so
 there is **no global ESC→board binding**. Card-click toggle:
 
 - Click a card → focus it (`FleetStore` **Promotes** it, Demotes the previous
-  focus). Focus does **not** clear Ready (§3.5 timestamp model — Ready clears on
-  prompt or decay, not on view). A board-v2 `put_read_state` "seen" write on focus
-  is a *separate* concern (off-thread), not coupled to Ready.
+  focus). Focus does **not** clear Ready (§3.5 — Ready clears on prompt or decay,
+  not view), but the Ready glow is **suppressed on the focused card** (render-time,
+  §3.5). A board-v2 `put_read_state` "seen" write on focus is a *separate* concern
+  (off-thread), not coupled to Ready.
 - In focused state (boards shrunk, **always visible** in the skeleton): click a
   **different** card → switch focus; click the **currently-focused** card → toggle
   back to board (Demote).
@@ -547,20 +571,25 @@ mounts a **real board + N real card views** in gpui's `TestAppContext` (headless
    then Promote then Detailed frames on the unified feed; assert the card ends on
    the Detailed projection (never regresses to a stale Summary), and blur emits a
    Summary that restores the coarse projection.
-   - **Ready decay (§3.5) — timestamp model, no ack:** drive `running→idle`, assert
-     the card goes **Ready** (`last_completed_at` stamped); assert it **stays Ready
-     when focused** (focus does not clear it); assert sending (`→running`) clears
-     Ready **and** a subsequent `idle` re-lights it; assert Ready **clears after
-     `READY_DECAY`** (inject clock) with no status change; assert a simulated
-     reconnect (actor respawn, same card) **does not** drop a within-window Ready.
+   - **Ready trigger + decay (§3.5) — counter-triggered, no ack:** (a) **coalesce
+     test** — deliver a **single** Summary frame whose `last_completed_turn` jumped
+     (a whole `idle→running→idle` turn collapsed to `idle`) and assert the card goes
+     **Ready** (proves the monotonic trigger; a status-edge detector would miss it);
+     (b) sending (`→running`) clears Ready and a later `idle`+counter-bump re-lights;
+     (c) Ready **clears after `READY_DECAY`** via the **per-card one-shot** (inject
+     clock; assert the decay timer notified **only** the card entity, `FleetStore`
+     notify==0); (d) glow **suppressed on the focused card**; (e) a simulated
+     reconnect (respawn, same card) with **no counter advance does not** drop a
+     within-window Ready, and **with** an advanced seed re-stamps.
    - **`⌘.` dispatch (§5.1):** with a terminal-focused tab, fire `⌘.`; assert Demote
      fires **and zero PTY bytes are sent** (the app-level Action wins over the
      terminal key handler).
 
 **This is a mechanism proof, not "D10 retired" (review calibration).** §6.1 +
-`FakeFleet` prove the sibling-cache / mode-order / ack mechanics; they do **not**
-exercise the real N-warm scheduler or production `refreshing=true` paths. D10-at-
-fleet-scale is retired only together with **live-verify at N≥10** (§7).
+`FakeFleet` prove the sibling-cache / mode-order / Ready-trigger-and-decay
+mechanics; they do **not** exercise the real N-warm scheduler or production
+`refreshing=true` paths. D10-at-fleet-scale is retired only together with
+**live-verify at N≥10** (§7).
 
 ---
 
@@ -582,8 +611,9 @@ fleet-scale is retired only together with **live-verify at N≥10** (§7).
 
 **In:** the §3 lens-core phase (unified `ActorFeed`; scheduler dual-mode plumbing
 + spawn-in-Summary; emit-on-Demote + seed-on-spawn; enrich `SummaryUpdate` incl.
-`harness` field); **Ready via `idle && recent-completion` timestamp** (RAM
-`last_completed_at`, no counter/ack, decays after `READY_DECAY`=5min);
+`harness` field + `last_completed_turn` as the Ready trigger); **Ready via
+`idle && recent-completion` timestamp** (RAM `last_completed_at`, counter-triggered
++ per-card decay one-shot, no ack, `READY_DECAY`=5min, glow suppressed on focus);
 `lens-app`/`lens-ui` split; `FleetStore`
 (owns scheduler + promote/demote policy) + per-session poller + the §4.4 isolation
 invariant; board state + enriched card chrome + full wave ladder; focused-state
@@ -621,18 +651,19 @@ the §6.1 acceptance test.
 
 - **Hermetic `lens-ui` tests** over `FakeFleet`: §6.1 assertions (independent
   cards, single-card repaint under `.cached`, mode-switch order-safety), card
-  chrome per feed variant, wave ladder incl. **Ready timestamp/decay** (§6.1:
-  lights on `running→idle`, stays under focus, clears on send + re-lights, decays
-  after `READY_DECAY`, survives reconnect), command-down.
+  chrome per feed variant, wave ladder incl. **Ready trigger+decay** (§6.1:
+  counter-triggered/coalesce-safe, glow suppressed on focus, clears on send +
+  re-lights, per-card decay one-shot, reconnect handling), command-down.
 - **lens-core tests** for §3: unified `ActorFeed` ordering preserved across a
   Promote/Demote transition; **Summary-mode actor with nonempty catch-up + seed
-  emits `updates` then `summaries` on the single FIFO in order** (the interleave
-  that motivates §3.1 — `lens-drive` can't cover it, Detailed-only); reconnect /
-  deferred-transcript-commit on the unified channel; emit-on-Demote; seed-on-spawn;
-  spawn-in-Summary emits Summary (not `SummaryConsumerGone`); `SummaryUpdate`
-  enrichment. **The lens-core §3 work (§3.1–§3.4) is the hard merge gate (§3
-  preamble): green + cross-family/Opus review + `lens-drive` still works, before
-  any lens-ui view code. §3.5 (pure lens-ui) may land alongside view code.**
+  emits `ActorFeed::Detailed(…)` then `ActorFeed::Summary(…)` on the single FIFO in
+  order** (the interleave that motivates §3.1 — `lens-drive` can't cover it,
+  Detailed-only); reconnect / deferred-transcript-commit on the unified channel;
+  emit-on-Demote; seed-on-spawn; spawn-in-Summary emits Summary (not
+  `SummaryConsumerGone`); `SummaryUpdate` enrichment incl. `last_completed_turn`.
+  **The lens-core §3 work (§3.1–§3.4) is the hard merge gate (§3 preamble): green +
+  cross-family/Opus review + `lens-drive` still works, before any lens-ui view
+  code. §3.5's Ready policy (lens-ui, over §3.4's counter) may land alongside.**
 - **Live-verify** (§7) as the acceptance gate.
 - Gate: `cargo clippy --workspace --all-targets -- -D warnings` + `fmt` clean.
 
@@ -786,3 +817,26 @@ contracts incomplete. The step-back mooted most of them:**
   disconnected overlay render *within* the fixed tile.
 - Stale-text sweep (§4.2/§4.3/§5.1/§6/§8/§9 ack references) + board-v2 read-state
   detail deferrals (`viewer_last_seen==null`, "finished" statuses).
+
+**Round 6 (re-review of the round-5 diff, 2026-07-15) — codex/gpt-5.6-sol +
+grok-4.5-xhigh; both hit the SAME blocker with the SAME fix. The timestamp model
+was right; its *trigger* was wrong:**
+- **BLOCKER: `running→idle` status-edge detection is not coalescing-safe** and
+  isn't semantically "completion" — the actor greedily drains/coalesces
+  (`runloop.rs:702/1166`) so a whole `idle→running→idle` turn arrives as `idle→idle`
+  (no stamp), and `response.completed` bumps `stream.turn` independently of status.
+  **Fix (both prescribed): trigger on the monotonic `last_completed_turn`** (kept on
+  `SummaryUpdate`, restored to §3.4) via a `seen_turn` edge-detector — *not* an ack.
+  Fires for any completion path (`waiting→idle` etc.) and survives coalescing.
+- **Decay needs a wake:** a per-card one-shot timer that notifies **only the card
+  entity** (§4.4-safe) at `last_completed_at + READY_DECAY` — else the glow sticks.
+- **§3.5 isn't pure-lens-ui** — its trigger is §3.4's counter; the Ready *policy*
+  (lens-ui) builds over that gated field, so "pure lens-ui parallel" was overstated.
+- **Reconnect handled by the same counter compare** (stamp iff `seen_turn` advanced;
+  no false status-edge stamp). **Two limitations stated:** pre-attach completions
+  show no Ready (→ board-v2 unread); skeleton Ready is live-only.
+- **Focused-glow suppressed** (grok pushback accepted — a card you're reading
+  shouldn't pulse; one-line render check, no state).
+- **Terminology:** gate tests now say `ActorFeed::Detailed(…)` then `Summary(…)`
+  (post-merge), not "`updates` then `summaries`"; §6.1 "ack mechanics" → "Ready
+  trigger-and-decay". Backpressure softening confirmed source-correct.
