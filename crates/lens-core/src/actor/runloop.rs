@@ -529,6 +529,15 @@ fn handle_command(
         }
         SessionCommand::Demote => {
             output.mode = OutputMode::Summary;
+            // §3.3 emit-on-Demote: blur returns the card to the summary projection
+            // instead of freezing on the last Detailed frame (symmetric with Promote).
+            if output
+                .feed
+                .send_blocking(ActorFeed::Summary(SummaryUpdate::from_state(state)))
+                .is_err()
+            {
+                return LoopControl::Break;
+            }
             LoopControl::Continue
         }
         SessionCommand::Send {
@@ -1022,6 +1031,21 @@ fn run(
     if invoke_catchup_and_replay(&mut ctx, false, false) == LoopControl::Break {
         // pre-loop spawn catch-up: no TransportChanged — Sleep cannot race yet
         return;
+    }
+
+    // §3.3 seed-on-spawn: a Summary-mode actor emits its initial projection after
+    // catch-up so the card has data before the first live event. Seed-fail pushes
+    // SummaryConsumerGone and continues (mirrors the Summary batch emit); it does
+    // not abort the actor, so Stop still works.
+    if ctx.output.mode == OutputMode::Summary
+        && ctx
+            .output
+            .feed
+            .send_blocking(ActorFeed::Summary(SummaryUpdate::from_state(ctx.state)))
+            .is_err()
+    {
+        ctx.ring.push(ActorOutcome::SummaryConsumerGone);
+        drain_outcome_ring(ctx.ring, &ctx.output.outcomes);
     }
 
     loop {
@@ -1674,6 +1698,12 @@ mod tests {
             noop_api(),
         );
 
+        // §3.3 seed-on-spawn: drain the initial Summary seed before driving events.
+        assert!(
+            matches!(feed_rx.recv_blocking().unwrap(), ActorFeed::Summary(_)),
+            "spawn-in-Summary seeds an initial Summary projection"
+        );
+
         ev_tx.send(status_running_event()).unwrap();
         assert!(matches!(
             feed_rx.recv_blocking().unwrap(),
@@ -1686,6 +1716,59 @@ mod tests {
 
         handle.commands.send(SessionCommand::Promote).unwrap();
         assert!(matches!(recv_detailed(&feed_rx), StreamUpdate::Rebased(_)));
+        handle.stop_and_join();
+    }
+
+    #[test]
+    fn summary_spawn_seeds_after_catchup() {
+        let _dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(_dir.path());
+        seed_connection(&stores);
+
+        let (_ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (feed_tx, feed_rx) = async_channel::bounded(64);
+        let handle = spawn_actor_dual(
+            fresh_state(),
+            ev_rx,
+            feed_tx,
+            OutputMode::Summary,
+            stores,
+            test_clock(),
+            noop_api(),
+        );
+
+        // Empty catch-up → no TranscriptAdvanced; seed must still arrive.
+        match feed_rx.recv_blocking().expect("seed") {
+            ActorFeed::Summary(u) => {
+                assert_eq!(u.last_completed_turn, 0);
+            }
+            other => panic!("expected Summary seed, got {other:?}"),
+        }
+        handle.stop_and_join();
+    }
+
+    #[test]
+    fn demote_emits_summary_from_state() {
+        let _dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(_dir.path());
+        seed_connection(&stores);
+
+        let mut state = fresh_state();
+        state.title = Some("focused".into());
+        state.stream.turn = 3;
+
+        let (_ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (feed_tx, feed_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(state, ev_rx, feed_tx, stores, test_clock(), noop_api());
+
+        handle.commands.send(SessionCommand::Demote).unwrap();
+        match feed_rx.recv_blocking().expect("demote summary") {
+            ActorFeed::Summary(u) => {
+                assert_eq!(u.title.as_deref(), Some("focused"));
+                assert_eq!(u.last_completed_turn, 3);
+            }
+            other => panic!("expected Summary on Demote, got {other:?}"),
+        }
         handle.stop_and_join();
     }
 
