@@ -3691,6 +3691,17 @@ mod tests {
             })
             .unwrap();
 
+        // FIFO frames: spawn seed, then the Demote emit, then the Send emit
+        // (commands are processed in order). Drain the first two so the final
+        // assertion actually verifies the Send-path Summary, not the seed.
+        assert!(
+            matches!(feed_rx.recv_blocking().unwrap(), ActorFeed::Summary(_)),
+            "spawn-in-Summary seed"
+        );
+        assert!(
+            matches!(feed_rx.recv_blocking().unwrap(), ActorFeed::Summary(_)),
+            "emit-on-Demote"
+        );
         assert!(
             matches!(feed_rx.recv_blocking().unwrap(), ActorFeed::Summary(_)),
             "summary emitted on send"
