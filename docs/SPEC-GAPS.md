@@ -87,6 +87,21 @@ Ordering below is by "blocks shipping Lens to a second human" (roughly).
 
 ## Cross-spec risks discovered during design
 
+- **lens-core drops `session.superseded`'s redirect target — blocks terminal
+  supersession reattach** (found 2026-07-15, grill of `docs/specs/2026-07-14-lens-ui-shell-skeleton-design.md`
+  §5.2). The terminal workstream (`lens-terminal-ws`) delegates to lens-ui:
+  observe public `session.superseded` and feed `target_conversation_id` into the
+  terminal tab so it reattaches the same terminal under the new conversation
+  (native `/clear` supersession; there is no public transfer route). But the
+  reducer folds `SessionEvent::Superseded { .. }` to **nothing** — marker-only,
+  `crates/lens-core/src/reduce/folds.rs:136` — so `target_conversation_id` never
+  reaches the feed. Fix (terminal-integration era, **not** the lens-ui skeleton):
+  lens-core must surface it, e.g. `StreamUpdate::Superseded { target_conversation_id,
+  reason }`. Transient / live-only / no-replay in the 0.5.1 contract, so the
+  durable `message`-item notice (persisted on the old conversation) is the
+  separate reload path. Owner: whoever lands the terminal-integration slice;
+  flagged to the terminal agent so they don't assume observation is free.
+
 - **Permissions spec — mode-change elicitations are TUI-only for native harnesses**
   (found 2026-07-14 spike, `docs/spikes/2026-07-14-tui-native-elicitation.md`).
   For `claude-native`, generic tool permissions round-trip fine from Lens's

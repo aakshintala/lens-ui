@@ -4,16 +4,19 @@
 folded in** (codex/gpt + grok-4.5-xhigh, both vs lens-core source): round 1
 corrected the feed (D10 dual-mode `SummaryUpdate`, not gated `StreamUpdate`);
 round 2 (verify-the-fixes) drove the **unified `ActorFeed` channel** decision and
-the implementation-precision fixes below. First rendering consumer of the state
-model.
+the implementation-precision fixes below. **Round 3 (grill, 2026-07-15, vs gpui +
+lens-core source) folded in** — see Appendix A: §3 merge-gate, fixed-size-tile
+isolation invariant, continuous-ack Ready timing, `⌘.` navigation, terminal seam
+locked to the sibling workstream. First rendering consumer of the state model.
 **Depends on:** `lens-core` (actor/`FleetScheduler`/`SummaryUpdate`/`StreamUpdate`/
 `SessionCommand`/`ActorOutcome`, through P3-3b, live-verified vs omnigent 0.5.1);
 `lens-client` (REST surface incl. `put_read_state` + `viewer_*` read fields);
 framework lock (gpui 0.2.2); application shell/layout; state model §9 (D10
 dual-mode) / §10 (list poll) / §13.2 (seams).
 **Feeds:** the parallel surface workstreams (transcript, terminal, workspace,
-permissions) — they plug into the slot API + `SessionAttach` this skeleton
-publishes.
+permissions) — they plug into the slot API (`ContentTab`/`TabHandle`) this
+skeleton publishes; the terminal stream is *hosted* by lens-ui via
+`lens-terminal::open(...)` (§5.2), not via a lens-ui-published attach type.
 
 ---
 
@@ -58,6 +61,15 @@ actor** (per-session poller); a shared bus would be wrong.
 ## 3. lens-core phase — unify, complete, and mode-switch the feed
 
 Four engine changes (each gets cross-family review — they touch the actor):
+
+**Implementation-sequencing gate (hard phase boundary, not soft ordering).**
+Although this is co-designed with its sole consumer (§4–7) in one doc, §3 is
+**not "skeleton plumbing"**: §3.1 is a **one-way door** on the actor's public
+channel shape and §3 is Opus-level, actor-touching work (CLAUDE.md). It therefore
+lands as its **own separately-reviewed, separately-merged lens-core milestone —
+cross-family + Opus review, all §9 lens-core tests green, `lens-drive` still
+working — BEFORE any lens-ui view code begins.** Do not merge §3 under-scrutinized
+alongside view code; the "skeleton" title covers §4–7, not this.
 
 ### 3.1 Unified `ActorFeed` channel (the keystone)
 
@@ -126,24 +138,58 @@ field below is available in Summary mode:
 
 Cadence stays coarse (ms–s) — D10's scale property holds; no per-token deltas.
 
-### 3.5 Ready wave — completed-turn counter + Lens-local ack (no migration)
+### 3.5 Ready wave — warm fast-path echo of read-state (no migration)
 
-"Ready = idle **with an unacknowledged completed turn**." Rather than a persisted
-`has_unseen_result` flag (which would need a real SQLite ALTER + a `Promote`-path
-write), derive it from the exposed counter + **Lens-local** ack:
+"Ready = idle **with an unacknowledged completed turn**." There is **one**
+concept here — server read-state — with a **local warm fast-path**. The
+authoritative cross-device/across-restart signal is the server's
+`viewer_unread`, but it rides only the **fleet poll** (§10), so it updates at
+poll cadence and isn't wired in the skeleton (→ board-v2). For a warm card you
+want Ready to light at **turn-completion latency**, so the skeleton derives it
+from the feed and treats the local ack as the **optimistic echo of the
+`put_read_state` we already write** — not a parallel invention. The two are
+complementary regimes, not substitutes: **warm/live → feed counter (instant);
+non-warm/cross-device/across-restart → `viewer_unread` (poll, board-v2).**
 
-- `SummaryUpdate.last_completed_turn` advances on each turn completion.
-- `FleetStore` holds a per-card `acked_turn` (RAM); **on focus it sets
-  `acked_turn = last_completed_turn`**. `Ready = status==idle &&
-  last_completed_turn > acked_turn`.
-- **No persisted flag, no migration, no `Promote`-path coupling.** (`acked_turn`
-  may persist Lens-side later for across-restart correctness — a refinement.)
+- `SummaryUpdate.last_completed_turn` advances on each turn completion (`=
+  state.stream.turn`). **Why a counter, not a RAM boolean edge:** the feed
+  coalesces bursts (§4.1), so a naive `running→idle` edge-detector can miss the
+  transition; `last_completed_turn > acked` is robust to coalescing. That
+  robustness is the *only* reason it's a counter.
+- `FleetStore` holds a per-card `acked_turn` (RAM), **initialized on card
+  creation to the seed's `last_completed_turn`** (so Ready means "completions
+  since this card appeared" — no assumption baked into a hardcoded 0).
+  `Ready = status==idle && last_completed_turn > acked_turn`.
+- **Ack rule = continuous-while-focused, NOT set-once-on-focus.** The focused
+  card keeps `acked_turn == last_completed_turn` for as long as it is focused —
+  set on Promote **and re-advanced on every turn-completion frame while focused**.
+  On Demote it **freezes** at that value. Rationale: acking only on focus captures
+  turns completed *before* focus but leaves turns completed *during* focus
+  un-acked, so the focused card would light **Ready while you are watching it**
+  (and stay stale-Ready on blur). Continuous-ack means "`acked_turn` = the last
+  turn you could have seen": a turn completed **while focused** never raises Ready;
+  only a completion **after blur** does. The `Ready` formula is unchanged — only
+  the ack-update rule.
+- **No persisted flag, no migration, no `Promote`-path coupling.**
+- **Invariant this rests on:** `stream.turn` **resets to 0 on every actor
+  spawn** — catch-up replays `/items` via `upsert_catchup_item`, *not* through
+  the turn-bumping reducer (`reduce/mod.rs:136`), and `turn` is never restored
+  from persistence. This is what makes the `acked=0`-equivalent seed safe (a
+  resumed card doesn't flash Ready). If catch-up is ever changed to reflect true
+  history depth, revisit this.
+- **Across-restart Ready is NOT provided and is not fixable by persisting
+  `acked_turn`.** Because `turn` resets to 0 on restart, a persisted high
+  `acked_turn` would permanently suppress Ready (`0 > 5` is false). Real
+  across-restart/cross-device Ready requires the monotonic server signal
+  (`viewer_unread`) — **board-v2**, not a Lens-local refinement.
 
 **Forward-compat (cheap):** on focus, also call the already-built
 `Sessions::put_read_state(id, now, false)` **on a background executor**
 (`cx.background_spawn` — it is a *blocking* client call, never on the gpui
 thread) so the web UI / a second Lens instance converge. Reading *other* devices'
-acks (`viewer_unread`/`viewer_last_seen` off the fleet poll) is **board-v2**.
+acks (`viewer_unread`/`viewer_last_seen` off the fleet poll) is **board-v2** —
+where it becomes the authoritative source and `acked_turn` degrades to a pure
+optimistic-latency shim.
 
 ---
 
@@ -222,6 +268,17 @@ No-cross-invalidation requires **all** of:
 3. **Cards are mounted as `AnyView` wrapped in `.cached(style)`** with **stable
    entity IDs** and **stable card bounds** — bare `AnyView` is uncached, and
    paint reuse also requires unchanged bounds/content-mask/text-style.
+4. **`SessionCard` is a FIXED-SIZE tile — no fold ever changes its outer bounds.**
+   This is not automatic: gpui's cache reuse keys on `cache_key.bounds == bounds`
+   (`view.rs:207-216`), and the board is an **ordinal reflow grid**, so a card that
+   *content-sizes* would grow/shrink under a fold (activity line appearing, a repo
+   added), shifting **every sibling's bounds** → siblings miss the cache and
+   repaint. So every variable element is absorbed **inside** a fixed bound: the
+   activity line is a **reserved slot** (blank when idle, never collapsing), repos
+   render as **exactly one row + a `·+N` overflow badge** (never a row-per-repo),
+   long strings ellipsize (§6). Any full-detail affordance (repo list) is a
+   **floating overlay** (hover tooltip) — never inline expansion, which would
+   resize the tile and reflow the grid.
 
 The board/root *will* still re-render on a membership change (ancestor dirty);
 the guarantee is that **unchanged sibling cards do no render/paint work**. (The
@@ -258,39 +315,112 @@ design forwards raw input to the harness — **ESC must reach the harness**, so
 there is **no global ESC→board binding**. Card-click toggle:
 
 - Click a card → focus it (`FleetStore` **Promotes** it, Demotes the previous
-  focus, sets its `acked_turn`).
-- In focused state (boards shrunk, visible): click a **different** card → switch
-  focus; click the **currently-focused** card → toggle back to board (Demote).
-- `⌘\` collapses/expands the boards column. `⌘D` deep-focus deferred. ESC stays
+  focus). The focused card's `acked_turn` then **tracks `last_completed_turn`
+  continuously** until blur (§3.5 continuous-ack), freezing on Demote.
+- In focused state (boards shrunk, **always visible** in the skeleton): click a
+  **different** card → switch focus; click the **currently-focused** card → toggle
+  back to board (Demote).
+- **`⌘.` = back to board** (Demote the focused session). A dedicated `⌘`-chord,
+  **not ESC**: ESC is reserved for harness forwarding (a bare key in the TUI-native
+  raw-input stream), but `⌘`-combos are intercepted at the app layer and never
+  forwarded, so `⌘.` is safe against the forwarder. This makes board-return
+  **keyboard-reachable** (not mouse-only) and **independent of the boards column**.
+- **`⌘\` (collapse boards column) is DEFERRED** (§10) — kept out of the skeleton so
+  the focused card's click-return target is always present; `⌘.` covers the
+  keyboard path and any future collapse. `⌘D` deep-focus deferred. ESC stays
   **surface-local**.
 
-### 5.2 `ContentTab` + `SessionAttach` (the terminal seam)
+### 5.2 `ContentTab` mount + the terminal integration seam
 
 The working-area slot is a **single-tile, single-content mount**. **Dispatch is
 decided: the mount holds a small `TabHandle { view: AnyView, title: SharedString }`**
 — an `Entity<T: Render + ContentTab>` erased to `AnyView`, with the **title stored
-alongside** (it cannot dispatch through `AnyView`). `ContentTab` is a thin
-object-safe capability marker; focus/blur arrive via gpui's `FocusHandle` on the
-view.
+alongside** (it cannot dispatch through `AnyView`). The **title must be
+updatable** by the mount, not write-once: dynamic-title content (the terminal tab
+sources title/lifecycle from `TerminalTab::presentation()`) refreshes it as the
+adapter observes change events. `ContentTab` is a thin object-safe capability
+marker; focus/blur arrive via gpui's `FocusHandle` on the view. In the skeleton
+the mount holds a **placeholder** tab.
 
-**`SessionAttach`** (what the terminal workstream codes against) carries
-**identity + a WS-attach capability**, *not* a notifications receiver:
+**Terminal integration — the seam runs lens-ui → lens-terminal, not the reverse.**
+The sibling terminal workstream (`lens-terminal-ws/docs/specs/2026-07-14-terminal-workstream-design.md`,
+both docs in planning as of 2026-07-14) is explicit that **`lens-ui` is not a
+dependency of it** and that integrating the tab into lens-ui is *out of its
+scope*. So **lens-ui depends on `lens-terminal`** and **hosts** its tab; there is
+**no lens-ui-published attach type** for the terminal stream to code against
+(the earlier `SessionAttach`/`TerminalAttachCapability` sketch was the wrong
+shape *and* wrong direction — **dropped**). The consumed contract, as corrected
+by the terminal agent's post-grill reconciliation:
 
 ```rust
-struct SessionAttach {
-    connection_id: ConnectionId,
-    session_id: SessionId,
-    attach: TerminalAttachCapability,   // open byte stream + resize
+// owned/exported by lens-terminal (identity is NOT a flat tuple):
+pub enum TerminalTarget {
+    Existing     { session_id: SessionId, terminal_id: TerminalId }, // exactly this
+                                                                     // resource; never
+                                                                     // adopts a successor
+    OpenOrCreate { session_id: SessionId, key: TerminalKey },        // logical slot;
+                                                                     // discover/create;
+                                                                     // follows only an
+                                                                     // exact-key heir
 }
+pub enum AccessIntent { Automatic, ReadOnly }   // rides in TerminalOpenOptions
+// no `host` param — the tab exposes its seam via methods + two typed streams:
+pub fn open(target: TerminalTarget, client: Arc<Client>,
+            options: TerminalOpenOptions, cx: &mut App) -> Entity<TerminalTab>;
 ```
+
+- **Target resolution (list/create/attach) lives privately inside `open()`**,
+  which returns immediately in `Starting` (discovery/create/attach run
+  off-thread; failures become lifecycle values, not constructor errors). lens-ui
+  never lists, creates, resolves, or attaches terminal resources.
+- **Access is intent, not authority.** `AccessIntent` rides inside
+  `TerminalOpenOptions` (access intent + scrollback limit + initial prefs). lens-ui
+  may force `ReadOnly` but must **not** assert authoritative write; under
+  `Automatic`, session ownership + *server authorization* decide the effective
+  mode and lens-terminal downgrades if ownership/permission is absent or lost.
+- **Host seam is LOCKED (terminal grill closed) — two typed streams + two
+  methods, no callback trait, no `host` constructor param:**
+  - `TerminalTab::focus_handle(cx)` — direct, host-driven focus.
+  - `TerminalTab::presentation()` — latest atomic title/lifecycle/access/progress
+    (the `ContentTab` adapter reads this for tab chrome, incl. the dynamic title).
+  - inbound **`TerminalHostEvent`** (lens-ui drives *into* the tab): session
+    Sleep/wake/reset, `session.superseded`, resource-generation signals, pref
+    changes, memory pressure, typed host-request responses.
+  - outbound **`TerminalEvent`** (lens-ui consumes): presentation changes + host
+    requests — user-gesture URL opens, permissioned OSC 52 clipboard writes,
+    background notifications (permissioned ones carry a typed request-id →
+    response). **No arbitrary `RequestClose`; no client transfer request.**
+- **lens-ui owns:** choosing `Existing` vs `OpenOrCreate` from the user action;
+  resolving `ConnectionId → Arc<Client>`; access intent via `TerminalOpenOptions`;
+  observing public `session.superseded` and feeding it as a `TerminalHostEvent`
+  (never the schema-hidden internal transfer route); **wrapping** the returned
+  `Entity<TerminalTab>` in a `ContentTab` adapter (reading `presentation()` for
+  title/lifecycle); app chrome / routing / policy. `lens-terminal` can't implement
+  lens-ui's `ContentTab` (no dependency edge that way), so lens-ui adapts.
+- **lens-ui does NOT own:** terminal list/create/attach REST, terminal WS
+  details, replacement/reconnect policy, effective authorization, or Ghostty /
+  transport types.
+- **⚠ lens-core dependency for the supersession responsibility (terminal-integration
+  era, NOT skeleton).** `session.superseded` carries `target_conversation_id`, but
+  the reducer currently folds `SessionEvent::Superseded` to **nothing** (marker-only,
+  `folds.rs:136`) — the payload is dropped, so lens-ui cannot get the redirect
+  target from the feed. Before the terminal slice can honor "feed
+  `session.superseded` to the tab," lens-core must **surface it** (e.g.
+  `StreamUpdate::Superseded { target_conversation_id, reason }`). It's transient /
+  live-only / no-replay (0.5.1 contract), so the durable `message`-item counterpart
+  is a separate reload path. Recorded here + flagged to the terminal agent; out of
+  skeleton scope (placeholder tab doesn't supersede).
+- **Skeleton scope:** publish only `ContentTab`/`TabHandle` + the placeholder;
+  the shapes above are the **locked joint contract**, mirrored in that repo's
+  `SPEC-GAPS.md` (terminal agent owns that file). Not built here.
 
 Corrections: `session.terminal.activity` folds to **nothing** (`folds.rs:125-136`,
 the reducer emits no delta); only `terminal_pending` →
 `StreamUpdate::TerminalPendingChanged(bool)`, which rides the normal feed;
 terminal resource create/delete surfaces as the generic `ResourcesChanged`
 marker. The **typed WS terminal client is UNBUILT in lens-client** (REST
-create/delete/transfer only) — a genuine dependency of the terminal workstream,
-not provided here.
+create/delete/transfer only) — owned by the terminal workstream (its
+`TerminalAttachment`), not provided here.
 
 **Deferred to workspace fan-out:** splits, tab-bar, launchers, +badge, preview
 tabs, content persistence.
@@ -304,6 +434,26 @@ summary, never a transcript: status icon tile + **wave**, `<STATUS>`/`<Title>`,
 `<harness> · <model>`, **activity line**, `📁 repo ⑂ branch`, footer (host pill ·
 `~$spend` cumulative, `—` when `None` · `ctx %` bar), connection-state takeover
 (§5.4).
+
+**Fixed-tile chrome rules (the §4.4 bounds invariant, made concrete).** The card
+is a **fixed-size tile**; every element occupies a reserved slot so no fold
+changes outer bounds:
+
+- **Activity line** — a **reserved slot**, blank when idle (not "active cards
+  only / absent" — an absent row would change height on active↔idle). Ellipsizes.
+- **Repo/branch** — **exactly one row.** Show the **primary** repo (first by
+  **stable** workspace order — never reorders under a fold) `📁 <repo> ⑂ <branch>`;
+  if >1 repo, suffix a compact **`·+N` badge** on the same row. `0` repos → `—`,
+  slot still reserved.
+- **Full repo list** — a **hover tooltip** (floating overlay; repaints only the
+  hovered card, never reflows the grid). Not inline, not a per-repo row stack.
+- All scalar strings (`<Title>`, model, activity, branch) **ellipsize** within the
+  fixed bound.
+
+> **Supersedes shell §5.1's "one row per repo" for the board tile.** §5.1 says
+> multi-repo sessions "show a row each" — that content-sizes the card and defeats
+> §4.4. Board tile = one row + `·+N` + hover tooltip; a full per-repo view belongs
+> to the focused surfaces. (Shell-doc reconciliation, like the terminal seam.)
 
 **Wave ladder** (shell §5.1) — fully derivable from the enriched feed:
 Needs-input (`needs_attention`), **Ready** (`idle && last_completed_turn >
@@ -319,13 +469,29 @@ mounts a **real board + N real card views** in gpui's `TestAppContext` (headless
 
 1. settle the first frame; instrument per-card `Render`/paint counters + the
    board/root counter; cards mounted `.cached(...)`;
+   - **Frame-driver caveat (impl):** drive redraws by `card.update(cx, |_, cx|
+     cx.notify())` + `run_until_parked` (test-support `flush_effects` auto-draws
+     dirty windows at `refreshing=false`). **Do NOT use `cx.refresh()` /
+     `refresh_windows()`** — they set `window.refreshing=true`, which makes gpui
+     *ignore* `.cached()` (`view.rs:100-101`, reuse guard `!window.refreshing`),
+     so every card repaints and the isolation assertion fails on correct code.
 2. inject an enriched `SummaryUpdate` on session B; drive the frame; assert **B's
    card re-renders, A's card does no render/paint work** (root may invalidate —
    the guarantee is unchanged-sibling reuse, §4.4);
+   - **Size-invariance sub-assertion (else this test gives false confidence):** a
+     single fixed-geometry injection can't prove bounds-stability. Add a fold on B
+     that *would* change intrinsic height under content-sizing — activity line
+     idle→present, **and** repos `1 → 3` (must collapse to one row + `·+2`, not
+     grow) — and assert **A still does no paint work**. This proves the fixed-tile
+     invariant (§4.4 pt 4) holds under size-changing folds, not just scalar swaps.
 3. **mode-switch order-safety:** with a *lagging* poller, enqueue Summary frames
    then Promote then Detailed frames on the unified feed; assert the card ends on
    the Detailed projection (never regresses to a stale Summary), and blur emits a
-   Summary that restores the coarse projection; `acked_turn` updates on focus.
+   Summary that restores the coarse projection.
+   - **continuous-ack (§3.5):** while focused, complete a turn (`last_completed_turn++`)
+     and assert the card does **not** go Ready; then Demote and complete another
+     turn and assert it **does** go Ready (ack froze on blur, post-blur completion
+     raises it). Guards against set-once-on-focus regressing.
 
 ---
 
@@ -350,8 +516,10 @@ mounts a **real board + N real card views** in gpui's `TestAppContext` (headless
 `put_read_state`-on-focus (off-thread); `lens-app`/`lens-ui` split; `FleetStore`
 (owns scheduler + promote/demote policy) + per-session poller + the §4.4 isolation
 invariant; board state + enriched card chrome + full wave ladder; focused-state
-empty slots + click-toggle recompose (promote/demote); `ContentTab`/`TabHandle` +
-`SessionAttach` + placeholder tab; minimal theme tokens; `FakeFleet` + live-verify;
+empty slots + click-toggle recompose (promote/demote) + `⌘.` back-to-board;
+`ContentTab`/`TabHandle` +
+placeholder tab (terminal seam = *consume* `lens-terminal::open`, §5.2, not built
+here); minimal theme tokens; `FakeFleet` + live-verify;
 the §6.1 acceptance test.
 
 **Out (later slices):**
@@ -360,8 +528,9 @@ the §6.1 acceptance test.
   *transcript fan-out* (also where the Detailed feed gets a real consumer);
 - workspace / diff / editor; splits / launchers / preview / persistence —
   *workspace fan-out*;
-- terminal internals + the **unbuilt typed WS terminal client** — *the parallel
-  terminal workstream* (plugs into `ContentTab`/`SessionAttach`);
+- terminal internals + the **unbuilt typed WS terminal client** (`TerminalAttachment`)
+  — *the parallel terminal workstream*; lens-ui hosts its `Entity<TerminalTab>` by
+  consuming `lens-terminal::open(...)` and wrapping it in a `ContentTab` adapter;
 - a real server **Interrupt** command path (new lens-core command);
 - permissions/elicitation forms; Bridge inbox; search; Canvas; Concierge;
   multi-board / groups / archive;
@@ -385,7 +554,9 @@ the §6.1 acceptance test.
   Promote/Demote transition; emit-on-Demote; seed-on-spawn; spawn-in-Summary emits
   Summary (not `SummaryConsumerGone`); `SummaryUpdate` enrichment (`from_state`
   populates new fields incl. in Summary mode); `last_completed_turn` tracks
-  `stream.turn`.
+  `stream.turn`. **These are the merge gate for the §3 milestone (§3 preamble):
+  green + cross-family/Opus review + `lens-drive` still works, before any lens-ui
+  view code.**
 - **Live-verify** (§7) as the acceptance gate.
 - Gate: `cargo clippy --workspace --all-targets -- -D warnings` + `fmt` clean.
 
@@ -393,7 +564,9 @@ the §6.1 acceptance test.
 
 ## 10. Open / deferred (tracked, not blocking)
 
-- `⌘D` deep-focus, `⌘\` polish — with the focused surfaces.
+- `⌘D` deep-focus, **`⌘\` collapse boards column** (deferred from the skeleton per
+  §5.1 to keep the click-return target always present) — with the focused surfaces.
+  (`⌘.` back-to-board **is** in the skeleton.)
 - Multi-server / connection badge — needs the engine registry re-key.
 - Send-recovery / `SendLost` UX — with the composer.
 - **Board-v2** — the REST-poll path, Slept/archived/groups/multi-board, inbound
@@ -430,3 +603,50 @@ confirmed correct.
 - focused-mode fold must include `TodosChanged`/`ScratchChanged` → §4.2.
 - `AnyView` erases `title` → `TabHandle{view,title}` §5.2; terminal fold wording
   corrected (`terminal.activity` → nothing) §5.2.
+
+**Round 3 (grill, 2026-07-14) — folded in:**
+- Acceptance-test frame-driver: `refresh()` sets `window.refreshing` which makes
+  gpui *ignore* `.cached()` (`view.rs:100-101`) → §6.1 pins targeted `notify` +
+  `run_until_parked`, forbids `refresh()`. (Impl caveat, not design.)
+- Ready wave reframed §3.5: `acked_turn` is the **warm fast-path echo of
+  read-state**, not a parallel scheme; `viewer_unread` (poll, board-v2) is the
+  complementary non-warm/cross-device source. Pinned initial `acked_turn = seed
+  turn`; documented the `turn`-resets-on-spawn invariant; **deleted** the
+  "persist `acked_turn` later" line (it would *suppress* Ready, not fix it —
+  across-restart correctness needs the monotonic server signal = board-v2);
+  counter-vs-boolean rationale (robust to burst-coalescing) recorded.
+- §4.4 isolation had an unstated precondition: cache reuse keys on stable
+  `bounds`, but §5.1 cards content-size (activity line "active-only"; row-per-repo)
+  → a size-changing fold reflows the ordinal grid and repaints siblings. Fix:
+  **fixed-size tile** invariant (§4.4 pt 4 + §6) — activity line reserved/blank;
+  repos = **one row + `·+N` badge + hover-tooltip full list** (supersedes shell
+  §5.1 "row per repo" for the board tile); ellipsize; overlay not inline. §6.1
+  gains a **size-invariance sub-assertion** (activity 0→1, repos 1→3, siblings
+  still don't paint).
+- Navigation §5.1: board-return was **mouse-only + had a `⌘\`-collapse dead-end**
+  (focused card is the only return target but collapse hides it; ESC reserved).
+  Fix: **`⌘.` back-to-board** (`⌘`-chord, safe vs harness forwarding unlike ESC;
+  keyboard-reachable, column-independent) + **defer `⌘\`** so the click target is
+  always present.
+- Ready ack timing corrected §3.5/§5.1/§6.1: **continuous-ack-while-focused**, not
+  set-once-on-focus — a set-once ack lights Ready on the focused card *while you
+  watch it* and leaves it stale-Ready on blur. Ack now tracks `last_completed_turn`
+  while focused, freezes on Demote; only post-blur completions raise Ready.
+- §3 elevated from "skeleton plumbing" to a **merge-gated lens-core milestone**
+  (§3 preamble + §9): one-way-door actor change, cross-family+Opus review +
+  `lens-drive` green before any view code. (`ActorFeed` backpressure objection
+  cleared: production is mode-exclusive, so Summary/Detailed never contend.)
+- Terminal seam corrected vs the sibling terminal-workstream design (both docs
+  in planning): `SessionAttach`/`TerminalAttachCapability` **dropped** — wrong
+  shape and wrong direction (lens-ui depends on lens-terminal, hosts+adapts its
+  `Entity<TerminalTab>`). §5.2 now records the *consumed* contract, corrected by
+  the terminal agent's reconciliation (terminal grill now **closed**): identity is
+  a **`TerminalTarget` enum** (`Existing`{sess,term} vs `OpenOrCreate`{sess,key} —
+  never a flat tuple); **access is `AccessIntent`** inside `TerminalOpenOptions`
+  (intent, not authority; server authz is authoritative); constructor is
+  `open(target, client, options, cx)` (**no `host` param**). Host seam **now
+  locked**: `focus_handle(cx)` + `presentation()` methods, inbound
+  `TerminalHostEvent` (lens-ui drives `session.superseded` etc.) + outbound
+  `TerminalEvent` (URL/OSC-52/notify), **no `RequestClose`/transfer**. `TabHandle`
+  title made updatable (dynamic-title content). Joint contract mirrored in
+  `lens-terminal-ws/docs/SPEC-GAPS.md` (owned there).
