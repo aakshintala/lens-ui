@@ -2,6 +2,7 @@
 //! persist write-through, coalesce, emit to the foreground bridge.
 
 use crate::actor::api::{CommandOutcome, SessionApi};
+use crate::actor::feed::ActorFeed;
 use crate::actor::outcome::{ActorOutcome, Mapped, OutcomeRing, map_client_error};
 use crate::actor::summary::SummaryUpdate;
 use crate::actor::transport::{ActorTransport, ParkReason};
@@ -89,8 +90,7 @@ impl ActorHandle {
 
 /// Bridge senders + output granularity for the actor run-loop.
 struct ActorOutput {
-    updates: async_channel::Sender<StreamUpdate>,
-    summaries: async_channel::Sender<SummaryUpdate>,
+    feed: async_channel::Sender<ActorFeed>,
     outcomes: async_channel::Sender<ActorOutcome>,
     mode: OutputMode,
 }
@@ -113,22 +113,19 @@ struct RunCtx<'a> {
     snapshot_pending_inputs: &'a mut Vec<PendingInput>,
 }
 
-/// Spawn the actor thread in `Detailed` mode (Task 5 API). Summary channel is
-/// created internally and dropped — never emitted to in Detailed mode.
+/// Spawn the actor thread in `Detailed` mode.
 pub fn spawn_actor(
     state: SessionState,
     events: Receiver<ServerStreamEvent>,
-    updates: async_channel::Sender<StreamUpdate>,
+    feed: async_channel::Sender<ActorFeed>,
     stores: ActorStores,
     clock: Box<dyn Clock + Send>,
     api: Box<dyn SessionApi + Send>,
 ) -> ActorHandle {
-    let (sum_tx, _sum_rx) = async_channel::bounded(1);
     spawn_actor_dual(
         state,
         events,
-        updates,
-        sum_tx,
+        feed,
         OutputMode::Detailed,
         stores,
         clock,
@@ -136,13 +133,11 @@ pub fn spawn_actor(
     )
 }
 
-/// Spawn the actor thread with explicit output mode and both bridge senders.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_actor_dual(
     state: SessionState,
     events: Receiver<ServerStreamEvent>,
-    updates: async_channel::Sender<StreamUpdate>,
-    summaries: async_channel::Sender<SummaryUpdate>,
+    feed: async_channel::Sender<ActorFeed>,
     mode: OutputMode,
     stores: ActorStores,
     clock: Box<dyn Clock + Send>,
@@ -158,8 +153,7 @@ pub fn spawn_actor_dual(
                 events,
                 cmd_rx,
                 ActorOutput {
-                    updates,
-                    summaries,
+                    feed,
                     outcomes: out_tx,
                     mode,
                 },
@@ -415,10 +409,10 @@ fn run_catchup(
         }
         if wrote_any
             && output
-                .updates
-                .send_blocking(StreamUpdate::TranscriptAdvanced {
+                .feed
+                .send_blocking(ActorFeed::Detailed(StreamUpdate::TranscriptAdvanced {
                     committed_ordinal: *next_ordinal - 1,
-                })
+                }))
                 .is_err()
         {
             return CatchupResult::Aborted;
@@ -522,8 +516,10 @@ fn handle_command(
         }
         SessionCommand::Promote => {
             if output
-                .updates
-                .send_blocking(StreamUpdate::Rebased(scalars_baseline(state)))
+                .feed
+                .send_blocking(ActorFeed::Detailed(StreamUpdate::Rebased(
+                    scalars_baseline(state),
+                )))
                 .is_err()
             {
                 return LoopControl::Break;
@@ -685,15 +681,22 @@ fn apply_reduced_batch(
                 .iter()
                 .any(|u| matches!(u, StreamUpdate::SnapshotRestored(_)));
             for u in coalesce(batch) {
-                if ctx.output.updates.send_blocking(u).is_err() {
+                if ctx
+                    .output
+                    .feed
+                    .send_blocking(ActorFeed::Detailed(u))
+                    .is_err()
+                {
                     return (LoopControl::Break, false);
                 }
             }
             if had_snapshot
                 && ctx
                     .output
-                    .updates
-                    .send_blocking(StreamUpdate::Rebased(scalars_baseline(ctx.state)))
+                    .feed
+                    .send_blocking(ActorFeed::Detailed(StreamUpdate::Rebased(
+                        scalars_baseline(ctx.state),
+                    )))
                     .is_err()
             {
                 return (LoopControl::Break, false);
@@ -702,8 +705,8 @@ fn apply_reduced_batch(
         OutputMode::Summary => {
             if ctx
                 .output
-                .summaries
-                .send_blocking(SummaryUpdate::from_state(ctx.state))
+                .feed
+                .send_blocking(ActorFeed::Summary(SummaryUpdate::from_state(ctx.state)))
                 .is_err()
             {
                 ctx.ring.push(ActorOutcome::SummaryConsumerGone);
@@ -803,10 +806,10 @@ fn finish_deferred_transcript_commit(
 ) -> LoopControl {
     if let Some(ord) = commit_terminal_prefix(stores, state, next_ordinal, ring)
         && output
-            .updates
-            .send_blocking(StreamUpdate::TranscriptAdvanced {
+            .feed
+            .send_blocking(ActorFeed::Detailed(StreamUpdate::TranscriptAdvanced {
                 committed_ordinal: ord,
-            })
+            }))
             .is_err()
     {
         return LoopControl::Break;
@@ -1064,14 +1067,15 @@ fn run(
 fn emit_pending_user(output: &ActorOutput, state: &SessionState) -> bool {
     match output.mode {
         OutputMode::Detailed => output
-            .updates
-            .send_blocking(StreamUpdate::PendingUserChanged(state.pending_user.clone()))
+            .feed
+            .send_blocking(ActorFeed::Detailed(StreamUpdate::PendingUserChanged(
+                state.pending_user.clone(),
+            )))
             .is_ok(),
         OutputMode::Summary => {
-            // Summary is not a pending_user replica; the optimistic bubble surfaces on Promote/Rebased.
             let _ = output
-                .summaries
-                .send_blocking(SummaryUpdate::from_state(state));
+                .feed
+                .send_blocking(ActorFeed::Summary(SummaryUpdate::from_state(state)));
             true
         }
     }
@@ -1186,6 +1190,7 @@ fn coalesce(batch: Updates) -> Updates {
 mod tests {
     use super::*;
     use crate::actor::api::SessionApi;
+    use crate::actor::feed::ActorFeed;
     use crate::actor::outcome::ActorOutcome;
     use crate::actor::transport::{ActorTransport, ParkReason};
     use crate::clock::ManualClock;
@@ -1328,27 +1333,37 @@ mod tests {
         Box::new(PanicApi)
     }
 
+    fn recv_detailed(feed_rx: &async_channel::Receiver<ActorFeed>) -> StreamUpdate {
+        match feed_rx.recv_blocking().unwrap() {
+            ActorFeed::Detailed(u) => u,
+            other => panic!("expected Detailed, got {other:?}"),
+        }
+    }
+
     fn expect_pending_user_changed(
-        up_rx: &async_channel::Receiver<StreamUpdate>,
+        feed_rx: &async_channel::Receiver<ActorFeed>,
     ) -> Vec<PendingUserMessage> {
-        match up_rx.recv_blocking().unwrap() {
+        match recv_detailed(feed_rx) {
             StreamUpdate::PendingUserChanged(v) => v,
             other => panic!("expected PendingUserChanged, got {other:?}"),
         }
     }
 
     fn recv_pending_user_changed_or_none(
-        up_rx: &async_channel::Receiver<StreamUpdate>,
+        feed_rx: &async_channel::Receiver<ActorFeed>,
     ) -> Option<Vec<PendingUserMessage>> {
         loop {
-            match up_rx.recv_blocking().unwrap() {
-                StreamUpdate::PendingUserChanged(v) => return Some(v),
-                StreamUpdate::Reconnected
-                | StreamUpdate::Reconnecting { .. }
-                | StreamUpdate::TranscriptAdvanced { .. }
-                | StreamUpdate::SnapshotRestored(_)
-                | StreamUpdate::Rebased(_) => {}
-                other => {
+            match feed_rx.recv_blocking().unwrap() {
+                ActorFeed::Detailed(StreamUpdate::PendingUserChanged(v)) => return Some(v),
+                ActorFeed::Detailed(
+                    StreamUpdate::Reconnected
+                    | StreamUpdate::Reconnecting { .. }
+                    | StreamUpdate::TranscriptAdvanced { .. }
+                    | StreamUpdate::SnapshotRestored(_)
+                    | StreamUpdate::Rebased(_),
+                ) => {}
+                ActorFeed::Summary(_) => {}
+                ActorFeed::Detailed(other) => {
                     panic!("unexpected update while waiting for PendingUserChanged: {other:?}")
                 }
             }
@@ -1648,13 +1663,11 @@ mod tests {
         seed_connection(&stores);
 
         let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, up_rx) = async_channel::bounded(64);
-        let (sum_tx, sum_rx) = async_channel::bounded(64);
+        let (feed_tx, feed_rx) = async_channel::bounded(64);
         let handle = spawn_actor_dual(
             fresh_state(),
             ev_rx,
-            up_tx,
-            sum_tx,
+            feed_tx,
             OutputMode::Summary,
             stores,
             test_clock(),
@@ -1663,19 +1676,16 @@ mod tests {
 
         ev_tx.send(status_running_event()).unwrap();
         assert!(matches!(
-            sum_rx.recv_blocking().unwrap(),
-            SummaryUpdate { .. }
+            feed_rx.recv_blocking().unwrap(),
+            ActorFeed::Summary(SummaryUpdate { .. })
         ));
         assert!(
-            up_rx.try_recv().is_err(),
+            feed_rx.try_recv().is_err(),
             "no Detailed deltas in Summary mode"
         );
 
         handle.commands.send(SessionCommand::Promote).unwrap();
-        assert!(matches!(
-            up_rx.recv_blocking().unwrap(),
-            StreamUpdate::Rebased(_)
-        ));
+        assert!(matches!(recv_detailed(&feed_rx), StreamUpdate::Rebased(_)));
         handle.stop_and_join();
     }
 
@@ -1686,20 +1696,18 @@ mod tests {
         seed_connection(&stores);
 
         let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, up_rx) = async_channel::bounded(64);
+        let (feed_tx, feed_rx) = async_channel::bounded(64);
         let handle = spawn_actor(
             fresh_state(),
             ev_rx,
-            up_tx,
+            feed_tx,
             stores,
             test_clock(),
             noop_api(),
         );
 
         ev_tx.send(one_output_item_done_event()).unwrap();
-        let _update = up_rx
-            .recv_blocking()
-            .expect("actor still emitted stream update");
+        let _update = recv_detailed(&feed_rx);
 
         match handle.outcomes.recv_blocking().unwrap() {
             ActorOutcome::PersistError { where_, message } => {
@@ -1719,11 +1727,11 @@ mod tests {
         seed_connection(&stores);
 
         let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, up_rx) = async_channel::bounded(64);
+        let (feed_tx, feed_rx) = async_channel::bounded(64);
         let handle = spawn_actor(
             fresh_state(),
             ev_rx,
-            up_tx,
+            feed_tx,
             stores,
             test_clock(),
             noop_api(),
@@ -1731,7 +1739,7 @@ mod tests {
 
         ev_tx.send(one_output_item_done_event()).unwrap();
         let mut saw_watermark = false;
-        while let Ok(update) = up_rx.recv_blocking() {
+        while let Ok(ActorFeed::Detailed(update)) = feed_rx.recv_blocking() {
             if matches!(
                 update,
                 StreamUpdate::TranscriptAdvanced {
@@ -1766,11 +1774,11 @@ mod tests {
         let stores = test_stores(dir.path());
         seed_connection(&stores);
         let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, up_rx) = async_channel::bounded(64);
+        let (feed_tx, feed_rx) = async_channel::bounded(64);
         let handle = spawn_actor(
             fresh_state(),
             ev_rx,
-            up_tx,
+            feed_tx,
             stores,
             test_clock(),
             noop_api(),
@@ -1793,7 +1801,7 @@ mod tests {
             .unwrap();
 
         let mut saw_watermark = false;
-        while let Ok(u) = up_rx.recv_blocking() {
+        while let Ok(ActorFeed::Detailed(u)) = feed_rx.recv_blocking() {
             if matches!(
                 u,
                 StreamUpdate::TranscriptAdvanced {
@@ -1827,7 +1835,7 @@ mod tests {
             ))
             .unwrap();
 
-        while up_rx.try_recv().is_ok() {}
+        while feed_rx.try_recv().is_ok() {}
 
         let rows = reopened.load_items().unwrap().rows;
         assert_eq!(rows.len(), 1, "fc_1 must stay above the watermark");
@@ -1845,11 +1853,11 @@ mod tests {
         let stores = test_stores(dir.path());
         seed_connection(&stores);
         let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, up_rx) = async_channel::bounded(64);
+        let (feed_tx, feed_rx) = async_channel::bounded(64);
         let handle = spawn_actor(
             fresh_state(),
             ev_rx,
-            up_tx,
+            feed_tx,
             stores,
             test_clock(),
             noop_api(),
@@ -1882,7 +1890,7 @@ mod tests {
             .unwrap();
 
         let mut saw_final_watermark = false;
-        while let Ok(u) = up_rx.recv_blocking() {
+        while let Ok(ActorFeed::Detailed(u)) = feed_rx.recv_blocking() {
             if matches!(
                 u,
                 StreamUpdate::TranscriptAdvanced {
@@ -1925,11 +1933,11 @@ mod tests {
         let stores = test_stores(dir.path());
         seed_connection(&stores);
         let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, up_rx) = async_channel::bounded(64);
+        let (feed_tx, feed_rx) = async_channel::bounded(64);
         let handle = spawn_actor(
             fresh_state(),
             ev_rx,
-            up_tx,
+            feed_tx,
             stores,
             test_clock(),
             noop_api(),
@@ -1947,7 +1955,7 @@ mod tests {
                 r#"{"item":{"id":"item_b","type":"message","role":"assistant","content":[{"type":"output_text","text":"b"}]}}"#,
             ))
             .unwrap();
-        while let Ok(u) = up_rx.recv_blocking() {
+        while let Ok(ActorFeed::Detailed(u)) = feed_rx.recv_blocking() {
             if matches!(
                 u,
                 StreamUpdate::TranscriptAdvanced {
@@ -1975,8 +1983,8 @@ mod tests {
         let mut saw_watermark_on_refire = false;
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
         while std::time::Instant::now() < deadline {
-            match up_rx.try_recv() {
-                Ok(StreamUpdate::TranscriptAdvanced { .. }) => {
+            match feed_rx.try_recv() {
+                Ok(ActorFeed::Detailed(StreamUpdate::TranscriptAdvanced { .. })) => {
                     saw_watermark_on_refire = true;
                 }
                 Ok(_) => {}
@@ -1994,7 +2002,7 @@ mod tests {
                 r#"{"item":{"id":"item_c","type":"message","role":"assistant","content":[{"type":"output_text","text":"c"}]}}"#,
             ))
             .unwrap();
-        while let Ok(u) = up_rx.recv_blocking() {
+        while let Ok(ActorFeed::Detailed(u)) = feed_rx.recv_blocking() {
             if matches!(
                 u,
                 StreamUpdate::TranscriptAdvanced {
@@ -2072,11 +2080,11 @@ mod tests {
         seed_connection(&stores);
 
         let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, up_rx) = async_channel::bounded(64);
+        let (feed_tx, feed_rx) = async_channel::bounded(64);
         let handle = spawn_actor(
             fresh_state(),
             ev_rx,
-            up_tx,
+            feed_tx,
             stores,
             test_clock(),
             noop_api(),
@@ -2097,7 +2105,7 @@ mod tests {
 
         let mut saw_snapshot = false;
         let mut saw_rebased = false;
-        while let Ok(u) = up_rx.recv_blocking() {
+        while let Ok(ActorFeed::Detailed(u)) = feed_rx.recv_blocking() {
             match &u {
                 StreamUpdate::SnapshotRestored(_) => saw_snapshot = true,
                 StreamUpdate::Rebased(baseline) => {
@@ -2126,23 +2134,38 @@ mod tests {
         let stores = test_stores(_dir.path());
         seed_connection(&stores);
 
-        let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, up_rx) = async_channel::bounded(64);
-        let handle = spawn_actor(
-            fresh_state(),
-            ev_rx,
-            up_tx,
-            stores,
-            test_clock(),
-            noop_api(),
-        );
+        let (api, _mock) = MockApi::succeed_with_ack(SendEventAck {
+            queued: true,
+            item_id: Some("msg_demote".into()),
+            pending_id: None,
+            ..Default::default()
+        });
+        let (_ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (feed_tx, feed_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(fresh_state(), ev_rx, feed_tx, stores, test_clock(), api);
 
+        // Commands are FIFO — Demote flips mode before Send's Summary emit.
         handle.commands.send(SessionCommand::Demote).unwrap();
-        ev_tx.send(status_running_event()).unwrap();
+        handle
+            .commands
+            .send(SessionCommand::Send {
+                text: "summary path".into(),
+                model_override: None,
+            })
+            .unwrap();
 
-        // Actor must survive Summary emit with no consumer and still accept Promote.
+        match feed_rx.recv_blocking().unwrap() {
+            ActorFeed::Summary(_) => {}
+            other => panic!("expected Summary after Demote+Send, got {other:?}"),
+        }
         handle.commands.send(SessionCommand::Promote).unwrap();
-        while !matches!(up_rx.recv_blocking().unwrap(), StreamUpdate::Rebased(_)) {}
+        loop {
+            match feed_rx.recv_blocking().unwrap() {
+                ActorFeed::Detailed(StreamUpdate::Rebased(_)) => break,
+                ActorFeed::Summary(_) => continue,
+                other => panic!("expected Rebased after Promote, got {other:?}"),
+            }
+        }
         handle.stop_and_join();
     }
 
@@ -2153,11 +2176,11 @@ mod tests {
         seed_connection(&stores);
 
         let (_ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, _up_rx) = async_channel::bounded(64);
+        let (feed_tx, _feed_rx) = async_channel::bounded(64);
         let handle = spawn_actor(
             fresh_state(),
             ev_rx,
-            up_tx,
+            feed_tx,
             stores,
             test_clock(),
             noop_api(),
@@ -2178,8 +2201,8 @@ mod tests {
             ..Default::default()
         });
         let (_ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, up_rx) = async_channel::bounded(64);
-        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+        let (feed_tx, feed_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(fresh_state(), ev_rx, feed_tx, stores, test_clock(), api);
 
         handle
             .commands
@@ -2189,14 +2212,14 @@ mod tests {
             })
             .unwrap();
 
-        let optimistic = expect_pending_user_changed(&up_rx);
+        let optimistic = expect_pending_user_changed(&feed_rx);
         assert_eq!(optimistic.len(), 1);
         assert_eq!(optimistic[0].pending_id, "lens_pend_1");
         assert_eq!(optimistic[0].content, "hello");
         assert_eq!(optimistic[0].server_pending_id, None);
         assert_eq!(optimistic[0].store_item_id, None);
 
-        let stamped = expect_pending_user_changed(&up_rx);
+        let stamped = expect_pending_user_changed(&feed_rx);
         assert_eq!(stamped.len(), 1);
         assert_eq!(stamped[0].pending_id, "lens_pend_1");
         assert_eq!(stamped[0].server_pending_id, None);
@@ -2253,8 +2276,8 @@ mod tests {
         });
 
         let (_ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, up_rx) = async_channel::bounded(64);
-        let handle = spawn_actor(state, ev_rx, up_tx, stores, test_clock(), api);
+        let (feed_tx, feed_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(state, ev_rx, feed_tx, stores, test_clock(), api);
 
         handle
             .commands
@@ -2264,14 +2287,14 @@ mod tests {
             })
             .unwrap();
 
-        let optimistic = expect_pending_user_changed(&up_rx);
+        let optimistic = expect_pending_user_changed(&feed_rx);
         assert_eq!(optimistic.len(), 2);
         assert_eq!(optimistic[0].pending_id, "lens_pend_1");
         assert_eq!(optimistic[0].content, "carried");
         assert_eq!(optimistic[1].pending_id, "lens_pend_2");
         assert_eq!(optimistic[1].content, "new");
 
-        let stamped = expect_pending_user_changed(&up_rx);
+        let stamped = expect_pending_user_changed(&feed_rx);
         assert_eq!(stamped.len(), 2);
         assert_eq!(stamped[0].pending_id, "lens_pend_1");
         assert_eq!(stamped[0].content, "carried");
@@ -2289,8 +2312,8 @@ mod tests {
 
         let (api, _mock) = MockApi::fail(ClientError::network_for_test());
         let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, up_rx) = async_channel::bounded(64);
-        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+        let (feed_tx, feed_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(fresh_state(), ev_rx, feed_tx, stores, test_clock(), api);
 
         handle
             .commands
@@ -2300,10 +2323,10 @@ mod tests {
             })
             .unwrap();
 
-        let optimistic = expect_pending_user_changed(&up_rx);
+        let optimistic = expect_pending_user_changed(&feed_rx);
         assert_eq!(optimistic.len(), 1);
 
-        let rolled_back = expect_pending_user_changed(&up_rx);
+        let rolled_back = expect_pending_user_changed(&feed_rx);
         assert!(rolled_back.is_empty());
 
         match handle.outcomes.recv_blocking().unwrap() {
@@ -2320,7 +2343,7 @@ mod tests {
 
         // Actor survives — still processes events after a network rollback.
         ev_tx.send(status_running_event()).unwrap();
-        assert!(up_rx.recv_blocking().is_ok());
+        assert!(feed_rx.recv_blocking().is_ok());
         handle.stop_and_join();
     }
 
@@ -2332,8 +2355,8 @@ mod tests {
 
         let (api, _mock) = MockApi::fail(ClientError::Auth { status: 401 });
         let (_ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, up_rx) = async_channel::bounded(64);
-        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+        let (feed_tx, feed_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(fresh_state(), ev_rx, feed_tx, stores, test_clock(), api);
 
         handle
             .commands
@@ -2343,12 +2366,12 @@ mod tests {
             })
             .unwrap();
 
-        let optimistic = expect_pending_user_changed(&up_rx);
+        let optimistic = expect_pending_user_changed(&feed_rx);
         assert_eq!(optimistic.len(), 1);
         assert_eq!(optimistic[0].pending_id, "lens_pend_1");
 
         // No rollback emit — bubble stays resident.
-        assert!(up_rx.try_recv().is_err());
+        assert!(feed_rx.try_recv().is_err());
 
         match handle.outcomes.recv_blocking().unwrap() {
             ActorOutcome::Command(CommandOutcome::SendPending { lens_pending_id }) => {
@@ -2371,8 +2394,8 @@ mod tests {
             body: serde_json::json!({}),
         });
         let (_ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, up_rx) = async_channel::bounded(64);
-        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+        let (feed_tx, feed_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(fresh_state(), ev_rx, feed_tx, stores, test_clock(), api);
 
         handle
             .commands
@@ -2382,10 +2405,10 @@ mod tests {
             })
             .unwrap();
 
-        let optimistic = expect_pending_user_changed(&up_rx);
+        let optimistic = expect_pending_user_changed(&feed_rx);
         assert_eq!(optimistic.len(), 1);
         assert!(
-            up_rx.try_recv().is_err(),
+            feed_rx.try_recv().is_err(),
             "5xx keeps bubble — no rollback emit"
         );
 
@@ -2408,8 +2431,8 @@ mod tests {
             body: serde_json::json!({}),
         });
         let (_ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, up_rx) = async_channel::bounded(64);
-        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+        let (feed_tx, feed_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(fresh_state(), ev_rx, feed_tx, stores, test_clock(), api);
 
         handle
             .commands
@@ -2419,8 +2442,8 @@ mod tests {
             })
             .unwrap();
 
-        let _ = expect_pending_user_changed(&up_rx);
-        let rolled_back = expect_pending_user_changed(&up_rx);
+        let _ = expect_pending_user_changed(&feed_rx);
+        let rolled_back = expect_pending_user_changed(&feed_rx);
         assert!(rolled_back.is_empty());
 
         match handle.outcomes.recv_blocking().unwrap() {
@@ -2441,8 +2464,8 @@ mod tests {
             what: "session".into(),
         });
         let (_ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, up_rx) = async_channel::bounded(64);
-        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+        let (feed_tx, feed_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(fresh_state(), ev_rx, feed_tx, stores, test_clock(), api);
 
         handle
             .commands
@@ -2452,8 +2475,8 @@ mod tests {
             })
             .unwrap();
 
-        let _ = expect_pending_user_changed(&up_rx);
-        let rolled_back = expect_pending_user_changed(&up_rx);
+        let _ = expect_pending_user_changed(&feed_rx);
+        let rolled_back = expect_pending_user_changed(&feed_rx);
         assert!(rolled_back.is_empty());
 
         match handle.outcomes.recv_blocking().unwrap() {
@@ -2477,8 +2500,8 @@ mod tests {
             ..Default::default()
         });
         let (_ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, up_rx) = async_channel::bounded(64);
-        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+        let (feed_tx, feed_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(fresh_state(), ev_rx, feed_tx, stores, test_clock(), api);
 
         handle
             .commands
@@ -2488,8 +2511,8 @@ mod tests {
             })
             .unwrap();
 
-        let _ = expect_pending_user_changed(&up_rx);
-        let rolled_back = expect_pending_user_changed(&up_rx);
+        let _ = expect_pending_user_changed(&feed_rx);
+        let rolled_back = expect_pending_user_changed(&feed_rx);
         assert!(rolled_back.is_empty());
 
         match handle.outcomes.recv_blocking().unwrap() {
@@ -2516,8 +2539,8 @@ mod tests {
 
         let (api, _mock) = MockApi::fail(ClientError::network_for_test());
         let (_ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, up_rx) = async_channel::bounded(64);
-        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+        let (feed_tx, feed_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(fresh_state(), ev_rx, feed_tx, stores, test_clock(), api);
 
         handle
             .commands
@@ -2527,8 +2550,8 @@ mod tests {
             })
             .unwrap();
 
-        let _ = expect_pending_user_changed(&up_rx);
-        assert!(expect_pending_user_changed(&up_rx).is_empty());
+        let _ = expect_pending_user_changed(&feed_rx);
+        assert!(expect_pending_user_changed(&feed_rx).is_empty());
 
         match handle.outcomes.recv_blocking().unwrap() {
             ActorOutcome::Command(CommandOutcome::SendFailed { content, .. }) => {
@@ -2551,8 +2574,8 @@ mod tests {
             body: serde_json::json!({}),
         });
         let (_ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, up_rx) = async_channel::bounded(64);
-        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+        let (feed_tx, feed_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(fresh_state(), ev_rx, feed_tx, stores, test_clock(), api);
 
         handle
             .commands
@@ -2562,11 +2585,11 @@ mod tests {
             })
             .unwrap();
 
-        let optimistic = expect_pending_user_changed(&up_rx);
+        let optimistic = expect_pending_user_changed(&feed_rx);
         assert_eq!(optimistic.len(), 1);
         assert_eq!(optimistic[0].content, "held");
         assert!(
-            up_rx.try_recv().is_err(),
+            feed_rx.try_recv().is_err(),
             "503 retains bubble — no rollback emit"
         );
 
@@ -2588,8 +2611,8 @@ mod tests {
 
         let (api, _mock) = MockApi::fail(ClientError::Auth { status: 403 });
         let (_ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, up_rx) = async_channel::bounded(64);
-        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+        let (feed_tx, feed_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(fresh_state(), ev_rx, feed_tx, stores, test_clock(), api);
 
         handle
             .commands
@@ -2599,8 +2622,8 @@ mod tests {
             })
             .unwrap();
 
-        let _ = expect_pending_user_changed(&up_rx);
-        assert!(expect_pending_user_changed(&up_rx).is_empty());
+        let _ = expect_pending_user_changed(&feed_rx);
+        assert!(expect_pending_user_changed(&feed_rx).is_empty());
 
         match handle.outcomes.recv_blocking().unwrap() {
             ActorOutcome::Command(CommandOutcome::SendDenied { content, .. }) => {
@@ -2627,8 +2650,8 @@ mod tests {
                 ..Default::default()
             });
             let (_ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-            let (up_tx, up_rx) = async_channel::bounded(64);
-            let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+            let (feed_tx, feed_rx) = async_channel::bounded(64);
+            let handle = spawn_actor(fresh_state(), ev_rx, feed_tx, stores, test_clock(), api);
             handle
                 .commands
                 .send(SessionCommand::Send {
@@ -2636,8 +2659,8 @@ mod tests {
                     model_override: None,
                 })
                 .unwrap();
-            let _ = expect_pending_user_changed(&up_rx);
-            let stamped = expect_pending_user_changed(&up_rx);
+            let _ = expect_pending_user_changed(&feed_rx);
+            let stamped = expect_pending_user_changed(&feed_rx);
             assert_eq!(stamped.len(), 1);
             assert_eq!(
                 stamped[0].server_pending_id.as_deref(),
@@ -2666,8 +2689,8 @@ mod tests {
                 ..Default::default()
             });
             let (_ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-            let (up_tx, up_rx) = async_channel::bounded(64);
-            let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores_b, test_clock(), api);
+            let (feed_tx, feed_rx) = async_channel::bounded(64);
+            let handle = spawn_actor(fresh_state(), ev_rx, feed_tx, stores_b, test_clock(), api);
             handle
                 .commands
                 .send(SessionCommand::Send {
@@ -2675,8 +2698,8 @@ mod tests {
                     model_override: None,
                 })
                 .unwrap();
-            let _ = expect_pending_user_changed(&up_rx);
-            let stamped = expect_pending_user_changed(&up_rx);
+            let _ = expect_pending_user_changed(&feed_rx);
+            let stamped = expect_pending_user_changed(&feed_rx);
             assert_eq!(stamped.len(), 1);
             assert_eq!(stamped[0].server_pending_id, None);
             assert_eq!(stamped[0].store_item_id.as_deref(), Some("msg_non_native"));
@@ -2705,8 +2728,8 @@ mod tests {
             ..Default::default()
         });
         let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, up_rx) = async_channel::bounded(64);
-        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+        let (feed_tx, feed_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(fresh_state(), ev_rx, feed_tx, stores, test_clock(), api);
 
         handle
             .commands
@@ -2715,8 +2738,8 @@ mod tests {
                 model_override: None,
             })
             .unwrap();
-        let _ = expect_pending_user_changed(&up_rx);
-        let _ = expect_pending_user_changed(&up_rx);
+        let _ = expect_pending_user_changed(&feed_rx);
+        let _ = expect_pending_user_changed(&feed_rx);
         let _ = handle.outcomes.recv_blocking().unwrap();
 
         ev_tx
@@ -2727,7 +2750,7 @@ mod tests {
             }))
             .unwrap();
 
-        let cleared = expect_pending_user_changed(&up_rx);
+        let cleared = expect_pending_user_changed(&feed_rx);
         assert!(cleared.is_empty(), "bubble removed after consumed");
 
         handle.stop_and_join();
@@ -2740,11 +2763,11 @@ mod tests {
         seed_connection(&stores);
 
         let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, _up_rx) = async_channel::bounded(64);
+        let (feed_tx, _feed_rx) = async_channel::bounded(64);
         let handle = spawn_actor(
             fresh_state(),
             ev_rx,
-            up_tx,
+            feed_tx,
             stores,
             test_clock(),
             noop_api(),
@@ -2773,11 +2796,11 @@ mod tests {
         seed_connection(&stores);
 
         let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, up_rx) = async_channel::bounded(64);
+        let (feed_tx, feed_rx) = async_channel::bounded(64);
         let handle = spawn_actor(
             fresh_state(),
             ev_rx,
-            up_tx,
+            feed_tx,
             stores,
             test_clock(),
             noop_api(),
@@ -2797,7 +2820,7 @@ mod tests {
         }
 
         assert!(matches!(
-            up_rx.recv_blocking().unwrap(),
+            recv_detailed(&feed_rx),
             StreamUpdate::Disconnected(DisconnectReason::Unauthorized)
         ));
 
@@ -2811,11 +2834,11 @@ mod tests {
         seed_connection(&stores);
 
         let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, up_rx) = async_channel::bounded(64);
+        let (feed_tx, feed_rx) = async_channel::bounded(64);
         let handle = spawn_actor(
             fresh_state(),
             ev_rx,
-            up_tx,
+            feed_tx,
             stores,
             test_clock(),
             noop_api(),
@@ -2835,7 +2858,7 @@ mod tests {
         }
 
         assert!(matches!(
-            up_rx.recv_blocking().unwrap(),
+            recv_detailed(&feed_rx),
             StreamUpdate::Disconnected(DisconnectReason::SessionFailed)
         ));
 
@@ -2849,11 +2872,11 @@ mod tests {
         seed_connection(&stores);
 
         let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, up_rx) = async_channel::bounded(64);
+        let (feed_tx, feed_rx) = async_channel::bounded(64);
         let handle = spawn_actor(
             fresh_state(),
             ev_rx,
-            up_tx,
+            feed_tx,
             stores,
             test_clock(),
             noop_api(),
@@ -2873,7 +2896,7 @@ mod tests {
         }
 
         assert!(matches!(
-            up_rx.recv_blocking().unwrap(),
+            recv_detailed(&feed_rx),
             StreamUpdate::Disconnected(DisconnectReason::RetriesExhausted)
         ));
 
@@ -2887,11 +2910,11 @@ mod tests {
         seed_connection(&stores);
 
         let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, _up_rx) = async_channel::bounded(64);
+        let (feed_tx, _feed_rx) = async_channel::bounded(64);
         let handle = spawn_actor(
             fresh_state(),
             ev_rx,
-            up_tx,
+            feed_tx,
             stores,
             test_clock(),
             noop_api(),
@@ -2933,11 +2956,11 @@ mod tests {
         seed_connection(&stores);
 
         let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, _up_rx) = async_channel::bounded(64);
+        let (feed_tx, _feed_rx) = async_channel::bounded(64);
         let handle = spawn_actor(
             fresh_state(),
             ev_rx,
-            up_tx,
+            feed_tx,
             stores,
             test_clock(),
             noop_api(),
@@ -2966,11 +2989,11 @@ mod tests {
         seed_connection(&stores);
 
         let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, _up_rx) = async_channel::bounded(64);
+        let (feed_tx, _feed_rx) = async_channel::bounded(64);
         let handle = spawn_actor(
             fresh_state(),
             ev_rx,
-            up_tx,
+            feed_tx,
             stores,
             test_clock(),
             noop_api(),
@@ -2999,11 +3022,11 @@ mod tests {
         seed_connection(&stores);
 
         let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, _up_rx) = async_channel::bounded(64);
+        let (feed_tx, _feed_rx) = async_channel::bounded(64);
         let handle = spawn_actor(
             fresh_state(),
             ev_rx,
-            up_tx,
+            feed_tx,
             stores,
             test_clock(),
             noop_api(),
@@ -3031,11 +3054,11 @@ mod tests {
         seed_connection(&stores);
 
         let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, _up_rx) = async_channel::bounded(64);
+        let (feed_tx, _feed_rx) = async_channel::bounded(64);
         let handle = spawn_actor(
             fresh_state(),
             ev_rx,
-            up_tx,
+            feed_tx,
             stores,
             test_clock(),
             noop_api(),
@@ -3075,11 +3098,11 @@ mod tests {
         seed_connection(&stores);
 
         let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, up_rx) = async_channel::bounded(64);
+        let (feed_tx, feed_rx) = async_channel::bounded(64);
         let handle = spawn_actor(
             fresh_state(),
             ev_rx,
-            up_tx,
+            feed_tx,
             stores,
             test_clock(),
             noop_api(),
@@ -3122,7 +3145,7 @@ mod tests {
         );
 
         let mut stream_updates = Vec::new();
-        while let Ok(u) = up_rx.try_recv() {
+        while let Ok(ActorFeed::Detailed(u)) = feed_rx.try_recv() {
             stream_updates.push(u);
         }
         assert!(
@@ -3383,11 +3406,11 @@ mod tests {
             ..Default::default()
         });
         let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, up_rx) = async_channel::bounded(64);
-        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+        let (feed_tx, feed_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(fresh_state(), ev_rx, feed_tx, stores, test_clock(), api);
 
         ev_tx.send(status_running_event()).unwrap();
-        let _ = up_rx.recv_blocking().expect("running status delta");
+        let _ = feed_rx.recv_blocking().expect("running status delta");
 
         handle
             .commands
@@ -3397,11 +3420,11 @@ mod tests {
             })
             .unwrap();
 
-        let optimistic = expect_pending_user_changed(&up_rx);
+        let optimistic = expect_pending_user_changed(&feed_rx);
         assert_eq!(optimistic.len(), 1);
         assert_eq!(optimistic[0].content, "while running");
 
-        let stamped = expect_pending_user_changed(&up_rx);
+        let stamped = expect_pending_user_changed(&feed_rx);
         assert_eq!(stamped[0].store_item_id.as_deref(), Some("msg_running"));
 
         match handle.outcomes.recv_blocking().unwrap() {
@@ -3416,7 +3439,7 @@ mod tests {
                 cleared_pending_id: None,
             }))
             .unwrap();
-        let cleared = expect_pending_user_changed(&up_rx);
+        let cleared = expect_pending_user_changed(&feed_rx);
         assert!(
             cleared.is_empty(),
             "InputConsumed clears bubble while running"
@@ -3424,7 +3447,7 @@ mod tests {
 
         // Stream stays alive — further events and Stop still work.
         ev_tx.send(status_running_event()).unwrap();
-        assert!(up_rx.recv_blocking().is_ok());
+        assert!(feed_rx.recv_blocking().is_ok());
         handle.stop_and_join();
 
         // Network fail while running: rollback but no stream teardown.
@@ -3433,10 +3456,10 @@ mod tests {
         seed_connection(&stores2);
         let (api2, _mock2) = MockApi::fail(ClientError::network_for_test());
         let (ev_tx2, ev_rx2) = crossbeam_channel::bounded(64);
-        let (up_tx2, up_rx2) = async_channel::bounded(64);
-        let handle2 = spawn_actor(fresh_state(), ev_rx2, up_tx2, stores2, test_clock(), api2);
+        let (feed_tx2, feed_rx2) = async_channel::bounded(64);
+        let handle2 = spawn_actor(fresh_state(), ev_rx2, feed_tx2, stores2, test_clock(), api2);
         ev_tx2.send(status_running_event()).unwrap();
-        let _ = up_rx2.recv_blocking();
+        let _ = feed_rx2.recv_blocking();
         handle2
             .commands
             .send(SessionCommand::Send {
@@ -3444,14 +3467,14 @@ mod tests {
                 model_override: None,
             })
             .unwrap();
-        let _ = expect_pending_user_changed(&up_rx2);
-        assert!(expect_pending_user_changed(&up_rx2).is_empty());
+        let _ = expect_pending_user_changed(&feed_rx2);
+        assert!(expect_pending_user_changed(&feed_rx2).is_empty());
         match handle2.outcomes.recv_blocking().unwrap() {
             ActorOutcome::Command(CommandOutcome::SendFailed { .. }) => {}
             other => panic!("expected SendFailed, got {other:?}"),
         }
         ev_tx2.send(status_running_event()).unwrap();
-        assert!(up_rx2.recv_blocking().is_ok());
+        assert!(feed_rx2.recv_blocking().is_ok());
         handle2.stop_and_join();
     }
 
@@ -3468,8 +3491,8 @@ mod tests {
             ..Default::default()
         });
         let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, up_rx) = async_channel::bounded(64);
-        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+        let (feed_tx, feed_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(fresh_state(), ev_rx, feed_tx, stores, test_clock(), api);
 
         handle
             .commands
@@ -3478,8 +3501,8 @@ mod tests {
                 model_override: None,
             })
             .unwrap();
-        let _ = expect_pending_user_changed(&up_rx);
-        let stamped = expect_pending_user_changed(&up_rx);
+        let _ = expect_pending_user_changed(&feed_rx);
+        let stamped = expect_pending_user_changed(&feed_rx);
         assert_eq!(stamped.len(), 1);
         assert_eq!(stamped[0].server_pending_id.as_deref(), Some("pend_recon"));
         let _ = handle.outcomes.recv_blocking().unwrap();
@@ -3497,12 +3520,12 @@ mod tests {
         }
 
         // §4 P3(b) rule 1: gap/reconnect alone must not clear pending_user.
-        let reconnect_delta = up_rx.recv_blocking().expect("Reconnecting delta");
+        let reconnect_delta = recv_detailed(&feed_rx);
         assert!(matches!(
             reconnect_delta,
             StreamUpdate::Reconnecting { attempt: 1 }
         ));
-        while let Ok(u) = up_rx.try_recv() {
+        while let Ok(ActorFeed::Detailed(u)) = feed_rx.try_recv() {
             assert!(
                 !matches!(u, StreamUpdate::PendingUserChanged(ref v) if v.is_empty()),
                 "bubble must not be cleared before snapshot reconcile"
@@ -3523,7 +3546,7 @@ mod tests {
             .unwrap();
 
         let mut saw_reconcile_clear = false;
-        while let Ok(u) = up_rx.recv_blocking() {
+        while let Ok(ActorFeed::Detailed(u)) = feed_rx.recv_blocking() {
             if matches!(&u, StreamUpdate::PendingUserChanged(v) if v.is_empty()) {
                 saw_reconcile_clear = true;
                 break;
@@ -3562,13 +3585,11 @@ mod tests {
             ..Default::default()
         });
         let (_ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, _up_rx) = async_channel::bounded(64);
-        let (sum_tx, sum_rx) = async_channel::bounded(64);
+        let (feed_tx, feed_rx) = async_channel::bounded(64);
         let handle = spawn_actor_dual(
             fresh_state(),
             ev_rx,
-            up_tx,
-            sum_tx,
+            feed_tx,
             OutputMode::Summary,
             stores,
             test_clock(),
@@ -3585,8 +3606,10 @@ mod tests {
             })
             .unwrap();
 
-        // Summary mode does not mirror pending_user on the Detailed channel (M2).
-        assert!(sum_rx.recv_blocking().is_ok(), "summary emitted on send");
+        assert!(
+            matches!(feed_rx.recv_blocking().unwrap(), ActorFeed::Summary(_)),
+            "summary emitted on send"
+        );
 
         match handle.outcomes.recv_blocking().unwrap() {
             ActorOutcome::Command(CommandOutcome::SendAccepted {
@@ -3601,32 +3624,28 @@ mod tests {
 
         handle.stop_and_join();
 
-        // Summary consumer dropped (spawn_actor) — Send still completes, actor survives.
+        // Dropped feed receiver — SummaryConsumerGone on the next Summary emit.
         let _dir2 = tempfile::tempdir().unwrap();
         let stores2 = test_stores(_dir2.path());
         seed_connection(&stores2);
-        let (api2, _mock2) = MockApi::succeed_with_ack(SendEventAck {
-            queued: true,
-            item_id: Some("msg_no_sum".into()),
-            pending_id: None,
-            ..Default::default()
-        });
         let (ev_tx2, ev_rx2) = crossbeam_channel::bounded(64);
-        let (up_tx2, _up_rx2) = async_channel::bounded(64);
-        let handle2 = spawn_actor(fresh_state(), ev_rx2, up_tx2, stores2, test_clock(), api2);
-        handle2.commands.send(SessionCommand::Demote).unwrap();
-        handle2
-            .commands
-            .send(SessionCommand::Send {
-                text: "no consumer".into(),
-                model_override: None,
-            })
-            .unwrap();
-        match handle2.outcomes.recv_blocking().unwrap() {
-            ActorOutcome::Command(CommandOutcome::SendAccepted { .. }) => {}
-            other => panic!("expected SendAccepted, got {other:?}"),
-        }
+        let (feed_tx2, feed_rx2) = async_channel::bounded(64);
+        drop(feed_rx2);
+        let handle2 = spawn_actor_dual(
+            fresh_state(),
+            ev_rx2,
+            feed_tx2,
+            OutputMode::Summary,
+            stores2,
+            test_clock(),
+            noop_api(),
+        );
         ev_tx2.send(status_running_event()).unwrap();
+        match handle2.outcomes.recv_blocking().unwrap() {
+            ActorOutcome::SummaryConsumerGone => {}
+            other => panic!("expected SummaryConsumerGone, got {other:?}"),
+        }
+        handle2.commands.send(SessionCommand::Stop).unwrap();
         handle2.stop_and_join();
     }
 
@@ -3645,8 +3664,8 @@ mod tests {
             ..Default::default()
         });
         let (_ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, up_rx) = async_channel::bounded(64);
-        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+        let (feed_tx, feed_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(fresh_state(), ev_rx, feed_tx, stores, test_clock(), api);
 
         handle
             .commands
@@ -3669,8 +3688,8 @@ mod tests {
             .expect("join thread panicked — actor hung with Stop queued during in-flight send");
 
         // Optimistic + stamp emits complete before join returns.
-        let _ = expect_pending_user_changed(&up_rx);
-        let _ = expect_pending_user_changed(&up_rx);
+        let _ = expect_pending_user_changed(&feed_rx);
+        let _ = expect_pending_user_changed(&feed_rx);
     }
 
     #[test]
@@ -3682,12 +3701,12 @@ mod tests {
         let stores = test_stores(dir.path());
         seed_connection(&stores);
         let (_ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, _up_rx) = async_channel::bounded(64);
+        let (feed_tx, _feed_rx) = async_channel::bounded(64);
         let (api, mock) = MockApi::succeed_with_ack(SendEventAck {
             queued: true,
             ..Default::default()
         });
-        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+        let handle = spawn_actor(fresh_state(), ev_rx, feed_tx, stores, test_clock(), api);
 
         handle.commands.send(SessionCommand::Sleep).unwrap();
         match handle.outcomes.recv_blocking().unwrap() {
@@ -3717,12 +3736,12 @@ mod tests {
             .upsert_session(&fresh_state(), 1)
             .unwrap();
         let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, up_rx) = async_channel::bounded(64);
+        let (feed_tx, feed_rx) = async_channel::bounded(64);
         let (api, mock) = MockApi::succeed_with_ack(SendEventAck {
             queued: true,
             ..Default::default()
         });
-        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+        let handle = spawn_actor(fresh_state(), ev_rx, feed_tx, stores, test_clock(), api);
 
         handle.commands.send(SessionCommand::Sleep).unwrap();
         match handle.outcomes.recv_blocking().unwrap() {
@@ -3742,7 +3761,7 @@ mod tests {
 
         ev_tx.send(status_running_event()).unwrap();
         assert!(
-            up_rx.recv_blocking().is_ok(),
+            feed_rx.recv_blocking().is_ok(),
             "actor must survive and process events"
         );
 
@@ -3761,14 +3780,14 @@ mod tests {
         let stores = test_stores(_dir.path());
         seed_connection(&stores);
         let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, up_rx) = async_channel::bounded(64);
+        let (feed_tx, feed_rx) = async_channel::bounded(64);
         let (api, mock) = MockApi::succeed_with_ack(SendEventAck {
             queued: true,
             ..Default::default()
         });
         let mut state = fresh_state();
         state.status = SessionStatusValue::Running;
-        let handle = spawn_actor(state, ev_rx, up_tx, stores, test_clock(), api);
+        let handle = spawn_actor(state, ev_rx, feed_tx, stores, test_clock(), api);
 
         handle.commands.send(SessionCommand::Sleep).unwrap();
         match handle.outcomes.recv_blocking().unwrap() {
@@ -3781,7 +3800,7 @@ mod tests {
         );
 
         ev_tx.send(status_running_event()).unwrap();
-        assert!(up_rx.recv_blocking().is_ok());
+        assert!(feed_rx.recv_blocking().is_ok());
         handle.stop_and_join();
     }
 
@@ -3954,8 +3973,8 @@ mod tests {
         );
 
         let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, up_rx) = async_channel::bounded(64);
-        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+        let (feed_tx, feed_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(fresh_state(), ev_rx, feed_tx, stores, test_clock(), api);
 
         handle
             .commands
@@ -3964,7 +3983,7 @@ mod tests {
                 model_override: None,
             })
             .unwrap();
-        let held = expect_pending_user_changed(&up_rx);
+        let held = expect_pending_user_changed(&feed_rx);
         assert_eq!(held.len(), 1);
         assert!(held[0].server_pending_id.is_none());
         let _ = handle.outcomes.recv_blocking();
@@ -3974,7 +3993,7 @@ mod tests {
             .unwrap();
 
         expect_send_lost(&handle, "gone");
-        let cleared = recv_pending_user_changed_or_none(&up_rx).expect("cleared pending_user");
+        let cleared = recv_pending_user_changed_or_none(&feed_rx).expect("cleared pending_user");
         assert!(cleared.is_empty());
         handle.stop_and_join();
     }
@@ -3996,8 +4015,8 @@ mod tests {
         );
 
         let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, up_rx) = async_channel::bounded(64);
-        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+        let (feed_tx, feed_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(fresh_state(), ev_rx, feed_tx, stores, test_clock(), api);
 
         handle
             .commands
@@ -4006,7 +4025,7 @@ mod tests {
                 model_override: None,
             })
             .unwrap();
-        let held = expect_pending_user_changed(&up_rx);
+        let held = expect_pending_user_changed(&feed_rx);
         assert_eq!(held.len(), 1);
         let _ = handle.outcomes.recv_blocking();
 
@@ -4015,7 +4034,7 @@ mod tests {
             .unwrap();
 
         expect_send_lost(&handle, "lost send");
-        let cleared = recv_pending_user_changed_or_none(&up_rx).expect("cleared pending_user");
+        let cleared = recv_pending_user_changed_or_none(&feed_rx).expect("cleared pending_user");
         assert!(cleared.is_empty());
         handle.stop_and_join();
     }
@@ -4035,8 +4054,8 @@ mod tests {
         );
 
         let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, up_rx) = async_channel::bounded(64);
-        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+        let (feed_tx, feed_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(fresh_state(), ev_rx, feed_tx, stores, test_clock(), api);
 
         handle
             .commands
@@ -4045,7 +4064,7 @@ mod tests {
                 model_override: None,
             })
             .unwrap();
-        let held = expect_pending_user_changed(&up_rx);
+        let held = expect_pending_user_changed(&feed_rx);
         assert_eq!(held.len(), 1);
         assert!(held[0].server_pending_id.is_none());
         let _ = handle.outcomes.recv_blocking();
@@ -4061,7 +4080,7 @@ mod tests {
         ev_tx
             .send(ServerStreamEvent::SnapshotRestored(Box::new(snap)))
             .unwrap();
-        while let Ok(u) = up_rx.try_recv() {
+        while let Ok(ActorFeed::Detailed(u)) = feed_rx.try_recv() {
             let _ = u;
         }
 
@@ -4069,7 +4088,7 @@ mod tests {
             .send(ServerStreamEvent::Reconnected { gap: None })
             .unwrap();
 
-        let stamped = recv_pending_user_changed_or_none(&up_rx).expect("stamped pending_user");
+        let stamped = recv_pending_user_changed_or_none(&feed_rx).expect("stamped pending_user");
         assert_eq!(stamped.len(), 1);
         assert_eq!(stamped[0].server_pending_id.as_deref(), Some("p9"));
         assert_eq!(stamped[0].content, "stamp me");
@@ -4093,8 +4112,8 @@ mod tests {
         );
 
         let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, up_rx) = async_channel::bounded(64);
-        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+        let (feed_tx, feed_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(fresh_state(), ev_rx, feed_tx, stores, test_clock(), api);
 
         handle
             .commands
@@ -4103,7 +4122,7 @@ mod tests {
                 model_override: None,
             })
             .unwrap();
-        let _ = expect_pending_user_changed(&up_rx);
+        let _ = expect_pending_user_changed(&feed_rx);
         let _ = handle.outcomes.recv_blocking();
 
         let snap = snapshot_fixture(serde_json::json!({
@@ -4121,7 +4140,7 @@ mod tests {
             .send(ServerStreamEvent::Reconnected { gap: None })
             .unwrap();
 
-        let stamped = recv_pending_user_changed_or_none(&up_rx).expect("first episode stamp");
+        let stamped = recv_pending_user_changed_or_none(&feed_rx).expect("first episode stamp");
         assert_eq!(stamped[0].server_pending_id.as_deref(), Some("p_stale"));
         while handle.outcomes.try_recv().is_ok() {}
 
@@ -4132,7 +4151,7 @@ mod tests {
                 model_override: None,
             })
             .unwrap();
-        let held2 = expect_pending_user_changed(&up_rx);
+        let held2 = expect_pending_user_changed(&feed_rx);
         let new_held = held2
             .iter()
             .find(|b| b.pending_id == "lens_pend_2")
@@ -4158,7 +4177,7 @@ mod tests {
                 other => panic!("expected SendLost for lens_pend_2, got {other:?}"),
             }
         }
-        let after = recv_pending_user_changed_or_none(&up_rx).expect("after ep2 reconcile");
+        let after = recv_pending_user_changed_or_none(&feed_rx).expect("after ep2 reconcile");
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].pending_id, "lens_pend_1");
         assert_eq!(after[0].server_pending_id.as_deref(), Some("p_stale"));
@@ -4183,7 +4202,7 @@ mod tests {
         let (api, _mock) = MockApi::with_fetch_script(VecDeque::from([Ok(page1), Ok(page2)]));
 
         let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, up_rx) = async_channel::bounded(64);
+        let (feed_tx, feed_rx) = async_channel::bounded(64);
         ev_tx
             .send(parse_response(
                 "response.output_item.done",
@@ -4191,10 +4210,10 @@ mod tests {
             ))
             .unwrap();
 
-        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+        let handle = spawn_actor(fresh_state(), ev_rx, feed_tx, stores, test_clock(), api);
 
         let mut saw_catchup_watermark = false;
-        while let Ok(u) = up_rx.recv_blocking() {
+        while let Ok(ActorFeed::Detailed(u)) = feed_rx.recv_blocking() {
             if matches!(
                 u,
                 StreamUpdate::TranscriptAdvanced {
@@ -4258,9 +4277,9 @@ mod tests {
             MockApi::with_fetch_script(VecDeque::from([Ok(empty_item_list()), Ok(history_page)]));
 
         let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, up_rx) = async_channel::bounded(64);
+        let (feed_tx, feed_rx) = async_channel::bounded(64);
         // spawn_actor returns only after spawn catch-up completes (empty page).
-        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+        let handle = spawn_actor(fresh_state(), ev_rx, feed_tx, stores, test_clock(), api);
 
         ev_tx
             .send(ServerStreamEvent::Reconnected { gap: None })
@@ -4272,7 +4291,7 @@ mod tests {
             ))
             .unwrap();
 
-        while let Ok(u) = up_rx.recv_blocking() {
+        while let Ok(ActorFeed::Detailed(u)) = feed_rx.recv_blocking() {
             if matches!(
                 u,
                 StreamUpdate::TranscriptAdvanced {
@@ -4322,8 +4341,8 @@ mod tests {
         );
 
         let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, up_rx) = async_channel::bounded(64);
-        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+        let (feed_tx, feed_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(fresh_state(), ev_rx, feed_tx, stores, test_clock(), api);
 
         assert_eq!(
             fetch_done_rx
@@ -4355,7 +4374,7 @@ mod tests {
             .unwrap();
         release_fetch2.send(()).expect("release blocked fetch");
 
-        while let Ok(u) = up_rx.recv_blocking() {
+        while let Ok(ActorFeed::Detailed(u)) = feed_rx.recv_blocking() {
             if matches!(
                 u,
                 StreamUpdate::TranscriptAdvanced {
@@ -4402,8 +4421,8 @@ mod tests {
         );
 
         let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, up_rx) = async_channel::bounded(64);
-        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+        let (feed_tx, feed_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(fresh_state(), ev_rx, feed_tx, stores, test_clock(), api);
 
         assert_eq!(
             fetch_done_rx
@@ -4419,8 +4438,10 @@ mod tests {
             .expect("release blocked spawn catch-up fetch");
 
         loop {
-            match up_rx.recv_blocking() {
-                Ok(StreamUpdate::StatusChanged(SessionStatusValue::Running)) => break,
+            match feed_rx.recv_blocking() {
+                Ok(ActorFeed::Detailed(StreamUpdate::StatusChanged(
+                    SessionStatusValue::Running,
+                ))) => break,
                 Ok(_) => {}
                 Err(_) => panic!("updates channel closed before Running status"),
             }
@@ -4438,7 +4459,7 @@ mod tests {
 
         ev_tx.send(status_running_event()).unwrap();
         assert!(
-            up_rx.recv_blocking().is_ok(),
+            feed_rx.recv_blocking().is_ok(),
             "actor must survive and keep processing events"
         );
 
@@ -4467,8 +4488,8 @@ mod tests {
         );
 
         let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, up_rx) = async_channel::bounded(64);
-        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+        let (feed_tx, feed_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(fresh_state(), ev_rx, feed_tx, stores, test_clock(), api);
 
         assert_eq!(
             fetch_done_rx
@@ -4484,7 +4505,7 @@ mod tests {
                 model_override: None,
             })
             .unwrap();
-        let held = expect_pending_user_changed(&up_rx);
+        let held = expect_pending_user_changed(&feed_rx);
         assert_eq!(held.len(), 1);
         assert_eq!(held[0].content, "gone");
         let _ = handle.outcomes.recv_blocking();
@@ -4547,8 +4568,8 @@ mod tests {
         );
 
         let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
-        let (up_tx, up_rx) = async_channel::bounded(64);
-        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+        let (feed_tx, feed_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(fresh_state(), ev_rx, feed_tx, stores, test_clock(), api);
 
         assert_eq!(
             fetch_done_rx
@@ -4564,7 +4585,7 @@ mod tests {
                 model_override: None,
             })
             .unwrap();
-        let held = expect_pending_user_changed(&up_rx);
+        let held = expect_pending_user_changed(&feed_rx);
         assert_eq!(held.len(), 1);
         assert_eq!(held[0].content, "hi");
         let _ = handle.outcomes.recv_blocking();
@@ -4603,7 +4624,7 @@ mod tests {
         release_fetch3.send(()).expect("release blocked fetch");
 
         expect_send_lost(&handle, "hi");
-        let cleared = recv_pending_user_changed_or_none(&up_rx).expect("held bubble cleared");
+        let cleared = recv_pending_user_changed_or_none(&feed_rx).expect("held bubble cleared");
         assert!(cleared.is_empty());
         handle.stop_and_join();
     }
@@ -4732,9 +4753,9 @@ mod tests {
         let (api, _mock) = MockApi::with_fetch_script(VecDeque::from([Ok(history), Ok(delta)]));
 
         let (ev_tx, ev_rx) = crossbeam_channel::bounded(1);
-        let (up_tx, up_rx) = async_channel::bounded(64);
+        let (feed_tx, feed_rx) = async_channel::bounded(64);
         // spawn_actor's startup catch-up consumes `history` -> canonical pre-turn state.
-        let handle = spawn_actor(fresh_state(), ev_rx, up_tx, stores, test_clock(), api);
+        let handle = spawn_actor(fresh_state(), ev_rx, feed_tx, stores, test_clock(), api);
 
         // LIVE turn: stream commits the tool call provisional above the history frontier.
         for ev in decode_all(include_bytes!(
@@ -4748,7 +4769,7 @@ mod tests {
             if item_provisional_opt(&db_path, "fc_7ad94742b335") == Some(1) {
                 break;
             }
-            match up_rx.recv_blocking() {
+            match feed_rx.recv_blocking() {
                 Ok(_) => continue,
                 Err(_) => panic!("actor exited before committing the live provisional fc"),
             }
@@ -4763,7 +4784,7 @@ mod tests {
             if item_provisional_opt(&db_path, "fc_9bb8ae52357c40a2a2f696e37b81d681") == Some(0) {
                 break;
             }
-            match up_rx.recv_blocking() {
+            match feed_rx.recv_blocking() {
                 Ok(_) => continue,
                 Err(_) => panic!("actor exited before the reconnect delta fold landed"),
             }
