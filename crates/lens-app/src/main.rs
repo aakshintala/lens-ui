@@ -7,13 +7,15 @@ use lens_client::sessions::{GetOpts, SessionSnapshot, SessionStatus};
 use lens_client::{Auth, Client, Connection};
 use lens_core::actor::ActorStores;
 use lens_core::domain::ids::AgentId;
-use lens_core::domain::scalars::SessionStatusValue;
+use lens_core::domain::scalars::{ErrorInfo, SessionLifecycle, SessionStatusValue};
 use lens_core::domain::session::SessionState;
+use lens_core::domain::usage::Cost;
 use lens_core::persist::{
     ConnectionRecord, ControlStore, SqliteControlStore, SqliteTranscriptStore,
 };
 use lens_ui::actions::BackToBoard;
 use lens_ui::board::BoardView;
+use lens_ui::card::model::SessionCard;
 use lens_ui::clock::{UiClock, WallUiClock};
 use lens_ui::fleet::store::FleetStore;
 use lens_ui::slot::placeholder_tab;
@@ -23,16 +25,17 @@ use std::sync::Arc;
 
 struct Config {
     base_url: url::Url,
-    session_id: Option<SessionId>,
+    session_ids: Vec<SessionId>,
     data_dir: PathBuf,
     fleet_verify: bool,
     fleet_count: usize,
+    demo: bool,
 }
 
 struct LivePrep {
     conn: Connection,
     client: Client,
-    session_id: SessionId,
+    session_ids: Vec<SessionId>,
     data_dir: PathBuf,
 }
 
@@ -54,15 +57,21 @@ fn main() {
         process::exit(exit);
     }
 
-    let live_prep = match config.session_id.as_ref() {
-        Some(sid) => match prepare_live(&config, sid) {
+    if config.demo {
+        run_demo();
+        return;
+    }
+
+    let live_prep = if config.session_ids.is_empty() {
+        None
+    } else {
+        match prepare_live(&config) {
             Ok(p) => Some(p),
             Err(msg) => {
                 eprintln!("lens-app: {msg}");
                 process::exit(1);
             }
-        },
-        None => None,
+        }
     };
 
     Application::new().run(move |cx: &mut App| {
@@ -75,14 +84,16 @@ fn main() {
         cx.open_window(WindowOptions::default(), move |window, cx| {
             if let Some(prep) = live_prep {
                 fleet.update(cx, |fleet, cx| {
-                    if let Err(e) = fleet.spawn_live_session(
-                        &prep.conn,
-                        &prep.client,
-                        prep.session_id,
-                        &prep.data_dir,
-                        cx,
-                    ) {
-                        eprintln!("lens-app: spawn_live_session: {e}");
+                    for sid in prep.session_ids {
+                        if let Err(e) = fleet.spawn_live_session(
+                            &prep.conn,
+                            &prep.client,
+                            sid.clone(),
+                            &prep.data_dir,
+                            cx,
+                        ) {
+                            eprintln!("lens-app: spawn_live_session {sid}: {e}");
+                        }
                     }
                 });
             }
@@ -99,7 +110,86 @@ fn register_keybindings(cx: &mut App) {
     cx.bind_keys([KeyBinding::new("cmd-.", BackToBoard, None)]);
 }
 
-fn prepare_live(config: &Config, session_id: &SessionId) -> Result<LivePrep, String> {
+/// `--demo`: paint six cards in the six wave states (no live server needed) so the
+/// status language is visible at a glance. Cards carry no poller/commands — clicking
+/// one still toggles focus (and suppresses that card's glow while focused).
+fn run_demo() {
+    Application::new().run(|cx: &mut App| {
+        gpui_component::init(cx);
+        register_keybindings(cx);
+
+        let clock = Arc::new(WallUiClock) as Arc<dyn UiClock>;
+        let now = clock.now_millis();
+        let fleet = FleetStore::new_live(clock, cx);
+
+        cx.open_window(WindowOptions::default(), move |window, cx| {
+            fleet.update(cx, |f, cx| {
+                for card in demo_cards(now) {
+                    let id = card.session_id.clone();
+                    let entity = cx.new(|_| card);
+                    f.cards.insert(id, entity);
+                }
+                cx.notify();
+            });
+            let board = cx.new(|cx| BoardView::mount(fleet.clone(), placeholder_tab(cx), None, cx));
+            let any: gpui::AnyView = board.into();
+            cx.new(|cx| Root::new(any, window, cx))
+        })
+        .ok();
+        cx.activate(true);
+    });
+}
+
+/// Six preset cards, one per wave state.
+fn demo_cards(now: i64) -> Vec<SessionCard> {
+    let base = |id: &str, title: &str| {
+        let mut c = SessionCard::new(SessionId::new(id));
+        c.harness = Some("claude-sdk".into());
+        c.llm_model = Some("opus".into());
+        c.workspace = Some("lens".into());
+        c.git_branch = Some("main".into());
+        c.context_window = Some(200_000);
+        c.last_total_tokens = Some(48_000);
+        c.cumulative_cost = Cost {
+            total_cost_usd: Some(0.42),
+            ..Cost::default()
+        };
+        c.title = Some(title.into());
+        c
+    };
+
+    let mut needs_input = base("demo-needs-input", "Approve: run `rm -rf build/`?");
+    needs_input.status = SessionStatusValue::Waiting;
+    needs_input.needs_attention = true;
+    needs_input.activity_summary = "awaiting your approval".into();
+
+    let mut ready = base("demo-ready", "Finished — reply with a greeting");
+    ready.status = SessionStatusValue::Idle;
+    ready.seeded = true;
+    ready.seen_turn = 1;
+    ready.last_completed_at = Some(now);
+
+    let mut working = base("demo-working", "Refactor the session poller");
+    working.status = SessionStatusValue::Running;
+    working.activity_summary = "running the test suite…".into();
+
+    let mut failed = base("demo-failed", "cargo build");
+    failed.status = SessionStatusValue::Failed;
+    failed.last_task_error = Some(ErrorInfo {
+        code: "build_error".into(),
+        message: "E0432: unresolved import".into(),
+    });
+
+    let mut slept = base("demo-slept", "Archived brainstorm");
+    slept.status = SessionStatusValue::Idle;
+    slept.lifecycle = SessionLifecycle::Slept;
+
+    let neutral = base("demo-neutral", "Fresh session — no activity yet");
+
+    vec![needs_input, ready, working, failed, slept, neutral]
+}
+
+fn prepare_live(config: &Config) -> Result<LivePrep, String> {
     std::fs::create_dir_all(&config.data_dir)
         .map_err(|e| format!("failed to create {}: {e}", config.data_dir.display()))?;
 
@@ -108,17 +198,19 @@ fn prepare_live(config: &Config, session_id: &SessionId) -> Result<LivePrep, Str
     let conn = Connection::new(conn_id, config.base_url.clone(), auth);
     let client = Client::new(conn.clone()).map_err(|e| format!("connect failed: {e}"))?;
 
-    let snap = client
-        .sessions()
-        .get(session_id, GetOpts::default())
-        .map_err(|e| format!("failed to resolve session {session_id}: {e}"))?;
-
-    seed_disk(&conn, session_id, &config.data_dir, &snap)?;
+    // One connection, all sessions share the control store; each seeds its own transcript.
+    for session_id in &config.session_ids {
+        let snap = client
+            .sessions()
+            .get(session_id, GetOpts::default())
+            .map_err(|e| format!("failed to resolve session {session_id}: {e}"))?;
+        seed_disk(&conn, session_id, &config.data_dir, &snap)?;
+    }
 
     Ok(LivePrep {
         conn,
         client,
-        session_id: session_id.clone(),
+        session_ids: config.session_ids.clone(),
         data_dir: config.data_dir.clone(),
     })
 }
@@ -126,10 +218,11 @@ fn prepare_live(config: &Config, session_id: &SessionId) -> Result<LivePrep, Str
 fn parse_config() -> Result<Config, String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut base_url: Option<String> = None;
-    let mut session_id: Option<SessionId> = None;
+    let mut session_ids: Vec<SessionId> = Vec::new();
     let mut data_dir: Option<PathBuf> = None;
     let mut fleet_verify = false;
     let mut fleet_count: usize = 10;
+    let mut demo = false;
     let mut i = 0;
 
     while i < args.len() {
@@ -140,6 +233,10 @@ fn parse_config() -> Result<Config, String> {
             }
             "--fleet-verify" => {
                 fleet_verify = true;
+                i += 1;
+            }
+            "--demo" => {
+                demo = true;
                 i += 1;
             }
             "--count" => {
@@ -161,7 +258,19 @@ fn parse_config() -> Result<Config, String> {
             "--session" => {
                 i += 1;
                 let id = next_flag_value(&args, i, "--session")?;
-                session_id = Some(SessionId::new(id));
+                // Repeatable: pass --session multiple times to show several cards.
+                session_ids.push(SessionId::new(id));
+                i += 1;
+            }
+            "--sessions" => {
+                i += 1;
+                let raw = next_flag_value(&args, i, "--sessions")?;
+                session_ids.extend(
+                    raw.split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(SessionId::new),
+                );
                 i += 1;
             }
             "--data-dir" => {
@@ -189,17 +298,18 @@ fn parse_config() -> Result<Config, String> {
         if fleet_verify {
             std::env::temp_dir().join("lens-fleet-verify")
         } else {
-            let sid = session_id.as_ref().map(|s| s.as_str()).unwrap_or("board");
+            let sid = session_ids.first().map(|s| s.as_str()).unwrap_or("board");
             std::env::temp_dir().join(format!("lens-app-{sid}"))
         }
     });
 
     Ok(Config {
         base_url,
-        session_id,
+        session_ids,
         data_dir,
         fleet_verify,
         fleet_count,
+        demo,
     })
 }
 

@@ -91,6 +91,26 @@ pub fn wave_border_color(wave: Wave) -> Hsla {
     .into()
 }
 
+/// Short state label for the colored status pill.
+fn wave_label(wave: Wave, status: SessionStatusValue) -> &'static str {
+    match wave {
+        Wave::NeedsInput => "NEEDS INPUT",
+        Wave::Ready => "READY",
+        Wave::Working => "WORKING",
+        Wave::Failed => "FAILED",
+        Wave::Slept => "SLEPT",
+        Wave::Neutral => status_label(status),
+    }
+}
+
+/// Contrasting text color for the filled pill (dark on bright waves, light on grey).
+fn pill_text_color(wave: Wave) -> Hsla {
+    match wave {
+        Wave::Neutral | Wave::Slept => gpui::rgb(0xe5e7eb).into(),
+        _ => gpui::rgb(0x0b1220).into(),
+    }
+}
+
 fn ellipsize_line(text: impl Into<SharedString>) -> Div {
     div().overflow_hidden().text_ellipsis().child(text.into())
 }
@@ -114,7 +134,6 @@ pub fn render_card_chrome(
     on_retry: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let title = card.title.clone().unwrap_or_else(|| "—".into());
-    let status = status_label(card.status);
     let harness_model = format_harness_model(card);
     let repos_row = format_repos_row(&card.repos);
     let repos_for_tooltip = card.repos.clone();
@@ -137,32 +156,28 @@ pub fn render_card_chrome(
         .p_2()
         .gap_1()
         .rounded_md()
-        .border_1()
+        .border_2()
         .border_color(border)
         .overflow_hidden();
 
-    // Header: status tile + STATUS/title + kebab
+    // Header: a filled state pill (wave color + label) + title + kebab.
     let mut header = div()
         .flex()
         .flex_row()
         .items_center()
         .gap_1()
-        .child(div().w(px(10.0)).h(px(10.0)).rounded_sm().bg(border))
         .child(
-            div().flex_grow().overflow_hidden().child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(gpui::rgb(0x9ca3af))
-                            .child(status),
-                    )
-                    .child(ellipsize_line(title)),
-            ),
+            div()
+                .flex_shrink_0()
+                .px_2()
+                .py(px(1.0))
+                .rounded_full()
+                .bg(border)
+                .text_color(pill_text_color(wave))
+                .text_xs()
+                .child(wave_label(wave, card.status)),
         )
+        .child(div().flex_grow().overflow_hidden().child(ellipsize_line(title)))
         .child(
             div()
                 .id("card-kebab")
