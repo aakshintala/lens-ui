@@ -9,7 +9,7 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Open threads & next up
 
-- **▶ ACTIVE: shared terminal workstream — ARCHITECTURE PIVOT 2026-07-15 (needs design redo).**
+- **▶ ACTIVE: shared terminal workstream — design-pass spikes DONE 2026-07-16; next = build `lens-terminal`.**
   Original design ([`specs/2026-07-14-terminal-workstream-design.md`](./specs/2026-07-14-terminal-workstream-design.md))
   assumed **porting Ghostty VT source** via the gpui-ghostty wrapper (adopt/adapt/exclude inventory,
   WP0 provenance gate). **That model is now superseded.** This session:
@@ -47,10 +47,29 @@ and roll older "Recent" pointers off this page as they age.
       plan+review docs. codegen/drift/gate intact (`cargo test -p xtask` 2/2).
     - **Docs superseded** — banners on the source-port design + roadmap (VT-adoption + `--workspace`
       gate lines flagged dead; model-independent parts still hold).
-  - **NEXT (design pass, tasks 3-4):** brainstorm→plan the **GPUI render layer** (grid→paint on
-    `RenderState`/`Row`/`Cell`) + **omnigent PTY-attach** (WS bytes↔`vt_write`/`on_pty_write`) on the
-    safe API. A terminal grid ≠ scrolling transcript — verify the virtualization/markdown spike
-    learnings transfer before locking the render contract. GPUI 0.2.2 + omnigent pins unchanged.
+  - **✅ DESIGN-PASS SPIKES DONE (2026-07-16, this session)** — both design questions answered;
+    merged to `terminal-ws` (unpushed). Spec `docs/specs/2026-07-15-terminal-spikes-design.md`,
+    plans `docs/plans/2026-07-15-terminal-spike-{a,b}-*.md`. Memory
+    [[terminal-render-ptyattach-spikes-executed]].
+    - **Spike A — render viability → VERDICT: full-snapshot repaint contract.** Standalone GPUI
+      probe (grok-built, Opus+codex reviewed). S1 (reshape every row every frame, no cache) full-redraw
+      p95 = **2.77 ms @ 200×50** ≤ 8.3 ms budget → Ghostty dirty-row tracking is **not** load-bearing;
+      per-row `ShapedLine` cache (S2) barely helps (2.45 ms) → shaping isn't the bottleneck. Wide/emoji
+      need per-cell glyph placement (per-row `shape_line` drifts). Liftable `paint.rs` kept +
+      codex 3-item punch-list (findings `docs/spikes/2026-07-15-terminal-render-viability.md`).
+      ⚠ p95 is paint-closure CPU only (no vsync/present) — re-measure end-to-end when building real.
+    - **Spike B — PTY-attach contract → DOCUMENTED + LIVE-VERIFIED** vs omnigent 0.5.1
+      (`docs/spikes/2026-07-15-pty-attach-contract.md`, corpus in `captures/2026-07-15-pty-attach/`).
+      **Wire is transport-independent** (control=default & pty both deliver **raw VT binary**; tmux
+      control-mode consumed server-side → **NO tmux parser in the client**). Attach `ws:// /v1/…/attach`,
+      101 before terminal lookup, no auth on dev; input=binary bytes (also the `on_pty_write` back-channel),
+      resize=JSON text; reconnect to same `terminal_id` = current-screen redraw, **no byte-replay**
+      (transient gap); typed close codes 4404(stop, live-confirmed)/4405(detach)/4500(retry).
+  - **NEXT (build, tasks 5+):** the real **`crates/lens-terminal`** deep module (wraps `libghostty-vt`,
+    no Ghostty type escapes) → off-thread actor (reuse state-model single-writer+replica pattern) →
+    **full-snapshot render layer** (lift `paint.rs`, apply the 3 codex fixes + wide/emoji per-cell +
+    full SGR) → **typed WS attach client** (binary↔`vt_write`, JSON resize, 4404/4405/4500 reconnect).
+    First host = standalone GPUI demo. GPUI 0.2.2 + omnigent pins unchanged.
 
 - **📋 SPEC-GAPS backlog (2026-07-13):** nine independent, un-specced/partial
   subsystems parked in [`SPEC-GAPS.md`](./SPEC-GAPS.md) — app release/signing/update,
