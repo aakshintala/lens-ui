@@ -54,6 +54,10 @@ async fn shell_skeleton_acceptance(cx: &mut gpui::TestAppContext) {
     let c = SessionId::new("c");
 
     let (fleet, pty) = cx.update(|cx| {
+        // Card chrome reads `cx.lens_theme()` on render (A2 migration), so the theme global must
+        // be installed before the board renders.
+        gpui_component::init(cx);
+        lens_ui::theme::install_at_startup(cx);
         let fleet = FleetStore::new(Arc::clone(&clock) as Arc<dyn UiClock>, cx);
         fleet.update(cx, |f, cx| {
             f.spawn_fake_session(a.clone(), cx);
