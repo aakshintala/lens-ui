@@ -18,11 +18,23 @@ and roll older "Recent" pointers off this page as they age.
   the two next efforts** in `docs/handoffs/2026-07-16-lens-ui-theming-and-card-audit.md`.
   - **User decisions locked:** Needs-input=orange; card readout = the **icon-tile** (§5.1), not the
     current placeholder text-pill (pill is throwaway); **invest in §18 theming NOW** before more surface.
-  - **▶ NEXT (gates the wave build): brainstorm §18 theming.** `gpui-component 0.5.1` already in-tree
-    (lens-ui+lens-app), zero theming today. Load-bearing fork: **adopt gpui-component's theme substrate
-    + layer `status.*` tokens** vs **own §18 `Theme` struct + bridge**. Resolve via
-    `superpowers:brainstorming` → design doc BEFORE code; then A2 (hex→token migration) + the wave build
-    (B1–B5) consume real tokens. Board packing (B6–B8) deferred. Memory [[lens-ui-theming-fork]].
+  - **✅ THEMING BRAINSTORM DONE (2026-07-16 eve): fork + token surface + scope + sequencing locked.**
+    Design doc NOT yet written — resume `superpowers:brainstorming` at step 6. Decisions +
+    resume checklist in `docs/handoffs/2026-07-16-theming-brainstorm-decisions.md`, memory
+    [[lens-ui-theming-fork]].
+    - **D1 substrate = BRIDGE (not vendor):** own a `LensTheme` superset, construct gpui-component's
+      public `Theme` from our base tokens at init/reload. NOT extend their theme — it's the crate root
+      (85 files) so extending = forking 60 components forever, to buy something we never need.
+    - **D2 tokens:** base (maps onto their `ThemeColor` + free syntax highlight) + `status.*` (ours, 6
+      waves) + terminal ANSI (ours; feeds libghostty renderer, `../lens-terminal-ws`) + diff (ours).
+    - **D3 scope now:** schema + `LensTheme` + accessor + bridge + **one embedded dark JSON** (no
+      watcher/registry). Defer file-load/registry/hot-reload/light/importers/picker.
+  - **▶ NEXT: write the theming design doc → `writing-plans` → implement minimal substrate**, then A2
+    (hex→token migration) + wave build (B1–B5). **File as two up-next items:** wave build (immediate) +
+    **full theming machinery §18 (importers/picker/hot-reload) = later standalone session (step 9, least
+    urgent — nothing depends on it).** Sequencing: theming schema → waves → board packing → light
+    checkpoint → transcript → composer/elicitation → panes/terminal/editor → shell polish → theming
+    machinery.
 
 - **📋 SPEC-GAPS backlog (2026-07-13):** nine independent, un-specced/partial
   subsystems parked in [`SPEC-GAPS.md`](./SPEC-GAPS.md) — app release/signing/update,
