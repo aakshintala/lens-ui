@@ -5,15 +5,26 @@
 **Status:** Design (brainstorm decisions D1–D4 locked in
 `docs/handoffs/2026-07-16-theming-brainstorm-decisions.md`; this doc specifies them for
 `writing-plans`).
-**Scope:** The *minimal* theming substrate — the load-bearing token schema + **two** embedded themes
-(dark + light, base+status each) + the gpui-component bridge + startup theme selection. Delivery
-machinery (importers, picker, registry, hot-reload, external files, live OS-appearance toggle) is out of
-scope and deferred to §18-machinery (D4 step 9).
+**Scope:** The theming substrate — the load-bearing token schema + **two** themes (dark + light,
+base+status each) + the gpui-component bridge + startup selection + **external-file loading and a manual
+reload command** (the tuning loop). The heavier control surface — settings pane, live OS-appearance
+toggle, auto file-watcher, theme registry/picker, importers — is the **next** workstream (§18-machinery),
+not this one.
 
-> **Amends the brainstorm handoff:** light-theme *authoring* moves from D4-step-4 (a later checkpoint)
-> into this step. Reason (user): authoring light now is the forcing function that proves the schema is
-> genuinely semantic (no dark-baked field values) *before* surfaces multiply. Live OS-appearance toggle
-> stays deferred; selection happens once at startup.
+> **Sequencing (decided with user, amends the brainstorm handoff D4):**
+> 1. **This workstream** — schema + dark + light + bridge + external files + manual reload.
+> 2. **Wave build (B1–B5) then board (B6–B8)** — the wedge; tunes its colors via this workstream's manual
+>    reload.
+> 3. **§18-machinery + settings pane** — live OS toggle, auto-watcher, registry, picker, and the settings
+>    pane that houses them. Lands *before* transcript/composer/side-pane/editor so settings has a home
+>    before those surfaces need to dock into it. (Ordering (b): wedge first, settings pane right after —
+>    the board's toggles then have somewhere to live and the pane isn't empty scaffolding.)
+> 4. Importers stay paired with their **terminal** surface (D4 step 7) — they theme tokens for a renderer
+>    that doesn't exist yet, so they're not part of §18-machinery.
+>
+> Light-theme *authoring* is pulled forward from D4-step-4 into step 1: authoring light now is the
+> forcing function that proves the schema is genuinely semantic (no dark-baked field values) *before*
+> surfaces multiply.
 
 ---
 
@@ -28,18 +39,20 @@ etc., we need **one semantic token surface** so that:
 2. Swapping the whole palette (dark↔light, or a user import later) is a data change, not a code change.
 3. The gpui-component widgets we already render on (buttons, inputs, scrollbars, markdown, tree-sitter
    syntax) pick up our base palette automatically — one source of truth, no per-widget theming.
+4. Tuning a color is *edit JSON → reload → see it*, not edit → recompile → relaunch.
 
 The **only** load-bearing deliverable is the token *schema*: once call sites bake
-`cx.lens_theme().status…`, all later delivery machinery slots in behind the same accessor with **zero
-call-site churn**. Everything else (importers, registry, watcher, external files) is deferred precisely
-because nothing depends on it yet and it themes surfaces that don't exist.
+`cx.lens_theme().status…`, all later delivery machinery (registry, picker, watcher, importers) slots in
+behind the same accessor with **zero call-site churn**. The reload loop is in scope here not because
+anything depends on it, but because we're about to tune every color against real pixels and restart-to-see
+is slow.
 
-### Non-goals (explicitly deferred to §18-machinery)
+### Non-goals (deferred to the §18-machinery + settings-pane workstream)
 
-* External theme-file loading and a `themes/` dir
-* registry / more than the two built-in themes / a settings picker
-* hot-reload watcher and **live OS-appearance toggle** (re-bridging when the OS flips while running)
-* iTerm/Alacritty importers
+* config-dir convention / a `themes/` registry / **more than the two built-in themes** / a settings picker
+* **auto** file-watcher (this workstream ships *manual* reload only)
+* **live OS-appearance toggle** (re-bridging when the OS flips while running)
+* iTerm/Alacritty importers (stay with the terminal surface, D4 step 7)
 * `JsonSchema` derivation for user tooling
 
 ---
@@ -61,8 +74,8 @@ because nothing depends on it yet and it themes surfaces that don't exist.
   here but not built until their consuming surface lands (D4 steps 5/7) — adding a struct field then is
   not a call-site change, so there is no churn cost to deferring.
 - **D4 — Sequencing.** This substrate is step 1; it's the sole prerequisite for the wave build (step 2)
-  which validates the schema immediately. (Light authoring pulled forward into this step — see the amend
-  note above.)
+  which validates the schema immediately. (See the amended sequencing note above for the settings-pane
+  slot.)
 
 ---
 
@@ -73,17 +86,17 @@ gpui-component bridge; `lens-core` is gpui-free domain types and must stay that 
 
 ```
 crates/lens-ui/src/theme/
-  mod.rs         LensTheme, globals, cx.lens_theme() accessor, init() + selection, the bridge fn
+  mod.rs         LensTheme, globals, cx.lens_theme() accessor, init()/reload()/resolve(), the bridge fn
   tokens.rs      BaseTokens, StatusTokens (+ Wave→Hsla), serde hex helper
-  lens-dark.json    embedded "Lens Dark"  (base + status), include_str!'d
-  lens-light.json   embedded "Lens Light" (base + status), include_str!'d
+  lens-dark.json    "Lens Dark"  (base + status) — embedded default AND the on-disk reload target
+  lens-light.json   "Lens Light" (base + status) — embedded default AND the on-disk reload target
 ```
 
 ### 3.1 Data model
 
 `LensTheme` is a plain global holding decoded `Hsla` values (not hex strings — parse once at startup).
 All token structs derive `serde::{Serialize, Deserialize}` (that is what `from_json` and a future
-exporter use); `Hsla` fields carry `#[serde(with = "hex_hsla")]` (§4.1); `mode` needs no helper —
+exporter use); `Hsla` fields carry `#[serde(with = "hex_hsla")]` (§4.3); `mode` needs no helper —
 `ThemeMode` is natively `Deserialize` (snake_case → `"dark"`/`"light"`).
 
 ```rust
@@ -206,7 +219,7 @@ identical to how gpui-component's own components reach `cx.theme()`.
 
 ```rust
 /// Overwrite the base tokens we own onto gpui-component's global Theme, and align its mode so its
-/// components render on our palette. Called once at init, after gpui_component::init.
+/// components render on our palette. Called at init and on every reload.
 fn bridge_into_gpui_component(lens: &LensTheme, cx: &mut App) {
     let theme = Theme::global_mut(cx);
     theme.mode = lens.mode;              // so components pick the right light/dark variants
@@ -247,46 +260,77 @@ fn bridge_into_gpui_component(lens: &LensTheme, cx: &mut App) {
 ```
 
 We do **not** call gpui-component's `apply_config` (it's `pub(crate)` — unreachable). We don't need it:
-their `init` already populated a complete default `Theme` (including a light and a dark default); we just
-override the ~30 base fields we own on top. Fields we don't touch (tables, sliders, tiles,
+their `init` already populated a complete default `Theme` (light + dark defaults); we just override the
+~30 base fields we own on top. Fields we don't touch (tables, sliders, tiles,
 red/green/blue/magenta/cyan/yellow, `bullish`/`bearish`, `highlight_theme`) keep gpui-component's
-sensible defaults. HighlightTheme (tree-sitter syntax) rides their default for now; authoring it is
-deferred to the transcript surface (D4 step 5).
+defaults. HighlightTheme (tree-sitter syntax) rides their default for now; authoring it is deferred to
+the transcript surface (D4 step 5).
 
-### 3.4 init + theme selection
+### 3.4 Selection, init, and reload
+
+Themes ship **embedded** (`include_str!`) as the always-works default. If `LENS_THEME_DIR` is set, the
+selected theme loads from `<dir>/lens-{mode}.json` on disk instead — and that same on-disk file is what a
+**reload** re-reads. For our dev loop, point `LENS_THEME_DIR` at `crates/lens-ui/src/theme/`, so the file
+we edit *is* both the compiled-in default and the live reload target (no copy-back).
 
 ```rust
-/// Parse the selected embedded theme, install it as the LensTheme global, and bridge its base tokens
-/// onto gpui-component's Theme. Call once, immediately after gpui_component::init(cx).
-pub fn init(cx: &mut App) {
+/// Pure, testable core: resolve which theme to use and load it. `dir` = the LENS_THEME_DIR override
+/// (None → embedded). A bad *external* file falls back to embedded and logs — a stray user edit must
+/// not crash a running app. The embedded default is a build-time invariant (panics only if IT is bad,
+/// which the §6 parse test prevents).
+fn resolve(mode: ThemeMode, dir: Option<&Path>) -> LensTheme {
     const DARK: &str = include_str!("lens-dark.json");
     const LIGHT: &str = include_str!("lens-light.json");
+    let (embedded, file) = if mode.is_dark() { (DARK, "lens-dark.json") }
+                           else              { (LIGHT, "lens-light.json") };
+    if let Some(dir) = dir {
+        let path = dir.join(file);
+        match std::fs::read_to_string(&path)
+            .map_err(anyhow::Error::from)
+            .and_then(|s| LensTheme::from_json(&s))
+        {
+            Ok(lens) => return lens,
+            Err(e) => eprintln!("lens-theme: {} — using embedded default: {e}", path.display()),
+        }
+    }
+    LensTheme::from_json(embedded).expect("embedded lens theme must parse — build-time invariant")
+}
 
-    // Default: follow the OS appearance (gpui_component::init already synced Theme.mode from the system).
-    // Dev/testing override: LENS_THEME=light|dark forces a mode regardless of the OS.
+/// Resolve mode (LENS_THEME override else the OS appearance gpui_component::init already synced) and
+/// the LENS_THEME_DIR override, then load.
+fn load_selected(cx: &App) -> LensTheme {
     let mode = match std::env::var("LENS_THEME").ok().as_deref() {
         Some("light") => ThemeMode::Light,
         Some("dark") => ThemeMode::Dark,
         _ => Theme::global(cx).mode,
     };
-    let json = if mode.is_dark() { DARK } else { LIGHT };
+    let dir = std::env::var("LENS_THEME_DIR").ok();
+    resolve(mode, dir.as_deref().map(Path::new))
+}
 
-    let lens = LensTheme::from_json(json)
-        .expect("embedded lens theme must parse — this is a build-time invariant");
+/// Install the selected theme + bridge. Call once, immediately after gpui_component::init(cx).
+pub fn init(cx: &mut App) {
+    let lens = load_selected(cx);
     bridge_into_gpui_component(&lens, cx);
     cx.set_global(lens);
 }
+
+/// Re-read the selected theme from disk (or embedded) and re-apply it live. Bound to a keybinding.
+pub fn reload(window: &mut Window, cx: &mut App) {
+    let lens = load_selected(cx);
+    bridge_into_gpui_component(&lens, cx);
+    cx.set_global(lens);
+    window.refresh();   // repaint all views on the new palette — gpui-component's Theme::change pattern
+}
 ```
 
-Both embedded JSONs are compiled-in invariants; a parse failure is a developer error caught by the parse
-unit tests (§6) long before runtime, so `expect` at startup is correct (not a user-facing failure mode).
+`main.rs` calls `lens_ui::theme::init(cx)` after each `gpui_component::init(cx)` — **two sites** (live run
++ `--demo`) — and binds a `ReloadTheme` action to a key (e.g. `cmd-shift-t`). The action is handled where
+a `Window` is in scope (the root view, exactly like the existing `cmd-.`/`BackToBoard`), calling
+`theme::reload(window, cx)`. Reload is **manual only**; an auto file-watcher is the next workstream.
 
-Selection is **at startup only**. If the OS appearance flips while the app is running we do *not*
-re-bridge (that's the deferred live toggle) — relaunch (or set `LENS_THEME`) to switch. This is enough
-to *validate* that the schema renders both themes; live switching is machinery, not substrate.
-
-`main.rs` calls `lens_ui::theme::init(cx)` on the line after each `gpui_component::init(cx)` — **two
-sites** (live run + `--demo`). Both must be updated (the demo is how we eyeball the wave palette).
+Selection is otherwise **at startup**: if the OS flips dark↔light while running we do not auto re-bridge
+(that's the deferred live toggle) — reload, relaunch, or set `LENS_THEME`.
 
 ---
 
@@ -296,6 +340,11 @@ Hex strings (the format importers and future themes reuse). Forward/backward com
 the parser does **not** `deny_unknown_fields`, and deferred groups will be `#[serde(default)]` when added,
 so (a) today's file omitting terminal/diff parses against a future binary, and (b) an early-authored
 terminal block parses against today's binary (ignored). `base` and `status` are required.
+
+**All status values below are placeholders pending on-device eyeballing** (per user). Dark is *seeded*
+from the locked `board-home.html` render; light is a first cut. Both will be retuned against real
+rendered surfaces during the wave/board build using the reload loop — treat the numbers as starting
+points, not final.
 
 ### 4.1 `lens-dark.json` — "Lens Dark"
 
@@ -350,15 +399,13 @@ terminal block parses against today's binary (ignored). `base` and `status` are 
 
 Dark base hexes are lifted from the locked `board-home.html :root`
 (`--bg #07080b`, `--bg1 #101319`, `--bg2 #151922`, `--bg3 #1c2230`, `--line #222936`, `--line2 #2c3442`,
-`--tx #eef2f7`, `--tx2 #9aa4b3`, `--tx3 #5f6a7a`). Status colors are the D2-locked wave palette.
+`--tx #eef2f7`, `--tx2 #9aa4b3`, `--tx3 #5f6a7a`). Status colors are seeded from the D2 wave palette.
 
-### 4.2 `lens-light.json` — "Lens Light" (first-pass, tunable)
+### 4.2 `lens-light.json` — "Lens Light" (first-cut)
 
-There is **no locked light SSOT** (board-home.html is dark-only), so this is authored for *structural*
-correctness — light surfaces, dark text, hue-matched-but-legible accents/status on a light background.
-The checkpoint is "the schema expresses light with no dark-baked assumptions," not "final light
-aesthetics"; treat the exact values as tunable. Status colors are darkened/saturated so colored text and
-a thin border read on a light card. (Values below are the design's proposed first cut.)
+No locked light SSOT exists, so this is authored for *structural* correctness — light surfaces, dark
+text, hue-matched-but-legible accents/status on a light background. The checkpoint is "the schema
+expresses light with no dark-baked assumptions," not "final light aesthetics."
 
 ```json
 {
@@ -444,7 +491,7 @@ the real surface (per `premature-layer-boundary-binding`: specify the shape, don
 
 ### 5.1 Terminal (group 3) — D4 step 7, with the terminal renderer
 Feeds the libghostty_vt + ghostty_rs custom gpui renderer (in progress at `../lens-terminal-ws`; no
-palette yet). ~20 tokens; target of §18-machinery's iTerm/Alacritty importer.
+palette yet). ~20 tokens; target of the iTerm/Alacritty importer.
 
 ```rust
 pub struct TerminalTokens {
@@ -476,19 +523,22 @@ When built, each gets `#[serde(default)]` on `LensTheme` so files that omit it s
 
 ## 6. Testing
 
-Pure, no gpui window needed for the core:
+Pure where possible (`resolve` takes an explicit `mode`/`dir` so tests never touch process env):
 
 1. **Both embedded themes parse** — `from_json(include_str!("lens-dark.json"))` and `…lens-light.json`
-   are both `Ok`; names/modes are `("Lens Dark", Dark)` / `("Lens Light", Light)`. This is what makes the
-   `expect` in `init` a build-time invariant.
-2. **Locked dark-status guard** — assert the six dark `status.*` values equal the D2-locked hexes
-   (`ready #4c8dff`, `working #36c98a`, `needs_input #ff8a3d`, `failed #ff5d5d`, `slept #7a8493`,
-   `neutral #374151`). Guards against silent drift from the `board-home.html` SSOT.
+   are both `Ok`; names/modes are `("Lens Dark", Dark)` / `("Lens Light", Light)`. Makes the `expect` in
+   `resolve` a build-time invariant.
+2. **Dark-status seed guard** — the six dark `status.*` values equal the `board-home.html` seed hexes.
+   Catches accidental drift; when we *intentionally* retune, update the render + this test together.
 3. **Light expresses distinctly** — light `base.background` ≠ dark `base.background` and light
    `base.foreground` is darker than its background (a cheap "not dark-baked" sanity check).
 4. **`for_wave` totality** — all six `Wave` variants resolve; adding a variant fails to compile.
 5. **hex round-trip** — `parse_hex → to_hex → parse_hex` is stable for a sample token.
-6. **Bridge smoke** (gpui `test_app` if cheap; else skip) — after `theme::init`, `cx.theme().background`
+6. **External override precedence** — `resolve(Dark, Some(tmpdir))` with a modified `lens-dark.json` in
+   `tmpdir` returns the on-disk values, not embedded.
+7. **Bad external file falls back** — `resolve(Dark, Some(tmpdir))` with a malformed `lens-dark.json`
+   returns the embedded default (no panic).
+8. **Bridge smoke** (gpui `test_app` if cheap; else skip) — after `theme::init`, `cx.theme().background`
    equals `cx.lens_theme().base.background`, confirming the bridge wrote through.
 
 ---
@@ -519,22 +569,24 @@ unaffected.
 
 - **New:** `crates/lens-ui/src/theme/mod.rs`, `crates/lens-ui/src/theme/tokens.rs`,
   `crates/lens-ui/src/theme/lens-dark.json`, `crates/lens-ui/src/theme/lens-light.json`.
-- **Edit:** `crates/lens-ui/src/lib.rs` (`pub mod theme;` + re-export `ActiveLensTheme`, `LensTheme`).
+- **Edit:** `crates/lens-ui/src/lib.rs` (`pub mod theme;` + re-export `ActiveLensTheme`, `LensTheme`; a
+  `ReloadTheme` action + its handler in the root view, alongside `BackToBoard`).
 - **Edit:** `crates/lens-app/src/main.rs` (call `lens_ui::theme::init(cx)` after both
-  `gpui_component::init(cx)` sites).
+  `gpui_component::init(cx)` sites; bind the `ReloadTheme` key next to `cmd-.`).
 - **A2 (companion):** `crates/lens-ui/src/card/chrome.rs`.
 
 No new dependencies — `gpui-component` (`Colorize`, `Theme`, `ThemeMode`), `serde`, `serde_json`,
-`anyhow` are already in `lens-ui`.
+`anyhow` are already in `lens-ui`; external loading uses only `std::fs`/`std::env`.
 
 ---
 
 ## 9. Verification (definition of done for the substrate)
 
 - `cargo test -p lens-ui` green (the §6 tests).
-- `cargo run -p lens-app -- --demo` shows the six cards in the **locked** wave colors (after A2); running
-  it with `LENS_THEME=light` shows the light palette on the same surfaces — proving the schema drives
-  both themes.
+- `cargo run -p lens-app -- --demo` shows the six cards in the seeded wave colors (after A2); running with
+  `LENS_THEME=light` shows the light palette on the same surfaces — proving the schema drives both themes.
+- **Reload loop:** with `LENS_THEME_DIR=crates/lens-ui/src/theme`, edit a color in `lens-dark.json`, press
+  the reload key, and the change appears **without restart**.
 - `xtask gate` clean (no warnings / dead code).
 - Cross-family review of the diff (per project rules: ≥1 review from a non-author model family).
 ```
