@@ -81,9 +81,15 @@ pub enum AccessMode {
 }
 
 /// Open-time configuration. Holds **only** access intent, a scrollback limit,
-/// and initial user preferences. Fields evolve as later slices land (the set
-/// here is not frozen — the *type name* is).
+/// and initial user preferences.
+///
+/// `#[non_exhaustive]` + [`Default`] + `with_*` setters so later slices can add
+/// preference fields **without** breaking a `lens-ui` struct literal (external
+/// crates construct via `TerminalOpenOptions::default().with_access(..)`, never
+/// a field-literal). Fields evolve as later slices land — the *type name* and
+/// this construction contract are what freeze.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct TerminalOpenOptions {
     pub access: AccessIntent,
     /// Bounded scrollback cap in **lines** (`libghostty-vt` caps by line, not
@@ -102,6 +108,22 @@ impl Default for TerminalOpenOptions {
     }
 }
 
+impl TerminalOpenOptions {
+    /// Set the access intent.
+    #[must_use]
+    pub fn with_access(mut self, access: AccessIntent) -> Self {
+        self.access = access;
+        self
+    }
+
+    /// Set the scrollback cap in lines (`None` = engine default).
+    #[must_use]
+    pub fn with_scrollback_lines(mut self, lines: Option<usize>) -> Self {
+        self.scrollback_lines = lines;
+        self
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Lifecycle (frozen: exactly these 7 variant names).
 // ---------------------------------------------------------------------------
@@ -109,9 +131,13 @@ impl Default for TerminalOpenOptions {
 /// The tab's modeled lifecycle. The tab renders these values and **never
 /// panics**; every failure path resolves to one of these variants.
 ///
-/// The **seven variant names are the frozen contract**; variant *payloads* may
-/// grow in later slices (e.g. `Ended` may carry an exit code, `Detached` a
-/// reason) — that churn is accepted within this cycle.
+/// A **pure, `Copy`, payload-free state tag** — the seven variants stay
+/// payload-free **permanently**. Details that would otherwise ride a variant
+/// (an `Ended` exit code, a `Detached` reason) live in the evolvable
+/// [`Presentation`] snapshot instead, so adding one never rewrites a caller's
+/// `match` arms or drops `Copy`. Cross-family review (2026-07-16) flagged that
+/// unit variants plus `Copy` are incompatible with growing payloads, so we
+/// commit to payload-free variants and route detail through `Presentation`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Lifecycle {
     /// Returned synchronously by [`open`]; discovery/attach in flight.
@@ -165,21 +191,17 @@ pub struct Progress {
 /// An immutable, plain-owned snapshot of the visible grid — the **Send
 /// boundary** between the non-`Send` engine worker and the gpui foreground.
 ///
-/// Opaque by construction: no Ghostty type crosses this boundary. Its cell
-/// representation (fg/bg/style/width/grapheme) is filled in by Slice 1b/1c;
-/// Slice 0 freezes only the *name* and the immutability invariant.
-#[derive(Clone, Debug, Default)]
+/// Opaque by construction: no Ghostty type crosses this boundary. Slice 1b fills
+/// in the cell representation (owned fg/bg/style/width/grapheme) **and** the
+/// constructor + accessors; Slice 0 freezes only the *name* and the sharing
+/// contract. **Deliberately not `Clone`/`Default`** (cross-family review,
+/// 2026-07-16): frames are shared as `Arc<Frame>` — clone the `Arc`, never the
+/// snapshot — and there is no meaningful synthetic empty frame.
+#[derive(Debug)]
+#[non_exhaustive]
 pub struct Frame {
-    rows: u16,
-    cols: u16,
-    // Cell data (immutable owned fg/bg/style/width/grapheme) lands in Slice 1b.
-}
-
-impl Frame {
-    /// Grid dimensions `(rows, cols)` of this snapshot.
-    pub fn dims(&self) -> (u16, u16) {
-        (self.rows, self.cols)
-    }
+    // Cell data (immutable owned fg/bg/style/width/grapheme) + constructor land
+    // in Slice 1b, built on the engine thread.
 }
 
 // ---------------------------------------------------------------------------
@@ -362,11 +384,6 @@ mod tests {
         let o = TerminalOpenOptions::default();
         assert_eq!(o.access, AccessIntent::Automatic);
         assert_eq!(o.scrollback_lines, None);
-    }
-
-    #[test]
-    fn frame_default_is_empty_grid() {
-        assert_eq!(Frame::default().dims(), (0, 0));
     }
 
     #[test]
