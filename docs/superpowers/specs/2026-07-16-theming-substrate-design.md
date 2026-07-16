@@ -3,8 +3,8 @@
 **Date:** 2026-07-16
 **Branch:** `feat/lens-app-multi-session`
 **Status:** Design (brainstorm decisions D1–D4 locked in
-`docs/handoffs/2026-07-16-theming-brainstorm-decisions.md`; this doc specifies them for
-`writing-plans`).
+`docs/handoffs/2026-07-16-theming-brainstorm-decisions.md`; cross-family reviewed by grok-4.5 +
+gpt-5.6-sol, findings folded in). Feeds `writing-plans`.
 **Scope:** The theming substrate — the load-bearing token schema + **two** themes (dark + light,
 base+status each) + the gpui-component bridge + startup selection + **external-file loading and a manual
 reload command** (the tuning loop). The heavier control surface — settings pane, live OS-appearance
@@ -17,14 +17,11 @@ not this one.
 >    reload.
 > 3. **§18-machinery + settings pane** — live OS toggle, auto-watcher, registry, picker, and the settings
 >    pane that houses them. Lands *before* transcript/composer/side-pane/editor so settings has a home
->    before those surfaces need to dock into it. (Ordering (b): wedge first, settings pane right after —
->    the board's toggles then have somewhere to live and the pane isn't empty scaffolding.)
-> 4. Importers stay paired with their **terminal** surface (D4 step 7) — they theme tokens for a renderer
->    that doesn't exist yet, so they're not part of §18-machinery.
+>    before those surfaces need to dock into it. (Ordering (b): wedge first, settings pane right after.)
+> 4. Importers stay paired with their **terminal** surface (D4 step 7).
 >
-> Light-theme *authoring* is pulled forward from D4-step-4 into step 1: authoring light now is the
-> forcing function that proves the schema is genuinely semantic (no dark-baked field values) *before*
-> surfaces multiply.
+> Light-theme *authoring* is pulled forward from D4-step-4 into step 1 (forcing function proving the
+> schema is genuinely semantic — no dark-baked field values — before surfaces multiply).
 
 ---
 
@@ -35,17 +32,16 @@ card chrome alone has 12 (`crates/lens-ui/src/card/chrome.rs`), and the six wave
 match the locked board palette. Before we build the wave card, the board, the transcript, the terminal,
 etc., we need **one semantic token surface** so that:
 
-1. Every call site reads a *named* token (`cx.lens_theme().status.for_wave(w)`), never a hex literal.
+1. Every call site reads a *named* token (`w.status_color(cx.lens_theme())`), never a hex literal.
 2. Swapping the whole palette (dark↔light, or a user import later) is a data change, not a code change.
 3. The gpui-component widgets we already render on (buttons, inputs, scrollbars, markdown, tree-sitter
    syntax) pick up our base palette automatically — one source of truth, no per-widget theming.
 4. Tuning a color is *edit JSON → reload → see it*, not edit → recompile → relaunch.
 
-The **only** load-bearing deliverable is the token *schema*: once call sites bake
-`cx.lens_theme().status…`, all later delivery machinery (registry, picker, watcher, importers) slots in
-behind the same accessor with **zero call-site churn**. The reload loop is in scope here not because
-anything depends on it, but because we're about to tune every color against real pixels and restart-to-see
-is slow.
+The **only** load-bearing deliverable is the token *schema*: once call sites read
+`cx.lens_theme()`, all later delivery machinery (registry, picker, watcher, importers) slots in behind
+the same accessor with **zero call-site churn**. The reload loop is in scope here not because anything
+depends on it, but because we're about to tune every color against real pixels and restart-to-see is slow.
 
 ### Non-goals (deferred to the §18-machinery + settings-pane workstream)
 
@@ -59,23 +55,26 @@ is slow.
 
 ## 2. Decisions carried in (from the brainstorm handoff)
 
-- **D1 — Bridge, do not fork.** Own a `LensTheme` superset. Bridge into gpui-component by *writing our
-  base tokens onto its public `Theme.colors`* at init. Rationale (airtight): gpui-component's `theme` is
-  the crate **root** — 85 of its files `use crate::ActiveTheme` and read `cx.theme().field`. A
-  crates.io-compiled component can never see an *extended* `ThemeColor`, so "extend their theme" means
-  forking the entire 60-component crate forever — the whole-crate vendor `framework.md:218` rejected. The
-  standing "vendor just the markdown module" decision works because markdown is a *leaf*; the theme is
-  not. Their widgets never need to be `status.*`-aware (status drives our custom card, not their
-  buttons), so the fork's only unique benefit is one we never use.
-- **D2 — 4 token groups.** Base (maps onto `ThemeColor`), status (ours), terminal (ours), diff (ours).
-  Wave *behavior* — glow, radial tint, pulse, and the derived tile/progress tints — is **not** a token;
-  it stays code keyed by `Wave`, computed from the one status color via `Colorize::opacity/mix`.
+- **D1 — Bridge, do not fork.** Own a `LensTheme` superset. Bridge into gpui-component **through its
+  public extension point** `Theme::apply_config` (schema.rs:645) — build a `ThemeConfig` from our base
+  tokens and apply it. Rationale (airtight): gpui-component's `theme` is the crate **root** — 85 of its
+  files `use crate::ActiveTheme` and read `cx.theme().field`. A crates.io-compiled component can never
+  see an *extended* `ThemeColor`, so "extend their theme" means forking the entire 60-component crate
+  forever — the whole-crate vendor `framework.md:218` rejected. Their widgets never need to be
+  `status.*`-aware (status drives our custom card, not their buttons). Using `apply_config` (rather than
+  poking `Theme.colors` fields directly — the approach an earlier draft took) is *more* in the spirit of
+  D1: it uses their public API, derives the interaction families from our base per **their** rules
+  (so we don't duplicate formulas that could drift on upgrade), and stores our config as the mode's
+  `dark_theme`/`light_theme` so a later `Theme::change` re-applies **ours** instead of wiping it (§3.3).
+- **D2 — 4 token groups.** Base (seeds gpui-component's `ThemeConfig`), status (ours), terminal (ours),
+  diff (ours). Wave *behavior* — glow, radial tint, pulse, and the derived tile/progress tints — is
+  **not** a token; it stays code keyed by `Wave`, computed from the one status color via
+  `Colorize::opacity/mix`.
 - **D3 — Build base+status now; design *room* for all 4 groups.** Terminal and diff shapes are specified
   here but not built until their consuming surface lands (D4 steps 5/7) — adding a struct field then is
   not a call-site change, so there is no churn cost to deferring.
-- **D4 — Sequencing.** This substrate is step 1; it's the sole prerequisite for the wave build (step 2)
-  which validates the schema immediately. (See the amended sequencing note above for the settings-pane
-  slot.)
+- **D4 — Sequencing.** This substrate is step 1; sole prerequisite for the wave build (step 2). (See the
+  amended sequencing note above for the settings-pane slot.)
 
 ---
 
@@ -86,37 +85,39 @@ gpui-component bridge; `lens-core` is gpui-free domain types and must stay that 
 
 ```
 crates/lens-ui/src/theme/
-  mod.rs         LensTheme, globals, cx.lens_theme() accessor, init()/reload()/resolve(), the bridge fn
-  tokens.rs      BaseTokens, StatusTokens (+ Wave→Hsla), serde hex helper
+  mod.rs         LensTheme, globals, cx.lens_theme() accessor, load/apply/reload, the ThemeConfig adapter
+  tokens.rs      BaseTokens, StatusTokens, serde hex helper
   lens-dark.json    "Lens Dark"  (base + status) — embedded default AND the on-disk reload target
   lens-light.json   "Lens Light" (base + status) — embedded default AND the on-disk reload target
 ```
 
+**Layering:** `theme` is a **leaf** — it does *not* depend on `card::Wave`. `StatusTokens` exposes six
+named fields; the `Wave → status color` map lives in `card/wave.rs` (card depends on theme, not the
+reverse) as `impl Wave { fn status_color(self, t: &LensTheme) -> Hsla }` (§7).
+
 ### 3.1 Data model
 
-`LensTheme` is a plain global holding decoded `Hsla` values (not hex strings — parse once at startup).
-All token structs derive `serde::{Serialize, Deserialize}` (that is what `from_json` and a future
-exporter use); `Hsla` fields carry `#[serde(with = "hex_hsla")]` (§4.3); `mode` needs no helper —
-`ThemeMode` is natively `Deserialize` (snake_case → `"dark"`/`"light"`).
+`LensTheme` is a plain global holding decoded `Hsla` values (parse once). All token structs derive
+`serde::{Serialize, Deserialize}`; `Hsla` fields carry `#[serde(with = "hex_hsla")]` (§4.3); `mode` needs
+no helper — `ThemeMode` is natively `Deserialize` (snake_case → `"dark"`/`"light"`).
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LensTheme {
     pub name: SharedString,
     pub mode: ThemeMode,        // gpui_component::ThemeMode — Light | Dark
-    pub base: BaseTokens,       // group 1 — bridged onto gpui-component Theme.colors
+    pub base: BaseTokens,       // group 1 — seeds gpui-component's Theme via the ThemeConfig adapter
     pub status: StatusTokens,   // group 2 — ours (card tile/border/glow/stat/progress, banners)
-    // group 3 (terminal) + group 4 (diff): shapes specified in §5; fields added when their
-    // consuming surface lands (D4 steps 5/7). Nothing references them today, so adding them
-    // later is a struct change, not a call-site change — zero churn.
+    // group 3 (terminal) + group 4 (diff): shapes specified in §5; fields added when their consuming
+    // surface lands (D4 steps 5/7). Adding them later is a struct change, not a call-site change.
 }
 impl gpui::Global for LensTheme {}
 ```
 
-`BaseTokens` is the **curated subset** of `ThemeColor` we own — field names mirror their `ThemeColor`
-counterparts so the bridge is a trivial field-by-field copy. Everything else in `ThemeColor` rides
-gpui-component's default. This set is a **starting cut** (per user: "start here, add/remove as we build
-more surfaces") — expect it to grow/shrink as real surfaces land; that churn is data + one bridge line
+`BaseTokens` is the **curated subset** we author. Its fields map onto gpui-component `ThemeConfigColors`
+fields in the adapter (§3.3); the interaction families (`primary_hover`, `*_active`, `*_foreground`, …)
+are **not** authored — `apply_config` derives them from these. This set is a **starting cut** (per user:
+"start here, add/remove as we build") — expect it to grow/shrink; that churn is data + one adapter line
 per field, never call-site churn.
 
 ```rust
@@ -130,7 +131,7 @@ pub struct BaseTokens {
     pub muted_foreground: Hsla,
     pub popover: Hsla,
     pub popover_foreground: Hsla,
-    pub accent: Hsla,
+    pub accent: Hsla,           // our brand/action color → mapped to gpui-component `primary` (§3.3)
     pub accent_foreground: Hsla,
     // chrome
     pub sidebar: Hsla,
@@ -143,7 +144,9 @@ pub struct BaseTokens {
     pub tab_active_foreground: Hsla,
     pub tab_foreground: Hsla,
     // controls
-    pub input: Hsla,
+    pub input: Hsla,            // NOTE: gpui-component `input` is the input *border* color — author from
+                                //       a line color (--line), NOT a fill. (grok review.)
+    pub caret: Hsla,            // input text cursor (gpui-component `caret`)
     pub ring: Hsla,
     pub selection: Hsla,
     pub scrollbar: Hsla,
@@ -152,7 +155,7 @@ pub struct BaseTokens {
     pub list_active: Hsla,
     pub list_hover: Hsla,
     pub progress_bar: Hsla,
-    // generic component-state (gpui-component already has these; we author to match our palette)
+    // generic component-state (apply_config derives their *_hover/*_active/*_foreground)
     pub success: Hsla,
     pub warning: Hsla,
     pub danger: Hsla,
@@ -161,9 +164,12 @@ pub struct BaseTokens {
     pub overlay: Hsla,
 }
 
-/// One saturated color per wave state. Every card consumer uses it directly (border, glow, tile icon,
-/// STATUS label, progress-bar fill, branch text) or a *derived tint* computed in code via
-/// `Colorize::opacity/mix` — the 12%/14%/30% mixes in the locked render are code, not tokens (D2).
+/// One saturated color per wave state. Consumers use it directly (border, glow, tile icon, STATUS
+/// label, progress fill, branch text) or a derived tint via `Colorize::opacity/mix` — the 12/14/30%
+/// mixes are code, not tokens (D2). No `on_fill`/contrast token: the locked card is the 44px icon-tile
+/// + card-overlay (handoff decision 2 + `board-home.html`), not a filled text pill, so nothing paints
+/// text on a saturated fill. A future filled banner needing contrast ink adds a token then — zero churn
+/// to existing consumers.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct StatusTokens {
     pub ready: Hsla,
@@ -173,32 +179,12 @@ pub struct StatusTokens {
     pub slept: Hsla,
     pub neutral: Hsla,
 }
-
-impl StatusTokens {
-    /// Total map from Wave → its color. Exhaustive; adding a Wave variant is a compile error here.
-    pub fn for_wave(&self, wave: Wave) -> Hsla {
-        match wave {
-            Wave::Ready => self.ready,
-            Wave::Working => self.working,
-            Wave::NeedsInput => self.needs_input,
-            Wave::Failed => self.failed,
-            Wave::Slept => self.slept,
-            Wave::Neutral => self.neutral,
-        }
-    }
-}
 ```
-
-**No `on_fill`/contrast token.** The locked card is the 44px **icon-tile** + card-level wave overlay
-(handoff decision 2 + `board-home.html`), not a filled text pill — so no surface paints text on a
-saturated fill. The throwaway pill in today's `chrome.rs` (and its `pill_text_color`) is deleted by the
-wave build (B1), not migrated. If a future *filled banner* ever needs contrast ink, that is a new token
-added then, with zero churn to the existing border/tile/stat consumers.
 
 ### 3.2 Accessor
 
-Extension trait mirroring gpui-component's own `ActiveTheme` pattern exactly, so call sites read the
-same way (`cx.lens_theme()` alongside `cx.theme()`):
+Extension trait mirroring gpui-component's own `ActiveTheme` pattern (so call sites read `cx.lens_theme()`
+alongside `cx.theme()`):
 
 ```rust
 pub trait ActiveLensTheme { fn lens_theme(&self) -> &LensTheme; }
@@ -212,139 +198,166 @@ impl LensTheme {
 }
 ```
 
-In render code `cx` is `&mut Context<Self>`, which derefs to `App`, so `cx.lens_theme()` resolves —
-identical to how gpui-component's own components reach `cx.theme()`.
+In render `cx` is `&mut Context<Self>`, which derefs to `App`, so `cx.lens_theme()` resolves.
+**Implementation constraint (grok review):** views must read tokens **in `render`**, not cache an `Hsla`
+in entity state, or a reload won't repaint them.
 
-### 3.3 The bridge
+### 3.3 The bridge — `LensTheme → ThemeConfig`, apply via the public API
+
+We build a gpui-component `ThemeConfig` from our base tokens and call the **public**
+`Theme::apply_config(&Rc<ThemeConfig>)`. That method (schema.rs:645) does three things we want:
+(1) stores the config as `self.dark_theme` or `self.light_theme` (by `config.mode`) — so a later
+`Theme::change` re-applies **our** config, not gpui-component's default (the wipe hazard grok flagged is
+gone); (2) sets `self.colors` via `ThemeColor::apply_config`, which **derives** every interaction family
+(`primary_hover = bg.blend(primary·0.9)`, `primary_active = primary.darken(0.2/0.1)`, `*_foreground`
+fallbacks, …) from the base colors we supply; (3) applies highlight/fonts/radius (we leave those `None`
+→ gpui-component defaults for now).
 
 ```rust
-/// Overwrite the base tokens we own onto gpui-component's global Theme, and align its mode so its
-/// components render on our palette. Called at init and on every reload.
-fn bridge_into_gpui_component(lens: &LensTheme, cx: &mut App) {
-    let theme = Theme::global_mut(cx);
-    theme.mode = lens.mode;              // so components pick the right light/dark variants
-    let c = &mut theme.colors;
-    c.background = lens.base.background;
-    c.foreground = lens.base.foreground;
-    c.border = lens.base.border;
-    c.muted = lens.base.muted;
-    c.muted_foreground = lens.base.muted_foreground;
-    c.popover = lens.base.popover;
-    c.popover_foreground = lens.base.popover_foreground;
-    c.accent = lens.base.accent;
-    c.accent_foreground = lens.base.accent_foreground;
-    c.sidebar = lens.base.sidebar;
-    c.sidebar_foreground = lens.base.sidebar_foreground;
-    c.sidebar_border = lens.base.sidebar_border;
-    c.title_bar = lens.base.title_bar;
-    c.title_bar_border = lens.base.title_bar_border;
-    c.tab = lens.base.tab;
-    c.tab_active = lens.base.tab_active;
-    c.tab_active_foreground = lens.base.tab_active_foreground;
-    c.tab_foreground = lens.base.tab_foreground;
-    c.input = lens.base.input;
-    c.ring = lens.base.ring;
-    c.selection = lens.base.selection;
-    c.scrollbar = lens.base.scrollbar;
-    c.scrollbar_thumb = lens.base.scrollbar_thumb;
-    c.list = lens.base.list;
-    c.list_active = lens.base.list_active;
-    c.list_hover = lens.base.list_hover;
-    c.progress_bar = lens.base.progress_bar;
-    c.success = lens.base.success;
-    c.warning = lens.base.warning;
-    c.danger = lens.base.danger;
-    c.info = lens.base.info;
-    c.overlay = lens.base.overlay;
+use std::rc::Rc;
+use gpui_component::{Theme, ThemeConfig};
+use gpui_component::theme::ThemeConfigColors;   // exact import path per crate; hex Strings
+use gpui_component::Colorize;                    // for Hsla::to_hex
+
+fn to_theme_config(lens: &LensTheme) -> ThemeConfig {
+    let b = &lens.base;
+    let hex = |c: Hsla| Some(SharedString::from(c.to_hex()));  // try_parse_color accepts "#RRGGBB"
+    ThemeConfig {
+        name: lens.name.clone(),
+        mode: lens.mode,
+        colors: ThemeConfigColors {
+            background: hex(b.background),
+            foreground: hex(b.foreground),
+            border: hex(b.border),
+            muted: hex(b.muted),
+            muted_foreground: hex(b.muted_foreground),
+            popover: hex(b.popover),
+            popover_foreground: hex(b.popover_foreground),
+            // our brand color seeds `primary` (buttons/switch/checkbox read primary, NOT accent);
+            // `secondary` (subtle button bg) seeds from muted; gpui-component's `accent` (menuitem
+            // hover bg) seeds from list_hover. *_hover/*_active/*_foreground are left None → derived.
+            primary: hex(b.accent),
+            primary_foreground: hex(b.accent_foreground),
+            secondary: hex(b.muted),
+            accent: hex(b.list_hover),
+            input: hex(b.input),
+            caret: hex(b.caret),
+            ring: hex(b.ring),
+            selection: hex(b.selection),
+            scrollbar: hex(b.scrollbar),
+            scrollbar_thumb: hex(b.scrollbar_thumb),
+            list: hex(b.list),
+            list_active: hex(b.list_active),
+            list_hover: hex(b.list_hover),
+            progress_bar: hex(b.progress_bar),
+            sidebar: hex(b.sidebar),
+            sidebar_foreground: hex(b.sidebar_foreground),
+            sidebar_border: hex(b.sidebar_border),
+            title_bar: hex(b.title_bar),
+            title_bar_border: hex(b.title_bar_border),
+            tab: hex(b.tab),
+            tab_active: hex(b.tab_active),
+            tab_active_foreground: hex(b.tab_active_foreground),
+            tab_foreground: hex(b.tab_foreground),
+            success: hex(b.success),
+            warning: hex(b.warning),
+            danger: hex(b.danger),
+            info: hex(b.info),
+            overlay: hex(b.overlay),
+            ..Default::default()   // everything else rides gpui-component's default for this mode
+        },
+        highlight: None,
+        ..Default::default()
+    }
+}
+
+/// Foreground-thread, pure (no I/O): install both globals. Widgets read `cx.theme()` on paint.
+fn apply(lens: LensTheme, cx: &mut App) {
+    Theme::global_mut(cx).apply_config(&Rc::new(to_theme_config(&lens)));
+    cx.set_global(lens);   // our own call sites read base/status as Hsla via cx.lens_theme()
 }
 ```
 
-We do **not** call gpui-component's `apply_config` (it's `pub(crate)` — unreachable). We don't need it:
-their `init` already populated a complete default `Theme` (light + dark defaults); we just override the
-~30 base fields we own on top. Fields we don't touch (tables, sliders, tiles,
-red/green/blue/magenta/cyan/yellow, `bullish`/`bearish`, `highlight_theme`) keep gpui-component's
-defaults. HighlightTheme (tree-sitter syntax) rides their default for now; authoring it is deferred to
-the transcript surface (D4 step 5).
+(`ThemeConfigColors` field/import names to be confirmed against the crate during implementation — the
+mapping is mechanical.) We keep `LensTheme` as its own global because our custom surfaces read
+`base.*`/`status.*` as `Hsla` directly; the config path is only how gpui-component's own widgets get our
+palette.
 
-### 3.4 Selection, init, and reload
+### 3.4 Selection, loading (off-thread), and reload
 
-Themes ship **embedded** (`include_str!`) as the always-works default. If `LENS_THEME_DIR` is set, the
-selected theme loads from `<dir>/lens-{mode}.json` on disk instead — and that same on-disk file is what a
-**reload** re-reads. For our dev loop, point `LENS_THEME_DIR` at `crates/lens-ui/src/theme/`, so the file
-we edit *is* both the compiled-in default and the live reload target (no copy-back).
+**I/O rule (MANDATORY — AGENTS.md:21 / .agents/rust-ui.md:8):** never block the gpui foreground thread;
+all disk reads happen off it. So loading is split from applying:
 
 ```rust
-/// Pure, testable core: resolve which theme to use and load it. `dir` = the LENS_THEME_DIR override
-/// (None → embedded). A bad *external* file falls back to embedded and logs — a stray user edit must
-/// not crash a running app. The embedded default is a build-time invariant (panics only if IT is bad,
-/// which the §6 parse test prevents).
-fn resolve(mode: ThemeMode, dir: Option<&Path>) -> LensTheme {
+/// Pure: parse + validate mode. No I/O, no env — fully unit-testable.
+fn parse_theme(json: &str, expected: ThemeMode) -> anyhow::Result<LensTheme> {
+    let t: LensTheme = serde_json::from_str(json)?;
+    anyhow::ensure!(t.mode == expected,
+        "theme mode {:?} != expected {:?} for this file", t.mode, expected);
+    Ok(t)
+}
+
+/// Off-thread I/O: resolve the source for `mode` and parse it. External file wins if present+valid;
+/// otherwise the embedded default. Returns Err only if the *embedded* default is bad (a build bug).
+fn load(mode: ThemeMode, dir: Option<&Path>) -> anyhow::Result<LensTheme> {
     const DARK: &str = include_str!("lens-dark.json");
     const LIGHT: &str = include_str!("lens-light.json");
     let (embedded, file) = if mode.is_dark() { (DARK, "lens-dark.json") }
                            else              { (LIGHT, "lens-light.json") };
     if let Some(dir) = dir {
         let path = dir.join(file);
-        match std::fs::read_to_string(&path)
-            .map_err(anyhow::Error::from)
-            .and_then(|s| LensTheme::from_json(&s))
+        match std::fs::read_to_string(&path).map_err(anyhow::Error::from)
+            .and_then(|s| parse_theme(&s, mode))
         {
-            Ok(lens) => return lens,
+            Ok(lens) => return Ok(lens),
             Err(e) => eprintln!("lens-theme: {} — using embedded default: {e}", path.display()),
         }
     }
-    LensTheme::from_json(embedded).expect("embedded lens theme must parse — build-time invariant")
+    parse_theme(embedded, mode)
 }
 
-/// Resolve mode (LENS_THEME override else the OS appearance gpui_component::init already synced) and
-/// the LENS_THEME_DIR override, then load.
-fn load_selected(cx: &App) -> LensTheme {
-    let mode = match std::env::var("LENS_THEME").ok().as_deref() {
+/// Resolve mode: LENS_THEME override (warn on unknown value) else the OS appearance.
+fn select_mode(cx: &App) -> ThemeMode {
+    match std::env::var("LENS_THEME").ok().as_deref() {
         Some("light") => ThemeMode::Light,
-        Some("dark") => ThemeMode::Dark,
-        _ => Theme::global(cx).mode,
-    };
-    let dir = std::env::var("LENS_THEME_DIR").ok();
-    resolve(mode, dir.as_deref().map(Path::new))
-}
-
-/// Install the selected theme + bridge. Call once, immediately after gpui_component::init(cx).
-pub fn init(cx: &mut App) {
-    let lens = load_selected(cx);
-    bridge_into_gpui_component(&lens, cx);
-    cx.set_global(lens);
-}
-
-/// Re-read the selected theme from disk (or embedded) and re-apply it live. Bound to a keybinding.
-pub fn reload(window: &mut Window, cx: &mut App) {
-    let lens = load_selected(cx);
-    bridge_into_gpui_component(&lens, cx);
-    cx.set_global(lens);
-    window.refresh();   // repaint all views on the new palette — gpui-component's Theme::change pattern
+        Some("dark")  => ThemeMode::Dark,
+        Some(other)   => { eprintln!("lens-theme: ignoring LENS_THEME={other:?}"); Theme::global(cx).mode }
+        None          => Theme::global(cx).mode,   // synced from the OS by gpui_component::init
+    }
 }
 ```
 
-`main.rs` calls `lens_ui::theme::init(cx)` after each `gpui_component::init(cx)` — **two sites** (live run
-+ `--demo`) — and binds a `ReloadTheme` action to a key (e.g. `cmd-shift-t`). The action is handled where
-a `Window` is in scope (the root view, exactly like the existing `cmd-.`/`BackToBoard`), calling
-`theme::reload(window, cx)`. Reload is **manual only**; an auto file-watcher is the next workstream.
+- **Startup:** the read happens **before the render loop is live**. `main` resolves `mode` + the
+  `LENS_THEME_DIR` override and calls `load(...)` (plain I/O, not on the gpui fg thread — either before
+  `Application::run`, or via `cx.background_executor().spawn` early in the window setup), then `apply(...)`
+  on the foreground. If `load` returns `Err` (embedded default itself is unparseable — a build bug),
+  `main` prints and exits non-zero, matching the existing `eprintln!`+`process::exit(1)` pattern in
+  `main.rs`. **No `panic!`/`expect`** in the theme module (no-process-panic).
+- **Reload** (manual, `ReloadTheme` keybinding): read+parse on `cx.background_executor()`, then on the
+  foreground: on `Ok`, `apply(...)` + `cx.refresh_windows()`; on `Err`, **keep the current active theme**
+  (do *not* reset to embedded — a half-saved edit shouldn't blow away the running palette) and log.
+  Uses `cx.refresh_windows()` (app.rs:755), not `window.refresh()` — the theme is app-global.
 
-Selection is otherwise **at startup**: if the OS flips dark↔light while running we do not auto re-bridge
-(that's the deferred live toggle) — reload, relaunch, or set `LENS_THEME`.
+Selection is **at startup** otherwise: if the OS flips dark↔light while running we do not auto re-bridge
+(deferred live toggle) — reload, relaunch, or set `LENS_THEME`.
+
+`main.rs` calls the startup load+apply after each `gpui_component::init(cx)` — **two sites** (live run +
+`--demo`) — and binds `ReloadTheme` to a key (e.g. `cmd-shift-t`), handled where a `Window`/`cx` is in
+scope (like the existing `cmd-.`/`BackToBoard`), calling the reload path.
 
 ---
 
 ## 4. Theme file format
 
-Hex strings (the format importers and future themes reuse). Forward/backward compatible by construction:
-the parser does **not** `deny_unknown_fields`, and deferred groups will be `#[serde(default)]` when added,
-so (a) today's file omitting terminal/diff parses against a future binary, and (b) an early-authored
-terminal block parses against today's binary (ignored). `base` and `status` are required.
+Hex strings (the format importers and future themes reuse). Forward/backward compatible: the parser does
+**not** `deny_unknown_fields`, and deferred groups will be `#[serde(default)]` when added, so today's file
+omitting terminal/diff parses against a future binary and vice-versa. `base` and `status` are required.
 
 **All status values below are placeholders pending on-device eyeballing** (per user). Dark is *seeded*
-from the locked `board-home.html` render; light is a first cut. Both will be retuned against real
-rendered surfaces during the wave/board build using the reload loop — treat the numbers as starting
-points, not final.
+from the locked `board-home.html` render; light is a first cut. Both will be retuned against real surfaces
+during the wave/board build using the reload loop. Status colors double as small text (STATUS label,
+branch), so they must clear the §6 contrast test against the card surface — the light values here are set
+text-safe (≥3:1 on white for the five active waves) but will move during eyeballing.
 
 ### 4.1 `lens-dark.json` — "Lens Dark"
 
@@ -371,7 +384,8 @@ points, not final.
     "tab_active": "#1c2230",
     "tab_active_foreground": "#eef2f7",
     "tab_foreground": "#9aa4b3",
-    "input": "#151922",
+    "input": "#2c3442",
+    "caret": "#4c8dff",
     "ring": "#4c8dff",
     "selection": "#4c8dff",
     "scrollbar": "#101319",
@@ -397,15 +411,14 @@ points, not final.
 }
 ```
 
-Dark base hexes are lifted from the locked `board-home.html :root`
-(`--bg #07080b`, `--bg1 #101319`, `--bg2 #151922`, `--bg3 #1c2230`, `--line #222936`, `--line2 #2c3442`,
-`--tx #eef2f7`, `--tx2 #9aa4b3`, `--tx3 #5f6a7a`). Status colors are seeded from the D2 wave palette.
+Dark base hexes are lifted from the locked `board-home.html :root` (`--bg #07080b`, `--bg1 #101319`,
+`--bg2 #151922`, `--bg3 #1c2230`, `--line #222936`, `--line2 #2c3442`, `--tx #eef2f7`, `--tx2 #9aa4b3`).
+`input` is a *border* color (`--line2`), not a fill. Status colors are seeded from the D2 wave palette.
 
 ### 4.2 `lens-light.json` — "Lens Light" (first-cut)
 
 No locked light SSOT exists, so this is authored for *structural* correctness — light surfaces, dark
-text, hue-matched-but-legible accents/status on a light background. The checkpoint is "the schema
-expresses light with no dark-baked assumptions," not "final light aesthetics."
+text, hue-matched-but-legible accents/status on a light background.
 
 ```json
 {
@@ -430,7 +443,8 @@ expresses light with no dark-baked assumptions," not "final light aesthetics."
     "tab_active": "#ffffff",
     "tab_active_foreground": "#1c2230",
     "tab_foreground": "#5f6a7a",
-    "input": "#ffffff",
+    "input": "#c2c9d4",
+    "caret": "#2f6bd8",
     "ring": "#2f6bd8",
     "selection": "#bcd3ff",
     "scrollbar": "#eef1f6",
@@ -450,7 +464,7 @@ expresses light with no dark-baked assumptions," not "final light aesthetics."
     "working": "#1f9d6b",
     "needs_input": "#d9701f",
     "failed": "#d43d3d",
-    "slept": "#8a93a3",
+    "slept": "#6b7280",
     "neutral": "#c2c9d4"
   }
 }
@@ -477,27 +491,25 @@ mod hex_hsla {
 }
 ```
 
-Each `Hsla` field carries `#[serde(with = "hex_hsla")]`. `mode` deserializes directly into
-`gpui_component::ThemeMode` (natively `Deserialize`, snake_case). `LensTheme::from_json(&str) ->
-anyhow::Result<LensTheme>` wraps `serde_json::from_str`.
+Each `Hsla` field carries `#[serde(with = "hex_hsla")]` (bare `Hsla` serde is RGBA-shaped, not hex —
+confirmed in review). `mode` deserializes directly into `gpui_component::ThemeMode`.
 
 ---
 
 ## 5. Deferred group *shapes* (specified, not built)
 
-Built when their consuming surface lands. Recorded here so the file format and importers have a target
-and so adding them later is mechanical. **Provisional** — values are placeholders until authored against
-the real surface (per `premature-layer-boundary-binding`: specify the shape, don't lock the values).
+Built when their consuming surface lands. Recorded so the file format + importers have a target and
+adding them later is mechanical. **Provisional** — values are placeholders (per
+`premature-layer-boundary-binding`: specify the shape, don't lock the values).
 
 ### 5.1 Terminal (group 3) — D4 step 7, with the terminal renderer
-Feeds the libghostty_vt + ghostty_rs custom gpui renderer (in progress at `../lens-terminal-ws`; no
-palette yet). ~20 tokens; target of the iTerm/Alacritty importer.
+Feeds the libghostty_vt + ghostty_rs custom gpui renderer (in progress at `../lens-terminal-ws`). ~20
+tokens; target of the iTerm/Alacritty importer.
 
 ```rust
 pub struct TerminalTokens {
     pub foreground: Hsla, pub background: Hsla, pub cursor: Hsla, pub selection: Hsla,
-    pub normal:  AnsiSet,   // black,red,green,yellow,blue,magenta,cyan,white
-    pub bright:  AnsiSet,
+    pub normal: AnsiSet, pub bright: AnsiSet,
 }
 pub struct AnsiSet { pub black: Hsla, pub red: Hsla, pub green: Hsla, pub yellow: Hsla,
                      pub blue: Hsla, pub magenta: Hsla, pub cyan: Hsla, pub white: Hsla }
@@ -509,59 +521,76 @@ gpui-component has `bullish`/`bearish` + red/green but no diff-semantic bg pairs
 
 ```rust
 pub struct DiffTokens {
-    pub added_bg: Hsla, pub added_fg: Hsla,
-    pub removed_bg: Hsla, pub removed_fg: Hsla,
-    pub context_fg: Hsla,
-    pub hunk_header: Hsla,
+    pub added_bg: Hsla, pub added_fg: Hsla, pub removed_bg: Hsla, pub removed_fg: Hsla,
+    pub context_fg: Hsla, pub hunk_header: Hsla,
 }
 ```
-JSON key: `"diff": { "added_bg": …, … }`.
-
-When built, each gets `#[serde(default)]` on `LensTheme` so files that omit it still parse.
+JSON key: `"diff": { "added_bg": …, … }`. Each gets `#[serde(default)]` on `LensTheme` when added.
 
 ---
 
 ## 6. Testing
 
-Pure where possible (`resolve` takes an explicit `mode`/`dir` so tests never touch process env):
+Pure where possible (`parse_theme`/`load` take explicit `mode`/`dir`, so tests never touch process env):
 
-1. **Both embedded themes parse** — `from_json(include_str!("lens-dark.json"))` and `…lens-light.json`
-   are both `Ok`; names/modes are `("Lens Dark", Dark)` / `("Lens Light", Light)`. Makes the `expect` in
-   `resolve` a build-time invariant.
-2. **Dark-status seed guard** — the six dark `status.*` values equal the `board-home.html` seed hexes.
-   Catches accidental drift; when we *intentionally* retune, update the render + this test together.
-3. **Light expresses distinctly** — light `base.background` ≠ dark `base.background` and light
-   `base.foreground` is darker than its background (a cheap "not dark-baked" sanity check).
-4. **`for_wave` totality** — all six `Wave` variants resolve; adding a variant fails to compile.
-5. **hex round-trip** — `parse_hex → to_hex → parse_hex` is stable for a sample token.
-6. **External override precedence** — `resolve(Dark, Some(tmpdir))` with a modified `lens-dark.json` in
-   `tmpdir` returns the on-disk values, not embedded.
-7. **Bad external file falls back** — `resolve(Dark, Some(tmpdir))` with a malformed `lens-dark.json`
-   returns the embedded default (no panic).
-8. **Bridge smoke** (gpui `test_app` if cheap; else skip) — after `theme::init`, `cx.theme().background`
-   equals `cx.lens_theme().base.background`, confirming the bridge wrote through.
+1. **Both embedded themes parse + mode matches file** — `parse_theme(include_str!("lens-dark.json"),
+   Dark)` and `…("lens-light.json", Light)` are `Ok` with names "Lens Dark"/"Lens Light".
+2. **Mode-mismatch rejected** — `parse_theme(dark_json, Light)` is `Err` (guards the selection bug where a
+   wrong `mode` in a file would flip the global mode and re-select a different file on next reload).
+3. **Dark-status seed guard** — the six dark `status.*` equal the `board-home.html` seed hexes; when
+   intentionally retuned, update render + this test together.
+4. **Light expresses distinctly** — light `base.background` ≠ dark's and light `base.foreground` is darker
+   than its background (cheap "not dark-baked" check).
+5. **Status text-contrast** — for each theme, the five active `status.*` (excluding `neutral`, the
+   de-emphasized idle state rendered via `muted_foreground`) have WCAG contrast **≥ 3:1** against the card
+   surface (`base.list`). Durable guard for "status is legible as a label"; the light placeholders are set
+   to pass and retuning must keep passing.
+6. **hex round-trip** — `parse_hex → to_hex → parse_hex` stable for a sample token.
+7. **External override precedence** — `load(Dark, Some(tmpdir))` with a modified `lens-dark.json` returns
+   the on-disk values.
+8. **Bad external file falls back** — `load(Dark, Some(tmpdir))` with a malformed file returns the
+   embedded default (`Ok`, no panic).
+9. **`Wave → status` totality** (in `card/wave.rs`) — all six `Wave` variants resolve; adding a variant
+   fails to compile.
+10. **Bridge (mandatory, gpui `test_app`)** — after startup `apply`: `cx.theme().mode` == `lens.mode`;
+    `cx.theme().background` == `lens.base.background`; `cx.theme().primary` == `lens.base.accent`; a
+    **derived** family is non-default (`cx.theme().primary_hover != ThemeColor::default().primary_hover`);
+    and after a subsequent `Theme::change(lens.mode, …)` the palette is **still ours** (`primary` unchanged)
+    — proving the config-store defeats the wipe hazard.
 
 ---
 
 ## 7. A2 — hex→token call-site migration (companion, runs right after the substrate)
 
 Not part of the substrate build but the immediate next step it unblocks (D4). `chrome.rs` today has 12
-hardcoded hexes. The **pill and its `pill_text_color`** are throwaway — the wave build (B1) replaces the
-pill with the icon-tile, so A2 does **not** migrate them; it re-homes the surviving call sites and fixes
-the border color (current code uses a different, wrong palette):
+hardcoded hexes. The **pill + `pill_text_color`** are throwaway — the wave build (B1) replaces the pill
+with the icon-tile, so A2 does **not** migrate them; it re-homes the surviving call sites and fixes the
+border color (current code uses a different, wrong palette). The `Wave → status color` map lives in
+`card/wave.rs` (keeps `theme` a leaf):
+
+```rust
+// crates/lens-ui/src/card/wave.rs
+impl Wave {
+    pub fn status_color(self, t: &LensTheme) -> Hsla {
+        match self {
+            Wave::Ready => t.status.ready,      Wave::Working => t.status.working,
+            Wave::NeedsInput => t.status.needs_input, Wave::Failed => t.status.failed,
+            Wave::Slept => t.status.slept,      Wave::Neutral => t.status.neutral,
+        }
+    }
+}
+```
 
 | current `chrome.rs`                          | becomes                                        |
 |----------------------------------------------|------------------------------------------------|
-| `wave_border_color` (6 rgb, wrong palette)   | `cx.lens_theme().status.for_wave(wave)`        |
+| `wave_border_color` (6 rgb, wrong palette)   | `wave.status_color(cx.lens_theme())`           |
 | kebab menu bg `0x1f2937`                      | `cx.lens_theme().base.popover`                 |
 | muted text `0x9ca3af` (×3)                    | `cx.lens_theme().base.muted_foreground`        |
 | overlay text `0xf3f4f6`                       | `cx.lens_theme().base.foreground`              |
 | overlay scrim `hsla(0,0,0,0.55)`              | `cx.lens_theme().base.overlay.opacity(0.55)`   |
 | pill fill + `pill_text_color`                 | *(not migrated — deleted by B1's icon-tile)*   |
 
-`wave_border_color` changes signature to take `&App` (or the resolved `LensTheme`) since it now reads the
-global. Existing chrome unit tests are color-agnostic (they assert repo-row text formatting) and are
-unaffected.
+Existing chrome unit tests are color-agnostic (repo-row text formatting) and unaffected.
 
 ---
 
@@ -569,24 +598,27 @@ unaffected.
 
 - **New:** `crates/lens-ui/src/theme/mod.rs`, `crates/lens-ui/src/theme/tokens.rs`,
   `crates/lens-ui/src/theme/lens-dark.json`, `crates/lens-ui/src/theme/lens-light.json`.
-- **Edit:** `crates/lens-ui/src/lib.rs` (`pub mod theme;` + re-export `ActiveLensTheme`, `LensTheme`; a
-  `ReloadTheme` action + its handler in the root view, alongside `BackToBoard`).
-- **Edit:** `crates/lens-app/src/main.rs` (call `lens_ui::theme::init(cx)` after both
-  `gpui_component::init(cx)` sites; bind the `ReloadTheme` key next to `cmd-.`).
-- **A2 (companion):** `crates/lens-ui/src/card/chrome.rs`.
+- **Edit:** `crates/lens-ui/src/lib.rs` (`pub mod theme;` + re-export `ActiveLensTheme`, `LensTheme`; the
+  `ReloadTheme` action + its handler in the root view).
+- **Edit:** `crates/lens-app/src/main.rs` (startup `load`+`apply` after both `gpui_component::init(cx)`
+  sites, off the fg thread; bind the `ReloadTheme` key; on startup `load` Err, `eprintln`+`exit`).
+- **A2 (companion):** `crates/lens-ui/src/card/chrome.rs`, `crates/lens-ui/src/card/wave.rs`.
 
-No new dependencies — `gpui-component` (`Colorize`, `Theme`, `ThemeMode`), `serde`, `serde_json`,
-`anyhow` are already in `lens-ui`; external loading uses only `std::fs`/`std::env`.
+No new dependencies — `gpui-component` (`Colorize`, `Theme`, `ThemeConfig`, `ThemeConfigColors`,
+`ThemeMode`), `serde`, `serde_json`, `anyhow` are already in `lens-ui`; loading uses `std::fs`/`std::env`.
 
 ---
 
 ## 9. Verification (definition of done for the substrate)
 
-- `cargo test -p lens-ui` green (the §6 tests).
+- `cargo test -p lens-ui` green (the §6 tests, incl. the mandatory bridge test).
 - `cargo run -p lens-app -- --demo` shows the six cards in the seeded wave colors (after A2); running with
-  `LENS_THEME=light` shows the light palette on the same surfaces — proving the schema drives both themes.
+  `LENS_THEME=light` shows the light palette on the same surfaces — proving the schema drives both themes,
+  and gpui-component buttons/inputs (once present) pick up the palette via `apply_config`.
 - **Reload loop:** with `LENS_THEME_DIR=crates/lens-ui/src/theme`, edit a color in `lens-dark.json`, press
-  the reload key, and the change appears **without restart**.
+  the reload key, and the change appears **without restart** (off-thread read → foreground apply →
+  `refresh_windows`).
 - `xtask gate` clean (no warnings / dead code).
-- Cross-family review of the diff (per project rules: ≥1 review from a non-author model family).
+- Cross-family review of the diff (per project rules) — this design already had one (grok-4.5 +
+  gpt-5.6-sol); the *implementation* diff gets another.
 ```
