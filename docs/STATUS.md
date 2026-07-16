@@ -29,17 +29,19 @@ and roll older "Recent" pointers off this page as they age.
       waves) + terminal ANSI (ours; feeds libghostty renderer, `../lens-terminal-ws`) + diff (ours).
     - **D3 scope now:** schema + `LensTheme` + accessor + bridge + **one embedded dark JSON** (no
       watcher/registry). Defer file-load/registry/hot-reload/light/importers/picker.
-  - **✅ THEMING SUBSTRATE SHIPPED (2026-07-16, branch `feat/lens-app-multi-session` @ `242a4b1`,
-    branch-only — not merged/pushed).** Design `docs/superpowers/specs/2026-07-16-theming-substrate-design.md`
-    → plan `docs/superpowers/plans/2026-07-16-theming-substrate.md` → subagent-driven build (composer-2.5
-    impl + codex/Opus review). Landed: `crates/lens-ui/src/theme/` — `LensTheme` global (base+status
-    tokens, hex↔Hsla serde, **dark+light** JSON), `cx.lens_theme()` accessor, gpui-component bridge via
-    public `Theme::apply_config`, external-file load + **manual `cmd-shift-t` reload**, startup install at
-    both init sites; **A2** card chrome migrated off hardcoded hex onto tokens. 27 lib + 1 acceptance
-    tests; gate green (now covers lens-ui/lens-app — was blind). Cross-family review saved: lossy
-    hex-roundtrip test bug, stale-highlight on cross-mode apply, clippy/fmt gate gap. **Manual §9 left
-    (user): `--demo` visual + `LENS_THEME=light` + reload loop.** Deferred (§18-machinery): reload
-    generation-guard, reload orchestration test, bridge field-coverage test, terminal/diff token groups.
+  - **✅ THEMING SUBSTRATE SHIPPED + LIVE-VERIFIED (2026-07-16, branch `feat/lens-app-multi-session`
+    @ `fdcaef8`, branch-only — not merged/pushed).** Handoff:
+    `docs/handoffs/2026-07-16-theming-substrate-shipped.md`. Design/plan under `docs/superpowers/`.
+    Landed: `crates/lens-ui/src/theme/` — `LensTheme` global (base+status tokens, hex↔Hsla serde,
+    **dark+light** JSON), `cx.lens_theme()` accessor, gpui-component bridge via public
+    `Theme::apply_config`, external-file load + **global `cmd-shift-t` reload** (off-thread); **A2**
+    card chrome → tokens; new `crates/lens-ui/src/shortcuts.rs` (global app shortcuts) + **BackToBoard
+    (⌘.) moved off the element handler**. 30 lib + 1 acceptance tests; gate green (now covers
+    lens-ui/lens-app — was blind). **Live-verified on device: dark ✓ light ✓ idle-yellow ✓ reload-loop ✓
+    BackToBoard ✓.** 4 gotchas saved as memories (lossy hex-roundtrip; global-vs-element actions;
+    xtask-gate-scope; whole-branch-review-needs-a-builder). Filed **SPEC-GAPS #10** (keyboard shortcuts +
+    macOS app menu — Cmd+Q dead). Color values are placeholders → **one end-of-build tuning pass** (the
+    reload loop makes it cheap).
   - **▶ NEXT: wave build (B1–B5)** — completes the card (icon-tile replaces the throwaway pill), tunes
     colors via the manual reload loop. Then board packing (B6–B8). **Full theming machinery §18
     (importers/picker/hot-reload/registry) = later standalone (step 9, least urgent).** Sequencing:
