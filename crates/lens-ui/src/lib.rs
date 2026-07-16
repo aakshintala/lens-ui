@@ -1,8 +1,21 @@
+pub mod actions;
+pub mod board;
 pub mod card;
 pub mod clock;
 pub mod fleet;
+pub mod slot;
 
+pub use board::{BoardView, ShellMode};
 pub use clock::{ManualUiClock, UiClock, WallUiClock};
 pub use fleet::fake::{FEED_CAPACITY, FakeFleet, FakeSessionHandles};
 pub use fleet::poller::spawn_session_poller;
 pub use fleet::store::FleetStore;
+pub use slot::{ContentTab, PlaceholderTab, TabHandle, placeholder_tab};
+
+use std::cell::Cell;
+use std::rc::Rc;
+
+/// Stub PTY byte counter — Task 5 asserts BackToBoard does not increment it.
+pub struct PtyProbe {
+    pub bytes_sent: Rc<Cell<usize>>,
+}
