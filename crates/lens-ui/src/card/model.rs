@@ -148,7 +148,7 @@ impl SessionCard {
                 self.needs_attention = !state.pending_elicitations.is_empty()
                     || state.status == SessionStatusValue::Failed;
                 self.todos = state.todos.clone();
-                self.refresh_activity_from_todos();
+                self.recompute_activity();
                 self.repos = match (&state.workspace, &state.git_branch) {
                     (None, None) => Vec::new(),
                     (name, branch) => vec![RepoRef {
@@ -170,12 +170,12 @@ impl SessionCard {
             StreamUpdate::ReasoningEffortChanged(e) => self.reasoning_effort = e,
             StreamUpdate::TodosChanged(todos) => {
                 self.todos = todos;
-                self.refresh_activity_from_todos();
+                self.recompute_activity();
             }
             StreamUpdate::ScratchChanged(_scratch) => {
                 // Focused activity: prefer in-progress todo; scratch is consumed so
                 // the match arm exists (activity must not stall while focused).
-                self.refresh_activity_from_todos();
+                self.recompute_activity();
             }
             StreamUpdate::SandboxChanged(s) => self.sandbox_status = s,
             StreamUpdate::TitleChanged(t) => self.title = t,
@@ -210,14 +210,17 @@ impl SessionCard {
         }
     }
 
-    fn refresh_activity_from_todos(&mut self) {
-        if let Some(t) = self
+    /// Recompute the coarse activity line: the in-progress todo's active_form, else BLANK.
+    /// Self-clears — mirrors Summary's `from_state` (which blanks when no in-progress todo).
+    /// The card can't do the in-flight-tool fallback that Summary does (it doesn't retain
+    /// `items`), so Detailed-mode activity is todos-only; that is an accepted skeleton limit.
+    fn recompute_activity(&mut self) {
+        self.activity_summary = self
             .todos
             .iter()
             .find(|t| t.status == TodoStatus::InProgress)
-        {
-            self.activity_summary = t.active_form.clone();
-        }
+            .map(|t| t.active_form.clone())
+            .unwrap_or_default();
     }
 
     pub fn set_repos_for_test(&mut self, repos: Vec<RepoRef>) {
@@ -303,13 +306,24 @@ mod tests {
         );
         assert_eq!(card.activity_summary, "wiring cards");
 
+        // TodosChanged([]) must self-clear the activity (not leave stale "wiring cards").
+        card.fold_feed(
+            ActorFeed::Detailed(StreamUpdate::TodosChanged(vec![])),
+            &clock,
+        );
+        assert_eq!(
+            card.activity_summary,
+            "",
+            "activity self-clears when no in-progress todo"
+        );
+
+        // ScratchChanged recomputes from todos (still empty) — proves the arm is not a no-op.
         let scratch = Arc::new(StreamScratch::default());
         card.fold_feed(
             ActorFeed::Detailed(StreamUpdate::ScratchChanged(scratch)),
             &clock,
         );
-        // ScratchChanged must be matched (not dropped); activity may stay from todos.
-        assert_eq!(card.activity_summary, "wiring cards");
+        assert_eq!(card.activity_summary, "");
     }
 
     #[test]

@@ -43,7 +43,12 @@ impl Render for SessionCardView {
 
 /// Mount as `AnyView` inside `.cached(...)` with stable bounds style.
 pub fn mount_cached_card(view: Entity<SessionCardView>) -> impl IntoElement {
-    let style = StyleRefinement::default();
+    // §4.4 pt4: pin the CACHED WRAPPER to the fixed tile size — the cache key IS the
+    // wrapper's bounds, so it must be 280×148 independent of parent packing (a default
+    // style lets a flex/grid parent resize it). Styled is impl'd for StyleRefinement.
+    let style = StyleRefinement::default()
+        .w(px(CARD_WIDTH_PX))
+        .h(px(CARD_HEIGHT_PX));
     AnyView::from(view).cached(style)
 }
 
