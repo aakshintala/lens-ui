@@ -191,7 +191,7 @@ pub struct Progress {
 // ---------------------------------------------------------------------------
 
 pub use engine::frame::{CellStyle, Frame, FrameCell, FrameRow, Rgb, UnderlineStyle};
-pub use engine::{EngineConfig, EngineError, EngineHandle, FeedError, VtEngine};
+pub use engine::{EngineConfig, EngineError, EngineHandle, EngineInspect, FeedError, VtEngine};
 
 // ---------------------------------------------------------------------------
 // Typed event seams (opaque; grow across slices — hence `#[non_exhaustive]`).

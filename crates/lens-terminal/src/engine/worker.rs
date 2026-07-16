@@ -9,6 +9,7 @@ use arc_swap::ArcSwapOption;
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 
 use super::frame::Frame;
+use super::inspect::InspectShared;
 use super::vt::{EngineConfig, VtEngine};
 
 pub(crate) type WakerSlot = Arc<Mutex<Option<Box<dyn Fn() + Send + Sync>>>>;
@@ -45,6 +46,10 @@ pub(crate) fn worker_channels() -> WorkerChannels {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "worker thread wires many channels and shared state"
+)]
 pub(crate) fn spawn_worker(
     cfg: EngineConfig,
     cmd_rx: Receiver<EngineCommand>,
@@ -53,6 +58,7 @@ pub(crate) fn spawn_worker(
     frame_slot: Arc<ArcSwapOption<Frame>>,
     frame_ready: Arc<AtomicBool>,
     waker: WakerSlot,
+    inspect: Arc<InspectShared>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut engine = match VtEngine::new(&cfg, |_| {}) {
@@ -78,6 +84,7 @@ pub(crate) fn spawn_worker(
                     &mut engine,
                     &da_dsr_tx,
                     &da_dsr_rx,
+                    &inspect,
                     &mut dirty,
                     &mut visible,
                     &mut force_build,
@@ -93,6 +100,7 @@ pub(crate) fn spawn_worker(
                     &mut engine,
                     &da_dsr_tx,
                     &da_dsr_rx,
+                    &inspect,
                     &mut dirty,
                     &mut visible,
                     &mut force_build,
@@ -104,6 +112,7 @@ pub(crate) fn spawn_worker(
                 &frame_slot,
                 &frame_ready,
                 &waker,
+                &inspect,
                 &mut dirty,
                 visible,
                 &mut force_build,
@@ -113,20 +122,28 @@ pub(crate) fn spawn_worker(
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "command dispatch threads engine + I/O handles"
+)]
 fn handle_command(
     cmd: EngineCommand,
     engine: &mut VtEngine,
     da_dsr_tx: &Sender<Vec<u8>>,
     da_dsr_rx: &Receiver<Vec<u8>>,
+    inspect: &InspectShared,
     dirty: &mut bool,
     visible: &mut bool,
     force_build: &mut bool,
 ) {
     match cmd {
         EngineCommand::Feed(bytes) => {
+            let n = bytes.len() as u64;
             engine.feed(&bytes);
+            inspect.record_bytes_fed(n);
             let replies = engine.take_replies();
             if !replies.is_empty() {
+                inspect.record_da_dsr(replies.len());
                 emit_da_dsr(da_dsr_tx, da_dsr_rx, replies);
             }
             *dirty = true;
@@ -135,12 +152,14 @@ fn handle_command(
             if let Err(e) = engine.resize(cols, rows) {
                 eprintln!("lens-terminal engine: resize failed: {e}");
             } else {
+                inspect.record_resize(cols, rows);
                 *dirty = true;
             }
         }
         EngineCommand::SetVisible(v) => {
             let was_visible = *visible;
             *visible = v;
+            inspect.set_visible(v);
             if v && !was_visible {
                 *force_build = true;
             }
@@ -152,12 +171,16 @@ fn handle_command(
     }
 }
 
-#[expect(clippy::too_many_arguments, reason = "publish gate threads many engine-owned handles")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "publish gate threads many engine-owned handles"
+)]
 fn maybe_publish(
     engine: &mut VtEngine,
     frame_slot: &Arc<ArcSwapOption<Frame>>,
     frame_ready: &Arc<AtomicBool>,
     waker: &WakerSlot,
+    inspect: &InspectShared,
     dirty: &mut bool,
     visible: bool,
     force_build: &mut bool,
@@ -174,8 +197,11 @@ fn maybe_publish(
 
     *force_build = false;
 
+    let started = Instant::now();
     match engine.build_frame() {
         Ok(frame) => {
+            let micros = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+            inspect.record_frame_built(micros);
             frame_slot.store(Some(Arc::new(frame)));
             frame_ready.store(true, Ordering::Release);
             *dirty = false;

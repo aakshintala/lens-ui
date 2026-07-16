@@ -9,6 +9,7 @@ use crossbeam_channel::{Receiver, Sender, TrySendError};
 use thiserror::Error;
 
 use super::frame::Frame;
+use super::inspect::{EngineInspect, InspectShared};
 use super::vt::EngineConfig;
 use super::worker::{self, EngineCommand, WakerSlot};
 
@@ -28,6 +29,7 @@ pub struct EngineHandle {
     frame_ready: Arc<AtomicBool>,
     waker: WakerSlot,
     da_dsr_rx: Receiver<Vec<u8>>,
+    inspect: Arc<InspectShared>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -42,6 +44,7 @@ impl EngineHandle {
         let frame_slot = Arc::new(ArcSwapOption::from(None));
         let frame_ready = Arc::new(AtomicBool::new(false));
         let waker: WakerSlot = Arc::new(Mutex::new(None));
+        let inspect = Arc::new(InspectShared::new(cfg.cols, cfg.rows, cfg.max_scrollback));
 
         let join = worker::spawn_worker(
             cfg,
@@ -51,6 +54,7 @@ impl EngineHandle {
             Arc::clone(&frame_slot),
             Arc::clone(&frame_ready),
             Arc::clone(&waker),
+            Arc::clone(&inspect),
         );
 
         Self {
@@ -59,6 +63,7 @@ impl EngineHandle {
             frame_ready,
             waker,
             da_dsr_rx,
+            inspect,
             join: Some(join),
         }
     }
@@ -105,6 +110,14 @@ impl EngineHandle {
         &self.da_dsr_rx
     }
 
+    pub fn set_inspect_enabled(&self, enabled: bool) {
+        self.inspect.set_enabled(enabled);
+    }
+
+    pub fn inspect(&self) -> EngineInspect {
+        self.inspect.snapshot()
+    }
+
     /// Bypass the publish throttle — intended for deterministic tests.
     pub fn build_now(&self) -> Result<(), FeedError> {
         self.cmd_tx
@@ -135,6 +148,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+    use crate::engine::inspect::InspectEventKind;
 
     fn test_config() -> EngineConfig {
         EngineConfig {
@@ -155,6 +169,31 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
         }
         panic!("timeout waiting for frame");
+    }
+
+    #[test]
+    fn inspect_records_events_when_enabled_and_ring_empty_when_disabled() {
+        let h = EngineHandle::spawn(test_config());
+        h.set_inspect_enabled(true);
+        h.feed(b"inspect-me".to_vec()).expect("feed");
+        h.build_now().expect("build_now");
+        let _ = wait_for_frame(&h);
+        let snap = h.inspect();
+        assert!(snap.frames_built >= 1);
+        assert!(snap.bytes_fed > 0);
+        assert!(
+            snap.recent
+                .iter()
+                .any(|e| matches!(e.kind, InspectEventKind::FrameBuilt { .. }))
+        );
+
+        h.set_inspect_enabled(false);
+        h.feed(b"more".to_vec()).expect("feed");
+        h.build_now().expect("build_now");
+        let _ = wait_for_frame(&h);
+        let snap_off = h.inspect();
+        assert!(snap_off.recent.is_empty());
+        h.stop();
     }
 
     #[test]
