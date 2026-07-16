@@ -97,6 +97,20 @@ these are environment-scoped and the listing is paginated.
 The **file tree provider** is the typed client's `Sessions::resources()` —
 Lens does not maintain a client-side fs index; the server is the source.
 
+**The File-tab editor** (the surface that reads/writes these files) is a
+**"comfortable editor" — top of band 2b** (syntax highlight, line numbers,
+find/replace, multi-cursor, folding — all computed from the file bytes), **not an
+IDE**. Band-3 language intelligence (completions, diagnostics, go-to-def) is
+**structurally unavailable**: Lens is a pure REST/SSE/WS client, the worktree
+lives on the omnigent host, and omnigent exposes no LSP-proxy endpoint — so there
+is no language server Lens could talk to. The widget-tier decision, its build
+plan (vendor-and-patch `gpui-component`'s code input; Zed's editor crate ruled
+out as GPL/coupled), and the parked band-3 LSP-proxy contract dependency are
+owned by **framework §4.4** (SSOT). This document owns only the **write path**:
+edits persist via the §3 verbs — `PUT {content}` full write / `PATCH {old_text,
+new_text}` search-replace. The user's own IDE, on the same worktree, is the
+band-3 escape hatch.
+
 - **Single root by default; sibling roots opt-in** (capability map decision A,
   resolved). The navigator's tree shows the **focused session's own worktree**
   by default — auto-showing every sibling worktree in its Group invites "which

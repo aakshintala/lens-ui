@@ -2,6 +2,7 @@
 //! Selects over the event stream + command channel, reduces, persists, and emits.
 
 mod api;
+mod feed;
 mod outcome;
 mod runloop;
 mod scheduler;
@@ -9,6 +10,7 @@ mod summary;
 mod transport;
 
 pub use api::{ClientSessionApi, CommandOutcome, SessionApi};
+pub use feed::ActorFeed;
 pub use outcome::ActorOutcome;
 pub use runloop::{
     ActorHandle, ActorStores, OutputMode, SessionCommand, spawn_actor, spawn_actor_dual,

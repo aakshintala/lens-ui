@@ -73,10 +73,9 @@ and roll older "Recent" pointers off this page as they age.
 
 - **📋 SPEC-GAPS backlog (2026-07-13):** nine independent, un-specced/partial
   subsystems parked in [`SPEC-GAPS.md`](./SPEC-GAPS.md) — app release/signing/update,
-  omnigent bundling, Lens observability, secrets lifecycle, TUI-native harness toggle,
-  first-run product UX, settings surface, data lifecycle, multi-machine identity. Each
-  gets its own spec→plan cycle; pick one to brainstorm. (TUI decision recorded: per-session
-  rendered-stream ↔ raw-TUI toggle.)
+  omnigent bundling, Lens observability, secrets lifecycle, ~~TUI-native harness toggle~~
+  (**#5 now spec'd, see below**), first-run product UX, settings surface, data lifecycle,
+  multi-machine identity. Each gets its own spec→plan cycle; **8 gaps remain** un-specced.
 
 - **✅ DONE (2026-07-12): state-model P3-3b EXECUTED + merged to `main`** (branch
   `state-model-p3-3b`, 16 commits, base 02d6d96; **push deferred — user call**). All 6 code/doc
@@ -118,9 +117,74 @@ and roll older "Recent" pointers off this page as they age.
     `AGENTS.md` now pins the gate to **workspace-wide** `cargo clippy --workspace --all-targets
     -- -D warnings` with a clean-before-push + fix-red-before-start rule (`1b75dd0`).
 
-- **▶ NEXT: `lens-ui` (Bucket B viewport)** — first rendering consumer of the §13.2 seams
-  (StreamUpdate/SessionCommand/ActorOutcome), incl. the arch-B composer-owns-durability draft.
-  lens-drive is the headless precedent proving the seams are drivable.
+- **✅ DONE (2026-07-15): `lens-ui` skeleton Plan 2 (§4–§7 + §3.5) EXECUTED + merged to `main`**
+  (branch `feat/lens-ui-shell-skeleton`, 11 commits, base ef60978; **push deferred — user call**).
+  The first rendering consumer of the state model. Plan **grok-4.5-authored + Opus-verified**
+  (4 gpui-structural corrections C1–C4 folded pre-exec: Task-cancels-on-drop, no-window-false-green,
+  stubbed-bounds, spawn-closure form); executed **subagent-driven** (composer-2.5 per task + **codex
+  cross-family seam review on Tasks 2 & 4** + **Opus whole-branch final = SHIP**). Shipped
+  `crates/lens-ui` (FleetStore two-mode fake/live · per-session coalescing async poller · dual-mode
+  SessionCard fold · §4.4 render-isolation: observe-own-entity + pinned-bounds `.cached` wrapper +
+  canvas paint/bounds instrumentation · wave ladder + §3.5 Ready monotonic-trigger/per-card-decay-
+  one-shot/focus-suppress · board↔focused recompose · `ContentTab`/`TabHandle` placeholder · `⌘.`
+  app-Action) + `crates/lens-app` (gpui-component `Root` bootstrap + `--session` live attach +
+  `--fleet-verify`). **D10-at-scale RETIRED: §6.1 hermetic acceptance (real window + canvas, all 6
+  groups non-vacuous) + N≥10 LIVE-VERIFY exit-0 vs omnigent 0.5.1** (10 sessions attached Summary,
+  seeds + promote/demote green; fail-closed exit-2). lens-ui 17 lib + 1 acceptance, workspace clippy
+  `-D warnings` + fmt clean, lens-core/client untouched. Cross-family seams earned their keep (codex
+  Task-2 F1 cached-bounds Critical + Task-4 F1 Failed-shown-as-NeedsInput / F2 stale-error-stuck-
+  Failed); F3 REJECTED (focus notify = intended layout notify, not §4.4 violation). Plan:
+  `docs/plans/2026-07-15-lens-ui-shell-skeleton.md`; memory [[grok45-as-plan-author]].
+  - **⚠ Two immediate follow-ups (Opus whole-branch flagged, both DEFERRED non-blocking):**
+    (1) `spawn_live_session` blocks the fg thread on stream-subscribe at window-init — fine at N=10
+    in the harness, **MUST go off-thread before opening N warm cards for a real user**; (2) **lens-ui
+    has no render benchmark** (AGENTS.md "every layer carries a benchmark") — deferred as the first
+    follow-up (nothing to regress against until the transcript slice adds real render cost; matches
+    the lens-client-benchmarks dedicated-plan precedent). Minor N1/N2 (Ready-before-Slept rung order;
+    Detailed `StatusChanged` doesn't clear stale error) are focused-only/transient, deferred.
+
+- **▶ NEXT: `lens-ui` transcript fan-out** — the first real consumer of the Detailed feed + the disk
+  `RowSource`/D23 render window (markdown + virtualization spikes both GO); plugs into the slot API
+  this skeleton publishes. Sibling parallel surfaces (terminal via `lens-terminal::open`, workspace,
+  permissions) can fan out against `ContentTab`/`TabHandle` now. First, land the two follow-ups above.
+  - **✅ DONE (2026-07-15): §3 lens-core ActorFeed gate MERGED + pushed to `main`** (`f67e686..7e9a2e7`,
+    10 code commits + plan). The merge-gated one-way-door milestone (§3.1–§3.4): unified `ActorFeed`
+    FIFO (replaces `updates`+`summaries`), scheduler dual-mode + spawn-in-Summary, seed-on-spawn +
+    emit-on-Demote, enriched `SummaryUpdate` (+ `last_completed_turn` + RAM-only `SessionState.harness`
+    snapshot-fold, **no schema migration**). Plan authored by **grok-4.5** (Opus source-verified);
+    executed subagent-driven — composer-2.5 per task + **codex/gpt-5.5 cross-family** seam reviews +
+    **fresh Opus** whole-branch. 201 lens-core lib tests (stable), `clippy --workspace --all-targets
+    -D warnings` clean, `generated.rs` untouched. **Reviews earned their keep:** codex caught a Task-2
+    Critical false-green (silent `while let Detailed` drains) + a Task-4 Important; the final review
+    SPLIT — Opus SHIP vs codex FIX-FIRST — adjudicated against source (C1 seed-duplicate-on-startup-
+    replay FIXED + regression test; C2 partially valid → 2 bare drains hardened, rest safe-by-
+    construction) → codex re-verified clean. **Trust-but-verify** caught a composer mid-task stall
+    (Task 4 → completed inline) + a composer over-claimed flaky-red gate (Task 5 → de-flaked a
+    pre-existing d30 timing race). Plan: `docs/plans/2026-07-15-lens-core-actorfeed-gate.md`; memory
+    [[grok45-as-plan-author]].
+  - **⚠ PLAN 2 ARCH NOTE (carry into the lens-ui poller/card):** a Summary-mode card consumer MUST
+    tolerate occasional `Detailed(TranscriptAdvanced)` watermarks — catch-up + deferred-commit emit
+    them regardless of mode (intended; the unified FIFO exists to keep them ordered vs Summary frames).
+    §3.5 Ready *policy* (seen_turn detector / last_completed_at stamp / per-card decay one-shot /
+    focus-suppress) is now Plan 2 lens-ui work, building over §3.4's `last_completed_turn`.
+  - **✅ Final-review Minors all fixed (2026-07-15, merged `abacd6c..43a52df`):** `activity_summary`
+    now scans `items` in order (deterministic, was HashMap-order); 6 `.is_ok()` presence-check drains
+    strengthened to `recv_detailed` (panic-on-Summary); `ActorOutcome::SummaryConsumerGone` renamed
+    `FeedConsumerGone` (unified feed). 202 lens-core tests, workspace gate green.
+  - **Design: `docs/specs/2026-07-14-lens-ui-shell-skeleton-design.md` — REVIEW-CLOSED at
+    `0ce67ad` (2026-07-15).** Don't re-litigate; the decisions below are settled.
+  - **Settled design decisions (see spec §§):** Ready = `idle && (now−last_completed_at)<5min`,
+    **triggered by the monotonic `last_completed_turn` (NOT a status edge — feed coalesces), per-card
+    decay one-shot notify, glow suppressed on focus** ([[coalescing-feed-monotonic-trigger]]); §4.4
+    fixed-size-tile isolation (pin W×H, 1 repo row + `·+N` + hover tooltip, Retry/disconnect overlay
+    in-bounds); `⌘.` back-to-board (app-level Action over terminal handler; `⌘\` deferred); §6.1
+    acceptance test (targeted notify not `refresh()`; downstream-sibling bounds test); terminal seam
+    = consume `lens-terminal::open(TerminalTarget, client, opts, cx)`, lens-ui adapts (identity-only,
+    locked with sibling `lens-terminal-ws`).
+  - **New cross-spec risk filed (SPEC-GAPS):** `session.superseded` reducer-drop
+    (`folds.rs:136` marker-only discards `target_conversation_id`) blocks the terminal
+    supersession-reattach the sibling workstream delegates to lens-ui — lens-core must surface it;
+    terminal-integration-era, not the skeleton.
 
 - **lens-client benchmarks: DONE** (2026-06-27, composer-2.5 build + free codex
   cross-family review → 4 Important + 1 Nit, all applied). Closes the MANDATORY
@@ -398,6 +462,55 @@ and roll older "Recent" pointers off this page as they age.
   status + harness-provider icon set.
 
 ## Recent
+
+- **2026-07-14** — **Editor tier DECIDED (framework §4.4) — docs-only, not pushed.**
+  Resolved the long-stubbed "raw file tab" (shell §8.5). **The File-tab editor targets
+  the top of a "comfortable editor" tier (band 2b: highlight, line numbers,
+  find/replace, multi-cursor, folding — all computed from file bytes); no LSP/IDE
+  intelligence.** Key reframe: band-3 intelligence (completions/diagnostics/go-to-def)
+  is **blocked by the omnigent contract, not by editor-widget effort** — Lens is a pure
+  REST/SSE/WS client, the worktree lives on the omnigent host, and omnigent exposes no
+  LSP-proxy endpoint, so there's no language server to talk to; the 2b/3 boundary
+  coincides exactly with the local-compute / needs-a-server line, making top-of-2b the
+  *correct* target, not a compromise. **Build:** vendor-and-patch `gpui-component`'s
+  Apache-2.0 code input (same play as §4.1 markdown), in-repo, **no separate library**
+  (YAGNI); **Zed's `crates/editor` ruled out** (GPL-3.0, ~40k LOC coupled to
+  `language`/`project`/LSP = forking Zed; consistent with §3 crates.io-default). Write
+  path = workspace §3 `PUT`/`PATCH`. **Parked:** band-3 needs an omnigent LSP-proxy
+  contract (sibling to `client-message-id`) or a pure-client-boundary break for
+  local-only worktrees — recorded in `SPEC-GAPS.md` "Parked contract dependencies", not
+  scheduled. Edits: framework §4.4 (SSOT) + §4 intro + §5 seams row; workspace §3; shell
+  §8.5; SPEC-GAPS. Memory `editor-tier-decision`. **No build impact on NEXT (`lens-ui`).**
+
+- **2026-07-14** — **TUI-native harness toggle SPEC WRITTEN + committed** (`bf72ea3`,
+  docs-only, **not pushed**; SPEC-GAPS #5 closed). Full brainstorm → **live spike** →
+  **dual cross-family review** → rework → commit, all this session.
+  [`spec`](./specs/2026-07-14-tui-native-toggle-design.md) ·
+  [`spike`](./spikes/2026-07-14-tui-native-elicitation.md). **Feature:** per-session
+  toggle in the focused chat column between the rendered stream and the harness's raw TUI
+  (the existing §9.4 agent-terminal) for TUI-native harnesses — intent (c) *both watch and
+  type*. **Spike (live claude-native on 0.5.1)** settled the load-bearing unknowns:
+  prompts are **dual-surface in parallel** (F1); web-resolve is a **dead-end for the
+  mode-change class** (`ExitPlanMode "run in auto mode"` — structurally TUI-only, F2);
+  **generic permissions round-trip fine** (F3); external approval can **destabilize the
+  harness mode → transient loop** (F4). Also confirmed the **transcript-forwarder** keeps
+  Lens's state coherent regardless of input surface (composer and TUI are the *same* input
+  path via `tmux send-keys`). **Locked decisions:** full interaction mode-swap; **typed
+  elicitation routing** `Terminal|LensCard|OwnerRequired` with **per-harness suppression**
+  (claude-native verified; others safe-default keep-card); hybrid **capability + tri-state
+  readiness** detection (via `terminal_pending`); switch-agent **view rule + epoch fence +
+  `/clear` `session.superseded` handling**; **runtime-only window-local view** (one
+  conversation ≤1 window); lazy-attach warm-while-open; **harness-tier graceful
+  degradation** (SDK-driven = first-class, `-native` = best-effort, bounded by forwarder
+  maturity). **Review (grok-4.5 ship-with-fixes + gpt-5.6/codex needs-rework)** caught 3
+  shared Criticals — non-owner mode-change deadlock, multi-window dual-surface, badge with
+  no data source — all folded; codex additionally caught the `/clear` supersession gap.
+  **Decision G tightened** across capability-map §0.7 SSOT + README row + shell §7:
+  **detach = move, a conversation is shown in ≤1 window** (raise-don't-clone). **Ahead of
+  build deps** — consumes Plan 7 (terminal WS client, still deferred) + docks into the
+  `lens-ui` viewport (the actual NEXT-up); plan it when those exist. **Handed to permissions
+  spec:** `OwnerRequired` resolution path + Bridge cross-surface arbitration + the
+  mode-change dead-end (SPEC-GAPS cross-spec risks). **NEXT remains `lens-ui` (Bucket B).**
 
 - **2026-07-11** — **state-model P3-3b GRILLED & CLOSED → spec amended; next = `writing-plans` +
   execute (NEW session).** Full grilling pass over **Bucket A** (recovery semantics) + **Bucket C**

@@ -32,7 +32,11 @@ Ordering below is by "blocks shipping Lens to a second human" (roughly).
    multi-user` (README) resolves the *posture*, not the credential storage
    lifecycle.
 
-5. **TUI-native harness handling** — reading **(A)**: `claude-native` /
+5. **TUI-native harness handling** — ✅ **SPEC WRITTEN 2026-07-14**
+   ([`docs/specs/2026-07-14-tui-native-toggle-design.md`](specs/2026-07-14-tui-native-toggle-design.md),
+   commit `bf72ea3`; brainstormed → live spike → dual cross-family review →
+   reworked). Blocked on build deps (Plan 7 terminal WS client + `lens-ui`
+   viewport). Original gap framing below. — reading **(A)**: `claude-native` /
    `cursor-native` are PTY/TUI-only and **fold reasoning** into `output_text`
    (memory `live-event-recapture-findings`), so they can't produce a clean
    rendered reasoning stream. **Decision (2026-07-13):** the focused chat for a
@@ -50,6 +54,14 @@ Ordering below is by "blocks shipping Lens to a second human" (roughly).
 7. **Settings / preferences surface** — the STATUS "Tunables" (auto-sleep
    threshold, poll cadence, terminal scrollback/fleet-memory budgets, transcript truncation tiers,
    `cost_samples` cadence) have no UI home. Where the user sees/changes them.
+   - **Known requirement — TUI-by-default global** (from the TUI-native toggle
+     spec, 2026-07-13): a global preference "prefer the raw TUI when a harness
+     offers one." The TUI-native toggle spec deliberately keeps per-session
+     current-view as *runtime-only* (always initializes to rendered); the durable
+     "I live in the TUI" default lives here as a global, not per-session disk
+     persistence. When honored, a fresh session materialization of a TUI-native
+     harness initializes to TUI (riding the same `starting TUI…` pending state)
+     instead of rendered.
 
 8. **Data lifecycle / migration** — the two-tier SQLite store has a
    schema-version degrade path, but no app-level story for data location, backup,
@@ -98,7 +110,7 @@ Ordering below is by "blocks shipping Lens to a second human" (roughly).
 
 ---
 
-## Upstream contract gaps
+## Upstream contract gaps (omnigent-side asks)
 
 - **Immutable terminal generation identity** — omnigent 0.5.1 derives terminal
   IDs from `(terminal_name, session_key)` and may recreate a few server-owned
@@ -109,3 +121,44 @@ Ordering below is by "blocks shipping Lens to a second human" (roughly).
   event history, and treats an observed duplicate creation as a replacement,
   but cannot prove the remaining race away. Omnigent should expose an immutable
   generation/resource ID (or an equivalent durable replacement discriminator).
+
+- **LSP-proxy endpoint — gates any IDE-grade (band-3) file editing** (recorded
+  2026-07-14, framework §4.4). The File-tab editor is scoped to a "comfortable
+  editor" (top of band 2b: highlight/find-replace/multi-cursor/fold, all local).
+  Band-3 intelligence (completions, diagnostics, go-to-def) is **blocked, not
+  deferred-by-effort**: Lens is a pure REST/SSE/WS client and the worktree lives
+  on the omnigent host, so a language server would have to run host-side with an
+  LSP-proxy protocol over the wire — which omnigent does not expose. Unblocking
+  band 3 needs **either** an omnigent LSP-proxy contract (sibling to the
+  `client-message-id` ask) **or** a deliberate break of the pure-client boundary
+  to run local language servers against *local-only* worktrees. Both are separate,
+  larger decisions; neither is an editor-widget problem. Not scheduled.
+
+## Cross-spec risks discovered during design
+
+- **lens-core drops `session.superseded`'s redirect target — blocks terminal
+  supersession reattach** (found 2026-07-15, grill of `docs/specs/2026-07-14-lens-ui-shell-skeleton-design.md`
+  §5.2). The terminal workstream (`lens-terminal-ws`) delegates to lens-ui:
+  observe public `session.superseded` and feed `target_conversation_id` into the
+  terminal tab so it reattaches the same terminal under the new conversation
+  (native `/clear` supersession; there is no public transfer route). But the
+  reducer folds `SessionEvent::Superseded { .. }` to **nothing** — marker-only,
+  `crates/lens-core/src/reduce/folds.rs:136` — so `target_conversation_id` never
+  reaches the feed. Fix (terminal-integration era, **not** the lens-ui skeleton):
+  lens-core must surface it, e.g. `StreamUpdate::Superseded { target_conversation_id,
+  reason }`. Transient / live-only / no-replay in the 0.5.1 contract, so the
+  durable `message`-item notice (persisted on the old conversation) is the
+  separate reload path. Owner: whoever lands the terminal-integration slice;
+  flagged to the terminal agent so they don't assume observation is free.
+
+- **Permissions spec — mode-change elicitations are TUI-only for native harnesses**
+  (found 2026-07-14 spike, `docs/spikes/2026-07-14-tui-native-elicitation.md`).
+  For `claude-native`, generic tool permissions round-trip fine from Lens's
+  rendered `/resolve` path, but the **mode-change class** (e.g. `ExitPlanMode`
+  "run in auto mode") **cannot be resolved from the API** — it structurally
+  requires the harness TUI. The existing `permissions-and-elicitations.md` spec
+  must (a) detect this class and route the user to the TUI toggle (or offer only
+  round-trippable options) instead of a dead-end approve button, and (b) treat
+  approval as pending until `elicitation_resolved`, never optimistic. Candidate
+  omnigent bug report (like the client-message-id ask). The TUI-native toggle is
+  the escape hatch this relies on.

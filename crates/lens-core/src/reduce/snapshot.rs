@@ -21,6 +21,14 @@ pub(crate) fn fold_snapshot(state: &mut SessionState, snap: &SessionSnapshot) ->
     state.status = map_snapshot_status(snap.status());
     state.agent_id = AgentId::new(snap.agent_id().to_string());
     state.agent_name = snap.agent_name().map(str::to_string);
+    state.harness = {
+        let h = snap.harness();
+        if h.is_empty() {
+            None
+        } else {
+            Some(h.to_string())
+        }
+    };
     state.stream.current_agent = state.agent_name.clone();
     state.llm_model = snap.llm_model().map(str::to_string);
     state.model_override = snap.model_override().map(str::to_string);
@@ -194,6 +202,21 @@ mod tests {
             &clock(),
         );
         assert!(s.stream.open_message.is_some());
+    }
+
+    #[test]
+    fn fold_snapshot_copies_harness() {
+        let mut s = crate::reduce::testutil::fresh_state();
+        let snap = crate::reduce::testutil::snapshot_fixture(serde_json::json!({
+            "id": "conv_1",
+            "status": "running",
+            "agent_id": "ag_1",
+            "created_at": 1_700_000_000,
+            "harness": "claude-sdk",
+            "items": []
+        }));
+        super::fold_snapshot(&mut s, &snap);
+        assert_eq!(s.harness.as_deref(), Some("claude-sdk"));
     }
 
     #[test]

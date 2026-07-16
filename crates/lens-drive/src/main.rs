@@ -18,8 +18,8 @@ use lens_client::sessions::{GetOpts, SessionSnapshot, SessionStatus};
 use lens_client::stream::EventStream;
 use lens_client::{Auth, Client, Connection};
 use lens_core::actor::{
-    ActorOutcome, ActorStores, ActorTransport, ClientSessionApi, CommandOutcome, FleetScheduler,
-    FleetSchedulerError, ParkReason, SessionCommand,
+    ActorFeed, ActorOutcome, ActorStores, ActorTransport, ClientSessionApi, CommandOutcome,
+    FleetScheduler, FleetSchedulerError, ParkReason, SessionCommand,
 };
 use lens_core::clock::Clock;
 use lens_core::domain::ids::AgentId;
@@ -124,7 +124,7 @@ fn run() -> Result<(), String> {
 
     seed_disk(&conn, &config.session_id, &config.data_dir, &snap)?;
 
-    let (updates_tx, updates_rx) = async_channel::bounded(64);
+    let (feed_tx, feed_rx) = async_channel::bounded(64);
     let (snap_gate, snap_done) = SnapshotGate::new();
     let snap_gate = Arc::new(snap_gate);
     let stop = Arc::new(AtomicBool::new(false));
@@ -136,7 +136,7 @@ fn run() -> Result<(), String> {
         &config.session_id,
         &config.data_dir,
         &mut scheduler,
-        updates_tx.clone(),
+        feed_tx.clone(),
     )?;
 
     let session_id = config.session_id.clone();
@@ -151,8 +151,7 @@ fn run() -> Result<(), String> {
 
     let update_gate = Arc::clone(&snap_gate);
     let update_stop = Arc::clone(&stop);
-    let update_handle =
-        thread::spawn(move || drain_updates(updates_rx, &update_gate, &update_stop));
+    let update_handle = thread::spawn(move || drain_updates(feed_rx, &update_gate, &update_stop));
 
     let input: Box<dyn BufRead> = match &config.script {
         Some(path) => {
@@ -179,7 +178,7 @@ fn run() -> Result<(), String> {
                     &session_id,
                     &config.data_dir,
                     &scheduler,
-                    updates_tx.clone(),
+                    feed_tx.clone(),
                     stream_bridge,
                 )?;
             }
@@ -256,7 +255,7 @@ fn attach_actor(
     session_id: &SessionId,
     data_dir: &Path,
     scheduler: &mut FleetScheduler,
-    updates_tx: async_channel::Sender<StreamUpdate>,
+    feed_tx: async_channel::Sender<ActorFeed>,
 ) -> Result<StreamBridge, String> {
     let stream = client
         .sessions()
@@ -267,7 +266,16 @@ fn attach_actor(
     let api = actor_api(conn)?;
     let clock = make_clock();
     scheduler
-        .reconnect(&conn.id, session_id, events, updates_tx, stores, clock, api)
+        .reconnect(
+            &conn.id,
+            session_id,
+            events,
+            feed_tx,
+            lens_core::actor::OutputMode::Detailed,
+            stores,
+            clock,
+            api,
+        )
         .map_err(scheduler_err)?;
     Ok(bridge)
 }
@@ -278,7 +286,7 @@ fn reconnect_command(
     session_id: &SessionId,
     data_dir: &Path,
     scheduler: &Arc<std::sync::Mutex<FleetScheduler>>,
-    updates_tx: async_channel::Sender<StreamUpdate>,
+    feed_tx: async_channel::Sender<ActorFeed>,
     mut old_bridge: StreamBridge,
 ) -> Result<StreamBridge, String> {
     old_bridge.shutdown();
@@ -295,7 +303,16 @@ fn reconnect_command(
             .lock()
             .map_err(|e| format!("scheduler lock: {e}"))?;
         sched
-            .reconnect(&conn.id, session_id, events, updates_tx, stores, clock, api)
+            .reconnect(
+                &conn.id,
+                session_id,
+                events,
+                feed_tx,
+                lens_core::actor::OutputMode::Detailed,
+                stores,
+                clock,
+                api,
+            )
             .map_err(scheduler_err)?
     };
     print_reconnect_line(live);
@@ -418,14 +435,10 @@ fn drain_outcomes(
     }
 }
 
-fn drain_updates(
-    rx: async_channel::Receiver<StreamUpdate>,
-    gate: &SnapshotGate,
-    stop: &AtomicBool,
-) {
+fn drain_updates(rx: async_channel::Receiver<ActorFeed>, gate: &SnapshotGate, stop: &AtomicBool) {
     while !stop.load(Ordering::Relaxed) {
         match rx.try_recv() {
-            Ok(update) => match update {
+            Ok(ActorFeed::Detailed(update)) => match update {
                 StreamUpdate::Rebased(state) => {
                     print_state_line(&state);
                     gate.signal_if_waiting();
@@ -435,6 +448,9 @@ fn drain_updates(
                 }
                 _ => {}
             },
+            Ok(ActorFeed::Summary(_)) => {
+                // lens-drive is Detailed-only; ignore Summary frames if any appear.
+            }
             Err(async_channel::TryRecvError::Empty) => {
                 thread::sleep(Duration::from_millis(50));
             }
@@ -715,7 +731,7 @@ fn actor_outcome_json(outcome: &ActorOutcome) -> Value {
         }),
         ActorOutcome::Slept => json!({"variant": "Slept"}),
         ActorOutcome::SleepDeclined => json!({"variant": "SleepDeclined"}),
-        ActorOutcome::SummaryConsumerGone => json!({"variant": "SummaryConsumerGone"}),
+        ActorOutcome::FeedConsumerGone => json!({"variant": "FeedConsumerGone"}),
         ActorOutcome::SendLost {
             lens_pending_id,
             content,

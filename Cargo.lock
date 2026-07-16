@@ -3335,6 +3335,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a79a3332a6609480d7d0c9eab957bca6b455b91bb84e66d19f5ff66294b85b8"
 
 [[package]]
+name = "lens-app"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "gpui-component",
+ "lens-client",
+ "lens-core",
+ "lens-ui",
+ "url",
+]
+
+[[package]]
 name = "lens-capture"
 version = "0.1.0"
 dependencies = [
@@ -3393,6 +3405,20 @@ dependencies = [
  "async-channel 2.5.0",
  "criterion",
  "gpui",
+ "lens-core",
+ "smallvec",
+]
+
+[[package]]
+name = "lens-ui"
+version = "0.1.0"
+dependencies = [
+ "async-channel 2.5.0",
+ "crossbeam-channel",
+ "futures",
+ "gpui",
+ "gpui-component",
+ "lens-client",
  "lens-core",
  "smallvec",
 ]
