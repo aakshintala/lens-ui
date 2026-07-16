@@ -2,28 +2,56 @@ use gpui::{
     AnyView, Context, Entity, IntoElement, ParentElement, Render, StyleRefinement, Window, div,
     prelude::*, px,
 };
+use lens_core::actor::SessionCommand;
+use lens_core::domain::ids::SessionId;
 use std::cell::Cell;
 use std::rc::Rc;
+use std::sync::Arc;
 
+use crate::clock::UiClock;
+use crate::fleet::store::FleetStore;
+
+use super::chrome::render_card_chrome;
 use super::model::{CARD_HEIGHT_PX, CARD_WIDTH_PX, SessionCard};
+use super::wave::derive_wave;
 
 /// §4.4: skeleton card chrome uses gpui `div`/text only — no gpui-component widget
 /// inside the tile — so cache-key/bounds risk from component internals is N/A.
 pub struct SessionCardView {
     card: Entity<SessionCard>,
+    clock: Arc<dyn UiClock>,
+    fleet: Entity<FleetStore>,
+    session_id: SessionId,
+    kebab_open: bool,
     pub render_count: Rc<Cell<usize>>,
     pub paint_count: Rc<Cell<usize>>,
 }
 
 impl SessionCardView {
-    pub fn new(card: Entity<SessionCard>, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        card: Entity<SessionCard>,
+        clock: Arc<dyn UiClock>,
+        fleet: Entity<FleetStore>,
+        session_id: SessionId,
+        cx: &mut Context<Self>,
+    ) -> Self {
         // §4.4: observe ONLY this card entity — never FleetStore or sibling cards.
         cx.observe(&card, |_, _, cx| cx.notify()).detach();
         Self {
             card,
+            clock,
+            fleet,
+            session_id,
+            kebab_open: false,
             render_count: Rc::new(Cell::new(0)),
             paint_count: Rc::new(Cell::new(0)),
         }
+    }
+
+    fn send_command(&self, cmd: SessionCommand, cx: &mut Context<Self>) {
+        let fleet = self.fleet.clone();
+        let sid = self.session_id.clone();
+        fleet.update(cx, |f, _| f.send_session_command(&sid, cmd));
     }
 }
 
@@ -31,13 +59,46 @@ impl Render for SessionCardView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.render_count.set(self.render_count.get() + 1);
         let card = self.card.read(cx);
-        let title = card.title.clone().unwrap_or_default();
-        // Chrome details land in Task 4 — fixed outer bounds are the §4.4 load-bearing bit.
+        let now_ms = self.clock.now_millis();
+        let wave = derive_wave(card, now_ms, card.is_focused);
+        let kebab_open = self.kebab_open;
+
         div()
             .id(("session-card", self.card.entity_id()))
             .w(px(CARD_WIDTH_PX))
             .h(px(CARD_HEIGHT_PX))
-            .child(title)
+            .child(render_card_chrome(
+                card,
+                wave,
+                kebab_open,
+                cx.listener(|view, _, _, cx| {
+                    view.kebab_open = !view.kebab_open;
+                    cx.notify();
+                }),
+                cx.listener(|view, _, _, cx| {
+                    view.kebab_open = false;
+                    view.send_command(SessionCommand::Sleep, cx);
+                }),
+                cx.listener(|view, _, _, cx| {
+                    view.kebab_open = false;
+                    view.send_command(
+                        SessionCommand::Send {
+                            text: String::new(),
+                            model_override: None,
+                        },
+                        cx,
+                    );
+                }),
+                cx.listener(|view, _, _, cx| {
+                    view.send_command(
+                        SessionCommand::Send {
+                            text: String::new(),
+                            model_override: None,
+                        },
+                        cx,
+                    );
+                }),
+            ))
     }
 }
 
@@ -74,17 +135,30 @@ mod tests {
 
     #[gpui::test]
     async fn session_card_view_observes_own_card_only(cx: &mut gpui::TestAppContext) {
+        let clock = Arc::new(crate::clock::ManualUiClock::new(0));
         let sid_a = SessionId::new("a");
         let sid_b = SessionId::new("b");
 
-        let (card_a, card_b, view_a, view_b, rc_a, rc_b) = cx.update(|cx| {
-            let card_a = cx.new(|_| SessionCard::new(sid_a.clone()));
-            let card_b = cx.new(|_| SessionCard::new(sid_b.clone()));
-            let view_a = cx.new(|cx| SessionCardView::new(card_a.clone(), cx));
-            let view_b = cx.new(|cx| SessionCardView::new(card_b.clone(), cx));
+        let (fleet, card_a, card_b, view_a, view_b, rc_a, rc_b) = cx.update(|cx| {
+            let fleet = FleetStore::new(clock, cx);
+            let card_a = fleet.update(cx, |f, cx| f.spawn_fake_session(sid_a.clone(), cx));
+            let card_b = fleet.update(cx, |f, cx| f.spawn_fake_session(sid_b.clone(), cx));
+            let clock = fleet.read(cx).clock();
+            let view_a = cx.new(|cx| {
+                SessionCardView::new(
+                    card_a.clone(),
+                    clock.clone(),
+                    fleet.clone(),
+                    sid_a.clone(),
+                    cx,
+                )
+            });
+            let view_b = cx.new(|cx| {
+                SessionCardView::new(card_b.clone(), clock, fleet.clone(), sid_b.clone(), cx)
+            });
             let rc_a = view_a.read(cx).render_count.clone();
             let rc_b = view_b.read(cx).render_count.clone();
-            (card_a, card_b, view_a, view_b, rc_a, rc_b)
+            (fleet, card_a, card_b, view_a, view_b, rc_a, rc_b)
         });
 
         let (_board, vcx) = cx.add_window_view(|_, _| DualCardBoard {
@@ -93,6 +167,7 @@ mod tests {
         });
 
         vcx.run_until_parked();
+        let _ = fleet;
 
         let after_first = (rc_a.get(), rc_b.get());
         assert_eq!(after_first, (1, 1), "initial mount renders both tiles once");

@@ -8,6 +8,7 @@ use lens_core::reduce::StreamUpdate;
 
 pub const CARD_WIDTH_PX: f32 = 280.0;
 pub const CARD_HEIGHT_PX: f32 = 148.0;
+pub const READY_DECAY_MS: i64 = 5 * 60 * 1000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepoRef {
@@ -48,6 +49,8 @@ pub struct SessionCard {
     pub seeded: bool,
     /// Task 4: one-shot decay reschedule guard.
     pub ready_reschedule: bool,
+    /// §4.4: focus glow suppression — set by FleetStore on focus/blur only.
+    pub is_focused: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -89,6 +92,7 @@ impl SessionCard {
             todos: Vec::new(),
             seeded: false,
             ready_reschedule: false,
+            is_focused: false,
         }
     }
 
@@ -99,7 +103,7 @@ impl SessionCard {
         }
     }
 
-    pub fn fold_summary(&mut self, u: &SummaryUpdate, _clock: &dyn UiClock) {
+    pub fn fold_summary(&mut self, u: &SummaryUpdate, clock: &dyn UiClock) {
         self.status = u.status;
         self.title = u.title.clone();
         self.last_total_tokens = u.last_total_tokens;
@@ -124,7 +128,17 @@ impl SessionCard {
                 branch: branch.clone(),
             }],
         };
-        // Ready stamp: Task 4
+        // §3.5: seed first (no stamp — pre-attach completions show no Ready), then stamp on a
+        // MONOTONIC turn advance (coalesce-safe; NOT a status edge). seen_turn is a detector, never
+        // the Ready criterion (the timestamp is).
+        if !self.seeded {
+            self.seen_turn = u.last_completed_turn;
+            self.seeded = true;
+        } else if u.last_completed_turn > self.seen_turn {
+            self.last_completed_at = Some(clock.now_millis());
+            self.seen_turn = u.last_completed_turn;
+            self.ready_reschedule = true; // poller consumes this to (re)schedule the decay wake
+        }
     }
 
     pub fn fold_detailed(&mut self, u: StreamUpdate) {
@@ -234,6 +248,7 @@ mod tests {
     use lens_core::domain::controls::{Todo, TodoStatus};
     use lens_core::domain::ids::{AgentId, ConnectionId, SessionId};
     use lens_core::domain::item::StreamScratch;
+    use lens_core::domain::scalars::SessionStatusValue;
     use lens_core::domain::session::SessionState;
     use std::sync::Arc;
 
@@ -312,8 +327,7 @@ mod tests {
             &clock,
         );
         assert_eq!(
-            card.activity_summary,
-            "",
+            card.activity_summary, "",
             "activity self-clears when no in-progress todo"
         );
 
@@ -324,6 +338,25 @@ mod tests {
             &clock,
         );
         assert_eq!(card.activity_summary, "");
+    }
+
+    #[test]
+    fn summary_fold_stamps_ready_on_turn_advance_not_status_edge() {
+        let clock = crate::clock::ManualUiClock::new(5_000);
+        let mut card = SessionCard::new(SessionId::new("s"));
+        let mut u = base_summary();
+        u.status = SessionStatusValue::Idle;
+        u.last_completed_turn = 2;
+        card.fold_summary(&u, &clock); // seed: seen_turn=2, no stamp
+        assert!(card.last_completed_at.is_none());
+        assert_eq!(card.seen_turn, 2);
+
+        u.last_completed_turn = 5; // coalesced idle→running→idle appears as turn jump
+        u.status = SessionStatusValue::Idle;
+        card.fold_summary(&u, &clock);
+        assert_eq!(card.last_completed_at, Some(5_000));
+        assert_eq!(card.seen_turn, 5);
+        assert!(card.ready_reschedule);
     }
 
     #[test]

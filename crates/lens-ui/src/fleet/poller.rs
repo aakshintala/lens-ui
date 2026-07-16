@@ -1,10 +1,11 @@
-use crate::card::model::{ConnectionOverlay, SessionCard};
+use crate::card::model::{ConnectionOverlay, READY_DECAY_MS, SessionCard};
 use crate::clock::UiClock;
 use futures::future::{Either, select};
 use futures::pin_mut;
 use gpui::{App, Entity, Task};
 use lens_core::actor::{ActorFeed, ActorOutcome};
 use std::sync::Arc;
+use std::time::Duration;
 
 pub fn spawn_session_poller(
     card: Entity<SessionCard>,
@@ -14,6 +15,9 @@ pub fn spawn_session_poller(
     cx: &mut App,
 ) -> Task<()> {
     cx.spawn(async move |cx| {
+        // Dual-clock: Ready DECISION uses UiClock; decay WAKE uses gpui's executor timer.
+        // Task 5 advances both consistently in tests (ManualUiClock + advance_clock).
+        let mut decay_timer: Option<Task<()>> = None;
         loop {
             let feed_wait = feed_rx.recv();
             let out_wait = outcomes_rx.recv();
@@ -27,17 +31,34 @@ pub fn spawn_session_poller(
                         batch.push(more);
                     }
                     let clock = Arc::clone(&clock);
-                    if card
-                        .update(cx, |card, cx| {
-                            for frame in batch.drain(..) {
-                                card.fold_feed(frame, clock.as_ref());
-                            }
-                            card.notify_count = card.notify_count.saturating_add(1);
-                            cx.notify();
-                        })
-                        .is_err()
-                    {
-                        break;
+                    match card.update(cx, |card, cx| {
+                        for frame in batch.drain(..) {
+                            card.fold_feed(frame, clock.as_ref());
+                        }
+                        card.notify_count = card.notify_count.saturating_add(1);
+                        cx.notify();
+                        let stamp_at = if card.ready_reschedule {
+                            card.last_completed_at
+                        } else {
+                            None
+                        };
+                        card.ready_reschedule = false;
+                        stamp_at
+                    }) {
+                        Ok(Some(stamp_at)) => {
+                            let delay =
+                                (stamp_at + READY_DECAY_MS - clock.now_millis()).max(0) as u64;
+                            let card_t = card.clone();
+                            // replace cancels any prior timer (Task cancels on drop).
+                            drop(decay_timer.replace(cx.spawn(async move |cx| {
+                                cx.background_executor()
+                                    .timer(Duration::from_millis(delay))
+                                    .await;
+                                let _ = card_t.update(cx, |_, cx| cx.notify());
+                            })));
+                        }
+                        Ok(None) => {}
+                        Err(_) => break,
                     }
                 }
                 Either::Right((Ok(first), _)) => {

@@ -36,6 +36,14 @@ impl FleetStore {
         self.store_notify_count.get()
     }
 
+    pub fn clock(&self) -> Arc<dyn UiClock> {
+        Arc::clone(&self.clock)
+    }
+
+    pub fn send_session_command(&self, id: &SessionId, cmd: SessionCommand) {
+        self.send_command(id, cmd);
+    }
+
     pub fn card(&self, id: &SessionId) -> Option<Entity<SessionCard>> {
         self.cards.get(id).cloned()
     }
@@ -51,8 +59,10 @@ impl FleetStore {
         }
         if let Some(prev) = self.focused.clone() {
             self.send_command(&prev, SessionCommand::Demote);
+            self.set_card_focused(&prev, false, cx);
         }
         self.send_command(&id, SessionCommand::Promote);
+        self.set_card_focused(&id, true, cx);
         self.focused = Some(id);
         self.store_notify_count
             .set(self.store_notify_count.get().saturating_add(1));
@@ -62,9 +72,19 @@ impl FleetStore {
     pub fn blur_to_board(&mut self, cx: &mut Context<Self>) {
         if let Some(prev) = self.focused.take() {
             self.send_command(&prev, SessionCommand::Demote);
+            self.set_card_focused(&prev, false, cx);
             self.store_notify_count
                 .set(self.store_notify_count.get().saturating_add(1));
             cx.notify();
+        }
+    }
+
+    fn set_card_focused(&self, id: &SessionId, focused: bool, cx: &mut Context<Self>) {
+        if let Some(card) = self.cards.get(id) {
+            card.update(cx, |c, cx| {
+                c.is_focused = focused;
+                cx.notify();
+            });
         }
     }
 

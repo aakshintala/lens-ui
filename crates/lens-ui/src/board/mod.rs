@@ -47,7 +47,11 @@ impl BoardView {
             .collect();
         let mut card_views = HashMap::new();
         for (id, card) in cards {
-            card_views.insert(id, cx.new(|cx| SessionCardView::new(card, cx)));
+            let clock = fleet.read(cx).clock();
+            card_views.insert(
+                id.clone(),
+                cx.new(|cx| SessionCardView::new(card, clock, fleet.clone(), id, cx)),
+            );
         }
         let fleet_for_observe = fleet.clone();
         cx.new(move |cx| {
@@ -65,6 +69,16 @@ impl BoardView {
         })
     }
 
+    fn make_card_view(
+        &self,
+        id: SessionId,
+        card: Entity<crate::card::model::SessionCard>,
+        cx: &mut Context<Self>,
+    ) -> Entity<SessionCardView> {
+        let clock = self.fleet.read(cx).clock();
+        cx.new(|cx| SessionCardView::new(card, clock, self.fleet.clone(), id, cx))
+    }
+
     fn sync_card_views(&mut self, cx: &mut Context<Self>) {
         let missing: Vec<_> = {
             let fleet = self.fleet.read(cx);
@@ -77,7 +91,7 @@ impl BoardView {
         };
         for (id, card) in missing {
             self.card_views
-                .insert(id, cx.new(|cx| SessionCardView::new(card, cx)));
+                .insert(id.clone(), self.make_card_view(id, card, cx));
         }
     }
 
