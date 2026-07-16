@@ -4,6 +4,7 @@ pub mod card;
 pub mod clock;
 pub mod fleet;
 pub mod slot;
+pub mod theme;
 
 pub use board::{BoardView, ShellMode};
 pub use clock::{ManualUiClock, UiClock, WallUiClock};
