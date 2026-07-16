@@ -16,6 +16,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 /// Stub PTY byte counter — Task 5 asserts BackToBoard does not increment it.
+#[derive(Clone)]
 pub struct PtyProbe {
     pub bytes_sent: Rc<Cell<usize>>,
 }

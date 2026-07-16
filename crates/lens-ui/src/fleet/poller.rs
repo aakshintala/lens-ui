@@ -56,7 +56,10 @@ pub fn spawn_session_poller(
                                 cx.background_executor()
                                     .timer(Duration::from_millis(delay))
                                     .await;
-                                let _ = card_t.update(cx, |_, cx| cx.notify());
+                                let _ = card_t.update(cx, |card, cx| {
+                                    card.notify_count = card.notify_count.saturating_add(1);
+                                    cx.notify();
+                                });
                             })));
                         }
                         Ok(None) => {}

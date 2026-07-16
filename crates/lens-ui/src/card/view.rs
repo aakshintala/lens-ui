@@ -1,6 +1,6 @@
 use gpui::{
-    AnyView, Context, Entity, IntoElement, ParentElement, Render, StyleRefinement, Window, div,
-    prelude::*, px,
+    AnyView, Bounds, Context, Entity, IntoElement, ParentElement, Pixels, Render, StyleRefinement,
+    Window, canvas, div, prelude::*, px,
 };
 use lens_core::actor::SessionCommand;
 use lens_core::domain::ids::SessionId;
@@ -25,6 +25,7 @@ pub struct SessionCardView {
     kebab_open: bool,
     pub render_count: Rc<Cell<usize>>,
     pub paint_count: Rc<Cell<usize>>,
+    pub last_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
 }
 
 impl SessionCardView {
@@ -45,6 +46,7 @@ impl SessionCardView {
             kebab_open: false,
             render_count: Rc::new(Cell::new(0)),
             paint_count: Rc::new(Cell::new(0)),
+            last_bounds: Rc::new(Cell::new(None)),
         }
     }
 
@@ -62,6 +64,8 @@ impl Render for SessionCardView {
         let now_ms = self.clock.now_millis();
         let wave = derive_wave(card, now_ms, card.is_focused);
         let kebab_open = self.kebab_open;
+        let paint_count = self.paint_count.clone();
+        let last_bounds = self.last_bounds.clone();
 
         div()
             .id(("session-card", self.card.entity_id()))
@@ -99,11 +103,22 @@ impl Render for SessionCardView {
                     );
                 }),
             ))
+            .child(
+                canvas(
+                    |_, _, _| (),
+                    move |bounds, _, _, _| {
+                        paint_count.set(paint_count.get() + 1);
+                        last_bounds.set(Some(bounds));
+                    },
+                )
+                .absolute()
+                .size_full(),
+            )
     }
 }
 
 /// Mount as `AnyView` inside `.cached(...)` with stable bounds style.
-pub fn mount_cached_card(view: Entity<SessionCardView>) -> impl IntoElement {
+pub fn mount_cached_card(view: Entity<SessionCardView>) -> AnyView {
     // §4.4 pt4: pin the CACHED WRAPPER to the fixed tile size — the cache key IS the
     // wrapper's bounds, so it must be 280×148 independent of parent packing (a default
     // style lets a flex/grid parent resize it). Styled is impl'd for StyleRefinement.

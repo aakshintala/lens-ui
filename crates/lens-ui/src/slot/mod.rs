@@ -1,10 +1,14 @@
-use gpui::{AnyView, App, Context, IntoElement, Render, SharedString, Window, div, prelude::*};
+use gpui::{
+    AnyView, App, Context, FocusHandle, InteractiveElement, IntoElement, Render, SharedString,
+    Window, div, prelude::*,
+};
 
 pub trait ContentTab {}
 
 pub struct TabHandle {
     pub view: AnyView,
     pub title: SharedString,
+    pub focus_handle: FocusHandle,
 }
 
 impl TabHandle {
@@ -13,21 +17,35 @@ impl TabHandle {
     }
 }
 
-pub struct PlaceholderTab;
+pub struct PlaceholderTab {
+    focus_handle: FocusHandle,
+}
 
 impl ContentTab for PlaceholderTab {}
 
+impl PlaceholderTab {
+    fn new(cx: &mut Context<Self>) -> Self {
+        Self {
+            focus_handle: cx.focus_handle(),
+        }
+    }
+}
+
 impl Render for PlaceholderTab {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().child("Working area (placeholder)")
+        div()
+            .track_focus(&self.focus_handle)
+            .child("Working area (placeholder)")
     }
 }
 
 pub fn placeholder_tab(cx: &mut App) -> TabHandle {
-    let view = cx.new(|_| PlaceholderTab);
+    let entity = cx.new(PlaceholderTab::new);
+    let focus_handle = entity.read(cx).focus_handle.clone();
     TabHandle {
-        view: view.into(),
+        view: entity.into(),
         title: SharedString::from("Placeholder"),
+        focus_handle,
     }
 }
 

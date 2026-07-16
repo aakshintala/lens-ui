@@ -1,0 +1,397 @@
+use gpui::Action;
+use lens_core::actor::{ActorFeed, SessionCommand, SummaryUpdate};
+use lens_core::domain::ids::SessionId;
+use lens_core::domain::scalars::SessionStatusValue;
+use lens_core::domain::usage::Cost;
+use lens_core::reduce::StreamUpdate;
+use lens_ui::PtyProbe;
+use lens_ui::actions::BackToBoard;
+use lens_ui::board::BoardView;
+use lens_ui::card::model::{READY_DECAY_MS, RepoRef, SessionCard};
+use lens_ui::card::wave::{Wave, derive_wave};
+use lens_ui::clock::{ManualUiClock, UiClock};
+use lens_ui::fleet::store::FleetStore;
+use lens_ui::slot::placeholder_tab;
+use std::cell::Cell;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Duration;
+
+fn summary(
+    status: SessionStatusValue,
+    title: &str,
+    activity: &str,
+    turn: u32,
+    workspace: Option<&str>,
+) -> SummaryUpdate {
+    SummaryUpdate {
+        status,
+        title: Some(title.into()),
+        last_total_tokens: Some(1_000),
+        host_id: None,
+        needs_attention: false,
+        subagent_active: false,
+        llm_model: Some("opus".into()),
+        model_override: None,
+        agent_name: None,
+        cumulative_cost: Cost::default(),
+        context_window: Some(200_000),
+        sandbox_status: None,
+        git_branch: Some("main".into()),
+        workspace: workspace.map(str::to_string),
+        reasoning_effort: None,
+        activity_summary: activity.into(),
+        last_completed_turn: turn,
+        harness: Some("claude-native".into()),
+    }
+}
+
+#[gpui::test]
+async fn shell_skeleton_acceptance(cx: &mut gpui::TestAppContext) {
+    let clock = Arc::new(ManualUiClock::new(10_000));
+    let a = SessionId::new("a");
+    let b = SessionId::new("b");
+    let c = SessionId::new("c");
+
+    let (fleet, pty) = cx.update(|cx| {
+        let fleet = FleetStore::new(Arc::clone(&clock) as Arc<dyn UiClock>, cx);
+        fleet.update(cx, |f, cx| {
+            f.spawn_fake_session(a.clone(), cx);
+            f.spawn_fake_session(b.clone(), cx);
+            f.spawn_fake_session(c.clone(), cx);
+        });
+        let pty = PtyProbe {
+            bytes_sent: Rc::new(Cell::new(0)),
+        };
+        (fleet, pty)
+    });
+
+    let fleet_for_window = fleet.clone();
+    let pty_for_window = pty.clone();
+    let (board_handle, vcx) = cx.add_window_view(|_, cx| {
+        let working_tab = placeholder_tab(cx);
+        BoardView::mount(fleet_for_window, working_tab, Some(pty_for_window), cx)
+    });
+
+    // (1) Settle first frame — targeted notify only (never cx.refresh()).
+    for id in [&a, &b, &c] {
+        vcx.update(|_, cx| {
+            let card = fleet.read(cx).card(id).unwrap();
+            card.update(cx, |_, cx| cx.notify());
+        });
+    }
+    vcx.run_until_parked();
+
+    let (rc_a, rc_b, rc_c, paint_a, paint_b, paint_c) = vcx.read(|cx| {
+        let views = board_handle.read(cx).card_views_for_test();
+        (
+            views[&a].read(cx).render_count.clone(),
+            views[&b].read(cx).render_count.clone(),
+            views[&c].read(cx).render_count.clone(),
+            views[&a].read(cx).paint_count.clone(),
+            views[&b].read(cx).paint_count.clone(),
+            views[&c].read(cx).paint_count.clone(),
+        )
+    });
+    let a0 = rc_a.get();
+    let b0 = rc_b.get();
+    let c0 = rc_c.get();
+    let c_paint0 = paint_c.get();
+    let store0 = vcx.read(|cx| fleet.read(cx).store_notify_count());
+
+    let bounds_c_before = vcx
+        .read(|cx| board_handle.read(cx).card_bounds_for_test(&c, cx))
+        .expect("C must have canvas-captured bounds after first draw");
+
+    // (2) Observe-isolation: inject Summary on B only.
+    vcx.update(|_, cx| {
+        fleet.read(cx).fake.as_ref().unwrap().push_feed(
+            &b,
+            ActorFeed::Summary(Box::new(summary(
+                SessionStatusValue::Running,
+                "B-live",
+                "",
+                1,
+                Some("lens"),
+            ))),
+        );
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        let card = fleet.read(cx).card(&b).unwrap();
+        card.update(cx, |_, cx| cx.notify());
+    });
+    vcx.run_until_parked();
+
+    assert!(rc_b.get() > b0, "B must re-render on its Summary fold");
+    assert_eq!(rc_a.get(), a0, "A sibling must not re-render");
+    let store1 = vcx.read(|cx| fleet.read(cx).store_notify_count());
+    assert_eq!(store1, store0, "FleetStore notify unchanged on scalar fold");
+
+    // (3) Size-invariance: activity present + repos 1→3 on B; C bounds byte-equal, paint unchanged.
+    // SummaryUpdate cannot carry N repos yet — drive growth via test hook + activity fold.
+    vcx.update(|_, cx| {
+        let card = fleet.read(cx).card(&b).unwrap();
+        card.update(cx, |card, cx| {
+            card.activity_summary = "wiring isolation".into();
+            card.set_repos_for_test(vec![
+                RepoRef {
+                    name: "lens".into(),
+                    branch: Some("main".into()),
+                },
+                RepoRef {
+                    name: "omnigent".into(),
+                    branch: Some("dev".into()),
+                },
+                RepoRef {
+                    name: "other".into(),
+                    branch: None,
+                },
+            ]);
+            cx.notify();
+        });
+    });
+    vcx.run_until_parked();
+    let bounds_c_after = vcx
+        .read(|cx| board_handle.read(cx).card_bounds_for_test(&c, cx))
+        .expect("C bounds must remain captured");
+    assert_eq!(
+        bounds_c_after, bounds_c_before,
+        "C bounds must be byte-equal after B content growth"
+    );
+    assert_eq!(
+        paint_c.get(),
+        c_paint0,
+        "downstream C must not repaint when B grows inside fixed tile"
+    );
+    assert_eq!(rc_c.get(), c0, "downstream C render_count unchanged");
+
+    // (4) Mode-switch order-safety on B's unified feed.
+    vcx.update(|_, cx| {
+        fleet.read(cx).fake.as_ref().unwrap().push_feed(
+            &b,
+            ActorFeed::Summary(Box::new(summary(
+                SessionStatusValue::Idle,
+                "stale-summary",
+                "",
+                2,
+                Some("lens"),
+            ))),
+        );
+        fleet.update(cx, |f, cx| f.focus_session(b.clone(), cx));
+        fleet.read(cx).fake.as_ref().unwrap().push_feed(
+            &b,
+            ActorFeed::Detailed(StreamUpdate::StatusChanged(SessionStatusValue::Running)),
+        );
+        fleet.read(cx).fake.as_ref().unwrap().push_feed(
+            &b,
+            ActorFeed::Detailed(StreamUpdate::TitleChanged(Some("detailed-title".into()))),
+        );
+    });
+    vcx.run_until_parked();
+    let title = vcx.read(|cx| fleet.read(cx).card(&b).unwrap().read(cx).title.clone());
+    assert_eq!(
+        title.as_deref(),
+        Some("detailed-title"),
+        "must end on Detailed projection, not stale Summary"
+    );
+    vcx.update(|_, cx| fleet.update(cx, |f, cx| f.blur_to_board(cx)));
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        fleet.read(cx).fake.as_ref().unwrap().push_feed(
+            &b,
+            ActorFeed::Summary(Box::new(summary(
+                SessionStatusValue::Idle,
+                "post-demote",
+                "",
+                2,
+                Some("lens"),
+            ))),
+        );
+    });
+    vcx.run_until_parked();
+    let title = vcx.read(|cx| fleet.read(cx).card(&b).unwrap().read(cx).title.clone());
+    assert_eq!(title.as_deref(), Some("post-demote"));
+
+    // (5) Ready trigger + decay (dual-clock).
+    clock.set(20_000);
+    vcx.update(|_, cx| {
+        let card = fleet.read(cx).card(&b).unwrap();
+        card.update(cx, |card: &mut SessionCard, _| {
+            card.seeded = true;
+            card.seen_turn = 2;
+            card.last_completed_at = None;
+            card.status = SessionStatusValue::Idle;
+        });
+        fleet.read(cx).fake.as_ref().unwrap().push_feed(
+            &b,
+            ActorFeed::Summary(Box::new(summary(
+                SessionStatusValue::Idle,
+                "done",
+                "",
+                9,
+                Some("lens"),
+            ))),
+        );
+    });
+    vcx.run_until_parked();
+    vcx.read(|cx| {
+        let card = fleet.read(cx).card(&b).unwrap().read(cx);
+        assert_eq!(card.last_completed_at, Some(20_000));
+        assert_eq!(
+            derive_wave(card, 20_000 + 1_000, false),
+            Wave::Ready,
+            "monotonic turn jump lights Ready"
+        );
+        assert_ne!(
+            derive_wave(card, 20_000 + 1_000, true),
+            Wave::Ready,
+            "glow suppressed when focused"
+        );
+    });
+
+    vcx.update(|_, cx| {
+        fleet.read(cx).fake.as_ref().unwrap().push_feed(
+            &b,
+            ActorFeed::Summary(Box::new(summary(
+                SessionStatusValue::Running,
+                "busy",
+                "working",
+                9,
+                Some("lens"),
+            ))),
+        );
+    });
+    vcx.run_until_parked();
+    vcx.read(|cx| {
+        let card = fleet.read(cx).card(&b).unwrap().read(cx);
+        assert_ne!(derive_wave(card, 21_000, false), Wave::Ready);
+    });
+    clock.set(22_000);
+    vcx.update(|_, cx| {
+        fleet.read(cx).fake.as_ref().unwrap().push_feed(
+            &b,
+            ActorFeed::Summary(Box::new(summary(
+                SessionStatusValue::Idle,
+                "done2",
+                "",
+                10,
+                Some("lens"),
+            ))),
+        );
+    });
+    vcx.run_until_parked();
+    vcx.read(|cx| {
+        let card = fleet.read(cx).card(&b).unwrap().read(cx);
+        assert_eq!(derive_wave(card, 22_000 + 1_000, false), Wave::Ready);
+    });
+
+    let store_before_decay = vcx.read(|cx| fleet.read(cx).store_notify_count());
+    let card_notifies_before =
+        vcx.read(|cx| fleet.read(cx).card(&b).unwrap().read(cx).notify_count);
+    clock.set(22_000 + READY_DECAY_MS + 1);
+    vcx.executor()
+        .advance_clock(Duration::from_millis((READY_DECAY_MS + 1) as u64));
+    vcx.run_until_parked();
+    vcx.read(|cx| {
+        let card = fleet.read(cx).card(&b).unwrap().read(cx);
+        assert_ne!(
+            derive_wave(card, clock.now_millis(), false),
+            Wave::Ready,
+            "Ready clears after READY_DECAY"
+        );
+        assert!(card.notify_count > card_notifies_before);
+        assert_eq!(
+            fleet.read(cx).store_notify_count(),
+            store_before_decay,
+            "decay timer must not notify FleetStore"
+        );
+    });
+
+    clock.set(30_000);
+    vcx.update(|_, cx| {
+        let card = fleet.read(cx).card(&b).unwrap();
+        card.update(cx, |card, _| {
+            card.last_completed_at = Some(29_000);
+            card.seen_turn = 10;
+            card.seeded = true;
+            card.status = SessionStatusValue::Idle;
+        });
+        fleet.read(cx).fake.as_ref().unwrap().push_feed(
+            &b,
+            ActorFeed::Summary(Box::new(summary(
+                SessionStatusValue::Idle,
+                "reconn",
+                "",
+                10,
+                Some("lens"),
+            ))),
+        );
+    });
+    vcx.run_until_parked();
+    vcx.read(|cx| {
+        let card = fleet.read(cx).card(&b).unwrap().read(cx);
+        assert_eq!(card.last_completed_at, Some(29_000));
+        assert_eq!(derive_wave(card, 30_000, false), Wave::Ready);
+    });
+    vcx.update(|_, cx| {
+        fleet.read(cx).fake.as_ref().unwrap().push_feed(
+            &b,
+            ActorFeed::Summary(Box::new(summary(
+                SessionStatusValue::Idle,
+                "reconn2",
+                "",
+                11,
+                Some("lens"),
+            ))),
+        );
+    });
+    vcx.run_until_parked();
+    vcx.read(|cx| {
+        let card = fleet.read(cx).card(&b).unwrap().read(cx);
+        assert_eq!(card.last_completed_at, Some(30_000));
+        assert_eq!(card.seen_turn, 11);
+    });
+
+    // (6) Focus doesn't repaint unrelated siblings (intra-focused-mode switch).
+    vcx.update(|_, cx| fleet.update(cx, |f, cx| f.focus_session(b.clone(), cx)));
+    vcx.run_until_parked();
+    let c_paint_before_focus = paint_c.get();
+    let a_paint_before = paint_a.get();
+    let b_paint_before = paint_b.get();
+    vcx.update(|_, cx| fleet.update(cx, |f, cx| f.focus_session(a.clone(), cx)));
+    vcx.run_until_parked();
+    assert!(
+        paint_a.get() > a_paint_before,
+        "newly focused card A must repaint on focus transition"
+    );
+    assert!(
+        paint_b.get() > b_paint_before,
+        "previously focused card B must repaint on demote-from-focus"
+    );
+    assert_eq!(
+        paint_c.get(),
+        c_paint_before_focus,
+        "sibling C paint_count unchanged — cache-reused when layout mode is stable"
+    );
+
+    // (7) BackToBoard — Demote + zero PTY bytes.
+    vcx.update(|window, cx| {
+        fleet.update(cx, |f, cx| f.focus_session(b.clone(), cx));
+        board_handle.read(cx).focus_working_tab_for_test(window, cx);
+        pty.bytes_sent.set(0);
+        window.dispatch_action(BackToBoard.boxed_clone(), cx);
+    });
+    vcx.run_until_parked();
+    // WEAK proxy: placeholder tab has no real PTY handler — proves dispatch+Demote, not
+    // true routing priority (that lands with the terminal slice).
+    assert_eq!(pty.bytes_sent.get(), 0, "⌘. must not send PTY bytes");
+    vcx.read(|cx| {
+        assert!(fleet.read(cx).focused().is_none());
+        let cmds = fleet.read(cx).fake.as_ref().unwrap().take_commands(&b);
+        assert!(
+            cmds.iter().any(|c| matches!(c, SessionCommand::Demote)),
+            "BackToBoard must Demote"
+        );
+    });
+}
