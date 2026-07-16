@@ -28,6 +28,7 @@ use gpui::{
 use lens_terminal::Frame;
 use lens_terminal::render_test_api::{
     CellMetrics, RenderStats, TabRenderState, ascii_frame, menlo_gate_ok, mixed_ascii_wide_frame,
+    sgr_frame,
 };
 
 fn main() {
@@ -59,8 +60,9 @@ enum Phase {
     MenloGate,
     PaintAscii,
     PaintWideRouting,
+    PaintSgr,
     Done,
-    // Tasks 5+: PaintSgr, PerfAscii200x50, PerfWide200x50, PerfWide400x100.
+    // Tasks 8: PerfAscii200x50, PerfWide200x50, PerfWide400x100.
 }
 
 struct HarnessView {
@@ -137,10 +139,22 @@ impl Render for HarnessView {
                         fail(&format!("PaintWideRouting stats bad: {stats:?}"));
                     }
                     println!("render_realwindow: PaintWideRouting OK ({stats:?})");
-                    *self.phase.borrow_mut() = Phase::Done;
+                    *self.phase.borrow_mut() = Phase::PaintSgr;
                 }
                 self.state
                     .render_element(&self.focus, "harness", "PaintWideRouting", window, cx)
+                    .into_any_element()
+            }
+            Phase::PaintSgr => {
+                if let Some(stats) = self.paint_phase_stats(phase, sgr_frame) {
+                    if stats.rows_painted != 1 || stats.paint_errors != 0 || stats.shapes < 1 {
+                        fail(&format!("PaintSgr stats bad: {stats:?}"));
+                    }
+                    println!("render_realwindow: PaintSgr OK ({stats:?})");
+                    *self.phase.borrow_mut() = Phase::Done;
+                }
+                self.state
+                    .render_element(&self.focus, "harness", "PaintSgr", window, cx)
                     .into_any_element()
             }
         }
