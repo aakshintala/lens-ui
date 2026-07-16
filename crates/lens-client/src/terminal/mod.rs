@@ -35,12 +35,8 @@ pub mod bench_api {
 
     pub fn encode_outbound(o: &WsOutbound) -> EncodedFrame {
         match super::wire::encode_outbound(o) {
-            tokio_tungstenite::tungstenite::Message::Binary(b) => {
-                EncodedFrame::Binary(b.into())
-            }
-            tokio_tungstenite::tungstenite::Message::Text(t) => {
-                EncodedFrame::Text(t.to_string())
-            }
+            tokio_tungstenite::tungstenite::Message::Binary(b) => EncodedFrame::Binary(b.into()),
+            tokio_tungstenite::tungstenite::Message::Text(t) => EncodedFrame::Text(t.to_string()),
             _ => EncodedFrame::Binary(Vec::new()),
         }
     }

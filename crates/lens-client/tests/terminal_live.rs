@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use lens_client::ids::{ConnectionId, SessionId, TerminalId};
 use lens_client::{
-    Auth, AttachOptions, CloseCause, Connection, CreateSessionRequest, TerminalCreate, WsInbound,
+    AttachOptions, Auth, CloseCause, Connection, CreateSessionRequest, TerminalCreate, WsInbound,
     WsOutbound, attach,
 };
 
@@ -129,13 +129,8 @@ fn bogus_terminal_id_attach_classifies_4404() {
     // A 101 upgrade happens BEFORE the terminal lookup, so a bogus tid yields an
     // app-level close with code 4404 (Spike-B live-confirmed).
     let bogus = TerminalId::new("term_does_not_exist");
-    let handle = attach(
-        &client,
-        &sid,
-        &bogus,
-        AttachOptions { read_only: false },
-    )
-    .expect("attach upgrades before lookup");
+    let handle = attach(&client, &sid, &bogus, AttachOptions { read_only: false })
+        .expect("attach upgrades before lookup");
 
     let mut saw_not_found = false;
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -149,7 +144,10 @@ fn bogus_terminal_id_attach_classifies_4404() {
             Err(_) => continue,
         }
     }
-    assert!(saw_not_found, "bogus tid should close with 4404 TerminalNotFound");
+    assert!(
+        saw_not_found,
+        "bogus tid should close with 4404 TerminalNotFound"
+    );
 
     handle.close();
     let _ = sessions.delete(&sid, false);

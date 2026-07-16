@@ -364,20 +364,14 @@ async fn io_loop(
     let request = match url_str.into_client_request() {
         Ok(req) => req,
         Err(_) => {
-            let _ = deliver_inbound(
-                &mut inbound_tx,
-                WsInbound::Closed(CloseCause::Network),
-            );
+            let _ = deliver_inbound(&mut inbound_tx, WsInbound::Closed(CloseCause::Network));
             return;
         }
     };
     let request = match apply_auth(request, &conn.auth) {
         Ok(req) => req,
         Err(_) => {
-            let _ = deliver_inbound(
-                &mut inbound_tx,
-                WsInbound::Closed(CloseCause::Network),
-            );
+            let _ = deliver_inbound(&mut inbound_tx, WsInbound::Closed(CloseCause::Network));
             return;
         }
     };
@@ -392,10 +386,7 @@ async fn io_loop(
     let (mut sink, mut stream) = match connect {
         Ok((ws, _resp)) => ws.split(),
         Err(_) => {
-            let _ = deliver_inbound(
-                &mut inbound_tx,
-                WsInbound::Closed(CloseCause::Network),
-            );
+            let _ = deliver_inbound(&mut inbound_tx, WsInbound::Closed(CloseCause::Network));
             return;
         }
     };
