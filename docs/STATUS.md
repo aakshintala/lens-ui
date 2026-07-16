@@ -9,6 +9,21 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Open threads & next up
 
+- **✅ DONE (2026-07-16): `lens-ui` card/board audit vs shell spec §4–§5 + cheap fixes** (branch
+  `feat/lens-app-multi-session`, commit `b367dbf`, branch-only). Audited `lens-app`/`lens-ui` against
+  `application-shell-and-layout.md` §4–§5 (deep) + thin whole-doc pass. Landed: **A1** wave colors
+  un-swapped (Ready→blue, Working→green — were backwards in `chrome.rs`); **C1** §5.1 Needs-input
+  red→orange (reconciled to `board-home.html` pixel SSOT); **C2** stale omnigent ref 0.3.0.dev0→0.5.1.
+  Gate green (build/clippy/17+1 tests). **Full deviation ledger (A/B/C buckets, incl. unbuilt B1–B8) +
+  the two next efforts** in `docs/handoffs/2026-07-16-lens-ui-theming-and-card-audit.md`.
+  - **User decisions locked:** Needs-input=orange; card readout = the **icon-tile** (§5.1), not the
+    current placeholder text-pill (pill is throwaway); **invest in §18 theming NOW** before more surface.
+  - **▶ NEXT (gates the wave build): brainstorm §18 theming.** `gpui-component 0.5.1` already in-tree
+    (lens-ui+lens-app), zero theming today. Load-bearing fork: **adopt gpui-component's theme substrate
+    + layer `status.*` tokens** vs **own §18 `Theme` struct + bridge**. Resolve via
+    `superpowers:brainstorming` → design doc BEFORE code; then A2 (hex→token migration) + the wave build
+    (B1–B5) consume real tokens. Board packing (B6–B8) deferred. Memory [[lens-ui-theming-fork]].
+
 - **📋 SPEC-GAPS backlog (2026-07-13):** nine independent, un-specced/partial
   subsystems parked in [`SPEC-GAPS.md`](./SPEC-GAPS.md) — app release/signing/update,
   omnigent bundling, Lens observability, secrets lifecycle, ~~TUI-native harness toggle~~
