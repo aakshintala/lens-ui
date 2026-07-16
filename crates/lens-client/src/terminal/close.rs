@@ -9,6 +9,7 @@ pub enum CloseCause {
     Network,
 }
 
+#[allow(dead_code)]
 pub(crate) fn classify_close(_code: u16) -> CloseCause {
     todo!("Task 4")
 }

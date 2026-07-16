@@ -69,6 +69,7 @@ impl Backoff {
     }
 }
 
+#[allow(dead_code)]
 pub fn attach(
     _client: &Client,
     _session: &SessionId,

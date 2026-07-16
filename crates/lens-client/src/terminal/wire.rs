@@ -13,12 +13,12 @@ pub enum WsOutbound {
     Resize { cols: u16, rows: u16 },
 }
 
+#[allow(dead_code)]
 pub(crate) fn encode_outbound(_o: &WsOutbound) -> tokio_tungstenite::tungstenite::Message {
     todo!("Task 3")
 }
 
-pub(crate) fn classify_inbound(
-    _msg: tokio_tungstenite::tungstenite::Message,
-) -> Option<WsInbound> {
+#[allow(dead_code)]
+pub(crate) fn classify_inbound(_msg: tokio_tungstenite::tungstenite::Message) -> Option<WsInbound> {
     todo!("Task 3")
 }
