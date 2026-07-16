@@ -102,7 +102,7 @@ impl EngineHandle {
 
     pub fn set_waker(&self, waker: Box<dyn Fn() + Send + Sync>) {
         if let Ok(mut guard) = self.waker.lock() {
-            *guard = Some(waker);
+            *guard = Some(Arc::from(waker));
         }
     }
 
@@ -134,9 +134,21 @@ impl EngineHandle {
     }
 
     pub fn stop(mut self) {
+        self.shutdown_worker();
+    }
+
+    fn shutdown_worker(&mut self) {
         let _ = self.cmd_tx.send(EngineCommand::Stop);
         if let Some(join) = self.join.take() {
             let _ = join.join();
+        }
+    }
+}
+
+impl Drop for EngineHandle {
+    fn drop(&mut self) {
+        if self.join.is_some() {
+            self.shutdown_worker();
         }
     }
 }

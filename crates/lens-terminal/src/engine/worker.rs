@@ -6,13 +6,13 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwapOption;
-use crossbeam_channel::{Receiver, Sender, TrySendError};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError};
 
 use super::frame::Frame;
 use super::inspect::InspectShared;
 use super::vt::{EngineConfig, VtEngine};
 
-pub(crate) type WakerSlot = Arc<Mutex<Option<Box<dyn Fn() + Send + Sync>>>>;
+pub(crate) type WakerSlot = Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>;
 
 const CMD_CHANNEL_CAP: usize = 256;
 const DA_DSR_CHANNEL_CAP: usize = 64;
@@ -77,9 +77,28 @@ pub(crate) fn spawn_worker(
             .unwrap_or_else(Instant::now);
 
         loop {
-            match cmd_rx.recv() {
-                Ok(EngineCommand::Stop) | Err(_) => break,
-                Ok(cmd) => handle_command(
+            let throttle_remaining = DEFAULT_BUILD_INTERVAL.saturating_sub(last_build.elapsed());
+            let wait_for_throttle =
+                dirty && visible && !force_build && throttle_remaining > Duration::ZERO;
+
+            let cmd = if wait_for_throttle {
+                match cmd_rx.recv_timeout(throttle_remaining) {
+                    Ok(cmd) => Some(cmd),
+                    Err(RecvTimeoutError::Timeout) => None,
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            } else {
+                match cmd_rx.recv() {
+                    Ok(cmd) => Some(cmd),
+                    Err(_) => break,
+                }
+            };
+
+            if let Some(cmd) = cmd {
+                if matches!(cmd, EngineCommand::Stop) {
+                    break;
+                }
+                handle_command(
                     cmd,
                     &mut engine,
                     &da_dsr_tx,
@@ -88,7 +107,7 @@ pub(crate) fn spawn_worker(
                     &mut dirty,
                     &mut visible,
                     &mut force_build,
-                ),
+                );
             }
 
             while let Ok(cmd) = cmd_rx.try_recv() {
@@ -206,9 +225,11 @@ fn maybe_publish(
             frame_ready.store(true, Ordering::Release);
             *dirty = false;
             *last_build = Instant::now();
-            if let Ok(guard) = waker.lock()
-                && let Some(w) = guard.as_ref()
-            {
+            let waker_fn = waker
+                .lock()
+                .ok()
+                .and_then(|guard| guard.as_ref().map(Arc::clone));
+            if let Some(w) = waker_fn {
                 w();
             }
         }

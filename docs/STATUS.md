@@ -9,7 +9,7 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Open threads & next up
 
-- **▶ ACTIVE: shared terminal workstream — design-pass spikes DONE 2026-07-16; next = build `lens-terminal`.**
+- **▶ ACTIVE: shared terminal workstream — Slice 1b (`lens-terminal` engine core) DONE 2026-07-16; next = 1c render layer.**
   Original design ([`specs/2026-07-14-terminal-workstream-design.md`](./specs/2026-07-14-terminal-workstream-design.md))
   assumed **porting Ghostty VT source** via the gpui-ghostty wrapper (adopt/adapt/exclude inventory,
   WP0 provenance gate). **That model is now superseded.** This session:
@@ -65,11 +65,17 @@ and roll older "Recent" pointers off this page as they age.
       101 before terminal lookup, no auth on dev; input=binary bytes (also the `on_pty_write` back-channel),
       resize=JSON text; reconnect to same `terminal_id` = current-screen redraw, **no byte-replay**
       (transient gap); typed close codes 4404(stop, live-confirmed)/4405(detach)/4500(retry).
-  - **NEXT (build, tasks 5+):** the real **`crates/lens-terminal`** deep module (wraps `libghostty-vt`,
-    no Ghostty type escapes) → off-thread actor (reuse state-model single-writer+replica pattern) →
-    **full-snapshot render layer** (lift `paint.rs`, apply the 3 codex fixes + wide/emoji per-cell +
-    full SGR) → **typed WS attach client** (binary↔`vt_write`, JSON resize, 4404/4405/4500 reconnect).
-    First host = standalone GPUI demo. GPUI 0.2.2 + omnigent pins unchanged.
+  - **✅ SLICE 1b DONE (2026-07-16, branch `terminal-1b`)** — `crates/lens-terminal` engine core:
+    non-`Send` `VtEngine` on a pinned `std::thread`, Lens-owned `Frame` seam (no Ghostty types
+    escape `engine/vt.rs`), throttled publish-and-wake (`ArcSwapOption` + coalesced waker +
+    `recv_timeout` throttle wake), DA/DSR reverse channel, hidden-tab suppression, gated
+    `EngineInspect` ring, offline replay tests (`attach`/`resize` captures), Criterion benches
+    (parse ~12µs / frame-build ~590µs @ 200×50). Plan:
+    `docs/plans/2026-07-16-terminal-slice-1b-lens-terminal-engine.md`. Commits `376dd1c`→`8bdb801`.
+  - **NEXT (build):** **1c** full-snapshot render layer (lift `paint.rs`, codex fixes + wide/emoji
+    per-cell + full SGR) → **1d** typed WS attach client (binary↔`vt_write`, JSON resize,
+    4404/4405/4500 reconnect, `cx.notify` waker). First host = standalone GPUI demo.
+    GPUI 0.2.2 + omnigent pins unchanged.
 
 - **📋 SPEC-GAPS backlog (2026-07-13):** nine independent, un-specced/partial
   subsystems parked in [`SPEC-GAPS.md`](./SPEC-GAPS.md) — app release/signing/update,
