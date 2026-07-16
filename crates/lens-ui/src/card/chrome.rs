@@ -82,8 +82,8 @@ fn host_label(card: &SessionCard) -> String {
 pub fn wave_border_color(wave: Wave) -> Hsla {
     match wave {
         Wave::NeedsInput => gpui::rgb(0xf59e0b),
-        Wave::Ready => gpui::rgb(0x22c55e),
-        Wave::Working => gpui::rgb(0x3b82f6),
+        Wave::Ready => gpui::rgb(0x3b82f6),
+        Wave::Working => gpui::rgb(0x22c55e),
         Wave::Failed => gpui::rgb(0xef4444),
         Wave::Slept => gpui::rgb(0x6b7280),
         Wave::Neutral => gpui::rgb(0x374151),
