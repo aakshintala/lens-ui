@@ -20,6 +20,9 @@ crossbeam-channel = "0.5"
 
 [features]
 bench = []
+# Exposes `render_test_api` for the real-window harness. Integration tests link
+# the crate's normal build (not cfg(test)), so the harness runs with this on.
+test-util = []
 
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false }
@@ -30,3 +33,14 @@ serde_json = "1"
 name = "engine"
 harness = false
 required-features = ["bench"]
+
+# Real-window render harness (Slice 1c C1/C5). `harness = false` → a plain
+# `fn main()` that opens a real GPUI window and drives Menlo/paint/perf
+# assertions from a canvas paint callback (gpui's NoopTextSystem is useless for
+# these). `required-features` keeps `cargo test --workspace` from building it;
+# xtask executes it on macOS with `--features test-util`.
+[[test]]
+name = "render_realwindow"
+path = "tests/render_realwindow.rs"
+harness = false
+required-features = ["test-util"]

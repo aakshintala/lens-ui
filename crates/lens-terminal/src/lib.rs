@@ -28,6 +28,20 @@
 use std::sync::Arc;
 
 mod engine;
+mod render;
+
+/// Test-only view onto the private `render` module for the real-window harness
+/// (`tests/render_realwindow.rs`). Gated on `test-util` because integration
+/// tests link the crate's **normal** build (not `cfg(test)`); the harness runs
+/// with `--features test-util`. Kept out of the default public API.
+#[cfg(any(test, feature = "test-util"))]
+pub mod render_test_api {
+    pub use crate::render::metrics::{
+        CellMetrics, MenloGateResult, menlo_gate_ok, per_row_alignment_ok,
+    };
+    pub use crate::render::paint::{RenderStats, paint_frame};
+    pub use crate::render::state::TabRenderState;
+}
 
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, EventEmitter, FocusHandle, IntoElement, Render, Window, div};
