@@ -101,7 +101,17 @@ and roll older "Recent" pointers off this page as they age.
     `clippy --workspace --all-targets -D warnings`, `cargo test --workspace` (lens-client 162 /
     lens-core 202 / lens-terminal 14+2 / all crates). `xtask gate` lists updated for the 2 new crates.
     ⚠ **unpushed** on `terminal-ws`.
-  - **NEXT (build):** **1c** full-snapshot render layer (lift `spikes/terminal-render/src/paint.rs`
+  - **✅ 1c + 1d PLANS DONE (2026-07-16, this session)** — authored by **grok-4.5**, cross-family
+    reviewed (**codex/gpt-5.6 + Opus** source-verification, **15 findings / 5 Criticals** folded),
+    revised, Opus diff-verified, committed `f12a933` (**unpushed**).
+    `docs/plans/2026-07-16-terminal-slice-1{c,d}-*.md`. Criticals fixed: `#[gpui::test]` NoopTextSystem
+    false-green → real-window `harness=false` gate (memory [[gpui-test-noop-text-system]]);
+    off-thread→entity wake impossible → `cx.spawn` sampler + `async_channel`; `TerminalRuntime`
+    teardown-ownership; reconnect-seed acceptance (leg-2 seed + scrollback probe); fail-closed perf
+    gate xtask-executed on macOS. **NEXT = BUILD 1c → 1d (sequential, 1d needs 1c)** — see
+    **[`docs/handoffs/2026-07-16-terminal-slice-1c-1d-build.md`](./handoffs/2026-07-16-terminal-slice-1c-1d-build.md)**
+    (self-contained driver for a fresh session).
+  - **Plan detail (build):** **1c** full-snapshot render layer (lift `spikes/terminal-render/src/paint.rs`
     split at the `collect_rows`/paint seam — engine already produces the owned `Frame`; apply the 3
     codex fixes + per-cell wide/emoji + **full SGR** the `Frame` now carries + **gate system `Menlo`**
     live-GPUI resolution/alignment, bundle-font fallback) → **1d** convergence (wire `open()`/
