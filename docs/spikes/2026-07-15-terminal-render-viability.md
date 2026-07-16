@@ -127,3 +127,38 @@ assume naive per-row `shape_line` is grid-safe.
    the paint cost.
 
 Raw TSV mirror: `spikes/terminal-render/MEASUREMENTS.md`.
+
+---
+
+## Lift-time correctness fixes (codex cross-family review of `paint.rs`)
+
+Three real defects found in the liftable `paint.rs`. **None affect the spike's
+verdict or perf numbers** (they're immaterial under a constant-font full-snapshot
+repaint), but each must be fixed when the mapping is lifted into
+`crates/lens-terminal`:
+
+1. **[High] S2 cache key omits `font_size`/font.** The content hash
+   (`paint.rs` `collect_rows`) covers grapheme/fg/bg/bold/selected but not
+   `font_size` or font identity, so on zoom/font-change the cache serves a stale
+   `ShapedLine` against new cell geometry. Also the `u64`-only key with no
+   full-key equality check means a hash collision paints the wrong row. Fix: key
+   the cache on `(font_size, font, content)` and retain the full key for equality
+   (or fold font metrics into the hash + store the key).
+
+2. **[Med] Alignment probe (`per_row_alignment_ok`) doesn't verify the cell after
+   the emoji.** It checks the *start* of `日` and `😀` but never the glyph after
+   `😀`, so an emoji that shapes narrower than 2 cells passes the probe while
+   misaligning everything downstream. Fix: assert the advance *consumed* by each
+   wide/emoji glyph (check the next cell's start), not just the wide glyph's start.
+
+3. **[Med] Dirty state cleared before paint; paint errors discarded.**
+   `collect_rows` marks rows + snapshot `Clean` *before* the `shaped.paint()`
+   calls, whose `Result`s are dropped (`let _ =`). Under a dirty-driven renderer a
+   failed glyph paint would not be retried (state already clean) and the error is
+   silent. Fix: clear dirty only after confirmed-successful paint, and surface
+   paint errors.
+
+Codex confirmed the rest is solid: wide/spacer column accounting correct
+(`Wide` → 2-cell bg, `SpacerTail` skipped after coverage, `SpacerHead`
+non-rendering), no terminal-data panic paths (both `unwrap`s are on fixed
+literals).

@@ -10,8 +10,6 @@ members = ["crates/*", "spikes/*"]
 exclude = [
     "vendor/libghostty-rs/libghostty-vt-sys",
     "vendor/libghostty-rs/libghostty-vt",
-    # Throwaway render spike — outside workspace members / lint wall.
-    "spikes/terminal-render",
 ]
 
 [workspace.package]
