@@ -5,9 +5,15 @@
 **Status:** Design (brainstorm decisions D1–D4 locked in
 `docs/handoffs/2026-07-16-theming-brainstorm-decisions.md`; this doc specifies them for
 `writing-plans`).
-**Scope:** The *minimal* theming substrate only — the load-bearing token schema + one embedded dark
-theme + the gpui-component bridge. Delivery machinery (importers, picker, registry, hot-reload,
-external files, light *authoring*) is out of scope and deferred to §18-machinery (D4 step 9).
+**Scope:** The *minimal* theming substrate — the load-bearing token schema + **two** embedded themes
+(dark + light, base+status each) + the gpui-component bridge + startup theme selection. Delivery
+machinery (importers, picker, registry, hot-reload, external files, live OS-appearance toggle) is out of
+scope and deferred to §18-machinery (D4 step 9).
+
+> **Amends the brainstorm handoff:** light-theme *authoring* moves from D4-step-4 (a later checkpoint)
+> into this step. Reason (user): authoring light now is the forcing function that proves the schema is
+> genuinely semantic (no dark-baked field values) *before* surfaces multiply. Live OS-appearance toggle
+> stays deferred; selection happens once at startup.
 
 ---
 
@@ -18,20 +24,23 @@ card chrome alone has 12 (`crates/lens-ui/src/card/chrome.rs`), and the six wave
 match the locked board palette. Before we build the wave card, the board, the transcript, the terminal,
 etc., we need **one semantic token surface** so that:
 
-1. Every call site reads a *named* token (`cx.lens_theme().status.working.fill`), never a hex literal.
-2. Swapping the whole palette (dark→light, or a user import later) is a data change, not a code change.
+1. Every call site reads a *named* token (`cx.lens_theme().status.for_wave(w)`), never a hex literal.
+2. Swapping the whole palette (dark↔light, or a user import later) is a data change, not a code change.
 3. The gpui-component widgets we already render on (buttons, inputs, scrollbars, markdown, tree-sitter
    syntax) pick up our base palette automatically — one source of truth, no per-widget theming.
 
 The **only** load-bearing deliverable is the token *schema*: once call sites bake
-`cx.lens_theme().status.working`, all later delivery machinery slots in behind the same accessor with
-**zero call-site churn**. Everything else (files, registry, watcher, importers) is deferred precisely
+`cx.lens_theme().status…`, all later delivery machinery slots in behind the same accessor with **zero
+call-site churn**. Everything else (importers, registry, watcher, external files) is deferred precisely
 because nothing depends on it yet and it themes surfaces that don't exist.
 
 ### Non-goals (explicitly deferred to §18-machinery)
-External theme-file loading / a `themes/` dir · registry / multiple selectable themes · hot-reload
-watcher · light-theme *authoring* (light must be *expressible*, not authored) · iTerm/Alacritty
-importers · settings picker · `JsonSchema` derivation for user tooling.
+
+* External theme-file loading and a `themes/` dir
+* registry / more than the two built-in themes / a settings picker
+* hot-reload watcher and **live OS-appearance toggle** (re-bridging when the OS flips while running)
+* iTerm/Alacritty importers
+* `JsonSchema` derivation for user tooling
 
 ---
 
@@ -45,13 +54,15 @@ importers · settings picker · `JsonSchema` derivation for user tooling.
   standing "vendor just the markdown module" decision works because markdown is a *leaf*; the theme is
   not. Their widgets never need to be `status.*`-aware (status drives our custom card, not their
   buttons), so the fork's only unique benefit is one we never use.
-- **D2 — 4 token groups.** Base (maps 1:1 onto `ThemeColor`), status (ours), terminal (ours), diff
-  (ours). Wave *behavior* (glow/pulse) is **not** a token — it stays code keyed by `Wave`.
-- **D3 — Build base+status+dark now; design *room* for all 4 groups.** Terminal and diff shapes are
-  specified here but not built until their consuming surface lands (D4 steps 5/7) — adding a struct field
-  then is not a call-site change, so there is no churn cost to deferring.
+- **D2 — 4 token groups.** Base (maps onto `ThemeColor`), status (ours), terminal (ours), diff (ours).
+  Wave *behavior* — glow, radial tint, pulse, and the derived tile/progress tints — is **not** a token;
+  it stays code keyed by `Wave`, computed from the one status color via `Colorize::opacity/mix`.
+- **D3 — Build base+status now; design *room* for all 4 groups.** Terminal and diff shapes are specified
+  here but not built until their consuming surface lands (D4 steps 5/7) — adding a struct field then is
+  not a call-site change, so there is no churn cost to deferring.
 - **D4 — Sequencing.** This substrate is step 1; it's the sole prerequisite for the wave build (step 2)
-  which validates the schema immediately.
+  which validates the schema immediately. (Light authoring pulled forward into this step — see the amend
+  note above.)
 
 ---
 
@@ -62,15 +73,15 @@ gpui-component bridge; `lens-core` is gpui-free domain types and must stay that 
 
 ```
 crates/lens-ui/src/theme/
-  mod.rs            LensTheme, globals, cx.lens_theme() accessor, init(), the bridge fn
-  tokens.rs         BaseTokens, StatusTokens, StatusColor (+ Wave→StatusColor), serde hex helper
-  lens-dark-deep.json   embedded default theme (base + status), include_str!'d
+  mod.rs         LensTheme, globals, cx.lens_theme() accessor, init() + selection, the bridge fn
+  tokens.rs      BaseTokens, StatusTokens (+ Wave→Hsla), serde hex helper
+  lens-dark.json    embedded "Lens Dark"  (base + status), include_str!'d
+  lens-light.json   embedded "Lens Light" (base + status), include_str!'d
 ```
 
 ### 3.1 Data model
 
-`LensTheme` is a plain global holding decoded `Hsla` values (not hex strings — parse once at startup):
-
+`LensTheme` is a plain global holding decoded `Hsla` values (not hex strings — parse once at startup).
 All token structs derive `serde::{Serialize, Deserialize}` (that is what `from_json` and a future
 exporter use); `Hsla` fields carry `#[serde(with = "hex_hsla")]` (§4.1); `mode` needs no helper —
 `ThemeMode` is natively `Deserialize` (snake_case → `"dark"`/`"light"`).
@@ -81,7 +92,7 @@ pub struct LensTheme {
     pub name: SharedString,
     pub mode: ThemeMode,        // gpui_component::ThemeMode — Light | Dark
     pub base: BaseTokens,       // group 1 — bridged onto gpui-component Theme.colors
-    pub status: StatusTokens,   // group 2 — ours (card, board, banners)
+    pub status: StatusTokens,   // group 2 — ours (card tile/border/glow/stat/progress, banners)
     // group 3 (terminal) + group 4 (diff): shapes specified in §5; fields added when their
     // consuming surface lands (D4 steps 5/7). Nothing references them today, so adding them
     // later is a struct change, not a call-site change — zero churn.
@@ -91,7 +102,9 @@ impl gpui::Global for LensTheme {}
 
 `BaseTokens` is the **curated subset** of `ThemeColor` we own — field names mirror their `ThemeColor`
 counterparts so the bridge is a trivial field-by-field copy. Everything else in `ThemeColor` rides
-gpui-component's default.
+gpui-component's default. This set is a **starting cut** (per user: "start here, add/remove as we build
+more surfaces") — expect it to grow/shrink as real surfaces land; that churn is data + one bridge line
+per field, never call-site churn.
 
 ```rust
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -135,22 +148,22 @@ pub struct BaseTokens {
     pub overlay: Hsla,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct StatusColor { pub fill: Hsla, pub on_fill: Hsla }
-
+/// One saturated color per wave state. Every card consumer uses it directly (border, glow, tile icon,
+/// STATUS label, progress-bar fill, branch text) or a *derived tint* computed in code via
+/// `Colorize::opacity/mix` — the 12%/14%/30% mixes in the locked render are code, not tokens (D2).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct StatusTokens {
-    pub ready: StatusColor,
-    pub working: StatusColor,
-    pub needs_input: StatusColor,
-    pub failed: StatusColor,
-    pub slept: StatusColor,
-    pub neutral: StatusColor,
+    pub ready: Hsla,
+    pub working: Hsla,
+    pub needs_input: Hsla,
+    pub failed: Hsla,
+    pub slept: Hsla,
+    pub neutral: Hsla,
 }
 
 impl StatusTokens {
     /// Total map from Wave → its color. Exhaustive; adding a Wave variant is a compile error here.
-    pub fn for_wave(&self, wave: Wave) -> StatusColor {
+    pub fn for_wave(&self, wave: Wave) -> Hsla {
         match wave {
             Wave::Ready => self.ready,
             Wave::Working => self.working,
@@ -163,8 +176,11 @@ impl StatusTokens {
 }
 ```
 
-`StatusColor` carries `on_fill` (the contrast text color for a filled pill/badge on that fill) — it
-replaces the current ad-hoc `pill_text_color` (light on neutral/slept, dark on the bright waves).
+**No `on_fill`/contrast token.** The locked card is the 44px **icon-tile** + card-level wave overlay
+(handoff decision 2 + `board-home.html`), not a filled text pill — so no surface paints text on a
+saturated fill. The throwaway pill in today's `chrome.rs` (and its `pill_text_color`) is deleted by the
+wave build (B1), not migrated. If a future *filled banner* ever needs contrast ink, that is a new token
+added then, with zero churn to the existing border/tile/stat consumers.
 
 ### 3.2 Accessor
 
@@ -231,28 +247,43 @@ fn bridge_into_gpui_component(lens: &LensTheme, cx: &mut App) {
 ```
 
 We do **not** call gpui-component's `apply_config` (it's `pub(crate)` — unreachable). We don't need it:
-their `init` already populated a complete default `Theme`; we just override the ~30 base fields we own on
-top. Fields we don't touch (tables, sliders, tiles, red/green/blue/magenta/cyan/yellow, `bullish`/
-`bearish`, `progress` internals, `highlight_theme`) keep gpui-component's sensible defaults. HighlightTheme
-(tree-sitter syntax) rides their default for now; authoring it is deferred to the transcript surface
-(D4 step 5).
+their `init` already populated a complete default `Theme` (including a light and a dark default); we just
+override the ~30 base fields we own on top. Fields we don't touch (tables, sliders, tiles,
+red/green/blue/magenta/cyan/yellow, `bullish`/`bearish`, `highlight_theme`) keep gpui-component's
+sensible defaults. HighlightTheme (tree-sitter syntax) rides their default for now; authoring it is
+deferred to the transcript surface (D4 step 5).
 
-### 3.4 init
+### 3.4 init + theme selection
 
 ```rust
-/// Parse the embedded dark theme, install it as the LensTheme global, and bridge its base tokens
+/// Parse the selected embedded theme, install it as the LensTheme global, and bridge its base tokens
 /// onto gpui-component's Theme. Call once, immediately after gpui_component::init(cx).
 pub fn init(cx: &mut App) {
-    const DARK: &str = include_str!("lens-dark-deep.json");
-    let lens = LensTheme::from_json(DARK)
-        .expect("embedded lens-dark-deep.json must parse — this is a build-time invariant");
+    const DARK: &str = include_str!("lens-dark.json");
+    const LIGHT: &str = include_str!("lens-light.json");
+
+    // Default: follow the OS appearance (gpui_component::init already synced Theme.mode from the system).
+    // Dev/testing override: LENS_THEME=light|dark forces a mode regardless of the OS.
+    let mode = match std::env::var("LENS_THEME").ok().as_deref() {
+        Some("light") => ThemeMode::Light,
+        Some("dark") => ThemeMode::Dark,
+        _ => Theme::global(cx).mode,
+    };
+    let json = if mode.is_dark() { DARK } else { LIGHT };
+
+    let lens = LensTheme::from_json(json)
+        .expect("embedded lens theme must parse — this is a build-time invariant");
     bridge_into_gpui_component(&lens, cx);
     cx.set_global(lens);
 }
 ```
 
-The embedded JSON is a compiled-in invariant; a parse failure is a developer error caught by the parse
-unit test (§6) long before runtime, so `expect` at startup is correct (not a user-facing failure mode).
+Both embedded JSONs are compiled-in invariants; a parse failure is a developer error caught by the parse
+unit tests (§6) long before runtime, so `expect` at startup is correct (not a user-facing failure mode).
+
+Selection is **at startup only**. If the OS appearance flips while the app is running we do *not*
+re-bridge (that's the deferred live toggle) — relaunch (or set `LENS_THEME`) to switch. This is enough
+to *validate* that the schema renders both themes; live switching is machinery, not substrate.
 
 `main.rs` calls `lens_ui::theme::init(cx)` on the line after each `gpui_component::init(cx)` — **two
 sites** (live run + `--demo`). Both must be updated (the demo is how we eyeball the wave palette).
@@ -261,15 +292,16 @@ sites** (live run + `--demo`). Both must be updated (the demo is how we eyeball 
 
 ## 4. Theme file format
 
-`lens-dark-deep.json` — hex strings (the format importers and a future light theme reuse). Forward/
-backward compatible by construction: the parser uses `#[serde(default)]` on optional groups and does
-**not** `deny_unknown_fields`, so (a) today's file omitting terminal/diff parses against a future binary,
-and (b) an early-authored terminal block parses against today's binary (ignored). `base` and `status`
-are required.
+Hex strings (the format importers and future themes reuse). Forward/backward compatible by construction:
+the parser does **not** `deny_unknown_fields`, and deferred groups will be `#[serde(default)]` when added,
+so (a) today's file omitting terminal/diff parses against a future binary, and (b) an early-authored
+terminal block parses against today's binary (ignored). `base` and `status` are required.
+
+### 4.1 `lens-dark.json` — "Lens Dark"
 
 ```json
 {
-  "name": "Lens Dark Deep",
+  "name": "Lens Dark",
   "mode": "dark",
   "base": {
     "background": "#07080b",
@@ -306,22 +338,78 @@ are required.
     "overlay": "#000000"
   },
   "status": {
-    "ready":       { "fill": "#4c8dff", "on_fill": "#0b1220" },
-    "working":     { "fill": "#36c98a", "on_fill": "#0b1220" },
-    "needs_input": { "fill": "#ff8a3d", "on_fill": "#0b1220" },
-    "failed":      { "fill": "#ff5d5d", "on_fill": "#0b1220" },
-    "slept":       { "fill": "#7a8493", "on_fill": "#e5e7eb" },
-    "neutral":     { "fill": "#374151", "on_fill": "#e5e7eb" }
+    "ready": "#4c8dff",
+    "working": "#36c98a",
+    "needs_input": "#ff8a3d",
+    "failed": "#ff5d5d",
+    "slept": "#7a8493",
+    "neutral": "#374151"
   }
 }
 ```
 
-Base hexes are lifted from the locked `board-home.html :root`
+Dark base hexes are lifted from the locked `board-home.html :root`
 (`--bg #07080b`, `--bg1 #101319`, `--bg2 #151922`, `--bg3 #1c2230`, `--line #222936`, `--line2 #2c3442`,
-`--tx #eef2f7`, `--tx2 #9aa4b3`, `--tx3 #5f6a7a`). Status fills are the D2-locked wave colors. `on_fill`
-follows the current contrast rule (dark ink on bright fills, light ink on neutral/slept).
+`--tx #eef2f7`, `--tx2 #9aa4b3`, `--tx3 #5f6a7a`). Status colors are the D2-locked wave palette.
 
-### 4.1 Deserialization
+### 4.2 `lens-light.json` — "Lens Light" (first-pass, tunable)
+
+There is **no locked light SSOT** (board-home.html is dark-only), so this is authored for *structural*
+correctness — light surfaces, dark text, hue-matched-but-legible accents/status on a light background.
+The checkpoint is "the schema expresses light with no dark-baked assumptions," not "final light
+aesthetics"; treat the exact values as tunable. Status colors are darkened/saturated so colored text and
+a thin border read on a light card. (Values below are the design's proposed first cut.)
+
+```json
+{
+  "name": "Lens Light",
+  "mode": "light",
+  "base": {
+    "background": "#ffffff",
+    "foreground": "#1c2230",
+    "border": "#d6dbe4",
+    "muted": "#f2f4f8",
+    "muted_foreground": "#5f6a7a",
+    "popover": "#ffffff",
+    "popover_foreground": "#1c2230",
+    "accent": "#2f6bd8",
+    "accent_foreground": "#ffffff",
+    "sidebar": "#f7f8fb",
+    "sidebar_foreground": "#5f6a7a",
+    "sidebar_border": "#d6dbe4",
+    "title_bar": "#f7f8fb",
+    "title_bar_border": "#d6dbe4",
+    "tab": "#eef1f6",
+    "tab_active": "#ffffff",
+    "tab_active_foreground": "#1c2230",
+    "tab_foreground": "#5f6a7a",
+    "input": "#ffffff",
+    "ring": "#2f6bd8",
+    "selection": "#bcd3ff",
+    "scrollbar": "#eef1f6",
+    "scrollbar_thumb": "#c2c9d4",
+    "list": "#ffffff",
+    "list_active": "#eef1f6",
+    "list_hover": "#f2f4f8",
+    "progress_bar": "#2f6bd8",
+    "success": "#1f9d6b",
+    "warning": "#d9701f",
+    "danger": "#d43d3d",
+    "info": "#2f6bd8",
+    "overlay": "#0b1220"
+  },
+  "status": {
+    "ready": "#2f6bd8",
+    "working": "#1f9d6b",
+    "needs_input": "#d9701f",
+    "failed": "#d43d3d",
+    "slept": "#8a93a3",
+    "neutral": "#c2c9d4"
+  }
+}
+```
+
+### 4.3 Deserialization
 
 Fields are typed `Hsla` for clean call sites; a serde `with`-module converts hex↔`Hsla` at the field
 level, reusing gpui-component's `Colorize::parse_hex`/`to_hex`:
@@ -329,7 +417,7 @@ level, reusing gpui-component's `Colorize::parse_hex`/`to_hex`:
 ```rust
 mod hex_hsla {
     use gpui::Hsla;
-    use gpui_component::Colorize;      // parse_hex + to_hex live here
+    use gpui_component::Colorize;      // parse_hex + to_hex; reachable via crate-root glob re-export
     use serde::{Deserialize, Deserializer, Serializer, de::Error};
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Hsla, D::Error> {
@@ -342,10 +430,9 @@ mod hex_hsla {
 }
 ```
 
-Each `Hsla` field carries `#[serde(with = "hex_hsla")]`. `mode` deserializes from `"dark"`/`"light"`
-into `gpui_component::ThemeMode`. `LensTheme::from_json(&str) -> Result<LensTheme>` is
-`serde_json::from_str`. (Deriving `Serialize` too is nearly free and lets a future exporter/importer
-round-trip; it costs nothing now.)
+Each `Hsla` field carries `#[serde(with = "hex_hsla")]`. `mode` deserializes directly into
+`gpui_component::ThemeMode` (natively `Deserialize`, snake_case). `LensTheme::from_json(&str) ->
+anyhow::Result<LensTheme>` wraps `serde_json::from_str`.
 
 ---
 
@@ -391,15 +478,17 @@ When built, each gets `#[serde(default)]` on `LensTheme` so files that omit it s
 
 Pure, no gpui window needed for the core:
 
-1. **Embedded parse** — `LensTheme::from_json(include_str!("lens-dark-deep.json"))` is `Ok` and
-   `name == "Lens Dark Deep"`, `mode == Dark`. (This is what makes the `expect` in `init` a build-time
-   invariant.)
-2. **Locked-palette guard** — assert the six `status.*.fill` values equal the D2-locked hexes
+1. **Both embedded themes parse** — `from_json(include_str!("lens-dark.json"))` and `…lens-light.json`
+   are both `Ok`; names/modes are `("Lens Dark", Dark)` / `("Lens Light", Light)`. This is what makes the
+   `expect` in `init` a build-time invariant.
+2. **Locked dark-status guard** — assert the six dark `status.*` values equal the D2-locked hexes
    (`ready #4c8dff`, `working #36c98a`, `needs_input #ff8a3d`, `failed #ff5d5d`, `slept #7a8493`,
    `neutral #374151`). Guards against silent drift from the `board-home.html` SSOT.
-3. **`for_wave` totality** — all six `Wave` variants resolve; adding a variant fails to compile.
-4. **hex round-trip** — `parse_hex → to_hex → parse_hex` is stable for a sample token.
-5. **Bridge smoke** (gpui `test_app` if cheap; else skip) — after `theme::init`, `cx.theme().background`
+3. **Light expresses distinctly** — light `base.background` ≠ dark `base.background` and light
+   `base.foreground` is darker than its background (a cheap "not dark-baked" sanity check).
+4. **`for_wave` totality** — all six `Wave` variants resolve; adding a variant fails to compile.
+5. **hex round-trip** — `parse_hex → to_hex → parse_hex` is stable for a sample token.
+6. **Bridge smoke** (gpui `test_app` if cheap; else skip) — after `theme::init`, `cx.theme().background`
    equals `cx.lens_theme().base.background`, confirming the bridge wrote through.
 
 ---
@@ -407,43 +496,45 @@ Pure, no gpui window needed for the core:
 ## 7. A2 — hex→token call-site migration (companion, runs right after the substrate)
 
 Not part of the substrate build but the immediate next step it unblocks (D4). `chrome.rs` today has 12
-hardcoded hexes; A2 both **tokenizes** them and **corrects** the wave colors (current code uses a
-different, wrong palette). Migration map:
+hardcoded hexes. The **pill and its `pill_text_color`** are throwaway — the wave build (B1) replaces the
+pill with the icon-tile, so A2 does **not** migrate them; it re-homes the surviving call sites and fixes
+the border color (current code uses a different, wrong palette):
 
-| current `chrome.rs`                         | becomes                                        |
-|---------------------------------------------|------------------------------------------------|
-| `wave_border_color` (6 rgb, wrong palette)  | `cx.lens_theme().status.for_wave(wave).fill`   |
-| `pill_text_color` (0xe5e7eb / 0x0b1220)     | `…status.for_wave(wave).on_fill`               |
-| kebab menu bg `0x1f2937`                     | `cx.lens_theme().base.popover`                 |
-| muted text `0x9ca3af` (×3)                   | `cx.lens_theme().base.muted_foreground`        |
-| overlay text `0xf3f4f6`                      | `cx.lens_theme().base.foreground`              |
-| overlay scrim `hsla(0,0,0,0.55)`             | `cx.lens_theme().base.overlay.opacity(0.55)`   |
+| current `chrome.rs`                          | becomes                                        |
+|----------------------------------------------|------------------------------------------------|
+| `wave_border_color` (6 rgb, wrong palette)   | `cx.lens_theme().status.for_wave(wave)`        |
+| kebab menu bg `0x1f2937`                      | `cx.lens_theme().base.popover`                 |
+| muted text `0x9ca3af` (×3)                    | `cx.lens_theme().base.muted_foreground`        |
+| overlay text `0xf3f4f6`                       | `cx.lens_theme().base.foreground`              |
+| overlay scrim `hsla(0,0,0,0.55)`              | `cx.lens_theme().base.overlay.opacity(0.55)`   |
+| pill fill + `pill_text_color`                 | *(not migrated — deleted by B1's icon-tile)*   |
 
-`wave_border_color`/`pill_text_color` change signature to take `&App` (or the resolved `LensTheme`)
-since they now read the global. Existing chrome unit tests are color-agnostic (they assert repo-row text
-formatting) and are unaffected.
+`wave_border_color` changes signature to take `&App` (or the resolved `LensTheme`) since it now reads the
+global. Existing chrome unit tests are color-agnostic (they assert repo-row text formatting) and are
+unaffected.
 
 ---
 
 ## 8. Files touched
 
 - **New:** `crates/lens-ui/src/theme/mod.rs`, `crates/lens-ui/src/theme/tokens.rs`,
-  `crates/lens-ui/src/theme/lens-dark-deep.json`.
+  `crates/lens-ui/src/theme/lens-dark.json`, `crates/lens-ui/src/theme/lens-light.json`.
 - **Edit:** `crates/lens-ui/src/lib.rs` (`pub mod theme;` + re-export `ActiveLensTheme`, `LensTheme`).
 - **Edit:** `crates/lens-app/src/main.rs` (call `lens_ui::theme::init(cx)` after both
   `gpui_component::init(cx)` sites).
 - **A2 (companion):** `crates/lens-ui/src/card/chrome.rs`.
 
-No new dependencies — `gpui-component` (`Colorize`, `Theme`, `ThemeMode`), `serde`, `serde_json` are
-already in `lens-ui`.
+No new dependencies — `gpui-component` (`Colorize`, `Theme`, `ThemeMode`), `serde`, `serde_json`,
+`anyhow` are already in `lens-ui`.
 
 ---
 
 ## 9. Verification (definition of done for the substrate)
 
 - `cargo test -p lens-ui` green (the §6 tests).
-- `cargo run -p lens-app -- --demo` shows the six cards in the **locked** wave colors (after A2), proving
-  the schema drives the real surface.
+- `cargo run -p lens-app -- --demo` shows the six cards in the **locked** wave colors (after A2); running
+  it with `LENS_THEME=light` shows the light palette on the same surfaces — proving the schema drives
+  both themes.
 - `xtask gate` clean (no warnings / dead code).
 - Cross-family review of the diff (per project rules: ≥1 review from a non-author model family).
 ```
