@@ -285,6 +285,10 @@ fn gate() -> Result<()> {
         "-p",
         "lens-capture",
         "-p",
+        "lens-terminal",
+        "-p",
+        "lens-terminal-demo",
+        "-p",
         "xtask",
         "--",
         "--check",
@@ -299,6 +303,10 @@ fn gate() -> Result<()> {
         "lens-client",
         "-p",
         "lens-capture",
+        "-p",
+        "lens-terminal",
+        "-p",
+        "lens-terminal-demo",
         "-p",
         "xtask",
         "--all-targets",
@@ -341,6 +349,8 @@ fn gate() -> Result<()> {
         "-p",
         "lens-capture",
         "-p",
+        "lens-terminal",
+        "-p",
         "xtask",
     ])?;
 
@@ -355,6 +365,14 @@ fn gate() -> Result<()> {
         "--no-run",
     ])?;
     run(&["bench", "-p", "lens-core", "--no-run"])?;
+    run(&[
+        "bench",
+        "-p",
+        "lens-terminal",
+        "--features",
+        "bench",
+        "--no-run",
+    ])?;
 
     // Contract drift vs the sibling omnigent pin. A MISSING sibling is a setup
     // bug, not a pass — drift() bails on an unreadable spec and we propagate that.

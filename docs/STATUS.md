@@ -9,7 +9,25 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Open threads & next up
 
-- **▶ ACTIVE: shared terminal workstream — Slice 1b (`lens-terminal` engine core) DONE 2026-07-16; next = 1c render layer.**
+- **▶ ACTIVE: shared terminal workstream — Slices 0 + 1a + 1b DONE + cross-family-reviewed + merged to `terminal-ws` 2026-07-16; next = 1c render layer → 1d convergence.**
+  - **✅ SLICE 0 (surface freeze) DONE + merged** (`fdba839`→`635eaa7`): froze the opaque public
+    names/seam invariants `lens-ui` binds to (`open`/`TerminalTarget`/`AccessIntent`/`TerminalKey`/
+    `TerminalOpenOptions`, 7-variant `Lifecycle`, `TerminalHostEvent`/`TerminalEvent`, opaque `Frame`,
+    `focus_handle`/`presentation`) + `lens-terminal` & `lens-terminal-demo` crate skeletons. **codex
+    (gpt-5.5) review** caught 3 evolvability issues, folded: `Lifecycle` = permanent payload-free
+    `Copy` tag (detail rides `Presentation`); `TerminalOpenOptions` `#[non_exhaustive]`+`with_*`
+    setters; `Frame` dropped `Clone`/`Default` (shared as `Arc<Frame>`).
+  - **✅ SLICE 1a (`lens-client` transport) DONE + merged** (branch `terminal-1a`, 8 commits
+    `0f7f23a`→`9e7b16f`): typed REST CRUD (`Terminals` subservice — **superseded** the dead
+    Value-leaking `create_terminal`/`delete_terminal`/`transfer_terminal` wrappers, no callers), WS
+    attach on a **contained tokio current-thread runtime + tokio-tungstenite** bridged to sync via
+    bounded crossbeam queues (NO `transport=`), typed frame codec, close-code **classification**
+    (4404/4405/4500/1008; policy deferred to 1d), gated `AttachInspect` ring, benches, feature-gated
+    live rider (create/attach/input/resize/delete + 4404). **gpt-5.6-sol review** caught 6 real
+    issues, all fixed (`9e7b16f`): `close()` deadlock on outbound saturation, unbounded connect/close,
+    **inbound-saturation `Closed` signal lost** (now drops the Sender → guaranteed `Disconnected`),
+    **queue bench deadlock**, `bench_api` `Message` leak (now typed), silent runtime-build failure.
+    162 lib tests. Plan `docs/plans/2026-07-16-terminal-slice-1a-lens-client-transport.md`.
   Original design ([`specs/2026-07-14-terminal-workstream-design.md`](./specs/2026-07-14-terminal-workstream-design.md))
   assumed **porting Ghostty VT source** via the gpui-ghostty wrapper (adopt/adapt/exclude inventory,
   WP0 provenance gate). **That model is now superseded.** This session:
@@ -65,17 +83,32 @@ and roll older "Recent" pointers off this page as they age.
       101 before terminal lookup, no auth on dev; input=binary bytes (also the `on_pty_write` back-channel),
       resize=JSON text; reconnect to same `terminal_id` = current-screen redraw, **no byte-replay**
       (transient gap); typed close codes 4404(stop, live-confirmed)/4405(detach)/4500(retry).
-  - **✅ SLICE 1b DONE (2026-07-16, branch `terminal-1b`)** — `crates/lens-terminal` engine core:
-    non-`Send` `VtEngine` on a pinned `std::thread`, Lens-owned `Frame` seam (no Ghostty types
-    escape `engine/vt.rs`), throttled publish-and-wake (`ArcSwapOption` + coalesced waker +
-    `recv_timeout` throttle wake), DA/DSR reverse channel, hidden-tab suppression, gated
-    `EngineInspect` ring, offline replay tests (`attach`/`resize` captures), Criterion benches
-    (parse ~12µs / frame-build ~590µs @ 200×50). Plan:
-    `docs/plans/2026-07-16-terminal-slice-1b-lens-terminal-engine.md`. Commits `376dd1c`→`8bdb801`.
-  - **NEXT (build):** **1c** full-snapshot render layer (lift `paint.rs`, codex fixes + wide/emoji
-    per-cell + full SGR) → **1d** typed WS attach client (binary↔`vt_write`, JSON resize,
-    4404/4405/4500 reconnect, `cx.notify` waker). First host = standalone GPUI demo.
-    GPUI 0.2.2 + omnigent pins unchanged.
+  - **✅ SLICE 1b (`lens-terminal` engine core) DONE + merged** (branch `terminal-1b`, 8 commits
+    `376dd1c`→`8de30f7`): non-`Send` `VtEngine` on a pinned `std::thread`, Lens-owned `Frame` seam
+    (no Ghostty types escape `engine/vt.rs`; full SGR carried for 1c), throttled publish-and-wake
+    (`ArcSwapOption` + coalesced waker + `recv_timeout` throttle wake), DA/DSR reverse channel,
+    hidden-tab suppression, gated `EngineInspect` ring, offline replay tests (`attach`/`resize`
+    captures), Criterion benches (parse ~12µs / frame-build ~590µs @ 200×50). Composer self-ran
+    cursor Bugbot (3 concurrency fixes). **grok-4.5 review** caught 4 publish/lifecycle edges, all
+    fixed (`8de30f7`): `build_frame` `Err` dropped the dirty bit, `SetVisible(true)` no-force,
+    `Stop` abandoned a dirty frame, `Drop` joined on the dropping thread (now detach; join via
+    `stop()` only, off-foreground). 16 tests. Plan
+    `docs/plans/2026-07-16-terminal-slice-1b-lens-terminal-engine.md`.
+  - **Process (this session):** Slice 0 authored + reviewed inline (Opus); 1a∥1b built **in parallel
+    isolated git worktrees** by **composer-2.5** (subagent-driven, per-task TDD commits), each
+    cross-family reviewed by a **different family** (gpt-5.6-sol on 1a, grok-4.5 on 1b), fixes
+    delegated back to composer, then merged to `terminal-ws`. **Full gate green:** `cargo fmt`,
+    `clippy --workspace --all-targets -D warnings`, `cargo test --workspace` (lens-client 162 /
+    lens-core 202 / lens-terminal 14+2 / all crates). `xtask gate` lists updated for the 2 new crates.
+    ⚠ **unpushed** on `terminal-ws`.
+  - **NEXT (build):** **1c** full-snapshot render layer (lift `spikes/terminal-render/src/paint.rs`
+    split at the `collect_rows`/paint seam — engine already produces the owned `Frame`; apply the 3
+    codex fixes + per-cell wide/emoji + **full SGR** the `Frame` now carries + **gate system `Menlo`**
+    live-GPUI resolution/alignment, bundle-font fallback) → **1d** convergence (wire `open()`/
+    `TerminalTab`/`presentation()`, transport↔engine bridge, `cx.notify` waker, close-code **policy**,
+    lifecycle subset + gap marker, retained-engine-seed acceptance test, standalone GPUI demo, live
+    proof vs omnigent 0.5.1). 1c needs 1b (done); plan 1c/1d against the now-landed APIs.
+    GPUI 0.2.2 + omnigent 0.5.1 pins unchanged.
 
 - **📋 SPEC-GAPS backlog (2026-07-13):** nine independent, un-specced/partial
   subsystems parked in [`SPEC-GAPS.md`](./SPEC-GAPS.md) — app release/signing/update,
