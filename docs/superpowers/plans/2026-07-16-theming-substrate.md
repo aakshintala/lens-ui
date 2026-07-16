@@ -151,10 +151,12 @@ mod tests {
 
     #[test]
     fn hex_round_trips_through_status_tokens() {
-        let json = r#"{
+        // NOTE: r##"…"## (not r#"…"#) — the hex strings contain `"#`, which would close a
+        // single-hash raw string. Same reason applies anywhere JSON hex is inlined as a raw string.
+        let json = r##"{
             "ready": "#4c8dff", "working": "#36c98a", "needs_input": "#ff8a3d",
             "failed": "#ff5d5d", "slept": "#7a8493", "neutral": "#374151"
-        }"#;
+        }"##;
         let s: StatusTokens = serde_json::from_str(json).expect("parse");
         // parse_hex → field → to_hex → parse_hex is stable for a sample token.
         assert_eq!(s.ready.to_hex(), Hsla::parse_hex("#4c8dff").unwrap().to_hex());
