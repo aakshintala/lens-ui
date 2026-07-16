@@ -4,9 +4,8 @@
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use crossbeam_channel::bounded;
 use lens_client::terminal::bench_api::{
-    WsInbound, WsOutbound, classify_inbound, encode_outbound,
+    WireInbound, WsInbound, WsOutbound, classify_inbound, encode_outbound,
 };
-use tokio_tungstenite::tungstenite::Message;
 
 const VT_FRAME: &[u8] = b"\x1b[0mhello terminal world";
 const CHANNEL_CAP: usize = 256;
@@ -15,7 +14,7 @@ const QUEUE_OPS: usize = 10_000;
 fn bench_classify_inbound_vt(c: &mut Criterion) {
     c.bench_function("classify_inbound_vt", |b| {
         b.iter_batched(
-            || Message::Binary(VT_FRAME.to_vec().into()),
+            || WireInbound::Binary(VT_FRAME.to_vec()),
             classify_inbound,
             BatchSize::SmallInput,
         );
@@ -45,11 +44,18 @@ fn bench_bounded_queue_throughput(c: &mut Criterion) {
     group.bench_function("push_drain", |b| {
         b.iter(|| {
             let (tx, rx) = bounded(CHANNEL_CAP);
-            for i in 0..QUEUE_OPS {
-                let payload = vec![(i % 256) as u8; 64];
-                let _ = tx.send(WsInbound::Vt(payload));
-            }
             let mut drained = Vec::with_capacity(QUEUE_OPS);
+            let mut i = 0usize;
+            while i < QUEUE_OPS {
+                for _ in 0..CHANNEL_CAP.min(QUEUE_OPS - i) {
+                    let payload = vec![(i % 256) as u8; 64];
+                    tx.send(WsInbound::Vt(payload)).unwrap();
+                    i += 1;
+                }
+                while let Ok(msg) = rx.try_recv() {
+                    drained.push(msg);
+                }
+            }
             while let Ok(msg) = rx.try_recv() {
                 drained.push(msg);
             }

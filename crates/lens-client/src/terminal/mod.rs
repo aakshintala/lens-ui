@@ -15,15 +15,51 @@ pub use wire::{WsInbound, WsOutbound};
 #[cfg(any(feature = "bench", feature = "live-tests"))]
 #[doc(hidden)]
 pub mod bench_api {
-    use tokio_tungstenite::tungstenite::Message;
-
     pub use super::wire::{WsInbound, WsOutbound};
 
-    pub fn encode_outbound(o: &WsOutbound) -> Message {
-        super::wire::encode_outbound(o)
+    /// Encoded WS frame payload — no tungstenite types on the public surface.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum EncodedFrame {
+        Binary(Vec<u8>),
+        Text(String),
     }
 
-    pub fn classify_inbound(msg: Message) -> Option<WsInbound> {
+    /// Raw inbound wire bytes for bench classify paths.
+    #[derive(Clone, Debug)]
+    pub enum WireInbound {
+        Binary(Vec<u8>),
+        Text(String),
+        Close(u16),
+        Ping(Vec<u8>),
+    }
+
+    pub fn encode_outbound(o: &WsOutbound) -> EncodedFrame {
+        match super::wire::encode_outbound(o) {
+            tokio_tungstenite::tungstenite::Message::Binary(b) => {
+                EncodedFrame::Binary(b.into())
+            }
+            tokio_tungstenite::tungstenite::Message::Text(t) => {
+                EncodedFrame::Text(t.to_string())
+            }
+            _ => EncodedFrame::Binary(Vec::new()),
+        }
+    }
+
+    pub fn classify_inbound(frame: WireInbound) -> Option<WsInbound> {
+        use tokio_tungstenite::tungstenite::Message;
+        use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+
+        let msg = match frame {
+            WireInbound::Binary(bytes) => Message::Binary(bytes.into()),
+            WireInbound::Text(text) => Message::Text(text.into()),
+            WireInbound::Close(code) => Message::Close(Some(CloseFrame {
+                code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::from(
+                    code,
+                ),
+                reason: Default::default(),
+            })),
+            WireInbound::Ping(bytes) => Message::Ping(bytes.into()),
+        };
         super::wire::classify_inbound(msg)
     }
 }

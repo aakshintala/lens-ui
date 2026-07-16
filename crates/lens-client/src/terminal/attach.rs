@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use futures_util::{SinkExt, StreamExt};
+use tokio::time::sleep;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
@@ -26,6 +27,8 @@ const INBOUND_SEND_TIMEOUT: Duration = Duration::from_millis(50);
 const BACKOFF_CAP: Duration = Duration::from_secs(30);
 const BACKOFF_BASE_MS: u64 = 100;
 const INSPECT_RING_CAP: usize = 32;
+const GRACEFUL_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+const SHUTDOWN_POLL: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Copy, Debug)]
 pub struct AttachOptions {
@@ -221,19 +224,24 @@ pub fn attach(
     let handle = std::thread::Builder::new()
         .name("lens-terminal-attach".into())
         .spawn(move || {
-            if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
             {
-                rt.block_on(io_loop(
-                    ws_url,
-                    conn,
-                    inbound_tx,
-                    outbound_rx,
-                    thread_shutdown,
-                    thread_inspect,
-                ));
-            }
+                Ok(rt) => rt,
+                Err(_) => {
+                    drop(inbound_tx);
+                    return;
+                }
+            };
+            rt.block_on(io_loop(
+                ws_url,
+                conn,
+                inbound_tx,
+                outbound_rx,
+                thread_shutdown,
+                thread_inspect,
+            ));
         })
         .map_err(|e| ClientError::ThreadSpawn(e.to_string()))?;
 
@@ -300,11 +308,46 @@ fn apply_auth(
     Ok(request)
 }
 
-fn deliver_inbound(tx: &Sender<WsInbound>, msg: WsInbound) -> bool {
+fn deliver_inbound(tx: &mut Option<Sender<WsInbound>>, msg: WsInbound) -> bool {
+    let Some(tx) = tx.as_ref() else {
+        return false;
+    };
     match tx.try_send(msg) {
         Ok(()) => true,
         Err(TrySendError::Full(msg)) => tx.send_timeout(msg, INBOUND_SEND_TIMEOUT).is_ok(),
         Err(TrySendError::Disconnected(_)) => false,
+    }
+}
+
+/// Drop the inbound sender so `recv()` returns `Disconnected` — a signal that
+/// cannot be blocked behind a saturated VT queue.
+fn signal_inbound_gone(tx: &mut Option<Sender<WsInbound>>) {
+    tx.take();
+}
+
+async fn wait_shutdown(shutdown: &AtomicBool) {
+    while !shutdown.load(Ordering::Relaxed) {
+        sleep(SHUTDOWN_POLL).await;
+    }
+}
+
+fn forward_outbound(
+    async_out_tx: &tokio::sync::mpsc::Sender<WsOutbound>,
+    mut msg: WsOutbound,
+    shutdown: &AtomicBool,
+) -> bool {
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            return false;
+        }
+        match async_out_tx.try_send(msg) {
+            Ok(()) => return true,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(returned)) => {
+                msg = returned;
+                std::thread::sleep(SHUTDOWN_POLL);
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return false,
+        }
     }
 }
 
@@ -316,41 +359,57 @@ async fn io_loop(
     shutdown: Arc<AtomicBool>,
     inspect: Arc<AttachInspectState>,
 ) {
+    let mut inbound_tx = Some(inbound_tx);
     let url_str = ws_url.to_string();
     let request = match url_str.into_client_request() {
         Ok(req) => req,
         Err(_) => {
-            let _ = deliver_inbound(&inbound_tx, WsInbound::Closed(CloseCause::Network));
+            let _ = deliver_inbound(
+                &mut inbound_tx,
+                WsInbound::Closed(CloseCause::Network),
+            );
             return;
         }
     };
     let request = match apply_auth(request, &conn.auth) {
         Ok(req) => req,
         Err(_) => {
-            let _ = deliver_inbound(&inbound_tx, WsInbound::Closed(CloseCause::Network));
+            let _ = deliver_inbound(
+                &mut inbound_tx,
+                WsInbound::Closed(CloseCause::Network),
+            );
             return;
         }
     };
 
-    let connect = connect_async(request).await;
+    let connect = tokio::select! {
+        result = connect_async(request) => result,
+        () = wait_shutdown(&shutdown) => {
+            signal_inbound_gone(&mut inbound_tx);
+            return;
+        }
+    };
     let (mut sink, mut stream) = match connect {
         Ok((ws, _resp)) => ws.split(),
         Err(_) => {
-            let _ = deliver_inbound(&inbound_tx, WsInbound::Closed(CloseCause::Network));
+            let _ = deliver_inbound(
+                &mut inbound_tx,
+                WsInbound::Closed(CloseCause::Network),
+            );
             return;
         }
     };
 
     inspect.on_connected();
 
-    let (async_out_tx, mut async_out_rx) =
+    let (async_out_tx, async_out_rx) =
         tokio::sync::mpsc::channel::<WsOutbound>(ATTACH_CHANNEL_BOUND);
     let forward_shutdown = Arc::clone(&shutdown);
     let forwarder = std::thread::spawn(move || {
         while !forward_shutdown.load(Ordering::Relaxed) {
             match outbound_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(msg) => {
-                    if async_out_tx.blocking_send(msg).is_err() {
+                    if !forward_outbound(&async_out_tx, msg, &forward_shutdown) {
                         break;
                     }
                 }
@@ -359,10 +418,13 @@ async fn io_loop(
             }
         }
     });
+    let mut async_out_rx = async_out_rx;
 
     let mut disconnect = false;
+    let mut drop_inbound = false;
     loop {
         if shutdown.load(Ordering::Relaxed) {
+            drop_inbound = true;
             break;
         }
         tokio::select! {
@@ -378,22 +440,19 @@ async fn io_loop(
                             let close_cause = match classified {
                                 WsInbound::Closed(c) => Some(c),
                                 other => {
-                                    if !deliver_inbound(&inbound_tx, other) {
+                                    if !deliver_inbound(&mut inbound_tx, other) {
                                         disconnect = true;
-                                        inspect.on_saturation();
                                         let cause = CloseCause::Network;
+                                        inspect.on_saturation();
                                         inspect.on_closed(cause);
-                                        let _ = deliver_inbound(
-                                            &inbound_tx,
-                                            WsInbound::Closed(cause),
-                                        );
+                                        signal_inbound_gone(&mut inbound_tx);
                                     }
                                     None
                                 }
                             };
                             if let Some(cause) = close_cause {
                                 let _ = deliver_inbound(
-                                    &inbound_tx,
+                                    &mut inbound_tx,
                                     WsInbound::Closed(cause),
                                 );
                                 inspect.on_closed(cause);
@@ -408,7 +467,7 @@ async fn io_loop(
                         let cause = CloseCause::Network;
                         inspect.on_closed(cause);
                         let _ = deliver_inbound(
-                            &inbound_tx,
+                            &mut inbound_tx,
                             WsInbound::Closed(cause),
                         );
                         break;
@@ -417,7 +476,7 @@ async fn io_loop(
                         let cause = CloseCause::Network;
                         inspect.on_closed(cause);
                         let _ = deliver_inbound(
-                            &inbound_tx,
+                            &mut inbound_tx,
                             WsInbound::Closed(cause),
                         );
                         break;
@@ -437,7 +496,7 @@ async fn io_loop(
                             let cause = CloseCause::Network;
                             inspect.on_closed(cause);
                             let _ = deliver_inbound(
-                                &inbound_tx,
+                                &mut inbound_tx,
                                 WsInbound::Closed(cause),
                             );
                             break;
@@ -449,9 +508,19 @@ async fn io_loop(
         }
     }
 
-    let _ = sink.close().await;
     shutdown.store(true, Ordering::Relaxed);
+    drop(async_out_rx);
     let _ = forwarder.join();
+
+    tokio::select! {
+        _ = sink.close() => {}
+        () = sleep(GRACEFUL_CLOSE_TIMEOUT) => {}
+    }
+    drop(sink);
+    drop(stream);
+    if drop_inbound {
+        signal_inbound_gone(&mut inbound_tx);
+    }
 }
 
 #[cfg(test)]
