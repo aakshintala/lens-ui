@@ -17,4 +17,7 @@ path = "src/main.rs"
 [dependencies]
 gpui = "0.2.2"
 gpui-component = "0.5.1"
+lens-client = { path = "../lens-client" }
+lens-core = { path = "../lens-core" }
 lens-ui = { path = "../lens-ui" }
+url = "2"
