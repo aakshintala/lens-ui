@@ -10,7 +10,7 @@ use gpui_component::{Colorize, Theme, ThemeConfig};
 use gpui_component::theme::ThemeConfigColors;
 use gpui_component::ThemeMode;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 const DARK_JSON: &str = include_str!("lens-dark.json");
@@ -150,6 +150,24 @@ pub(crate) fn load_or_embedded(mode: ThemeMode, dir: Option<&Path>) -> anyhow::R
     }
     let embedded = if mode.is_dark() { DARK_JSON } else { LIGHT_JSON };
     parse_theme(embedded, mode)
+}
+
+/// The external theme dir override, if set.
+pub(crate) fn theme_dir() -> Option<PathBuf> {
+    std::env::var_os("LENS_THEME_DIR").map(PathBuf::from)
+}
+
+/// Startup install (fg thread, pre-window — synchronous read is allowed here). Resolves mode +
+/// external dir, loads, applies. On Err (embedded default unparseable — a build bug), print + exit 1.
+pub fn install_at_startup(cx: &mut App) {
+    let mode = select_mode(cx);
+    match load_or_embedded(mode, theme_dir().as_deref()) {
+        Ok(lens) => apply(lens, cx),
+        Err(e) => {
+            eprintln!("lens-app: theme load failed (build bug): {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Resolve mode: LENS_THEME override (warn on unknown value) else the current gpui-component

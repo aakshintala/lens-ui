@@ -1,5 +1,5 @@
 use crate::PtyProbe;
-use crate::actions::BackToBoard;
+use crate::actions::{BackToBoard, ReloadTheme};
 use crate::card::view::{SessionCardView, mount_cached_card};
 use crate::fleet::store::FleetStore;
 use crate::slot::{TabHandle, placeholder_tab};
@@ -114,6 +114,31 @@ impl BoardView {
 
     fn on_back_to_board(&mut self, _: &BackToBoard, _: &mut Window, cx: &mut Context<Self>) {
         self.fleet.update(cx, |fleet, cx| fleet.blur_to_board(cx));
+    }
+
+    fn on_reload_theme(&mut self, _: &ReloadTheme, _: &mut Window, cx: &mut Context<Self>) {
+        // Window is live → read off the fg thread, apply on it. Bad edit → keep current theme.
+        let mode = crate::theme::LensTheme::global(cx).mode;
+        let dir = crate::theme::theme_dir();
+        let Some(dir) = dir else {
+            eprintln!("lens-theme: reload ignored — LENS_THEME_DIR not set");
+            return;
+        };
+        cx.spawn(async move |_, cx| {
+            let loaded = cx
+                .background_executor()
+                .spawn(async move { crate::theme::load(mode, &dir) })
+                .await;
+            cx.update(|cx| match loaded {
+                Ok(lens) => {
+                    crate::theme::apply(lens, cx);
+                    cx.refresh_windows();
+                }
+                Err(e) => eprintln!("lens-theme: reload failed, keeping current theme: {e}"),
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn card_click(
@@ -243,6 +268,7 @@ impl Render for BoardView {
             .id("board-view")
             .size_full()
             .on_action(cx.listener(Self::on_back_to_board))
+            .on_action(cx.listener(Self::on_reload_theme))
             .child(body)
     }
 }

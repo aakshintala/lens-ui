@@ -1,3 +1,3 @@
 use gpui::actions;
 
-actions!(lens_ui, [BackToBoard]);
+actions!(lens_ui, [BackToBoard, ReloadTheme]);
