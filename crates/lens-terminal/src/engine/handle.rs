@@ -133,6 +133,16 @@ impl EngineHandle {
         self.cmd_tx.clone()
     }
 
+    #[cfg(test)]
+    fn frame_slot(&self) -> Arc<ArcSwapOption<Frame>> {
+        Arc::clone(&self.frame_slot)
+    }
+
+    /// Stop the worker and **block until the thread exits**.
+    ///
+    /// Slice 1d must call this from a background task — never from the gpui
+    /// foreground. This is the only path that joins the pinned worker and
+    /// reclaims the non-`Send` `VtEngine` + scrollback.
     pub fn stop(mut self) {
         self.shutdown_worker();
     }
@@ -143,12 +153,22 @@ impl EngineHandle {
             let _ = join.join();
         }
     }
+
+    fn signal_stop(&mut self) {
+        let _ = self.cmd_tx.send(EngineCommand::Stop);
+    }
 }
 
 impl Drop for EngineHandle {
+    /// Signals stop and **detaches** the worker without joining.
+    ///
+    /// Non-blocking so dropping on the gpui foreground cannot stall the UI.
+    /// For a confirmed worker exit (Sleep teardown, scrollback reclaim), call
+    /// [`EngineHandle::stop`] from a background task instead.
     fn drop(&mut self) {
         if self.join.is_some() {
-            self.shutdown_worker();
+            self.signal_stop();
+            let _ = self.join.take();
         }
     }
 }
@@ -254,17 +274,117 @@ mod tests {
     #[test]
     fn hidden_tab_suppresses_publish_until_visible() {
         let h = EngineHandle::spawn(test_config());
-        h.set_visible(false).expect("set_visible");
+        let woke = Arc::new(AtomicUsize::new(0));
+        {
+            let w = Arc::clone(&woke);
+            h.set_waker(Box::new(move || {
+                w.fetch_add(1, Ordering::Relaxed);
+            }));
+        }
+
         h.feed(b"XY".to_vec()).expect("feed");
         h.build_now().expect("build_now");
-        thread::sleep(Duration::from_millis(20));
-        assert!(h.latest_frame().is_none());
+        let _ = wait_for_frame(&h);
+        let wakes_after_first_publish = woke.load(Ordering::Relaxed);
+        assert!(wakes_after_first_publish >= 1);
 
-        h.set_visible(true).expect("set_visible");
+        h.set_visible(false).expect("set_visible");
         h.build_now().expect("build_now");
-        let f = wait_for_frame(&h);
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(
+            woke.load(Ordering::Relaxed),
+            wakes_after_first_publish,
+            "no wake while hidden"
+        );
+
+        // Hidden → shown with no new feed must still publish + wake once.
+        h.set_visible(true).expect("set_visible");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while woke.load(Ordering::Relaxed) <= wakes_after_first_publish {
+            if Instant::now() >= deadline {
+                panic!("show-after-hide must wake even without a new feed");
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        let f = h.latest_frame().expect("frame");
         assert!(f.grid[0].cells.iter().any(|c| c.grapheme == "X"));
         h.stop();
+    }
+
+    #[test]
+    fn build_failure_retries_on_next_pump() {
+        use crate::engine::worker;
+
+        let h = EngineHandle::spawn(test_config());
+        h.set_inspect_enabled(true);
+        let woke = Arc::new(AtomicUsize::new(0));
+        {
+            let w = Arc::clone(&woke);
+            h.set_waker(Box::new(move || {
+                w.fetch_add(1, Ordering::Relaxed);
+            }));
+        }
+
+        h.feed(b"warm".to_vec()).expect("feed");
+        h.build_now().expect("build_now");
+        let _ = wait_for_frame(&h);
+        let wakes_before_failure = woke.load(Ordering::Relaxed);
+        let built_before_failure = h.inspect().frames_built;
+
+        worker::test_inject_build_failures(1);
+        h.feed(b"\x1b[2J\x1b[HRE".to_vec()).expect("feed");
+        h.build_now().expect("build_now");
+        assert_eq!(
+            h.inspect().frames_built,
+            built_before_failure,
+            "injected build failure must not publish"
+        );
+        assert_eq!(
+            woke.load(Ordering::Relaxed),
+            wakes_before_failure,
+            "injected build failure must not wake"
+        );
+
+        worker::test_inject_build_failures(0);
+        h.build_now().expect("build_now");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while h.inspect().frames_built <= built_before_failure {
+            if Instant::now() >= deadline {
+                panic!("retry must publish on the next pump");
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            woke.load(Ordering::Relaxed) > wakes_before_failure,
+            "retry must wake"
+        );
+        h.stop();
+    }
+
+    #[test]
+    fn stop_publishes_final_frame_before_join() {
+        let h = EngineHandle::spawn(test_config());
+        let slot = h.frame_slot();
+        h.feed(b"warm".to_vec()).expect("feed");
+        h.build_now().expect("build_now");
+        let _ = wait_for_frame(&h);
+
+        h.feed(b"FINAL".to_vec()).expect("feed");
+        h.stop();
+        let f = slot.load_full().expect("stop must publish dirty frame");
+        assert!(f.grid[0].cells.iter().any(|c| c.grapheme == "F"));
+    }
+
+    #[test]
+    fn drop_signals_stop_without_blocking_join() {
+        let h = EngineHandle::spawn(test_config());
+        h.feed(b"Z".to_vec()).expect("feed");
+        let start = Instant::now();
+        drop(h);
+        assert!(
+            start.elapsed() < Duration::from_millis(50),
+            "Drop must not block on worker join"
+        );
     }
 
     #[test]

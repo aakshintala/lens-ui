@@ -1,5 +1,7 @@
 //! Engine worker run-loop — owns the non-`Send` [`VtEngine`] on a pinned OS thread.
 
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -18,6 +20,15 @@ const CMD_CHANNEL_CAP: usize = 256;
 const DA_DSR_CHANNEL_CAP: usize = 64;
 /// Default min interval between frame builds (~60 Hz).
 const DEFAULT_BUILD_INTERVAL: Duration = Duration::from_millis(16);
+
+/// Test hook: the next N `build_frame` attempts in `maybe_publish` fail synthetically.
+#[cfg(test)]
+static TEST_BUILD_FAILURES: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn test_inject_build_failures(count: usize) {
+    TEST_BUILD_FAILURES.store(count, Ordering::SeqCst);
+}
 
 pub(crate) enum EngineCommand {
     Feed(Vec<u8>),
@@ -72,6 +83,7 @@ pub(crate) fn spawn_worker(
         let mut dirty = false;
         let mut visible = true;
         let mut force_build = false;
+        let mut stopping = false;
         let mut last_build = Instant::now()
             .checked_sub(DEFAULT_BUILD_INTERVAL)
             .unwrap_or_else(Instant::now);
@@ -96,23 +108,25 @@ pub(crate) fn spawn_worker(
 
             if let Some(cmd) = cmd {
                 if matches!(cmd, EngineCommand::Stop) {
-                    break;
+                    stopping = true;
+                } else {
+                    handle_command(
+                        cmd,
+                        &mut engine,
+                        &da_dsr_tx,
+                        &da_dsr_rx,
+                        &inspect,
+                        &mut dirty,
+                        &mut visible,
+                        &mut force_build,
+                    );
                 }
-                handle_command(
-                    cmd,
-                    &mut engine,
-                    &da_dsr_tx,
-                    &da_dsr_rx,
-                    &inspect,
-                    &mut dirty,
-                    &mut visible,
-                    &mut force_build,
-                );
             }
 
             while let Ok(cmd) = cmd_rx.try_recv() {
                 if matches!(cmd, EngineCommand::Stop) {
-                    return;
+                    stopping = true;
+                    break;
                 }
                 handle_command(
                     cmd,
@@ -137,6 +151,24 @@ pub(crate) fn spawn_worker(
                 &mut force_build,
                 &mut last_build,
             );
+
+            if stopping {
+                if dirty && visible {
+                    force_build = true;
+                    maybe_publish(
+                        &mut engine,
+                        &frame_slot,
+                        &frame_ready,
+                        &waker,
+                        &inspect,
+                        &mut dirty,
+                        visible,
+                        &mut force_build,
+                        &mut last_build,
+                    );
+                }
+                break;
+            }
         }
     })
 }
@@ -180,6 +212,7 @@ fn handle_command(
             *visible = v;
             inspect.set_visible(v);
             if v && !was_visible {
+                *dirty = true;
                 *force_build = true;
             }
         }
@@ -214,7 +247,21 @@ fn maybe_publish(
         return;
     }
 
-    *force_build = false;
+    let was_forced = *force_build;
+
+    #[cfg(test)]
+    {
+        let remaining = TEST_BUILD_FAILURES.load(Ordering::SeqCst);
+        if remaining > 0 {
+            TEST_BUILD_FAILURES.store(remaining - 1, Ordering::SeqCst);
+            eprintln!("lens-terminal engine: build_frame failed (test injection)");
+            *dirty = true;
+            if was_forced {
+                *force_build = true;
+            }
+            return;
+        }
+    }
 
     let started = Instant::now();
     match engine.build_frame() {
@@ -224,6 +271,7 @@ fn maybe_publish(
             frame_slot.store(Some(Arc::new(frame)));
             frame_ready.store(true, Ordering::Release);
             *dirty = false;
+            *force_build = false;
             *last_build = Instant::now();
             let waker_fn = waker
                 .lock()
@@ -235,7 +283,10 @@ fn maybe_publish(
         }
         Err(e) => {
             eprintln!("lens-terminal engine: build_frame failed: {e}");
-            *dirty = false;
+            *dirty = true;
+            if was_forced {
+                *force_build = true;
+            }
         }
     }
 }
