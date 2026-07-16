@@ -1,5 +1,4 @@
 use crate::PtyProbe;
-use crate::actions::BackToBoard;
 use crate::card::view::{SessionCardView, mount_cached_card};
 use crate::fleet::store::FleetStore;
 use crate::slot::{TabHandle, placeholder_tab};
@@ -110,10 +109,6 @@ impl BoardView {
             let view = self.make_card_view(id.clone(), card, cx);
             self.insert_card_view(id, view);
         }
-    }
-
-    fn on_back_to_board(&mut self, _: &BackToBoard, _: &mut Window, cx: &mut Context<Self>) {
-        self.fleet.update(cx, |fleet, cx| fleet.blur_to_board(cx));
     }
 
     fn card_click(
@@ -239,10 +234,6 @@ impl Render for BoardView {
                         .child(self.working_tab.view.clone()),
                 ),
         };
-        div()
-            .id("board-view")
-            .size_full()
-            .on_action(cx.listener(Self::on_back_to_board))
-            .child(body)
+        div().id("board-view").size_full().child(body)
     }
 }

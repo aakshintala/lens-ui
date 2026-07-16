@@ -1,6 +1,6 @@
 mod fleet_verify;
 
-use gpui::{App, AppContext, Application, KeyBinding, WindowOptions};
+use gpui::{App, AppContext, Application, WindowOptions};
 use gpui_component::Root;
 use lens_client::ids::{ConnectionId, SessionId};
 use lens_client::sessions::{GetOpts, SessionSnapshot, SessionStatus};
@@ -13,7 +13,6 @@ use lens_core::domain::usage::Cost;
 use lens_core::persist::{
     ConnectionRecord, ControlStore, SqliteControlStore, SqliteTranscriptStore,
 };
-use lens_ui::actions::{BackToBoard, ReloadTheme};
 use lens_ui::board::BoardView;
 use lens_ui::card::model::SessionCard;
 use lens_ui::clock::{UiClock, WallUiClock};
@@ -77,11 +76,10 @@ fn main() {
     Application::new().run(move |cx: &mut App| {
         gpui_component::init(cx);
         lens_ui::theme::install_at_startup(cx);
-        lens_ui::theme::register_reload_action(cx);
-        register_keybindings(cx);
 
         let clock = Arc::new(WallUiClock) as Arc<dyn UiClock>;
         let fleet = FleetStore::new_live(clock, cx);
+        lens_ui::shortcuts::register(&fleet, cx);
 
         cx.open_window(WindowOptions::default(), move |window, cx| {
             if let Some(prep) = live_prep {
@@ -108,13 +106,6 @@ fn main() {
     });
 }
 
-fn register_keybindings(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("cmd-.", BackToBoard, None),
-        KeyBinding::new("cmd-shift-t", ReloadTheme, None),
-    ]);
-}
-
 /// `--demo`: paint six cards in the six wave states (no live server needed) so the
 /// status language is visible at a glance. Cards carry no poller/commands — clicking
 /// one still toggles focus (and suppresses that card's glow while focused).
@@ -122,12 +113,11 @@ fn run_demo() {
     Application::new().run(|cx: &mut App| {
         gpui_component::init(cx);
         lens_ui::theme::install_at_startup(cx);
-        lens_ui::theme::register_reload_action(cx);
-        register_keybindings(cx);
 
         let clock = Arc::new(WallUiClock) as Arc<dyn UiClock>;
         let now = clock.now_millis();
         let fleet = FleetStore::new_live(clock, cx);
+        lens_ui::shortcuts::register(&fleet, cx);
 
         cx.open_window(WindowOptions::default(), move |window, cx| {
             fleet.update(cx, |f, cx| {

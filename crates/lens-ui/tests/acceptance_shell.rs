@@ -59,6 +59,9 @@ async fn shell_skeleton_acceptance(cx: &mut gpui::TestAppContext) {
         gpui_component::init(cx);
         lens_ui::theme::install_at_startup(cx);
         let fleet = FleetStore::new(Arc::clone(&clock) as Arc<dyn UiClock>, cx);
+        // BackToBoard is now an app-global action (not an element handler); register it so the
+        // window.dispatch_action(BackToBoard) below routes to the global handler.
+        lens_ui::shortcuts::register(&fleet, cx);
         fleet.update(cx, |f, cx| {
             f.spawn_fake_session(a.clone(), cx);
             f.spawn_fake_session(b.clone(), cx);

@@ -3,6 +3,7 @@ pub mod board;
 pub mod card;
 pub mod clock;
 pub mod fleet;
+pub mod shortcuts;
 pub mod slot;
 pub mod theme;
 
