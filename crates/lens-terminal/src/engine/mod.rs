@@ -1,7 +1,4 @@
 pub mod frame;
+pub mod vt;
 
-#[expect(
-    unused_imports,
-    reason = "public engine surface; consumed as later tasks land"
-)]
-pub use frame::{CellStyle, Frame, FrameCell, FrameRow, Rgb, UnderlineStyle};
+pub use vt::{EngineConfig, EngineError, VtEngine};
