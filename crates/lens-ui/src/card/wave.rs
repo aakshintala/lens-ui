@@ -1,4 +1,6 @@
 use super::model::{READY_DECAY_MS, SessionCard};
+use crate::theme::LensTheme;
+use gpui::Hsla;
 use lens_core::domain::scalars::{SessionLifecycle, SessionStatusValue};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,6 +43,21 @@ pub fn derive_wave(card: &SessionCard, now_ms: i64, is_focused: bool) -> Wave {
         return Wave::Slept;
     }
     Wave::Neutral
+}
+
+impl Wave {
+    /// The saturated status color for this wave (spec §7). Keeps `theme` a leaf — the
+    /// Wave→status map lives here in `card`, not in `theme`.
+    pub fn status_color(self, t: &LensTheme) -> Hsla {
+        match self {
+            Wave::Ready => t.status.ready,
+            Wave::Working => t.status.working,
+            Wave::NeedsInput => t.status.needs_input,
+            Wave::Failed => t.status.failed,
+            Wave::Slept => t.status.slept,
+            Wave::Neutral => t.status.neutral,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -87,5 +104,21 @@ mod tests {
             message: "boom".into(),
         });
         assert_eq!(derive_wave(&card, 0, false), Wave::Failed);
+    }
+
+    #[test]
+    fn status_color_total_over_all_waves() {
+        let t: crate::theme::LensTheme =
+            serde_json::from_str(include_str!("../theme/lens-dark.json")).unwrap();
+        for w in [
+            Wave::Ready,
+            Wave::Working,
+            Wave::NeedsInput,
+            Wave::Failed,
+            Wave::Slept,
+            Wave::Neutral,
+        ] {
+            let _c = w.status_color(&t); // resolves for every variant
+        }
     }
 }

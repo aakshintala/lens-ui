@@ -5,6 +5,8 @@ use gpui::{
 use lens_core::domain::scalars::SessionStatusValue;
 use lens_core::domain::usage::Cost;
 
+use crate::theme::ActiveLensTheme;
+
 use super::model::{ConnectionOverlay, RepoRef, SessionCard};
 use super::wave::Wave;
 
@@ -79,18 +81,6 @@ fn host_label(card: &SessionCard) -> String {
         .unwrap_or_else(|| "—".into())
 }
 
-pub fn wave_border_color(wave: Wave) -> Hsla {
-    match wave {
-        Wave::NeedsInput => gpui::rgb(0xf59e0b),
-        Wave::Ready => gpui::rgb(0x3b82f6),
-        Wave::Working => gpui::rgb(0x22c55e),
-        Wave::Failed => gpui::rgb(0xef4444),
-        Wave::Slept => gpui::rgb(0x6b7280),
-        Wave::Neutral => gpui::rgb(0x374151),
-    }
-    .into()
-}
-
 /// Short state label for the colored status pill.
 fn wave_label(wave: Wave, status: SessionStatusValue) -> &'static str {
     match wave {
@@ -128,11 +118,19 @@ pub fn render_card_chrome(
     card: &SessionCard,
     wave: Wave,
     kebab_open: bool,
+    cx: &App,
     on_kebab_toggle: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
     on_sleep: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
     on_send: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
     on_retry: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
+    let t = cx.lens_theme();
+    let border = wave.status_color(t);
+    let popover = t.base.popover;
+    let muted_fg = t.base.muted_foreground;
+    let overlay_fg = t.base.foreground;
+    let overlay_scrim = t.base.overlay.opacity(0.55);
+
     let title = card.title.clone().unwrap_or_else(|| "—".into());
     let harness_model = format_harness_model(card);
     let repos_row = format_repos_row(&card.repos);
@@ -147,7 +145,6 @@ pub fn render_card_chrome(
         card.activity_summary.clone()
     };
 
-    let border = wave_border_color(wave);
     let mut root = div()
         .relative()
         .size_full()
@@ -194,7 +191,7 @@ pub fn render_card_chrome(
                 .right(px(4.0))
                 .flex()
                 .flex_col()
-                .bg(gpui::rgb(0x1f2937))
+                .bg(popover)
                 .rounded_md()
                 .p_1()
                 .gap_1()
@@ -220,7 +217,7 @@ pub fn render_card_chrome(
         .child(
             ellipsize_line(harness_model)
                 .text_xs()
-                .text_color(gpui::rgb(0x9ca3af)),
+                .text_color(muted_fg),
         )
         .child({
             let mut activity_slot = div()
@@ -255,7 +252,7 @@ pub fn render_card_chrome(
                 .flex_row()
                 .justify_between()
                 .text_xs()
-                .text_color(gpui::rgb(0x9ca3af))
+                .text_color(muted_fg)
                 .child(ellipsize_line(host).max_w(px(80.0)))
                 .child(ellipsize_line(spend))
                 .child(ellipsize_line(ctx_pct)),
@@ -271,11 +268,11 @@ pub fn render_card_chrome(
             div()
                 .absolute()
                 .inset_0()
-                .bg(gpui::hsla(0.0, 0.0, 0.0, 0.55))
+                .bg(overlay_scrim)
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_color(gpui::rgb(0xf3f4f6))
+                .text_color(overlay_fg)
                 .child(label),
         );
     }

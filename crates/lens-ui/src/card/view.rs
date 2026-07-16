@@ -75,6 +75,7 @@ impl Render for SessionCardView {
                 card,
                 wave,
                 kebab_open,
+                cx,
                 cx.listener(|view, _, _, cx| {
                     view.kebab_open = !view.kebab_open;
                     cx.notify();
@@ -155,6 +156,8 @@ mod tests {
         let sid_b = SessionId::new("b");
 
         let (fleet, card_a, card_b, view_a, view_b, rc_a, rc_b) = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::install_at_startup(cx);
             let fleet = FleetStore::new(clock, cx);
             let card_a = fleet.update(cx, |f, cx| f.spawn_fake_session(sid_a.clone(), cx));
             let card_b = fleet.update(cx, |f, cx| f.spawn_fake_session(sid_b.clone(), cx));
