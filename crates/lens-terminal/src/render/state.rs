@@ -20,6 +20,10 @@ pub struct TabRenderState {
     pub latest_frame: Option<Arc<Frame>>,
     pub cell_metrics: Option<CellMetrics>,
     pub inspect: RenderInspectShared,
+    /// Written every paint; read only via `last_stats` (the test/harness stats
+    /// surface). In the normal 1c build there is no reader yet, so suppress
+    /// dead-code there — the production stats surface is the Inspect ring.
+    #[cfg_attr(not(any(test, feature = "test-util")), allow(dead_code))]
     stats_slot: Rc<RefCell<Option<RenderStats>>>,
 }
 
@@ -33,13 +37,17 @@ impl TabRenderState {
         }
     }
 
-    /// Replace the frame to paint on the next render.
+    /// Replace the frame to paint on the next render. In 1c the only frame
+    /// source is the test path; Slice 1d writes `latest_frame` from the engine
+    /// wake sampler. `test-util`-gated so it isn't dead code in the 1c build.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn set_frame(&mut self, frame: Arc<Frame>) {
         self.latest_frame = Some(frame);
     }
 
     /// Stats from the most recent completed paint (written by the canvas
-    /// closure). `None` until the first paint runs.
+    /// closure). `None` until the first paint runs. Test/inspect surface only.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn last_stats(&self) -> Option<RenderStats> {
         self.stats_slot.borrow().clone()
     }

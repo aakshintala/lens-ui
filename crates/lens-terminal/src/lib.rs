@@ -45,7 +45,7 @@ pub mod render_test_api {
 }
 
 use gpui::prelude::*;
-use gpui::{App, Context, Entity, EventEmitter, FocusHandle, IntoElement, Render, Window, div};
+use gpui::{App, Context, Entity, EventEmitter, FocusHandle, IntoElement, Render, Window};
 use lens_client::Client;
 use lens_client::ids::{SessionId, TerminalId};
 use serde::{Deserialize, Serialize};
@@ -251,6 +251,10 @@ pub struct TerminalTab {
     lifecycle: Lifecycle,
     presentation: Presentation,
 
+    /// Full-snapshot render state (Slice 1c). Owns `latest_frame` + the shared
+    /// canvas builder. Slice 1d makes the engine the source of `latest_frame`.
+    render: render::state::TabRenderState,
+
     // Captured at `open()`; consumed by the transport (Slice 1a) + convergence
     // (Slice 1d) that drive off-thread discovery/attach. `#[expect]` (not
     // `#[allow]`) so the lint fires the moment a later slice starts reading
@@ -288,6 +292,7 @@ impl TerminalTab {
                 reported_title: None,
                 progress: None,
             },
+            render: render::state::TabRenderState::new(),
             target,
             client,
             options,
@@ -309,18 +314,27 @@ impl TerminalTab {
     pub fn on_host_event(&mut self, _event: TerminalHostEvent, _cx: &mut Context<Self>) {
         // Slice 1d+ dispatches Sleep/wake/reset/etc.
     }
+
+    /// Push a `Frame` into the render state (test/harness only — Slice 1d wires
+    /// the engine wake sampler as the production source).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn set_frame_for_test(&mut self, frame: Arc<Frame>, cx: &mut Context<Self>) {
+        self.render.set_frame(frame);
+        cx.notify();
+    }
 }
 
 impl EventEmitter<TerminalEvent> for TerminalTab {}
 
 impl Render for TerminalTab {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        // Slice 1c replaces this placeholder with the full-snapshot `Frame`
-        // painter. Renders modeled values only — never panics.
-        div().track_focus(&self.focus_handle).child(format!(
-            "{} — {:?}",
-            self.presentation.identity_title, self.lifecycle
-        ))
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The one shared canvas builder (I6). No frame yet → modeled
+        // placeholder (`identity — lifecycle`); a frame → full-snapshot paint.
+        // Never panics.
+        let title = self.presentation.identity_title.clone();
+        let life = format!("{:?}", self.lifecycle);
+        self.render
+            .render_element(&self.focus_handle, &title, &life, window, cx)
     }
 }
 
@@ -359,6 +373,13 @@ fn identity_title_of(target: &TerminalTarget) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tab_render_state_starts_empty() {
+        let s = render::state::TabRenderState::new();
+        assert!(s.latest_frame.is_none());
+        assert!(s.last_stats().is_none());
+    }
 
     #[test]
     fn identity_title_prefers_name_key_for_open_or_create() {
