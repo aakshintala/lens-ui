@@ -35,6 +35,9 @@ pub struct BoardView {
     cached_tiles: HashMap<SessionId, AnyView>,
     working_tab: TabHandle,
     pty_probe: Option<PtyProbe>,
+    /// Holds the in-flight manual theme reload. Replacing it drops (cancels) a prior reload so a
+    /// rapid second cmd-shift-t wins instead of an older read applying after a newer one.
+    reload_task: Option<gpui::Task<()>>,
 }
 
 impl BoardView {
@@ -72,6 +75,7 @@ impl BoardView {
             cached_tiles,
             working_tab,
             pty_probe,
+            reload_task: None,
         }
     }
 
@@ -119,26 +123,13 @@ impl BoardView {
     fn on_reload_theme(&mut self, _: &ReloadTheme, _: &mut Window, cx: &mut Context<Self>) {
         // Window is live → read off the fg thread, apply on it. Bad edit → keep current theme.
         let mode = crate::theme::LensTheme::global(cx).mode;
-        let dir = crate::theme::theme_dir();
-        let Some(dir) = dir else {
+        let Some(dir) = crate::theme::theme_dir() else {
             eprintln!("lens-theme: reload ignored — LENS_THEME_DIR not set");
             return;
         };
-        cx.spawn(async move |_, cx| {
-            let loaded = cx
-                .background_executor()
-                .spawn(async move { crate::theme::load(mode, &dir) })
-                .await;
-            cx.update(|cx| match loaded {
-                Ok(lens) => {
-                    crate::theme::apply(lens, cx);
-                    cx.refresh_windows();
-                }
-                Err(e) => eprintln!("lens-theme: reload failed, keeping current theme: {e}"),
-            })
-            .ok();
-        })
-        .detach();
+        // Store the task; assigning replaces (drops → cancels) any in-flight reload so the latest
+        // trigger wins and a stale read can't apply after a newer one.
+        self.reload_task = Some(crate::theme::spawn_reload(mode, dir, cx));
     }
 
     fn card_click(

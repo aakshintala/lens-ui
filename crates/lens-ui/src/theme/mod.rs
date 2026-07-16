@@ -182,6 +182,28 @@ pub fn install_at_startup(cx: &mut App) {
     }
 }
 
+/// Manual reload (window live): read the external file for `mode` from `dir` OFF the foreground
+/// thread, then apply on the foreground + refresh. Uses `load` (strict — no embedded fallback) so a
+/// bad edit keeps the current theme. Returns the driving task; the caller stores it, and assigning a
+/// replacement drops (cancels) any in-flight reload so a rapid second trigger wins rather than an
+/// older read applying after a newer one.
+pub fn spawn_reload(mode: ThemeMode, dir: PathBuf, cx: &mut App) -> gpui::Task<()> {
+    cx.spawn(async move |cx| {
+        let loaded = cx
+            .background_executor()
+            .spawn(async move { load(mode, &dir) })
+            .await;
+        cx.update(|cx| match loaded {
+            Ok(lens) => {
+                apply(lens, cx);
+                cx.refresh_windows();
+            }
+            Err(e) => eprintln!("lens-theme: reload failed, keeping current theme: {e}"),
+        })
+        .ok();
+    })
+}
+
 /// Resolve mode: LENS_THEME override (warn on unknown value) else the current gpui-component
 /// mode (synced from the OS by `gpui_component::init`).
 pub(crate) fn select_mode(cx: &App) -> ThemeMode {
@@ -388,5 +410,133 @@ mod tests {
             gpui_component::Theme::change(ThemeMode::Dark, None, cx);
             assert_eq!(gpui_component::Theme::global(cx).primary, bridged_primary);
         });
+    }
+
+    #[gpui::test]
+    async fn bridge_maps_every_base_field(cx: &mut gpui::TestAppContext) {
+        // Guards the ~35 hand-written mappings in to_theme_config against a copy-paste mis-map:
+        // every base token must reach its gpui-component field (RGB within tolerance — apply_config
+        // alpha-clamps list_active/selection, which close() ignores). Deliberate non-1:1 seeds
+        // (accent→primary, muted→secondary, list_hover→gpui accent) asserted explicitly.
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            let lens = parse_theme(DARK_JSON, ThemeMode::Dark).unwrap();
+            let b = lens.base;
+            super::apply(lens, cx);
+            let t = gpui_component::Theme::global(cx);
+            for (name, got, want) in [
+                ("background", t.background, b.background),
+                ("foreground", t.foreground, b.foreground),
+                ("border", t.border, b.border),
+                ("muted", t.muted, b.muted),
+                ("muted_foreground", t.muted_foreground, b.muted_foreground),
+                ("popover", t.popover, b.popover),
+                (
+                    "popover_foreground",
+                    t.popover_foreground,
+                    b.popover_foreground,
+                ),
+                ("input", t.input, b.input),
+                ("caret", t.caret, b.caret),
+                ("ring", t.ring, b.ring),
+                ("selection", t.selection, b.selection),
+                ("scrollbar", t.scrollbar, b.scrollbar),
+                ("scrollbar_thumb", t.scrollbar_thumb, b.scrollbar_thumb),
+                ("list", t.list, b.list),
+                ("list_active", t.list_active, b.list_active),
+                ("list_hover", t.list_hover, b.list_hover),
+                ("progress_bar", t.progress_bar, b.progress_bar),
+                ("sidebar", t.sidebar, b.sidebar),
+                (
+                    "sidebar_foreground",
+                    t.sidebar_foreground,
+                    b.sidebar_foreground,
+                ),
+                ("sidebar_border", t.sidebar_border, b.sidebar_border),
+                ("title_bar", t.title_bar, b.title_bar),
+                ("title_bar_border", t.title_bar_border, b.title_bar_border),
+                ("tab", t.tab, b.tab),
+                ("tab_active", t.tab_active, b.tab_active),
+                (
+                    "tab_active_foreground",
+                    t.tab_active_foreground,
+                    b.tab_active_foreground,
+                ),
+                ("tab_foreground", t.tab_foreground, b.tab_foreground),
+                ("success", t.success, b.success),
+                ("warning", t.warning, b.warning),
+                ("danger", t.danger, b.danger),
+                ("info", t.info, b.info),
+                ("overlay", t.overlay, b.overlay),
+                // deliberate non-1:1 seeds
+                ("primary<-accent", t.primary, b.accent),
+                (
+                    "primary_foreground<-accent_foreground",
+                    t.primary_foreground,
+                    b.accent_foreground,
+                ),
+                ("secondary<-muted", t.secondary, b.muted),
+                ("accent<-list_hover", t.accent, b.list_hover),
+            ] {
+                assert!(
+                    close(got, want),
+                    "{name}: bridged {got:?} not close to {want:?}"
+                );
+            }
+        });
+    }
+
+    #[gpui::test]
+    async fn reload_applies_valid_external_off_thread(cx: &mut gpui::TestAppContext) {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("lens-reload-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut modified: LensTheme = serde_json::from_str(DARK_JSON).unwrap();
+        modified.base.background = Hsla::parse_hex("#123456").unwrap();
+        let json = serde_json::to_string(&modified).unwrap();
+        std::fs::File::create(dir.join("lens-dark.json"))
+            .unwrap()
+            .write_all(json.as_bytes())
+            .unwrap();
+
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            super::apply(parse_theme(DARK_JSON, ThemeMode::Dark).unwrap(), cx);
+        });
+        let embedded_bg = cx.update(|cx| LensTheme::global(cx).base.background);
+
+        // Hold the task (dropping cancels it) and drive the bg read + fg apply to completion.
+        let _task = cx.update(|cx| super::spawn_reload(ThemeMode::Dark, dir.clone(), cx));
+        cx.run_until_parked();
+
+        let reloaded_bg = cx.update(|cx| LensTheme::global(cx).base.background);
+        let from_file: LensTheme = serde_json::from_str(&json).unwrap();
+        assert_eq!(reloaded_bg, from_file.base.background); // external file applied off-thread
+        assert_ne!(reloaded_bg, embedded_bg);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[gpui::test]
+    async fn reload_bad_file_keeps_current(cx: &mut gpui::TestAppContext) {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("lens-reload-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::File::create(dir.join("lens-dark.json"))
+            .unwrap()
+            .write_all(b"{ not json")
+            .unwrap();
+
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            super::apply(parse_theme(DARK_JSON, ThemeMode::Dark).unwrap(), cx);
+        });
+        let before = cx.update(|cx| LensTheme::global(cx).base.background);
+
+        let _task = cx.update(|cx| super::spawn_reload(ThemeMode::Dark, dir.clone(), cx));
+        cx.run_until_parked();
+
+        let after = cx.update(|cx| LensTheme::global(cx).base.background);
+        assert_eq!(before, after); // bad edit → running theme preserved
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
