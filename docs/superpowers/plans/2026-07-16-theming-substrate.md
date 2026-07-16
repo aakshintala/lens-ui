@@ -597,53 +597,56 @@ impl LensTheme {
 /// Build a gpui-component `ThemeConfig` from our base tokens. `apply_config` derives every
 /// interaction family (`*_hover`/`*_active`/`*_foreground`) from these; we leave those + fonts/
 /// radius/highlight `None` → gpui-component defaults.
+// NOTE: `ThemeConfigColors` has private fields, so functional-record-update
+// (`ThemeConfigColors { field: …, ..Default::default() }`) fails to compile from outside the crate
+// (E0451: private field). Build from `::default()` and assign only the public fields we seed — the
+// unset fields keep gpui-component's default for the mode. Same mapping, same result.
 pub(crate) fn to_theme_config(lens: &LensTheme) -> ThemeConfig {
     let b = &lens.base;
     let hex = |c: gpui::Hsla| Some(SharedString::from(c.to_hex()));
+    let mut colors = ThemeConfigColors::default();
+    colors.background = hex(b.background);
+    colors.foreground = hex(b.foreground);
+    colors.border = hex(b.border);
+    colors.muted = hex(b.muted);
+    colors.muted_foreground = hex(b.muted_foreground);
+    colors.popover = hex(b.popover);
+    colors.popover_foreground = hex(b.popover_foreground);
+    // brand color seeds `primary` (buttons/switch/checkbox read primary, NOT accent);
+    // `secondary` (subtle button bg) from muted; gpui-component `accent` (menuitem hover
+    // bg) from list_hover. *_hover/*_active/*_foreground left None → derived.
+    colors.primary = hex(b.accent);
+    colors.primary_foreground = hex(b.accent_foreground);
+    colors.secondary = hex(b.muted);
+    colors.accent = hex(b.list_hover);
+    colors.input = hex(b.input);
+    colors.caret = hex(b.caret);
+    colors.ring = hex(b.ring);
+    colors.selection = hex(b.selection);
+    colors.scrollbar = hex(b.scrollbar);
+    colors.scrollbar_thumb = hex(b.scrollbar_thumb);
+    colors.list = hex(b.list);
+    colors.list_active = hex(b.list_active);
+    colors.list_hover = hex(b.list_hover);
+    colors.progress_bar = hex(b.progress_bar);
+    colors.sidebar = hex(b.sidebar);
+    colors.sidebar_foreground = hex(b.sidebar_foreground);
+    colors.sidebar_border = hex(b.sidebar_border);
+    colors.title_bar = hex(b.title_bar);
+    colors.title_bar_border = hex(b.title_bar_border);
+    colors.tab = hex(b.tab);
+    colors.tab_active = hex(b.tab_active);
+    colors.tab_active_foreground = hex(b.tab_active_foreground);
+    colors.tab_foreground = hex(b.tab_foreground);
+    colors.success = hex(b.success);
+    colors.warning = hex(b.warning);
+    colors.danger = hex(b.danger);
+    colors.info = hex(b.info);
+    colors.overlay = hex(b.overlay);
     ThemeConfig {
         name: lens.name.clone(),
         mode: lens.mode,
-        colors: ThemeConfigColors {
-            background: hex(b.background),
-            foreground: hex(b.foreground),
-            border: hex(b.border),
-            muted: hex(b.muted),
-            muted_foreground: hex(b.muted_foreground),
-            popover: hex(b.popover),
-            popover_foreground: hex(b.popover_foreground),
-            // brand color seeds `primary` (buttons/switch/checkbox read primary, NOT accent);
-            // `secondary` (subtle button bg) from muted; gpui-component `accent` (menuitem hover
-            // bg) from list_hover. *_hover/*_active/*_foreground left None → derived.
-            primary: hex(b.accent),
-            primary_foreground: hex(b.accent_foreground),
-            secondary: hex(b.muted),
-            accent: hex(b.list_hover),
-            input: hex(b.input),
-            caret: hex(b.caret),
-            ring: hex(b.ring),
-            selection: hex(b.selection),
-            scrollbar: hex(b.scrollbar),
-            scrollbar_thumb: hex(b.scrollbar_thumb),
-            list: hex(b.list),
-            list_active: hex(b.list_active),
-            list_hover: hex(b.list_hover),
-            progress_bar: hex(b.progress_bar),
-            sidebar: hex(b.sidebar),
-            sidebar_foreground: hex(b.sidebar_foreground),
-            sidebar_border: hex(b.sidebar_border),
-            title_bar: hex(b.title_bar),
-            title_bar_border: hex(b.title_bar_border),
-            tab: hex(b.tab),
-            tab_active: hex(b.tab_active),
-            tab_active_foreground: hex(b.tab_active_foreground),
-            tab_foreground: hex(b.tab_foreground),
-            success: hex(b.success),
-            warning: hex(b.warning),
-            danger: hex(b.danger),
-            info: hex(b.info),
-            overlay: hex(b.overlay),
-            ..Default::default()
-        },
+        colors,
         highlight: None,
         ..Default::default()
     }
