@@ -7,18 +7,22 @@
 //! window and drives assertions from the canvas paint callback.
 //!
 //! `cx.quit()` exits the *process* on the macOS gpui path, so all workloads run
-//! in ONE `Application::run`, sequentially. On failure: `std::process::exit(1)`.
-//! On full success: `std::process::exit(0)`. xtask executes this on macOS with
-//! `--features test-util`.
+//! in ONE `Application::run`, sequentially. The canvas paint closure only sees
+//! `&mut App` (not the entity), so the phase machine + shared state live in
+//! `Rc<RefCell<_>>` cells the closure mutates; `render()` re-dispatches on the
+//! next animation frame. On failure: `std::process::exit(1)`. On full success:
+//! `std::process::exit(0)`. xtask executes this on macOS with `test-util`.
 //!
-//! Tasks 2–8 grow the `Phase` state machine (Menlo gate, paint, SGR, perf).
-//! Task 1 asserts only that Menlo resolves to the real Menlo family.
+//! Tasks 3–8 grow the `Phase` machine (paint, SGR, perf).
+
+use std::cell::RefCell;
+use std::rc::Rc;
 
 use gpui::{
     Application, Bounds, Context, IntoElement, Render, TitlebarOptions, Window, WindowBounds,
     WindowOptions, canvas, prelude::*, px, size,
 };
-use lens_terminal::render_test_api::CellMetrics;
+use lens_terminal::render_test_api::{CellMetrics, menlo_gate_ok};
 
 fn main() {
     Application::new().run(move |cx| {
@@ -36,53 +40,75 @@ fn main() {
                 ))),
                 ..Default::default()
             },
-            |_window, cx| {
-                cx.new(|_cx| HarnessView {
-                    phase: Phase::ResolveMenlo,
-                })
-            },
+            |_window, _cx_win| _cx_win.new(|_cx| HarnessView::new()),
         )
         .expect("open_window");
         cx.activate(true);
     });
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
     ResolveMenlo,
-    // Task 2+: MenloGate, PaintAscii, PaintWideRouting, PaintSgr,
-    // PerfAscii200x50, PerfWide200x50, PerfWide400x100, Done.
+    MenloGate,
+    Done,
+    // Tasks 3+: PaintAscii, PaintWideRouting, PaintSgr,
+    // PerfAscii200x50, PerfWide200x50, PerfWide400x100.
 }
 
 struct HarnessView {
-    phase: Phase,
+    phase: Rc<RefCell<Phase>>,
+    metrics: Rc<RefCell<Option<CellMetrics>>>,
+}
+
+impl HarnessView {
+    fn new() -> Self {
+        Self {
+            phase: Rc::new(RefCell::new(Phase::ResolveMenlo)),
+            metrics: Rc::new(RefCell::new(None)),
+        }
+    }
+}
+
+fn fail(msg: &str) -> ! {
+    eprintln!("render_realwindow FAIL: {msg}");
+    std::process::exit(1);
 }
 
 impl Render for HarnessView {
     fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         window.request_animation_frame();
 
-        match self.phase {
-            Phase::ResolveMenlo => canvas(
-                |_, _, _| {},
-                move |_bounds, _prepaint, window, _cx| {
-                    let m = CellMetrics::resolve_menlo(window);
-                    let font_id = window.text_system().resolve_font(&m.font);
-                    let family = window
-                        .text_system()
-                        .get_font_for_id(font_id)
-                        .map(|f| f.family.to_string())
-                        .unwrap_or_default();
-                    if family != "Menlo" {
-                        eprintln!("resolve_menlo: expected family Menlo, got {family:?}");
-                        std::process::exit(1);
+        let phase = *self.phase.borrow();
+        let phase_cell = Rc::clone(&self.phase);
+        let metrics_cell = Rc::clone(&self.metrics);
+
+        canvas(
+            |_, _, _| {},
+            move |_bounds, _prepaint, window, _cx| match phase {
+                Phase::ResolveMenlo => {
+                    *metrics_cell.borrow_mut() = Some(CellMetrics::resolve_menlo(window));
+                    *phase_cell.borrow_mut() = Phase::MenloGate;
+                }
+                Phase::MenloGate => {
+                    let m = metrics_cell.borrow();
+                    let metrics = m.as_ref().expect("metrics resolved");
+                    let gate = menlo_gate_ok(window, metrics);
+                    if !gate.ok {
+                        fail(&format!(
+                            "Menlo gate: {} — reopen lens-fonts; do not soft-pass",
+                            gate.reason
+                        ));
                     }
-                    // Task 1 terminal exit; T2+ advance the phase machine instead.
-                    println!("render_realwindow: ResolveMenlo OK (family=Menlo)");
+                    println!("render_realwindow: MenloGate OK");
+                    *phase_cell.borrow_mut() = Phase::Done;
+                }
+                Phase::Done => {
+                    println!("render_realwindow: all phases OK");
                     std::process::exit(0);
-                },
-            )
-            .size_full(),
-        }
+                }
+            },
+        )
+        .size_full()
     }
 }
