@@ -503,12 +503,15 @@ impl AttachConn {
     }
 
     async fn hard_drop(self) -> Result<(FrameStats, Option<CloseInfo>)> {
+        // Force a transient disconnect. Dropping only the write sink is not
+        // enough: the reader task owns the read half via `split()`, so the
+        // connection stays open and `reader.await` would block until the server
+        // closes. Abort the reader to drop the read half, then drop the write
+        // half, so the WS/TCP connection actually tears down mid-output.
+        self.reader.abort();
+        let _ = self.reader.await; // JoinError(Cancelled) expected; ignore
         drop(self.write);
-        match self.reader.await {
-            Ok(Ok(result)) => Ok(result),
-            Ok(Err(err)) => Err(err),
-            Err(join_err) => Err(join_err).context("reader task join after hard drop"),
-        }
+        Ok((FrameStats::default(), None))
     }
 }
 

@@ -1,8 +1,10 @@
 # omnigent PTY-attach WebSocket contract (Spike B)
 
-**Status:** B0 (source-read) **DONE** 2026-07-15. B2 (live-verify + divergence)
-**pending** — the "Actual (from wire)" column is filled once the B1 harness runs
-against a live omnigent 0.5.1.
+**Status:** B0 (source-read) **DONE** 2026-07-15. B2 (live-verify) **DONE**
+2026-07-16 — driven against a live omnigent 0.5.1 (`08285468`) local server
+(`:6767`) attaching a real `claude` native terminal. **Every source-derived
+claim confirmed on the wire; no material divergence.** See "Actual (from wire)"
+below; raw corpus in `docs/spikes/captures/2026-07-15-pty-attach/`.
 
 Source: sibling checkout `../omnigent` @ `v0.5.1` / `08285468` (matches
 `vendor/omnigent-0.5.1/OMNIGENT_PIN`). All citations are `omnigent/…` paths there.
@@ -127,19 +129,62 @@ local/in-process server and the contract generalizes.
 
 ---
 
-## B2 — live-verify checklist (pending)
+## Actual (from wire) — live-verified 2026-07-16
 
-Fill an "Actual (from wire)" column for each of the above and flag divergences:
-1. Confirm `/v1` prefix + `ws://` scheme + no-auth on a dev server.
-2. Confirm terminal-resource creation path + the exact `{terminal_id}` shape.
-3. Confirm **both** `?transport=pty` and `?transport=control` (+ omitted=control)
-   present **identically** on the wire (binary out = raw VT, JSON resize in, binary
-   in). This is the load-bearing finding — verify it, don't trust the docstring.
-4. Confirm binary input reaches the PTY (echo) and that a DA/DSR-style byte reply
-   round-trips (back-channel).
-5. Confirm the resize JSON applies (observe reflow bytes).
-6. **Reconnect:** capture exactly what arrives on re-attach after a forced mid-output
-   drop — confirm current-screen snapshot vs no byte-replay; confirm 4405 on a clean
-   detach vs 4404 on a killed session.
+Driven with the B1 harness (`spikes/terminal-attach`) against a local omnigent
+0.5.1 server, attaching the `claude` native terminal `terminal_claude_main` on
+session `conv_0b31…`. Corpus: `attach`/`input`/`resize`/`reconnect`.frames.jsonl.
 
-Raw corpus → `docs/spikes/captures/2026-07-15-pty-attach/`.
+1. **URL / scheme / prefix / auth — CONFIRMED.** `ws://127.0.0.1:6767/v1/sessions/
+   {sid}/resources/terminals/{tid}/attach?transport=…&read_only=false` →
+   `101 Switching Protocols`. **No auth** on the local dev server (`permission_store
+   is None`). *Precision add:* the handshake upgrades to `101` **before** the
+   terminal lookup, so even a bad `{tid}` gets `101` then an app-level close (see 6).
+
+2. **Terminal resource — CONFIRMED.** `GET …/resources/terminals` → `{object:"list",
+   data:[{id:"terminal_claude_main", type:"terminal", metadata:{terminal_name,
+   session_key, running:true, tmux_socket, tmux_target, terminal_transport:
+   "control"}}], has_more:false}`. Create body `{"terminal","session_key"}` → resource
+   with `id` (matches source); reusing an existing `{sid,tid}` sidesteps it.
+   `metadata.terminal_transport:"control"` **confirms control is the default**.
+
+3. **Output framing — CONFIRMED binary raw VT.** Attach seed = one binary frame
+   `\x1b[H\x1b[2J` + the Claude Code TUI in SGR truecolor/256 + box-drawing, then a
+   mode-setup frame (`\x1b[?1000h`… mouse/kitty). Straight into `vt_write`.
+
+4. **Transport-independent — CONFIRMED (the load-bearing B0 finding).** Both
+   `?transport=control` (default) and `?transport=pty` deliver **raw VT binary**. Only
+   difference is the seed *mechanism*: control seeds via `capture-pane` (~1.4 KB), pty
+   via a full `tmux attach` redraw (~3.1 KB) — both raw VT; a client cannot tell them
+   apart. **No tmux-control-mode protocol reaches the client.**
+
+5. **Input framing — CONFIRMED binary.** A 28-byte command sent as a binary frame
+   reaches the PTY (terminal reacts/redraws). Arbitrary bytes pass verbatim → the
+   `on_pty_write` DA/DSR back-channel rides this path.
+
+6. **Resize — CONFIRMED.** Text frame `{"type":"resize","cols":120,"rows":40}` (38 B)
+   → full reflow (`\x1b[2J\x1b[H` + repaint at the new width).
+
+7. **Reconnect / output gap — CONFIRMED transient.** Forced abrupt drop mid-output,
+   then re-attach to the **same** `{tid}`: succeeds, and leg-2's seed is a fresh
+   `\x1b[H\x1b[2J` + **current-screen redraw** — **no byte-replay** of leg-1's
+   intermediate frames. The tmux pane persisted across the drop. So the gap is
+   transient (current state delivered; missed intermediate output not replayed), as
+   source predicted.
+
+8. **Close codes — 4404 CONFIRMED live.** Attaching a non-existent `{tid}` → `101`
+   then close **`4404` reason `"terminal resource not found or not running"`**.
+   `4405` (detach) and `4500` (internal) are source-documented (`ws_bridge.py`) but
+   need server-side triggers (tmux-attach-child exit / bridge failure) not cleanly
+   forced from a WS client — left source-derived, not live-triggered.
+
+**Divergences from source: none material.** The `terminal_attach.py` /
+`ws_bridge.py` / `control_bridge.py` docstrings were accurate. Only precision adds:
+(1) `101` upgrade precedes the terminal lookup; (2) control vs pty seed sizes differ
+(mechanism), both raw VT.
+
+**Net for the build:** the future attach client feeds `{tid}`'s binary frames
+straight to `vt_write`, sends keystrokes/DA-DSR as binary + resize as JSON text,
+branches its reconnect loop on 4404/4405/4500, and treats re-attach as a
+current-screen repaint (no gap-fill needed). No transport negotiation, no tmux
+parser.

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*", "spikes/*"]
+members = ["crates/*"]
 # Vendored third-party VT binding (build-from-source). EXCLUDED from the
 # workspace — not first-party — and consumed only via `path` deps. Being
 # non-members, Cargo compiles them with `--cap-lints=allow`, so their upstream
@@ -10,6 +10,19 @@ members = ["crates/*", "spikes/*"]
 exclude = [
     "vendor/libghostty-rs/libghostty-vt-sys",
     "vendor/libghostty-rs/libghostty-vt",
+    # All spikes/* are throwaway/exploratory and deliberately outside the
+    # production lint wall — holding exploratory code to `-D warnings` fights its
+    # purpose (e.g. a liftable 10-arg signature trips too_many_arguments). They are
+    # NOT workspace members; `xtask gate` already scopes to production crates.
+    # Build one via `cargo <cmd> --manifest-path spikes/<name>/Cargo.toml`.
+    # ADD EVERY NEW SPIKE HERE.
+    "spikes/elicitation-form",
+    "spikes/large-transcript",
+    "spikes/libghostty-link",
+    "spikes/markdown-stream",
+    "spikes/transcript-virtual",
+    "spikes/terminal-render",
+    "spikes/terminal-attach",
 ]
 
 [workspace.package]
