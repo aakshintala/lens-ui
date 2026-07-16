@@ -44,8 +44,8 @@ WebSocket.
 
 Delivered by this workstream (across the slices in "Build sequence"):
 
-- Typed terminal list/get/create/delete and WS attach in `lens-client`; no
-  generic WebSocket or `serde_json::Value` leaks to callers.
+- Typed terminal list/get/create/delete and **auth/access-modeled** WS attach in
+  `lens-client`; no generic WebSocket or `serde_json::Value` leaks to callers.
 - A deep `lens-terminal` module wrapping `libghostty-vt`, with a small host
   interface and a standalone GPUI demo as its first consumer.
 - Owner-write and viewer-read-only behavior; keyboard, IME, paste, resize,
@@ -53,8 +53,12 @@ Delivered by this workstream (across the slices in "Build sequence"):
   handling.
 - Brief reconnect with a retained emulator and an explicit marker that output
   during the interruption may be missing.
-- Reproducible offline builds (vendored VT from source), deterministic tests,
-  pinned-omnigent executable verification, and release-mode terminal benchmarks.
+- Reproducible, pinned builds — **offline *after* the first cached build**, not on
+  a clean build: `build.rs` fetches the pinned Ghostty source and Zig fetches its
+  system deps over the network (both pinned/reproducible), then cache in `OUT_DIR`.
+  Full clean-build offline (a vendored Ghostty tree) is deferred to the CI trigger.
+  Deterministic tests, pinned-omnigent executable verification, and release-mode
+  terminal benchmarks.
 
 Out of scope:
 
@@ -68,8 +72,11 @@ Out of scope:
 - A client-callable terminal transfer operation; intentionally absent from the
   public omnigent 0.5.1 contract.
 - A bundled-font / font-registry story. The terminal renders with the **system
-  monospace `Menlo`** referenced by name (macOS-only posture; guaranteed present,
-  grid-aligns). Font *selection* (bundled defaults, user-supplied files, Nerd-Font
+  monospace `Menlo`** referenced by name (macOS-only posture; guaranteed present).
+  ⚠ Menlo's grid-alignment is an **unproven hypothesis** — Spike A only proved a
+  *missing* font mis-aligns and never tested Menlo — so Slice 1c **gates** it (see
+  Render contract); **fallback = bundle a font** (reopening `lens-fonts`) if the
+  gate fails. Font *selection* (bundled defaults, user-supplied files, Nerd-Font
   symbol fallback) is a runtime **font registry** deferred to the settings
   workstream and owned by `lens-app` (`docs/SPEC-GAPS.md` §7).
 
@@ -91,8 +98,9 @@ a per-file adopt/adapt/exclude manifest. gpui-ghostty is reference-only.
   `libghostty-vt` parses APC/DCS; unsupported image payloads are consumed with
   strict bounds and no per-byte warnings. Lens does not inherit Ghostty's large
   Kitty image-allocation defaults.
-- Build reproducibility: normal builds are offline w.r.t. the vendored crates;
-  the Ghostty source pin is a blobless fetch cached in `OUT_DIR`. The `ZIG`
+- Build reproducibility: **a clean build fetches** the pinned Ghostty source
+  (blobless, cached in `OUT_DIR`) and Zig's system deps — pinned/reproducible but
+  **not offline**; only cached rebuilds are offline (see Scope). The `ZIG`
   override + one-line `build.rs` patch are documented in the vendor README and
   re-applied on each pin bump.
 
@@ -102,7 +110,8 @@ REST assertions are grounded in `openapi.json` (paths
 `/v1/sessions/{sid}/resources/terminals[/{tid}]`; schemas `SessionResourceObject`,
 `ResourceEventData`, `SessionResourceCreatedEvent`, `SessionResourceDeletedEvent`,
 `SessionSupersededEvent`). WS facts absent from OpenAPI were source-audited at
-`08285468` **and live-verified** against a real 0.5.1 server (Spike B, B2).
+`08285468`; the wire contract + `4404` were **live-verified** (Spike B, B2);
+`4405`/`4500` remain **source-derived** (not live-triggered).
 
 - Terminal resources expose `id`, `session_id`, `name`, `environment`, and
   metadata incl. `terminal_name`, `session_key`, `running`, `terminal_transport`.
@@ -115,13 +124,16 @@ REST assertions are grounded in `openapi.json` (paths
   app-level close). No auth on a local dev server (`permission_store is None`).
 - **The wire is transport-independent raw VT** (the load-bearing Spike-B finding).
   omnigent has two server-side bridges — `control` (default) and `pty` — but both
-  deliver **identical raw VT binary frames** to the client; the tmux control-mode
-  `%output` protocol is decoded **server-side**. **The client cannot tell which
-  transport served it, needs no tmux-control parser, and does not request a
-  transport** (correcting the 2026-07-14 spec's `transport=pty`). `pty` remains a
-  one-line escape hatch if a reconnect-fidelity issue ever surfaces; none did in
-  B2 (control seeds current screen via `capture-pane`, pty via `tmux attach`
-  redraw — both raw VT, both prefixed with a clear; no history duplication).
+  deliver the **same raw-VT wire contract** (binary frames of raw VT); the tmux
+  control-mode `%output` protocol is decoded **server-side**. **The client cannot
+  tell which served it, needs no tmux-control parser, and does not request a
+  transport** (correcting the 2026-07-14 spec's `transport=pty`). The reconnect
+  **seed bytes/sizes differ** (control `capture-pane` ~1.4 KB, pty `tmux attach`
+  redraw ~3.1 KB), both raw VT, both prefixed with a clear. ⚠ Whether feeding a
+  reconnect seed into a **retained** engine (which already holds scrollback)
+  duplicates history is **NOT proven by Spike B** — it is a **Slice 1d acceptance
+  test** (see Threading). `pty` remains a **documented** escape hatch (a future
+  change, never a silent per-attach toggle).
 - Framing: server→client **binary** = raw VT → feed verbatim to `vt_write`;
   client→server **binary** = keystrokes/paste/mouse + the `on_pty_write` DA/DSR
   back-channel; client→server **text** = `{"type":"resize","cols":N,"rows":M}`.
@@ -134,11 +146,15 @@ REST assertions are grounded in `openapi.json` (paths
   detached is applied to the tmux pane but never replayed — a **transient gap**,
   not state loss. tmux panes outlive detach; the native-pane reaper reclaims an
   idle pane after ~30 min (`OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S`).
-- **Close codes** (branch the reconnect loop): `1008` authorization; `4404`
-  terminal missing/dead (**live-confirmed** via a bogus `tid`) → stop; `4405`
-  tmux client detached while terminal alive → reconnect OK (must NOT read as
-  gone); `4500` internal → retry. Generic network closure has no replay/sequence
-  proof.
+- **Close codes** — `lens-client` **classifies** these typed causes; `lens-terminal`
+  owns the *policy* (see Lifecycle), because stop/retry/downgrade/reattach needs
+  terminal identity + lifecycle state the transport layer must not hold. `4404`
+  terminal missing/dead (**live-confirmed** via a bogus `tid`) → policy: stop.
+  `1008` authorization → policy: disable input, refresh access, may downgrade to
+  read-only. `4405` tmux client detached while terminal alive (source-derived) →
+  policy: `Detached` with reattach **available, not automatic** (must NOT read as
+  gone). `4500` internal (source-derived) → policy: retry with backoff. Generic
+  network closure has no replay/sequence proof.
 - Agent switch resets terminals: `session.resource.deleted`, then any successor
   as a new `session.resource.created`.
 - Native `/clear` moves the same running terminal internally and emits the
@@ -154,8 +170,10 @@ REST assertions are grounded in `openapi.json` (paths
 
 **Full-snapshot repaint.** Each frame, re-read every visible cell from the engine
 snapshot, rebuild an immutable `Frame`, and emit all quads + glyphs. Measured
-full-redraw p95 = **2.77 ms @ 200×50** (budget 8.3 ms); the snapshot read is
-≪ 0.2 ms; the cost is GPUI primitive emission, not text shaping. Therefore:
+**ASCII PerRow** full-redraw p95 = **2.77 ms @ 200×50** (budget 8.3 ms); the
+snapshot read is ≪ 0.2 ms; **shaping + primitive emission dominate** (snapshot is
+negligible). **⚠ The PerCell wide/emoji path is heavier and can miss budget:
+~6.3 ms @ 200×50, ~16.5 ms @ 400×100 (over 8.3 ms).** Therefore:
 
 - **Dirty/damage tracking is NOT part of the contract** — an optional later
   optimization only. No per-frame diffing machinery.
@@ -163,10 +181,17 @@ full-redraw p95 = **2.77 ms @ 200×50** (budget 8.3 ms); the snapshot read is
   CJK/emoji off the monospace grid; ASCII rows shape per-row (fast). The lifted
   painter uses PerRow for ASCII rows and PerCell for any row containing a wide
   cell.
-- **System monospace `Menlo`.** The terminal references `Menlo` by name (macOS
-  guaranteed, grid-aligns). Build-time check: verify it resolves to a
-  **non-fallback** font (the Spike-A `per_row_alignment_ok`-style probe) before
-  trusting the grid. No bundled font in this workstream.
+- **System monospace `Menlo` — unproven hypothesis, gated.** References `Menlo`
+  by name (macOS-guaranteed). Spike A **never tested Menlo** — it only proved a
+  *missing* font falls back to proportional. Slice 1c **gates** Menlo with a
+  **live-GPUI** test (the probe needs a real text system — *not* a static
+  build-time check): exact non-fallback resolution + post-emoji advance +
+  box-drawing alignment. **If the gate fails, bundle a font** (reopen
+  `lens-fonts`). No bundled font *unless the gate forces it*.
+- **Full SGR is new work, not spike-proven.** `paint.rs` today emits only
+  fg/bg/bold/selection (underline/strikethrough always `None`; no italic/dim/
+  reverse). Slice 1c **extends** it to the full attribute set the wire carries;
+  the spike proved layout viability, not SGR coverage.
 - **Liftable artifact:** `spikes/terminal-render/src/paint.rs` (cell→quad+glyph
   mapping). Three codex-found fixes to apply on lift: (1) key any shape cache on
   `(font_size, font, content)` + retain the full key — or drop the cache (it
@@ -185,16 +210,28 @@ moves between threads or is touched from two. Everything follows:
 - **Engine worker = a dedicated, pinned `std::thread`** that owns the `Terminal`
   for its lifetime and is the single writer of terminal state. It **cannot** use
   gpui's background executor (which may migrate work across threads). Spawn once,
-  own forever; teardown = drop the thread. This is the create/teardown/recreate
-  worker-lifecycle control.
+  own forever. **Teardown = signal stop → the worker drains + exits → an
+  off-foreground `join`.** Dropping a `JoinHandle` only *detaches*; it does NOT
+  stop the worker or free the `Terminal`/scrollback — so Sleep/replacement
+  (which must actually reclaim the engine) completes only after a **confirmed
+  worker exit**. This is the create/teardown/recreate worker-lifecycle control.
 - **`Frame` is the Send boundary.** The engine snapshots and builds the immutable
   `Frame` (plain owned cell data — fg/bg/style/width/grapheme) **on the engine
   thread**, then publishes it as an `Arc<Frame>`. No Ghostty type crosses.
-- **Sample-to-coalesce.** The engine writes the latest `Frame` into a shared slot
-  (`ArcSwap`/mutex-`Arc`); the UI **samples** it each `request_animation_frame`.
-  The engine pushes at byte-arrival rate; the UI pulls at its own rate; bursts
-  coalesce into one painted frame with no per-byte signaling and no render-side
-  queue.
+- **Engine→transport reverse channel.** The engine also *emits* bytes — VT replies
+  (DA/DSR) via `libghostty`'s `on_pty_write` callback. These ride a **bounded
+  engine→transport channel** to the WS binary-input path; the callback must **not**
+  block the engine loop on WS I/O. This is distinct from UI→engine keystroke input.
+- **Publish-and-wake, throttled-to-coalesce.** The engine **throttles** snapshot→
+  `Frame` construction to at most once per display sample (mark dirty on new bytes;
+  build a `Frame` only when due — **not** per byte/chunk), publishes it into a
+  shared slot (`ArcSwap`/mutex-`Arc`), and sends a **coalesced foreground wake**
+  (`cx.notify()` via an async handle) under a **lost-wake-safe dirty/ack**
+  protocol. The UI samples the slot on wake / its `request_animation_frame`.
+  `ArcSwap` coalesces *paints* but neither schedules RAF nor throttles construction
+  — hence the explicit wake **and** worker-side throttle (continuous RAF would burn
+  foreground work while idle). A visibility change (hidden→shown) forces one
+  publication.
 - **Backpressure** rides the transport→engine bounded channel: sustained
   saturation enters **visible reconnect** rather than dropping PTY bytes. The
   render side never backs up (it samples, not queues).
@@ -358,10 +395,17 @@ auto-creates a terminal.
 
 ## Scrollback, memory, resize
 
-- Retain one bounded emulator state (no second raw-byte ring). Provisional
-  per-terminal limit = Ghostty's app default 10 MB, lazily allocated, oldest-first
-  eviction, visible grid always preserved; applies to newly opened terminals.
-- Track retained bytes fleet-wide. Under macOS memory warning, trim
+- Retain one bounded emulator state (no second raw-byte ring). **Near-term the cap
+  is a LINE count** — `libghostty-vt::Options::max_scrollback` is *lines*, not
+  bytes, and the binding exposes no byte-level trim (verified in the vendored
+  source). Provisional default ≈ the line-equivalent of Ghostty's **10,000,000-byte
+  (decimal, not MiB)** app default; lazily allocated, oldest-first eviction, visible
+  grid always preserved; applies to newly opened terminals. **Byte-accurate
+  retained-byte accounting + selective byte-trim require a safe-FFI extension —
+  deferred to Slice 3/4** (fleet memory pressure). Until then fleet accounting
+  *estimates* bytes (≈ lines × cols × per-cell size).
+- Track retained bytes fleet-wide (estimated until the FFI extension lands). Under
+  macOS memory warning, trim
   least-recently-viewed hidden histories first + insert a visible truncation
   marker. Under critical pressure, disconnect least-recently-viewed hidden tabs
   (retain final viewport, expose explicit reattach). Never silently drop PTY
@@ -383,9 +427,13 @@ macOS, commit, build metadata. Acceptance:
   input-event-to-first-paint measured separately.
 
 Required workloads: rapid typing with echo; sustained/bursty styled output;
-scrolling a full 10 MB history; continuous resize/reflow; hidden-to-visible
-catch-up; one visible terminal with several hidden terminals streaming. The 10 MB
-default and fleet soft budget are provisional until measurements include real RSS.
+**dense wide/emoji @ 200×50 and 400×100** (the PerCell budget risk); scrolling a
+full history (line-equivalent of 10,000,000 bytes); continuous resize/reflow;
+hidden-to-visible catch-up; one visible terminal with several hidden terminals
+streaming. The scrollback default and fleet soft budget are provisional until
+measurements include real RSS. The PerCell wide/emoji path is a **fail-closed
+gate**: if it misses budget at a required grid, Slice 1c/4 must land an
+optimization (or the budget explicitly re-scoped), not silently pass.
 
 Benchmarks at every level: Criterion for `lens-client` WS frame
 classification/control codec and bounded-queue throughput; engine benches for VT
@@ -406,32 +454,48 @@ planned against APIs that actually landed. **This cycle builds through Slice 1,
 then reassesses with real end-to-end perf.** Inspect + benchmarks are threaded
 per-slice, never deferred.
 
-- **Slice 0 — Surface freeze.** Declare the frozen public types as skeleton:
-  `open`/`TerminalTarget`/`AccessIntent`/`TerminalOpenOptions`, the full 7-state
-  lifecycle enum, `TerminalHostEvent`/`TerminalEvent`, the immutable `Frame`.
-  Crate skeletons (`lens-terminal`, demo). Nothing reshapes these later.
+- **Slice 0 — Surface freeze (names + invariants, not representations).** Freeze
+  the **opaque public type *names*** lens-ui binds to — `open`/`TerminalTarget`/
+  `AccessIntent`/`TerminalOpenOptions`, the 7 lifecycle **variant names**,
+  `TerminalHostEvent`/`TerminalEvent` (opaque seams), `Frame` (opaque immutable
+  snapshot) — plus the **seam invariants** (`open` returns in `Starting`; failures
+  are lifecycle values; no Ghostty type escapes; exactly one inbound + one outbound
+  event stream; `focus_handle`/`presentation` accessors). **Internal
+  representations stay evolvable** — `Frame` fields, event payloads, options fields
+  fill in as their producing+consuming slices converge (avoids premature
+  layer-boundary binding). Crate skeletons (`lens-terminal`, demo).
 - **Slice 1 — Live vertical slice to first pixels** (four plans):
-  - **1a — `lens-client` transport.** Typed REST list/get/create/delete + typed WS
-    attach + reconnect on `4404`/`4405`/`4500`/`1008` + bounded queues with
-    saturation→visible-reconnect. No `transport=` param. Deterministic tests +
-    live REST rider.
+  - **1a — `lens-client` transport.** Typed REST list/get/create/delete +
+    auth/access-modeled WS attach + **classify** close causes
+    (`4404`/`4405`/`4500`/`1008`) + reconnect *mechanics* (backoff, re-attach) +
+    bounded queues with saturation→visible-reconnect. **Close-code *policy*
+    (stop/retry/downgrade/reattach) lives in `lens-terminal` (1d), not here.**
+    Omits `transport=`. Deterministic tests + live REST rider.
   - **1b — `lens-terminal` engine core.** Engine worker thread owning the
     non-`Send` `Terminal`; `vt_write`; snapshot→`Frame`; resize. Driven by
     replayed Spike-B captures — offline/deterministic.
   - **1c — `lens-terminal` render.** Lift `paint.rs` + the 3 fixes + per-cell
-    wide/emoji + full SGR + system `Menlo`. Paints a `Frame`. GPUI frame-timing
-    smoke gate → re-measure end-to-end.
+    wide/emoji + **extend to full SGR** (paint.rs does fg/bg/bold/selection only —
+    italic/underline/strikethrough/reverse/dim are new work) + **gate system
+    `Menlo`** with the live-GPUI resolution/alignment test (bundle-fallback if it
+    fails). Paints a `Frame`. GPUI frame-timing smoke gate incl. **dense
+    wide/emoji @ 200×50 and 400×100 (fail-closed)** → re-measure end-to-end.
   - **1d — Convergence + demo + live proof.** Wire `open()`/`TerminalTab`/
     `presentation()`; transport↔engine bridge; lifecycle subset
     `Starting`/`Live`/`Reconnecting`/`Detached` + reconnect gap marker; standalone
     GPUI demo; live vertical proof vs real omnigent 0.5.1 (attach/input/output/
     resize/forced-drop/same-resource-reconnect/retained-engine/gap-marker).
+    **Owns close-code policy** (consuming 1a's classification) + the DA/DSR
+    forwarding + **hidden-tab Frame suppression** (it's part of the Frame seam) +
+    the **retained-engine-seed acceptance test** (does re-seeding a retained engine
+    duplicate scrollback? define the expected clear/redraw + gap-marker semantics).
     1a∥1b are independent; 1c needs 1b; 1d needs 1a+1b+1c.
 - **Slice 2 — Interaction** (next cycle): keyboard/IME/paste/selection/copy/mouse
   modes, OSC 52 policy, titles, hyperlink gestures, read-only gating.
 - **Slice 3 — Lifecycle & fleet:** reset/supersession/generation guard, Sleep/wake
-  reclaim, `ReplacementWaiting`/`Sleeping`/`Ended`, hidden-tab suppression,
-  memory-pressure trim/disconnect.
+  reclaim (confirmed-worker-exit teardown), `ReplacementWaiting`/`Sleeping`/`Ended`,
+  memory-pressure trim/disconnect + the byte-accounting FFI extension. (Hidden-tab
+  Frame suppression lands in 1d; fleet *trim/disconnect* is here.)
 - **Slice 4 — Perf acceptance:** full workload harness, real RSS, the numeric
   frame-budget gate, shipping evidence.
 
@@ -444,19 +508,27 @@ Every requirement maps to a slice; deferral is explicit, never forgotten.
 
 | Requirement | Slice(s) |
 | --- | --- |
-| Public API surface (`open`/targets/access/events/`Frame`/lifecycle enum) | 0 |
-| Transport: REST CRUD, WS attach, close codes, backpressure→reconnect | 1a |
-| Engine: VT parse, scrollback, `Frame`, resize (non-`Send` worker) | 1b |
-| Render: full-snapshot, per-cell wide/emoji, SGR, system `Menlo` | 1c |
+| Public API surface — opaque names + seam invariants (`open`/targets/access/events/`Frame`/7-variant lifecycle) | 0 |
+| Transport: REST CRUD, WS attach, close-cause **classification**, reconnect mechanics, backpressure→reconnect | 1a |
+| Auth / read-only access modeling (attach-level) | 1a (transport), 2 (read-only UI gating) |
+| Close-code **policy** (stop/retry/downgrade/reattach) | 1d |
+| Engine: VT parse, scrollback (line-cap), `Frame`, resize reflow (non-`Send` worker) | 1b |
+| DA/DSR (`on_pty_write`) reverse channel | 1b (engine callback), 1d (forward to WS) |
+| Resize end-to-end: codec / engine reflow / newest-size-before-input ordering | 1a + 1b + 1d; during-reconnect 3 |
+| Render: full-snapshot, per-cell wide/emoji, **full-SGR (extend `paint.rs`)**, **Menlo gate** (bundle-fallback) | 1c |
+| Frame publish/wake protocol + hidden-tab Frame suppression | 1d |
 | Lifecycle basic (`Starting`/`Live`/`Reconnecting`/`Detached`) + gap marker | 1d |
+| Retained-engine reconnect-seed semantics (scrollback dup / gap-marker) | 1d (acceptance test) |
 | Live vertical proof vs real omnigent | 1d |
-| Identity/replacement: `Existing`/`OpenOrCreate`, basic generation guard | 1d (guard), 3 (full) |
-| Interaction: keyboard/IME/paste/selection/copy/mouse, OSC 52, titles, hyperlinks | 2 |
-| Lifecycle full: `ReplacementWaiting`/`Sleeping`/`Ended`, Sleep/wake, supersession | 3 |
-| Fleet memory pressure, hidden-tab suppression | 3 |
-| Inspect + diagnostic rings (disabled-path proof) | per-slice (1a/1b/1c/1d), integrated 4 |
-| Benchmarks (client codec/queue, engine parse/frame/scroll/reflow, GPUI frame) | per-slice, full harness 4 |
-| Perf acceptance (numeric budgets, real RSS, workloads) | 4 |
+| Identity/replacement: `Existing`/`OpenOrCreate`, generation guard | 1d (basic guard), 3 (full) |
+| Interaction: keyboard/IME/paste/selection/copy/mouse; OSC 52 write-cap + **read-denial**; OSC progress + background notifications; titles; hyperlink gestures | 2 |
+| Lifecycle full: `ReplacementWaiting`/`Sleeping`/`Ended`, Sleep/wake (confirmed-exit teardown), supersession | 3 |
+| Fleet memory-pressure trim/disconnect + **byte-accounting FFI extension** | 3 |
+| Inspect + diagnostic rings (disabled-path proof) | per-slice (1a/1b/1c/1d **+ 2/3 extensions**), integrated 4 |
+| Benchmarks (client codec/queue, engine parse/frame/scroll/reflow, GPUI frame incl. dense wide/emoji) | per-slice, full harness 4 |
+| Verification gates: deterministic + GPUI + live tests, `rustfmt`, workspace clippy | per-slice, full 4 |
+| Perf acceptance (numeric budgets, real RSS, PerCell fail-closed gate, workloads) | 4 |
+| Build acceptance: offline-after-cache; full clean-build offline (vendored Ghostty tree) | 4 / CI trigger |
 | Font registry / bundled defaults / Nerd-Font symbols | deferred → settings workstream (SPEC-GAPS §7) |
 
 ## Open contract gaps
