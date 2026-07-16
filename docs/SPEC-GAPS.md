@@ -86,6 +86,35 @@ Ordering below is by "blocks shipping Lens to a second human" (roughly).
     `.on_action`, which silently drop the keystroke when nothing in their subtree
     is focused. Small, self-contained; no omnigent dependency.
 
+11. **Lens-owned MCP producer layer** — *surfaced 2026-07-16 designing the two new
+    wave states (`docs/superpowers/specs/2026-07-16-wave-states-scheduled-awaitingreview-design.md`).*
+    Lens exposes its own MCP server to agents: `await_review` (ask a human to review
+    a Canvas artifact), `schedule_wake` (park-until-T) + the wake-firing **scheduler**
+    (Lens sends a message at T; also drives the `Ready`-style repaint timer in the
+    poller so the `Scheduled` wave self-clears), **board control**, **messaging**, and
+    **knowledge-base** tools. This layer is the **producer** for the `Scheduled` and
+    `AwaitingReview` waves — the wave-side presentation contract is already locked (the
+    spec above), but nothing sets the `scheduled_wake_at` / `awaiting_review` card
+    fields outside `--demo` until this ships.
+    - **`await_review` mechanics (decided):** **non-blocking** — a blocking MCP call
+      would time out. The tool posts the review request to Lens and **returns control
+      to the agent, who ends its turn** (session settles into the `AwaitingReview`
+      wave). The human reviews the Canvas and submits comments, which flow back as a
+      prompt message via **MessageCenter** (a SessionStart hook *or* a second MCP tool
+      — Lens posts a "You've got Mail" message), and that return path **clears**
+      `awaiting_review`.
+    - **⚠ OPEN RISK (load-bearing):** a **remote** agent (managed host / omnigent
+      server) must reach an MCP server running on the **user's local Mac**. If that
+      transport doesn't work, the whole Lens-owned-signal model (both new waves +
+      board/messaging/KB tools) needs a different shape. Resolve this **first** — it
+      gates the layer. (The wave-side contract does not depend on it; `--demo` sets
+      the fields directly, so that slice proceeds regardless.)
+    - **Scheduling ownership:** built **Lens-owned** ("A"); a future omnigent
+      `scheduled_until` forward ("B", sibling to the `client-message-id` ask) would
+      populate the same source-agnostic `scheduled_wake_at` field with no
+      `derive_wave` change. Native harness `/loop`/`ScheduleWakeup` are **invisible**
+      (not forwarded) and out of scope until B.
+
 ## Parked contract dependencies (omnigent-side asks)
 
 - **LSP-proxy endpoint — gates any IDE-grade (band-3) file editing** (recorded
