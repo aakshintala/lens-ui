@@ -71,6 +71,21 @@ Ordering below is by "blocks shipping Lens to a second human" (roughly).
    the same remote omnigent: independent replicas, or any Lens-side sync? Decide
    the posture even if the answer is "independent, no sync."
 
+10. **Keyboard shortcuts + macOS app menu** — *surfaced 2026-07-16 during the
+    theming demo (Cmd+Q dead; ⌘. was silently focus-dependent).* gpui apps get
+    **no standard macOS menu/shortcuts for free**: `Cmd+Q` (quit), `Cmd+W`,
+    `Cmd+H`, `Cmd+M`, About, etc. are all dead until an app menu is wired via
+    gpui's menu API. Today only two app-specific globals exist
+    (`crates/lens-ui/src/shortcuts.rs`: `cmd-.` BackToBoard, `cmd-shift-t`
+    ReloadTheme — the seed of this module). Needs: (a) the standard macOS app menu
+    (Quit/Close/Hide/Minimize/About), (b) a coherent app-wide shortcut map (new
+    session, switch/cycle session, focus composer/terminal, back, reload, maybe a
+    command palette), (c) a single owner for keybinding + handler registration.
+    **Hard rule** (learned the hard way — memory `gpui-global-vs-element-actions`):
+    app-global commands MUST be `cx.on_action` globals, never element-level
+    `.on_action`, which silently drop the keystroke when nothing in their subtree
+    is focused. Small, self-contained; no omnigent dependency.
+
 ## Parked contract dependencies (omnigent-side asks)
 
 - **LSP-proxy endpoint — gates any IDE-grade (band-3) file editing** (recorded
