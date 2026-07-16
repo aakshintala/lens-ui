@@ -13,7 +13,7 @@ use lens_core::domain::usage::Cost;
 use lens_core::persist::{
     ConnectionRecord, ControlStore, SqliteControlStore, SqliteTranscriptStore,
 };
-use lens_ui::actions::BackToBoard;
+use lens_ui::actions::{BackToBoard, ReloadTheme};
 use lens_ui::board::BoardView;
 use lens_ui::card::model::SessionCard;
 use lens_ui::clock::{UiClock, WallUiClock};
@@ -76,6 +76,7 @@ fn main() {
 
     Application::new().run(move |cx: &mut App| {
         gpui_component::init(cx);
+        lens_ui::theme::install_at_startup(cx);
         register_keybindings(cx);
 
         let clock = Arc::new(WallUiClock) as Arc<dyn UiClock>;
@@ -107,7 +108,10 @@ fn main() {
 }
 
 fn register_keybindings(cx: &mut App) {
-    cx.bind_keys([KeyBinding::new("cmd-.", BackToBoard, None)]);
+    cx.bind_keys([
+        KeyBinding::new("cmd-.", BackToBoard, None),
+        KeyBinding::new("cmd-shift-t", ReloadTheme, None),
+    ]);
 }
 
 /// `--demo`: paint six cards in the six wave states (no live server needed) so the
@@ -116,6 +120,7 @@ fn register_keybindings(cx: &mut App) {
 fn run_demo() {
     Application::new().run(|cx: &mut App| {
         gpui_component::init(cx);
+        lens_ui::theme::install_at_startup(cx);
         register_keybindings(cx);
 
         let clock = Arc::new(WallUiClock) as Arc<dyn UiClock>;
