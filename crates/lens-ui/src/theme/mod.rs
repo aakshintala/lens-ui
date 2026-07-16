@@ -6,9 +6,12 @@ pub use tokens::{BaseTokens, StatusTokens};
 use anyhow::ensure;
 use gpui::App;
 use gpui::SharedString;
+use gpui_component::{Colorize, Theme, ThemeConfig};
+use gpui_component::theme::ThemeConfigColors;
 use gpui_component::ThemeMode;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::rc::Rc;
 
 const DARK_JSON: &str = include_str!("lens-dark.json");
 const LIGHT_JSON: &str = include_str!("lens-light.json");
@@ -22,6 +25,83 @@ pub struct LensTheme {
     // groups 3 (terminal) + 4 (diff): shapes in spec §5, added with their consuming surface.
 }
 impl gpui::Global for LensTheme {}
+
+pub trait ActiveLensTheme {
+    fn lens_theme(&self) -> &LensTheme;
+}
+impl ActiveLensTheme for App {
+    #[inline(always)]
+    fn lens_theme(&self) -> &LensTheme {
+        LensTheme::global(self)
+    }
+}
+impl LensTheme {
+    #[inline(always)]
+    pub fn global(cx: &App) -> &LensTheme {
+        cx.global::<LensTheme>()
+    }
+}
+
+/// Build a gpui-component `ThemeConfig` from our base tokens. `apply_config` derives every
+/// interaction family (`*_hover`/`*_active`/`*_foreground`) from these; we leave those + fonts/
+/// radius/highlight `None` → gpui-component defaults.
+pub(crate) fn to_theme_config(lens: &LensTheme) -> ThemeConfig {
+    let b = &lens.base;
+    let hex = |c: gpui::Hsla| Some(SharedString::from(c.to_hex()));
+    let mut colors = ThemeConfigColors::default();
+    colors.background = hex(b.background);
+    colors.foreground = hex(b.foreground);
+    colors.border = hex(b.border);
+    colors.muted = hex(b.muted);
+    colors.muted_foreground = hex(b.muted_foreground);
+    colors.popover = hex(b.popover);
+    colors.popover_foreground = hex(b.popover_foreground);
+    // brand color seeds `primary` (buttons/switch/checkbox read primary, NOT accent);
+    // `secondary` (subtle button bg) from muted; gpui-component `accent` (menuitem hover
+    // bg) from list_hover. *_hover/*_active/*_foreground left None → derived.
+    colors.primary = hex(b.accent);
+    colors.primary_foreground = hex(b.accent_foreground);
+    colors.secondary = hex(b.muted);
+    colors.accent = hex(b.list_hover);
+    colors.input = hex(b.input);
+    colors.caret = hex(b.caret);
+    colors.ring = hex(b.ring);
+    colors.selection = hex(b.selection);
+    colors.scrollbar = hex(b.scrollbar);
+    colors.scrollbar_thumb = hex(b.scrollbar_thumb);
+    colors.list = hex(b.list);
+    colors.list_active = hex(b.list_active);
+    colors.list_hover = hex(b.list_hover);
+    colors.progress_bar = hex(b.progress_bar);
+    colors.sidebar = hex(b.sidebar);
+    colors.sidebar_foreground = hex(b.sidebar_foreground);
+    colors.sidebar_border = hex(b.sidebar_border);
+    colors.title_bar = hex(b.title_bar);
+    colors.title_bar_border = hex(b.title_bar_border);
+    colors.tab = hex(b.tab);
+    colors.tab_active = hex(b.tab_active);
+    colors.tab_active_foreground = hex(b.tab_active_foreground);
+    colors.tab_foreground = hex(b.tab_foreground);
+    colors.success = hex(b.success);
+    colors.warning = hex(b.warning);
+    colors.danger = hex(b.danger);
+    colors.info = hex(b.info);
+    colors.overlay = hex(b.overlay);
+    ThemeConfig {
+        name: lens.name.clone(),
+        mode: lens.mode,
+        colors,
+        highlight: None,
+        ..Default::default()
+    }
+}
+
+/// Foreground-thread, pure (no I/O): install both globals. gpui-component widgets read
+/// `cx.theme()` on paint; our surfaces read `cx.lens_theme()`.
+pub(crate) fn apply(lens: LensTheme, cx: &mut App) {
+    Theme::global_mut(cx).apply_config(&Rc::new(to_theme_config(&lens)));
+    cx.set_global(lens);
+}
 
 /// Pure: parse + validate mode. No I/O, no env — fully unit-testable.
 pub(crate) fn parse_theme(json: &str, expected: ThemeMode) -> anyhow::Result<LensTheme> {
@@ -64,7 +144,6 @@ pub(crate) fn load_or_embedded(mode: ThemeMode, dir: Option<&Path>) -> anyhow::R
 /// Resolve mode: LENS_THEME override (warn on unknown value) else the current gpui-component
 /// mode (synced from the OS by `gpui_component::init`).
 pub(crate) fn select_mode(cx: &App) -> ThemeMode {
-    use gpui_component::Theme;
     match std::env::var("LENS_THEME").ok().as_deref() {
         Some("light") => ThemeMode::Light,
         Some("dark") => ThemeMode::Dark,
@@ -192,5 +271,44 @@ mod tests {
                 assert!(ratio >= 3.0, "{} status {name} contrast {ratio:.2} < 3:1", t.name);
             }
         }
+    }
+
+    /// gpui-component stores our colors after a hex round-trip (Hsla → to_hex → its own parse),
+    /// which is lossy to ~1/255 per channel (gpui-component Colorize is not round-trip-exact).
+    /// So value assertions across the bridge compare within tolerance; identity assertions
+    /// (mode, derivation, change-survival) that never cross the hex boundary a different number
+    /// of times stay exact.
+    fn close(a: gpui::Hsla, b: gpui::Hsla) -> bool {
+        let (a, b): (gpui::Rgba, gpui::Rgba) = (a.into(), b.into());
+        let d = |x: f32, y: f32| (x - y).abs() <= 2.0 / 255.0;
+        d(a.r, b.r) && d(a.g, b.g) && d(a.b, b.b)
+    }
+
+    #[gpui::test]
+    async fn bridge_pushes_base_palette_and_survives_theme_change(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            let lens = parse_theme(DARK_JSON, ThemeMode::Dark).unwrap();
+            let (accent, background) = (lens.base.accent, lens.base.background);
+            super::apply(lens, cx);
+
+            // Capture the bridged values (Hsla is Copy) then drop the borrow so Theme::change can
+            // take &mut cx below.
+            let (bridged_mode, bridged_bg, bridged_primary, bridged_primary_hover) = {
+                let t = gpui_component::Theme::global(cx);
+                (t.mode, t.background, t.primary, t.primary_hover)
+            };
+            assert_eq!(bridged_mode, ThemeMode::Dark);
+            assert!(close(bridged_bg, background), "bridged bg {bridged_bg:?} not close to {background:?}");
+            assert!(close(bridged_primary, accent), "bridged primary not close to accent");
+            // a derived interaction family is non-trivial (hover differs from base primary).
+            assert_ne!(bridged_primary_hover, bridged_primary);
+
+            // After a later Theme::change to the same mode, the palette is STILL ours (config-store
+            // defeats the wipe hazard): primary unchanged vs the bridged value (same cycle count →
+            // exact eq, no tolerance needed).
+            gpui_component::Theme::change(ThemeMode::Dark, None, cx);
+            assert_eq!(gpui_component::Theme::global(cx).primary, bridged_primary);
+        });
     }
 }
