@@ -27,6 +27,8 @@
 
 use std::sync::Arc;
 
+mod engine;
+
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, EventEmitter, FocusHandle, IntoElement, Render, Window, div};
 use lens_client::Client;
@@ -185,24 +187,11 @@ pub struct Progress {
 }
 
 // ---------------------------------------------------------------------------
-// The Frame — opaque immutable render snapshot (the Send boundary).
+// The Frame — immutable render snapshot (the Send boundary).
 // ---------------------------------------------------------------------------
 
-/// An immutable, plain-owned snapshot of the visible grid — the **Send
-/// boundary** between the non-`Send` engine worker and the gpui foreground.
-///
-/// Opaque by construction: no Ghostty type crosses this boundary. Slice 1b fills
-/// in the cell representation (owned fg/bg/style/width/grapheme) **and** the
-/// constructor + accessors; Slice 0 freezes only the *name* and the sharing
-/// contract. **Deliberately not `Clone`/`Default`** (cross-family review,
-/// 2026-07-16): frames are shared as `Arc<Frame>` — clone the `Arc`, never the
-/// snapshot — and there is no meaningful synthetic empty frame.
-#[derive(Debug)]
-#[non_exhaustive]
-pub struct Frame {
-    // Cell data (immutable owned fg/bg/style/width/grapheme) + constructor land
-    // in Slice 1b, built on the engine thread.
-}
+pub use engine::frame::{CellStyle, Frame, FrameCell, FrameRow, Rgb, UnderlineStyle};
+pub use engine::{EngineConfig, EngineError, EngineHandle, EngineInspect, FeedError, VtEngine};
 
 // ---------------------------------------------------------------------------
 // Typed event seams (opaque; grow across slices — hence `#[non_exhaustive]`).

@@ -14,12 +14,19 @@ gpui = "0.2.2"
 lens-client = { path = "../lens-client" }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
-# NOTE: `libghostty-vt` (the VT engine) is intentionally NOT a dependency yet.
-# It lands in Slice 1b, when the engine worker actually drives `vt_write`.
-# Pulling it in earlier would trigger the pinned-Ghostty `build.rs` source
-# fetch/build for a skeleton that does not use it. See the workstream design,
-# "VT foundation".
+libghostty-vt = { path = "../../vendor/libghostty-rs/libghostty-vt" }
+arc-swap = "1"
+crossbeam-channel = "0.5"
+
+[features]
+bench = []
 
 [dev-dependencies]
+criterion = { version = "0.5", default-features = false }
 gpui = { version = "0.2.2", features = ["test-support"] }
 serde_json = "1"
+
+[[bench]]
+name = "engine"
+harness = false
+required-features = ["bench"]
