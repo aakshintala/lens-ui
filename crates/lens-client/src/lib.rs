@@ -13,6 +13,7 @@ mod reconnect;
 pub mod registries;
 pub mod sessions;
 pub mod stream;
+pub mod terminal;
 
 /// The omnigent contract version this crate is pinned to (ADR-0001).
 pub const PINNED_OMNIGENT_VERSION: &str = "0.5.1";
@@ -23,6 +24,10 @@ pub use error::{ClientError, Result};
 pub use registries::{
     AgentList, DirectoryObject, HostList, HostObject, Me, PolicyEvaluation, PolicyList,
     PolicyObject, PolicyRegistry, RunnerLaunchResult, RunnerStatus,
+};
+pub use terminal::{
+    AttachHandle, AttachInspect, AttachOptions, Backoff, CloseCause, TerminalCreate,
+    TerminalMetadata, TerminalResource, Terminals, WsInbound, WsOutbound,
 };
 pub use sessions::{
     ChildSessionList, ChildSessionSummary, CommentObject, ConversationDeleted,
