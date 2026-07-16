@@ -1,5 +1,11 @@
 # Shared Terminal Infrastructure Implementation Roadmap
 
+> **⚠️ SUPERSEDED IN FULL (2026-07-16) by
+> [`docs/specs/2026-07-16-terminal-workstream-design.md`](../specs/2026-07-16-terminal-workstream-design.md)**
+> ("Build sequence" + "Completion matrix"). WP0–WP7 are re-expressed there as
+> Slices 0–4 on the vendored-libghostty model. This roadmap's *method* survives;
+> its *content* does not. Historical banner below.
+>
 > **⚠️ SUPERSEDED (2026-07-15) — VT-adoption + provenance sequencing is dead.**
 > The "provenance-controlled Ghostty **port**" / "narrow attributed gpui-ghostty
 > port" / "adopt/adapt/exclude every candidate file" / "full provenance manifest

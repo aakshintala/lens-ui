@@ -1,5 +1,11 @@
 # Shared terminal infrastructure & E2E GPUI terminal tab
 
+> **⚠️ SUPERSEDED IN FULL (2026-07-16) by
+> [`docs/specs/2026-07-16-terminal-workstream-design.md`](./2026-07-16-terminal-workstream-design.md).**
+> That refreshed doc folds this spec's still-valid requirements + the two
+> design-pass spike verdicts into one self-contained spec. Read it, not this.
+> Historical banner below.
+>
 > **⚠️ SUPERSEDED (2026-07-15) — VT-adoption mechanism only.**
 > This doc's Ghostty story — a "narrow, attributed **port** of gpui-ghostty"
 > gated by a provenance manifest that classifies every candidate file
