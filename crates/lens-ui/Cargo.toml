@@ -16,6 +16,7 @@ crossbeam-channel = "0.5"
 futures = "0.3"
 gpui = "0.2.2"
 gpui-component = "0.5.1"
+lens-client = { path = "../lens-client" }
 lens-core = { path = "../lens-core" }
 smallvec = "1"
 

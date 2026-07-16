@@ -3322,7 +3322,10 @@ version = "0.1.0"
 dependencies = [
  "gpui",
  "gpui-component",
+ "lens-client",
+ "lens-core",
  "lens-ui",
+ "url",
 ]
 
 [[package]]
@@ -3397,6 +3400,7 @@ dependencies = [
  "futures",
  "gpui",
  "gpui-component",
+ "lens-client",
  "lens-core",
  "smallvec",
 ]
