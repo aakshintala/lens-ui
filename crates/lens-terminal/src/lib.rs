@@ -36,7 +36,7 @@ mod render;
 /// with `--features test-util`. Kept out of the default public API.
 #[cfg(any(test, feature = "test-util"))]
 pub mod render_test_api {
-    pub use crate::render::fixtures::ascii_frame;
+    pub use crate::render::fixtures::{ascii_frame, mixed_ascii_wide_frame};
     pub use crate::render::metrics::{
         CellMetrics, MenloGateResult, menlo_gate_ok, per_row_alignment_ok,
     };

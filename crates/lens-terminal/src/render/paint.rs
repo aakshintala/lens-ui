@@ -89,13 +89,29 @@ fn paint_backgrounds(
     n
 }
 
+/// Whether a row must use per-cell placement. **The single routing SSOT**: a
+/// row with any wide cell is placed per-cell (per-row shaping drifts wide/emoji
+/// advances off the grid — see `metrics::per_row_alignment_ok`).
+pub fn row_needs_per_cell(row: &FrameRow) -> bool {
+    row.cells.iter().any(|c| c.wide)
+}
+
 /// Shape a whole row as one line (T3: bold-aware; full SGR lands in T5).
 /// Gap-fills missing columns with spaces so glyphs stay on the grid.
+///
+/// Invariant (behind the Menlo-gate fix): the per-row path never receives a
+/// wide cell — those route to `paint_per_cell_row` via `row_needs_per_cell`.
+/// A misroute would silently place a wide glyph off-grid, so we `debug_assert`
+/// it (debug/test only — the paint path must never panic in release).
 pub(super) fn shape_row_line(
     row: &FrameRow,
     metrics: &CellMetrics,
     window: &Window,
 ) -> Option<ShapedLine> {
+    debug_assert!(
+        !row.cells.iter().any(|c| c.wide),
+        "per-row shaping received a wide cell; wide rows must route to per-cell (row_needs_per_cell)"
+    );
     if row.cells.is_empty() {
         return None;
     }
@@ -168,6 +184,52 @@ fn paint_per_row_row(
     (1, errors)
 }
 
+/// Shape + paint each cell at its exact `col * cell_w` (T4: bold-aware; full
+/// SGR lands in T5). Used for rows containing wide/emoji cells, where per-row
+/// shaping would drift them off the grid. Skips blank cells. Returns
+/// `(shapes, paint_errors)`.
+fn paint_per_cell_row(
+    row: &FrameRow,
+    y: Pixels,
+    origin_x: Pixels,
+    metrics: &CellMetrics,
+    window: &mut Window,
+    cx: &mut App,
+) -> (u32, u32) {
+    let mut shapes = 0u32;
+    let mut errors = 0u32;
+    for cell in &row.cells {
+        if cell.grapheme == " " {
+            continue;
+        }
+        let x = origin_x + metrics.cell_w * f32::from(cell.col);
+        let run_font = if cell.style.bold {
+            metrics.bold_font.clone()
+        } else {
+            metrics.font.clone()
+        };
+        let text = SharedString::from(cell.grapheme.clone());
+        let run = TextRun {
+            len: text.len(),
+            font: run_font,
+            color: rgb_to_hsla(cell.fg),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let shaped = window
+            .text_system()
+            .shape_line(text, metrics.font_size, &[run], None);
+        shapes += 1;
+        errors += u32::from(
+            shaped
+                .paint(point(x, y), metrics.cell_h, window, cx)
+                .is_err(),
+        );
+    }
+    (shapes, errors)
+}
+
 /// Paint a full `Frame` snapshot at `origin`. Emits the default-bg fill, per
 /// cell background quads, then per-row glyphs. Never `unwrap`s the paint path:
 /// `ShapedLine::paint` errors are counted into `RenderStats::paint_errors`.
@@ -194,13 +256,18 @@ pub fn paint_frame(
 
     let mut shapes = 0u32;
     let mut per_row_rows = 0u32;
-    let per_cell_rows = 0u32; // T4 populates this.
+    let mut per_cell_rows = 0u32;
     let mut paint_errors = 0u32;
 
     for (row_i, row) in frame.grid.iter().enumerate() {
         let y = origin.y + metrics.cell_h * (row_i as f32);
-        per_row_rows += 1;
-        let (s, e) = paint_per_row_row(row, y, origin.x, metrics, window, cx);
+        let (s, e) = if row_needs_per_cell(row) {
+            per_cell_rows += 1;
+            paint_per_cell_row(row, y, origin.x, metrics, window, cx)
+        } else {
+            per_row_rows += 1;
+            paint_per_row_row(row, y, origin.x, metrics, window, cx)
+        };
         shapes += s;
         paint_errors += e;
     }
@@ -213,5 +280,39 @@ pub fn paint_frame(
         per_cell_rows,
         paint_errors,
         paint_micros: t0.elapsed().as_micros() as u64,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::CellStyle;
+
+    fn cell(col: u16, grapheme: &str, wide: bool) -> FrameCell {
+        FrameCell {
+            col,
+            grapheme: grapheme.to_owned(),
+            fg: Rgb {
+                r: 255,
+                g: 255,
+                b: 255,
+            },
+            bg: None,
+            wide,
+            selected: false,
+            style: CellStyle::default(),
+        }
+    }
+
+    #[test]
+    fn row_needs_per_cell_detects_wide() {
+        let narrow = FrameRow {
+            cells: vec![cell(0, "a", false)],
+        };
+        let wide = FrameRow {
+            cells: vec![cell(0, "日", true)],
+        };
+        assert!(!row_needs_per_cell(&narrow));
+        assert!(row_needs_per_cell(&wide));
     }
 }

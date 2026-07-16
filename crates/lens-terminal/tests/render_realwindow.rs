@@ -9,12 +9,13 @@
 //! `cx.quit()` exits the *process* on the macOS gpui path, so all workloads run
 //! in ONE `Application::run`, sequentially. Phase state lives in `Rc<RefCell>`
 //! cells (gate/perf phases advance from inside the canvas paint closure, which
-//! only sees `&mut App`); paint phases advance from `render()` after reading
-//! `TabRenderState::last_stats()` on the frame *after* the paint. On failure:
-//! `std::process::exit(1)`; on full success: `std::process::exit(0)`. xtask runs
-//! this on macOS with `--features test-util`.
+//! only sees `&mut App`); paint phases use a two-frame dance — frame A sets the
+//! frame, the canvas paints it, frame B reads `TabRenderState::last_stats()`.
+//! `setup_phase` guards frame A from reading the *previous* phase's stale stats.
+//! On failure: `std::process::exit(1)`; on success: `std::process::exit(0)`.
+//! xtask runs this on macOS with `--features test-util`.
 //!
-//! Tasks 4–8 grow the `Phase` machine (wide routing, SGR, perf).
+//! Tasks 5–8 grow the `Phase` machine (SGR, perf).
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -24,7 +25,10 @@ use gpui::{
     Application, Bounds, Context, FocusHandle, IntoElement, Render, TitlebarOptions, Window,
     WindowBounds, WindowOptions, canvas, prelude::*, px, size,
 };
-use lens_terminal::render_test_api::{CellMetrics, TabRenderState, ascii_frame, menlo_gate_ok};
+use lens_terminal::Frame;
+use lens_terminal::render_test_api::{
+    CellMetrics, RenderStats, TabRenderState, ascii_frame, menlo_gate_ok, mixed_ascii_wide_frame,
+};
 
 fn main() {
     Application::new().run(move |cx| {
@@ -54,9 +58,9 @@ enum Phase {
     ResolveMenlo,
     MenloGate,
     PaintAscii,
+    PaintWideRouting,
     Done,
-    // Tasks 4+: PaintWideRouting, PaintSgr,
-    // PerfAscii200x50, PerfWide200x50, PerfWide400x100.
+    // Tasks 5+: PaintSgr, PerfAscii200x50, PerfWide200x50, PerfWide400x100.
 }
 
 struct HarnessView {
@@ -64,6 +68,9 @@ struct HarnessView {
     metrics: Rc<RefCell<Option<CellMetrics>>>,
     focus: FocusHandle,
     state: TabRenderState,
+    /// Which paint phase's frame is currently loaded (guards the two-frame
+    /// dance from reading the previous phase's stats).
+    setup_phase: Option<Phase>,
 }
 
 impl HarnessView {
@@ -73,6 +80,23 @@ impl HarnessView {
             metrics: Rc::new(RefCell::new(None)),
             focus: cx.focus_handle(),
             state: TabRenderState::new(),
+            setup_phase: None,
+        }
+    }
+
+    /// On the first frame of a paint phase, load its frame and return `None`.
+    /// On later frames, return the stats from painting it.
+    fn paint_phase_stats(
+        &mut self,
+        phase: Phase,
+        make_frame: impl FnOnce() -> Frame,
+    ) -> Option<RenderStats> {
+        if self.setup_phase != Some(phase) {
+            self.state.set_frame(Arc::new(make_frame()));
+            self.setup_phase = Some(phase);
+            None
+        } else {
+            self.state.last_stats()
         }
     }
 }
@@ -92,17 +116,31 @@ impl Render for HarnessView {
                 self.gate_canvas(phase).into_any_element()
             }
             Phase::PaintAscii => {
-                if self.state.latest_frame.is_none() {
-                    self.state.set_frame(Arc::new(ascii_frame(40, 10, 'A')));
-                } else if let Some(stats) = self.state.last_stats() {
+                if let Some(stats) = self.paint_phase_stats(phase, || ascii_frame(40, 10, 'A')) {
                     if stats.rows_painted != 10 || stats.paint_errors != 0 || stats.shapes < 1 {
                         fail(&format!("PaintAscii stats bad: {stats:?}"));
                     }
                     println!("render_realwindow: PaintAscii OK ({stats:?})");
-                    *self.phase.borrow_mut() = Phase::Done;
+                    *self.phase.borrow_mut() = Phase::PaintWideRouting;
                 }
                 self.state
                     .render_element(&self.focus, "harness", "PaintAscii", window, cx)
+                    .into_any_element()
+            }
+            Phase::PaintWideRouting => {
+                if let Some(stats) = self.paint_phase_stats(phase, || mixed_ascii_wide_frame(20, 2))
+                {
+                    if stats.per_row_rows != 1
+                        || stats.per_cell_rows != 1
+                        || stats.paint_errors != 0
+                    {
+                        fail(&format!("PaintWideRouting stats bad: {stats:?}"));
+                    }
+                    println!("render_realwindow: PaintWideRouting OK ({stats:?})");
+                    *self.phase.borrow_mut() = Phase::Done;
+                }
+                self.state
+                    .render_element(&self.focus, "harness", "PaintWideRouting", window, cx)
                     .into_any_element()
             }
         }
