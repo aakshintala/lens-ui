@@ -207,6 +207,7 @@ pub struct Progress {
 
 pub use engine::frame::{CellStyle, Frame, FrameCell, FrameRow, Rgb, UnderlineStyle};
 pub use engine::{EngineConfig, EngineError, EngineHandle, EngineInspect, FeedError, VtEngine};
+pub use render::inspect::{RenderInspect, RenderInspectEvent, RenderInspectEventKind};
 
 // ---------------------------------------------------------------------------
 // Typed event seams (opaque; grow across slices — hence `#[non_exhaustive]`).
@@ -313,6 +314,16 @@ impl TerminalTab {
     /// concrete handling lands with the slice that owns each variant.
     pub fn on_host_event(&mut self, _event: TerminalHostEvent, _cx: &mut Context<Self>) {
         // Slice 1d+ dispatches Sleep/wake/reset/etc.
+    }
+
+    /// Enable/disable the render Inspect ring (zero-cost when disabled).
+    pub fn set_render_inspect_enabled(&self, enabled: bool) {
+        self.render.inspect.set_enabled(enabled);
+    }
+
+    /// Snapshot the render Inspect state (paint counters + recent-paints ring).
+    pub fn render_inspect(&self) -> RenderInspect {
+        self.render.inspect.snapshot()
     }
 
     /// Push a `Frame` into the render state (test/harness only — Slice 1d wires
