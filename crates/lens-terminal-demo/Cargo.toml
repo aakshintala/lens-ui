@@ -1,0 +1,19 @@
+[package]
+name = "lens-terminal-demo"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "lens-terminal-demo"
+path = "src/main.rs"
+
+[dependencies]
+# `lens-terminal`'s first consumer. The standalone GPUI window (real `open()` +
+# `TerminalTab` render) is wired in Slice 1d; Slice 0 only establishes the crate.
+lens-terminal = { path = "../lens-terminal" }
