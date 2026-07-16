@@ -11,6 +11,23 @@ pub use close::CloseCause;
 pub use rest::{TerminalCreate, TerminalMetadata, TerminalResource, Terminals};
 pub use wire::{WsInbound, WsOutbound};
 
+/// Bench/live-test-only wrappers over `pub(crate)` codec fns.
+#[cfg(any(feature = "bench", feature = "live-tests"))]
+#[doc(hidden)]
+pub mod bench_api {
+    use tokio_tungstenite::tungstenite::Message;
+
+    pub use super::wire::{WsInbound, WsOutbound};
+
+    pub fn encode_outbound(o: &WsOutbound) -> Message {
+        super::wire::encode_outbound(o)
+    }
+
+    pub fn classify_inbound(msg: Message) -> Option<WsInbound> {
+        super::wire::classify_inbound(msg)
+    }
+}
+
 use crate::client::Client;
 use crate::ids::SessionId;
 
