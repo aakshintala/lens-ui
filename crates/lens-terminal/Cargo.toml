@@ -18,6 +18,15 @@ libghostty-vt = { path = "../../vendor/libghostty-rs/libghostty-vt" }
 arc-swap = "1"
 crossbeam-channel = "0.5"
 
+[features]
+bench = []
+
 [dev-dependencies]
+criterion = { version = "0.5", default-features = false }
 gpui = { version = "0.2.2", features = ["test-support"] }
 serde_json = "1"
+
+[[bench]]
+name = "engine"
+harness = false
+required-features = ["bench"]
