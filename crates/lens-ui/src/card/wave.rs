@@ -14,7 +14,10 @@ pub enum Wave {
 /// Priority ladder for card status glow (shell §5.1). Ready uses `UiClock` window
 /// math; the decay wake is a separate gpui executor timer (dual-clock — see poller).
 pub fn derive_wave(card: &SessionCard, now_ms: i64, is_focused: bool) -> Wave {
-    if card.needs_attention {
+    if card.needs_attention
+        && card.status != SessionStatusValue::Failed
+        && card.last_task_error.is_none()
+    {
         return Wave::NeedsInput;
     }
     if card.status == SessionStatusValue::Failed || card.last_task_error.is_some() {
@@ -23,7 +26,7 @@ pub fn derive_wave(card: &SessionCard, now_ms: i64, is_focused: bool) -> Wave {
     if card.status == SessionStatusValue::Idle
         && card
             .last_completed_at
-            .is_some_and(|t| now_ms - t < READY_DECAY_MS)
+            .is_some_and(|t| now_ms.saturating_sub(t) < READY_DECAY_MS)
         && !is_focused
     {
         return Wave::Ready;
@@ -60,11 +63,19 @@ mod tests {
         card.status = SessionStatusValue::Idle;
         card.last_completed_at = Some(1_000);
         assert_eq!(derive_wave(&card, 1_000 + 60_000, false), Wave::Ready);
-        assert_ne!(derive_wave(&card, 1_000 + 60_000, true), Wave::Ready);
-        assert_ne!(
+        assert_eq!(derive_wave(&card, 1_000 + 60_000, true), Wave::Neutral);
+        assert_eq!(
             derive_wave(&card, 1_000 + READY_DECAY_MS + 1, false),
-            Wave::Ready
+            Wave::Neutral
         );
+    }
+
+    #[test]
+    fn failed_status_with_needs_attention_derives_failed_not_needs_input() {
+        let mut card = SessionCard::new(SessionId::new("s"));
+        card.status = SessionStatusValue::Failed;
+        card.needs_attention = true;
+        assert_eq!(derive_wave(&card, 0, false), Wave::Failed);
     }
 
     #[test]

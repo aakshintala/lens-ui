@@ -1,7 +1,7 @@
 use crate::clock::UiClock;
 use lens_core::actor::{ActorFeed, SummaryUpdate};
 use lens_core::domain::controls::{SandboxStatus, Todo, TodoStatus};
-use lens_core::domain::ids::SessionId;
+use lens_core::domain::ids::{HostId, SessionId};
 use lens_core::domain::scalars::{SessionLifecycle, SessionStatusValue};
 use lens_core::domain::usage::Cost;
 use lens_core::reduce::StreamUpdate;
@@ -31,6 +31,7 @@ pub struct SessionCard {
     pub llm_model: Option<String>,
     pub model_override: Option<String>,
     pub agent_name: Option<String>,
+    pub host_id: Option<HostId>,
     pub harness: Option<String>,
     pub cumulative_cost: Cost,
     pub context_window: Option<u64>,
@@ -76,6 +77,7 @@ impl SessionCard {
             llm_model: None,
             model_override: None,
             agent_name: None,
+            host_id: None,
             harness: None,
             cumulative_cost: Cost::default(),
             context_window: None,
@@ -105,6 +107,9 @@ impl SessionCard {
 
     pub fn fold_summary(&mut self, u: &SummaryUpdate, clock: &dyn UiClock) {
         self.status = u.status;
+        if u.status != SessionStatusValue::Failed {
+            self.last_task_error = None;
+        }
         self.title = u.title.clone();
         self.last_total_tokens = u.last_total_tokens;
         self.needs_attention = u.needs_attention;
@@ -112,6 +117,7 @@ impl SessionCard {
         self.llm_model = u.llm_model.clone();
         self.model_override = u.model_override.clone();
         self.agent_name = u.agent_name.clone();
+        self.host_id = u.host_id.clone();
         self.cumulative_cost = u.cumulative_cost.clone();
         self.context_window = u.context_window;
         self.sandbox_status = u.sandbox_status.clone();
@@ -150,6 +156,7 @@ impl SessionCard {
                 self.llm_model = state.llm_model.clone();
                 self.model_override = state.model_override.clone();
                 self.agent_name = state.agent_name.clone();
+                self.host_id = state.host_id.clone();
                 self.cumulative_cost = state.cumulative_cost.clone();
                 self.context_window = state.context_window;
                 self.last_total_tokens = state.last_total_tokens;
@@ -338,6 +345,20 @@ mod tests {
             &clock,
         );
         assert_eq!(card.activity_summary, "");
+    }
+
+    #[test]
+    fn summary_fold_clears_stale_error_on_non_failed_status() {
+        let clock = crate::clock::ManualUiClock::new(0);
+        let mut card = SessionCard::new(SessionId::new("s"));
+        card.last_task_error = Some(lens_core::domain::scalars::ErrorInfo {
+            code: "e".into(),
+            message: "boom".into(),
+        });
+        let mut u = base_summary();
+        u.status = SessionStatusValue::Idle;
+        card.fold_summary(&u, &clock);
+        assert!(card.last_task_error.is_none());
     }
 
     #[test]

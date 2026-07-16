@@ -71,8 +71,10 @@ fn format_ctx_pct(context_window: Option<u64>, last_total_tokens: Option<u64>) -
 }
 
 fn host_label(card: &SessionCard) -> String {
-    card.workspace
-        .clone()
+    card.host_id
+        .as_ref()
+        .map(|h| h.as_str().to_string())
+        .or_else(|| card.workspace.clone())
         .or_else(|| card.agent_name.clone())
         .unwrap_or_else(|| "—".into())
 }
@@ -115,7 +117,7 @@ pub fn render_card_chrome(
     let status = status_label(card.status);
     let harness_model = format_harness_model(card);
     let repos_row = format_repos_row(&card.repos);
-    let repos_tooltip = format_repos_tooltip(&card.repos);
+    let repos_for_tooltip = card.repos.clone();
     let spend = format_spend(&card.cumulative_cost);
     let ctx_pct = format_ctx_pct(card.context_window, card.last_total_tokens);
     let host = host_label(card);
@@ -209,6 +211,7 @@ pub fn render_card_chrome(
             let mut activity_slot = div()
                 .id("card-activity")
                 .h(px(16.0))
+                .flex_shrink_0()
                 .overflow_hidden()
                 .child(ellipsize_line(if activity.is_empty() {
                     SharedString::from(" ")
@@ -225,8 +228,10 @@ pub fn render_card_chrome(
                 .id("card-repos")
                 .text_xs()
                 .tooltip({
-                    let tip = repos_tooltip.clone();
-                    move |_, cx| cx.new(|_| ReposTooltip(tip.clone())).into()
+                    move |_, cx| {
+                        let tip = format_repos_tooltip(&repos_for_tooltip);
+                        cx.new(|_| ReposTooltip(tip)).into()
+                    }
                 }),
         )
         .child(
@@ -245,7 +250,7 @@ pub fn render_card_chrome(
         let label = match card.connection_overlay {
             ConnectionOverlay::Reconnecting => "Reconnecting…",
             ConnectionOverlay::Disconnected => "Disconnected",
-            ConnectionOverlay::Connected => unreachable!(),
+            ConnectionOverlay::Connected => "",
         };
         root = root.child(
             div()

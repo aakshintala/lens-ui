@@ -46,8 +46,10 @@ pub fn spawn_session_poller(
                         stamp_at
                     }) {
                         Ok(Some(stamp_at)) => {
-                            let delay =
-                                (stamp_at + READY_DECAY_MS - clock.now_millis()).max(0) as u64;
+                            let delay = stamp_at
+                                .saturating_add(READY_DECAY_MS)
+                                .saturating_sub(clock.now_millis())
+                                .max(0) as u64;
                             let card_t = card.clone();
                             // replace cancels any prior timer (Task cancels on drop).
                             drop(decay_timer.replace(cx.spawn(async move |cx| {
