@@ -471,7 +471,14 @@ git commit -m "feat(theme): LensTheme + parse_theme + Lens Dark/Light JSON"
         std::fs::File::create(dir.join("lens-dark.json")).unwrap().write_all(json.as_bytes()).unwrap();
 
         let loaded = super::load_or_embedded(ThemeMode::Dark, Some(&dir)).expect("load ok");
-        assert_eq!(loaded.base.background.to_hex(), Hsla::parse_hex("#123456").unwrap().to_hex());
+        // External file wins: the loaded background matches the value written to disk (compared as
+        // Hsla against a re-parse of the SAME json — gpui-component's hex<->Hsla is lossy per cycle,
+        // so never compare to_hex values that crossed the hex boundary a different number of times),
+        // and differs from the embedded default.
+        let from_file: LensTheme = serde_json::from_str(&json).unwrap();
+        let embedded: LensTheme = serde_json::from_str(DARK_JSON).unwrap();
+        assert_eq!(loaded.base.background, from_file.base.background);
+        assert_ne!(loaded.base.background, embedded.base.background);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -661,6 +668,17 @@ pub use theme::{ActiveLensTheme, LensTheme};
 - [ ] **Step 3: Write the failing bridge test (append to `mod tests` in `mod.rs`)**
 
 ```rust
+    /// gpui-component stores our colors after a hex round-trip (Hsla → to_hex → its own parse),
+    /// which is lossy to ~1/255 per channel (gpui-component Colorize is not round-trip-exact).
+    /// So value assertions across the bridge compare within tolerance; identity assertions
+    /// (mode, derivation, change-survival) that never cross the hex boundary a different number
+    /// of times stay exact.
+    fn close(a: gpui::Hsla, b: gpui::Hsla) -> bool {
+        let (a, b): (gpui::Rgba, gpui::Rgba) = (a.into(), b.into());
+        let d = |x: f32, y: f32| (x - y).abs() <= 2.0 / 255.0;
+        d(a.r, b.r) && d(a.g, b.g) && d(a.b, b.b)
+    }
+
     #[gpui::test]
     async fn bridge_pushes_base_palette_and_survives_theme_change(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
@@ -669,17 +687,23 @@ pub use theme::{ActiveLensTheme, LensTheme};
             let (accent, background) = (lens.base.accent, lens.base.background);
             super::apply(lens, cx);
 
-            let theme = gpui_component::Theme::global(cx);
-            assert_eq!(theme.mode, ThemeMode::Dark);
-            assert_eq!(theme.background, background);
-            assert_eq!(theme.primary, accent);
+            // Capture the bridged values (Hsla is Copy) then drop the borrow so Theme::change can
+            // take &mut cx below.
+            let (bridged_mode, bridged_bg, bridged_primary, bridged_primary_hover) = {
+                let t = gpui_component::Theme::global(cx);
+                (t.mode, t.background, t.primary, t.primary_hover)
+            };
+            assert_eq!(bridged_mode, ThemeMode::Dark);
+            assert!(close(bridged_bg, background), "bridged bg {bridged_bg:?} not close to {background:?}");
+            assert!(close(bridged_primary, accent), "bridged primary not close to accent");
             // a derived interaction family is non-trivial (hover differs from base primary).
-            assert_ne!(theme.primary_hover, theme.primary);
+            assert_ne!(bridged_primary_hover, bridged_primary);
 
-            // After a later Theme::change to the same mode, the palette is STILL ours
-            // (config-store defeats the wipe hazard) — primary unchanged.
+            // After a later Theme::change to the same mode, the palette is STILL ours (config-store
+            // defeats the wipe hazard): primary unchanged vs the bridged value (same cycle count →
+            // exact eq, no tolerance needed).
             gpui_component::Theme::change(ThemeMode::Dark, None, cx);
-            assert_eq!(gpui_component::Theme::global(cx).primary, accent);
+            assert_eq!(gpui_component::Theme::global(cx).primary, bridged_primary);
         });
     }
 ```
