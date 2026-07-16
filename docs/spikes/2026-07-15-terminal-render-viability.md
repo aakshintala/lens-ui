@@ -162,3 +162,22 @@ Codex confirmed the rest is solid: wide/spacer column accounting correct
 (`Wide` → 2-cell bg, `SpacerTail` skipped after coverage, `SpacerHead`
 non-rendering), no terminal-data panic paths (both `unwrap`s are on fixed
 literals).
+
+---
+
+## Real-capture replay + a build requirement it surfaced
+
+`terminal-render --replay=<capture.frames.jsonl> [--cols --rows --placement=per-row]`
+feeds a Spike-B capture's server→client binary frames into a real `libghostty-vt`
+terminal and paints it — end-to-end proof (omnigent PTY bytes → VT parse → GPUI
+paint). Verified live on the captured Claude Code TUI: **VT parse, colors, and
+layout are all correct.**
+
+**New build requirement surfaced: `lens-terminal` MUST bundle a real monospaced
+font.** With `.ZedMono` unavailable the fallback is proportional, and neither
+placement is acceptable: **PerCell** jams each glyph into a `ch_advance('0')` cell →
+visible per-char slack ("spaced-out" text); **PerRow** flows text naturally but
+without a true monospace face the columns don't grid-align (box-drawing / logo /
+status-bar drift). A bundled monospace font makes cell width == glyph advance, so
+PerRow reads clean AND aligns. Deferred to the real build (glyph placement is
+already on the punch-list above).

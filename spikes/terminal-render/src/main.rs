@@ -462,7 +462,162 @@ fn run_one(config: RunConfig) {
     let _ = slot;
 }
 
+/// Load the raw server→client PTY bytes from a B1 capture JSONL: concatenate
+/// the `hex` of every `direction:"in", kind:"binary"` frame, in order. The
+/// `utf8_lossy` field is JSON-escaped, so an unescaped `"hex":"` only ever marks
+/// the real field — safe to hand-parse without a serde dep.
+fn load_replay_bytes(path: &str) -> Vec<u8> {
+    let text = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("read replay capture {path}: {e}"));
+    let mut bytes = Vec::new();
+    for line in text.lines() {
+        if !line.contains(r#""direction":"in""#) || !line.contains(r#""kind":"binary""#) {
+            continue;
+        }
+        let Some(i) = line.find(r#""hex":""#) else {
+            continue;
+        };
+        let rest = &line[i + r#""hex":""#.len()..];
+        let Some(j) = rest.find('"') else { continue };
+        let hex = &rest[..j];
+        for pair in hex.as_bytes().chunks_exact(2) {
+            let s = std::str::from_utf8(pair).unwrap_or("00");
+            if let Ok(b) = u8::from_str_radix(s, 16) {
+                bytes.push(b);
+            }
+        }
+    }
+    bytes
+}
+
+/// A static replay view: feed a captured VT byte stream into a real
+/// `libghostty-vt` terminal once, then paint that grid via the liftable
+/// `paint_grid` mapping every frame. No measurement, never quits.
+struct ReplayView {
+    vt: Rc<RefCell<VtEngine>>,
+    bytes: Vec<u8>,
+    fed: bool,
+    metrics: Option<CellMetrics>,
+    placement: TextPlacement,
+}
+
+impl ReplayView {
+    fn new(
+        bytes: Vec<u8>,
+        cols: u16,
+        rows: u16,
+        placement: TextPlacement,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Self {
+        Self {
+            vt: Rc::new(RefCell::new(VtEngine::new(cols, rows))),
+            bytes,
+            fed: false,
+            metrics: None,
+            placement,
+        }
+    }
+}
+
+impl Render for ReplayView {
+    fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        window.request_animation_frame();
+        if self.metrics.is_none() {
+            self.metrics = Some(CellMetrics::resolve(window));
+        }
+        if !self.fed {
+            self.vt.borrow_mut().terminal.vt_write(&self.bytes);
+            self.fed = true;
+        }
+        let vt = Rc::clone(&self.vt);
+        let metrics = self.metrics.clone().expect("metrics");
+        let placement = self.placement;
+        canvas(
+            |_bounds, _window, _cx| {},
+            move |bounds, _prepaint, window, cx| {
+                let mut vt = vt.borrow_mut();
+                let VtEngine {
+                    terminal,
+                    render_state,
+                    rows,
+                    cells,
+                    cache,
+                    ..
+                } = &mut *vt;
+                let _ = cache;
+                let snapshot = render_state.update(terminal).expect("update");
+                let origin = point(bounds.origin.x + px(4.0), bounds.origin.y + px(4.0));
+                let _ = paint_grid(
+                    &snapshot,
+                    rows,
+                    cells,
+                    origin,
+                    &metrics,
+                    Strategy::S1,
+                    placement,
+                    None,
+                    window,
+                    cx,
+                );
+            },
+        )
+        .size_full()
+    }
+}
+
+fn run_replay(path: &str, cols: u16, rows: u16, placement: TextPlacement) {
+    let bytes = load_replay_bytes(path);
+    eprintln!(
+        "REPLAY {path} → {} bytes into {cols}×{rows} placement={placement:?}",
+        bytes.len()
+    );
+    Application::new().run(move |cx| {
+        let bytes = bytes.clone();
+        cx.open_window(
+            WindowOptions {
+                titlebar: Some(TitlebarOptions {
+                    title: Some(format!("terminal-render REPLAY {cols}×{rows}").into()),
+                    ..Default::default()
+                }),
+                focus: true,
+                window_bounds: Some(WindowBounds::Windowed(gpui::Bounds::centered(
+                    None,
+                    size(px(1100.0), px(800.0)),
+                    cx,
+                ))),
+                ..Default::default()
+            },
+            move |window, cx| cx.new(|cx| ReplayView::new(bytes.clone(), cols, rows, placement, window, cx)),
+        )
+        .unwrap();
+        cx.activate(true);
+    });
+}
+
 fn main() {
+    // Replay mode: paint a captured VT byte stream (bypasses the measurement sweep).
+    let raw: Vec<String> = env::args().skip(1).collect();
+    if let Some(replay) = raw.iter().find_map(|a| a.strip_prefix("--replay=")) {
+        let cols = raw
+            .iter()
+            .find_map(|a| a.strip_prefix("--cols="))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(80);
+        let rows = raw
+            .iter()
+            .find_map(|a| a.strip_prefix("--rows="))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(24);
+        let placement = if raw.iter().any(|a| a == "--placement=per-row") {
+            TextPlacement::PerRow
+        } else {
+            TextPlacement::PerCell
+        };
+        run_replay(replay, cols, rows, placement);
+        return;
+    }
+
     let configs = parse_args();
     let path = results_path();
 
