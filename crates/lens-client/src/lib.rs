@@ -25,10 +25,6 @@ pub use registries::{
     AgentList, DirectoryObject, HostList, HostObject, Me, PolicyEvaluation, PolicyList,
     PolicyObject, PolicyRegistry, RunnerLaunchResult, RunnerStatus,
 };
-pub use terminal::{
-    AttachHandle, AttachInspect, AttachOptions, Backoff, CloseCause, TerminalCreate,
-    TerminalMetadata, TerminalResource, Terminals, WsInbound, WsOutbound,
-};
 pub use sessions::{
     ChildSessionList, ChildSessionSummary, CommentObject, ConversationDeleted,
     CreateSessionRequest, CreatedSessionResponse, ElicitationAction, ElicitationResult,
@@ -36,4 +32,8 @@ pub use sessions::{
     FilesystemList, HostType, OwnerInfo, PermissionsInfo, ResourceList, ResourceObject,
     SearchQuery, SendEventAck, SessionEventInput, SessionFilter, SessionKind, SessionList,
     SessionSnapshot, SessionStatus, SessionSummary, Sessions, ShellResult,
+};
+pub use terminal::{
+    AttachHandle, AttachInspect, AttachOptions, Backoff, CloseCause, TerminalCreate,
+    TerminalMetadata, TerminalResource, Terminals, WsInbound, WsOutbound, attach,
 };

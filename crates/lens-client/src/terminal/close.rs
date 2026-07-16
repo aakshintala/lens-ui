@@ -9,7 +9,6 @@ pub enum CloseCause {
     Network,
 }
 
-#[allow(dead_code)]
 pub(crate) fn classify_close(code: u16) -> CloseCause {
     match code {
         4404 => CloseCause::TerminalNotFound,

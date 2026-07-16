@@ -6,7 +6,7 @@ mod close;
 mod rest;
 mod wire;
 
-pub use attach::{AttachHandle, AttachInspect, AttachOptions, Backoff};
+pub use attach::{AttachHandle, AttachInspect, AttachOptions, Backoff, attach};
 pub use close::CloseCause;
 pub use rest::{TerminalCreate, TerminalMetadata, TerminalResource, Terminals};
 pub use wire::{WsInbound, WsOutbound};

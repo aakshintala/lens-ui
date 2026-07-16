@@ -15,7 +15,6 @@ pub enum WsOutbound {
     Resize { cols: u16, rows: u16 },
 }
 
-#[allow(dead_code)]
 pub(crate) fn encode_outbound(o: &WsOutbound) -> Message {
     match o {
         WsOutbound::Input(bytes) => Message::Binary(bytes.clone().into()),
@@ -25,7 +24,6 @@ pub(crate) fn encode_outbound(o: &WsOutbound) -> Message {
     }
 }
 
-#[allow(dead_code)]
 pub(crate) fn classify_inbound(msg: Message) -> Option<WsInbound> {
     match msg {
         Message::Binary(bin) => Some(WsInbound::Vt(bin.into())),
