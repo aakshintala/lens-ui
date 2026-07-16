@@ -62,6 +62,18 @@ Ordering below is by "blocks shipping Lens to a second human" (roughly).
      persistence. When honored, a fresh session materialization of a TUI-native
      harness initializes to TUI (riding the same `starting TUI…` pending state)
      instead of rendered.
+   - **Known requirement — font registry** (deferred here from the terminal
+     workstream, 2026-07-16). Monospace font *selection* (terminal + chat code
+     blocks) belongs to a runtime **font registry** owned by lens-app: enumerate
+     `{system-resolvable} ∪ {optional bundled defaults} ∪ {user-supplied file}`,
+     let the user pick, hand the chosen family name down (e.g. through
+     `TerminalOpenOptions`). Until this lands, consumers use a **system monospace
+     (`Menlo`)** referenced by name — zero bundling, guaranteed on macOS, grid-
+     aligns. A `lens-fonts` bundle crate is **not** built now: without a registry
+     it has nothing to do (system fonts resolve by name for free; the spike's
+     alignment failure was a *missing* font, not the lack of a good system one).
+     Bundling a brand default (e.g. JetBrains Mono, OFL) and Nerd-Font/powerline
+     symbol fallback are decided *inside* this registry work, not before it.
 
 8. **Data lifecycle / migration** — the two-tier SQLite store has a
    schema-version degrade path, but no app-level story for data location, backup,
