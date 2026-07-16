@@ -1,3 +1,5 @@
+mod fleet_verify;
+
 use gpui::{App, AppContext, Application, KeyBinding, WindowOptions};
 use gpui_component::Root;
 use lens_client::ids::{ConnectionId, SessionId};
@@ -23,6 +25,8 @@ struct Config {
     base_url: url::Url,
     session_id: Option<SessionId>,
     data_dir: PathBuf,
+    fleet_verify: bool,
+    fleet_count: usize,
 }
 
 struct LivePrep {
@@ -40,6 +44,15 @@ fn main() {
             process::exit(2);
         }
     };
+
+    if config.fleet_verify {
+        let exit = fleet_verify::run(fleet_verify::FleetVerifyOptions {
+            base_url: config.base_url,
+            count: config.fleet_count,
+            data_dir: config.data_dir,
+        });
+        process::exit(exit);
+    }
 
     let live_prep = match config.session_id.as_ref() {
         Some(sid) => match prepare_live(&config, sid) {
@@ -115,6 +128,8 @@ fn parse_config() -> Result<Config, String> {
     let mut base_url: Option<String> = None;
     let mut session_id: Option<SessionId> = None;
     let mut data_dir: Option<PathBuf> = None;
+    let mut fleet_verify = false;
+    let mut fleet_count: usize = 10;
     let mut i = 0;
 
     while i < args.len() {
@@ -122,6 +137,21 @@ fn parse_config() -> Result<Config, String> {
             "--help" | "-h" => {
                 print_help();
                 process::exit(0);
+            }
+            "--fleet-verify" => {
+                fleet_verify = true;
+                i += 1;
+            }
+            "--count" => {
+                i += 1;
+                let raw = next_flag_value(&args, i, "--count")?;
+                fleet_count = raw
+                    .parse::<usize>()
+                    .map_err(|_| format!("--count must be a positive integer, got `{raw}`"))?;
+                if fleet_count == 0 {
+                    return Err("--count must be at least 1".into());
+                }
+                i += 1;
             }
             "--base-url" => {
                 i += 1;
@@ -156,14 +186,20 @@ fn parse_config() -> Result<Config, String> {
         .map_err(|e| format!("invalid base URL `{base_url}`: {e}"))?;
 
     let data_dir = data_dir.unwrap_or_else(|| {
-        let sid = session_id.as_ref().map(|s| s.as_str()).unwrap_or("board");
-        std::env::temp_dir().join(format!("lens-app-{sid}"))
+        if fleet_verify {
+            std::env::temp_dir().join("lens-fleet-verify")
+        } else {
+            let sid = session_id.as_ref().map(|s| s.as_str()).unwrap_or("board");
+            std::env::temp_dir().join(format!("lens-app-{sid}"))
+        }
     });
 
     Ok(Config {
         base_url,
         session_id,
         data_dir,
+        fleet_verify,
+        fleet_count,
     })
 }
 
@@ -181,13 +217,16 @@ lens-app — Lens native macOS client (board shell)
 
 Usage:
   lens-app [--base-url URL] [--session CONV_ID] [--data-dir PATH]
+  lens-app --fleet-verify [--count N] [--base-url URL] [--data-dir PATH]
 
 With --session, attaches a live omnigent session on the real FleetScheduler.
 Without --session, opens an empty board.
 
 Environment:
   LENS_OMNIGENT_URL     default base URL (fallback http://127.0.0.1:8080)
-  LENS_OMNIGENT_TOKEN   optional bearer token"
+  LENS_OMNIGENT_TOKEN   optional bearer token
+{}",
+        fleet_verify::help_section()
     );
 }
 
