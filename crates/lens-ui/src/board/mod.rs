@@ -1,5 +1,5 @@
 use crate::PtyProbe;
-use crate::actions::{BackToBoard, ReloadTheme};
+use crate::actions::BackToBoard;
 use crate::card::view::{SessionCardView, mount_cached_card};
 use crate::fleet::store::FleetStore;
 use crate::slot::{TabHandle, placeholder_tab};
@@ -35,9 +35,6 @@ pub struct BoardView {
     cached_tiles: HashMap<SessionId, AnyView>,
     working_tab: TabHandle,
     pty_probe: Option<PtyProbe>,
-    /// Holds the in-flight manual theme reload. Replacing it drops (cancels) a prior reload so a
-    /// rapid second cmd-shift-t wins instead of an older read applying after a newer one.
-    reload_task: Option<gpui::Task<()>>,
 }
 
 impl BoardView {
@@ -75,7 +72,6 @@ impl BoardView {
             cached_tiles,
             working_tab,
             pty_probe,
-            reload_task: None,
         }
     }
 
@@ -118,18 +114,6 @@ impl BoardView {
 
     fn on_back_to_board(&mut self, _: &BackToBoard, _: &mut Window, cx: &mut Context<Self>) {
         self.fleet.update(cx, |fleet, cx| fleet.blur_to_board(cx));
-    }
-
-    fn on_reload_theme(&mut self, _: &ReloadTheme, _: &mut Window, cx: &mut Context<Self>) {
-        // Window is live → read off the fg thread, apply on it. Bad edit → keep current theme.
-        let mode = crate::theme::LensTheme::global(cx).mode;
-        let Some(dir) = crate::theme::theme_dir() else {
-            eprintln!("lens-theme: reload ignored — LENS_THEME_DIR not set");
-            return;
-        };
-        // Store the task; assigning replaces (drops → cancels) any in-flight reload so the latest
-        // trigger wins and a stale read can't apply after a newer one.
-        self.reload_task = Some(crate::theme::spawn_reload(mode, dir, cx));
     }
 
     fn card_click(
@@ -259,7 +243,6 @@ impl Render for BoardView {
             .id("board-view")
             .size_full()
             .on_action(cx.listener(Self::on_back_to_board))
-            .on_action(cx.listener(Self::on_reload_theme))
             .child(body)
     }
 }

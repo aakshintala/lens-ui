@@ -77,6 +77,7 @@ fn main() {
     Application::new().run(move |cx: &mut App| {
         gpui_component::init(cx);
         lens_ui::theme::install_at_startup(cx);
+        lens_ui::theme::register_reload_action(cx);
         register_keybindings(cx);
 
         let clock = Arc::new(WallUiClock) as Arc<dyn UiClock>;
@@ -121,6 +122,7 @@ fn run_demo() {
     Application::new().run(|cx: &mut App| {
         gpui_component::init(cx);
         lens_ui::theme::install_at_startup(cx);
+        lens_ui::theme::register_reload_action(cx);
         register_keybindings(cx);
 
         let clock = Arc::new(WallUiClock) as Arc<dyn UiClock>;

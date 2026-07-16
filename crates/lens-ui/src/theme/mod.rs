@@ -3,6 +3,7 @@ mod tokens;
 
 pub use tokens::{BaseTokens, StatusTokens};
 
+use crate::actions::ReloadTheme;
 use anyhow::ensure;
 use gpui::App;
 use gpui::SharedString;
@@ -204,6 +205,33 @@ pub fn spawn_reload(mode: ThemeMode, dir: PathBuf, cx: &mut App) -> gpui::Task<(
     })
 }
 
+/// Holds the in-flight manual reload so a replacement drops (cancels) the prior one — a rapid second
+/// cmd-shift-t wins instead of a stale read applying after a newer one.
+#[derive(Default)]
+struct ReloadTask(Option<gpui::Task<()>>);
+impl gpui::Global for ReloadTask {}
+
+/// Register the manual `ReloadTheme` (cmd-shift-t) as an **app-global** action so it dispatches
+/// regardless of what element has focus (an element-level handler misses keystrokes when nothing in
+/// its subtree is focused). Call once per `App` at startup, after `install_at_startup`.
+pub fn register_reload_action(cx: &mut App) {
+    cx.set_global(ReloadTask::default());
+    cx.on_action::<ReloadTheme>(|_, cx| {
+        let mode = LensTheme::global(cx).mode;
+        let Some(dir) = theme_dir() else {
+            eprintln!("lens-theme: reload ignored — LENS_THEME_DIR not set");
+            return;
+        };
+        eprintln!(
+            "lens-theme: reloading {} from {}",
+            mode.name(),
+            dir.display()
+        );
+        let task = spawn_reload(mode, dir, cx);
+        cx.global_mut::<ReloadTask>().0 = Some(task);
+    });
+}
+
 /// Resolve mode: LENS_THEME override (warn on unknown value) else the current gpui-component
 /// mode (synced from the OS by `gpui_component::init`).
 pub(crate) fn select_mode(cx: &App) -> ThemeMode {
@@ -285,7 +313,7 @@ mod tests {
         );
         assert_eq!(
             d.status.neutral.to_hex(),
-            Hsla::parse_hex("#374151").unwrap().to_hex()
+            Hsla::parse_hex("#eab308").unwrap().to_hex()
         );
     }
 
@@ -528,15 +556,21 @@ mod tests {
 
         cx.update(|cx| {
             gpui_component::init(cx);
-            super::apply(parse_theme(DARK_JSON, ThemeMode::Dark).unwrap(), cx);
+            // Seed a DISTINCT current theme (background ≠ embedded) so a wrong embedded-fallback
+            // would be detectable — otherwise before == after == embedded is a false-green.
+            let mut seed = parse_theme(DARK_JSON, ThemeMode::Dark).unwrap();
+            seed.base.background = Hsla::parse_hex("#abcdef").unwrap();
+            super::apply(seed, cx);
         });
         let before = cx.update(|cx| LensTheme::global(cx).base.background);
 
         let _task = cx.update(|cx| super::spawn_reload(ThemeMode::Dark, dir.clone(), cx));
         cx.run_until_parked();
 
+        // A bad file must leave the running (distinct) theme untouched — if reload wrongly fell back
+        // to the embedded default, `after` would be the embedded background, not #abcdef.
         let after = cx.update(|cx| LensTheme::global(cx).base.background);
-        assert_eq!(before, after); // bad edit → running theme preserved
+        assert_eq!(before, after);
         std::fs::remove_dir_all(&dir).ok();
     }
 }
