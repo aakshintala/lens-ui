@@ -114,6 +114,9 @@ impl Render for ReposTooltip {
 }
 
 /// Card chrome inside the fixed 280×148 tile (§4.4 — reserved slots, no collapse).
+// Single internal call site (card/view.rs); the four `on_*` handlers are distinct captured closures
+// that don't bundle cleanly, and `cx` is needed for theme tokens — a struct here would only add noise.
+#[allow(clippy::too_many_arguments)]
 pub fn render_card_chrome(
     card: &SessionCard,
     wave: Wave,
@@ -174,7 +177,12 @@ pub fn render_card_chrome(
                 .text_xs()
                 .child(wave_label(wave, card.status)),
         )
-        .child(div().flex_grow().overflow_hidden().child(ellipsize_line(title)))
+        .child(
+            div()
+                .flex_grow()
+                .overflow_hidden()
+                .child(ellipsize_line(title)),
+        )
         .child(
             div()
                 .id("card-kebab")
@@ -214,11 +222,7 @@ pub fn render_card_chrome(
 
     root = root
         .child(header)
-        .child(
-            ellipsize_line(harness_model)
-                .text_xs()
-                .text_color(muted_fg),
-        )
+        .child(ellipsize_line(harness_model).text_xs().text_color(muted_fg))
         .child({
             let mut activity_slot = div()
                 .id("card-activity")

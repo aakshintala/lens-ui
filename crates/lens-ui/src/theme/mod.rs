@@ -6,9 +6,9 @@ pub use tokens::{BaseTokens, StatusTokens};
 use anyhow::ensure;
 use gpui::App;
 use gpui::SharedString;
-use gpui_component::{Colorize, Theme, ThemeConfig};
-use gpui_component::theme::ThemeConfigColors;
 use gpui_component::ThemeMode;
+use gpui_component::theme::ThemeConfigColors;
+use gpui_component::{Colorize, Theme, ThemeConfig};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -129,7 +129,11 @@ pub(crate) fn parse_theme(json: &str, expected: ThemeMode) -> anyhow::Result<Len
 /// Off-thread I/O: read + parse the external file for `mode`. Err on missing/unreadable/malformed.
 /// No fallback — the reload path uses this so a bad edit → Err → keep the current theme.
 pub(crate) fn load(mode: ThemeMode, dir: &Path) -> anyhow::Result<LensTheme> {
-    let file = if mode.is_dark() { "lens-dark.json" } else { "lens-light.json" };
+    let file = if mode.is_dark() {
+        "lens-dark.json"
+    } else {
+        "lens-light.json"
+    };
     let path = dir.join(file);
     let s = std::fs::read_to_string(&path)?;
     parse_theme(&s, mode)
@@ -144,11 +148,19 @@ pub(crate) fn load_or_embedded(mode: ThemeMode, dir: Option<&Path>) -> anyhow::R
             Err(e) => eprintln!(
                 "lens-theme: {}/{} — using embedded default: {e}",
                 dir.display(),
-                if mode.is_dark() { "lens-dark.json" } else { "lens-light.json" }
+                if mode.is_dark() {
+                    "lens-dark.json"
+                } else {
+                    "lens-light.json"
+                }
             ),
         }
     }
-    let embedded = if mode.is_dark() { DARK_JSON } else { LIGHT_JSON };
+    let embedded = if mode.is_dark() {
+        DARK_JSON
+    } else {
+        LIGHT_JSON
+    };
     parse_theme(embedded, mode)
 }
 
@@ -229,12 +241,30 @@ mod tests {
     fn dark_status_matches_board_home_seed() {
         // Seeds from board-home.html; when intentionally retuned, update render + this test together.
         let d = parse_theme(DARK_JSON, ThemeMode::Dark).unwrap();
-        assert_eq!(d.status.ready.to_hex(), Hsla::parse_hex("#4c8dff").unwrap().to_hex());
-        assert_eq!(d.status.working.to_hex(), Hsla::parse_hex("#36c98a").unwrap().to_hex());
-        assert_eq!(d.status.needs_input.to_hex(), Hsla::parse_hex("#ff8a3d").unwrap().to_hex());
-        assert_eq!(d.status.failed.to_hex(), Hsla::parse_hex("#ff5d5d").unwrap().to_hex());
-        assert_eq!(d.status.slept.to_hex(), Hsla::parse_hex("#7a8493").unwrap().to_hex());
-        assert_eq!(d.status.neutral.to_hex(), Hsla::parse_hex("#374151").unwrap().to_hex());
+        assert_eq!(
+            d.status.ready.to_hex(),
+            Hsla::parse_hex("#4c8dff").unwrap().to_hex()
+        );
+        assert_eq!(
+            d.status.working.to_hex(),
+            Hsla::parse_hex("#36c98a").unwrap().to_hex()
+        );
+        assert_eq!(
+            d.status.needs_input.to_hex(),
+            Hsla::parse_hex("#ff8a3d").unwrap().to_hex()
+        );
+        assert_eq!(
+            d.status.failed.to_hex(),
+            Hsla::parse_hex("#ff5d5d").unwrap().to_hex()
+        );
+        assert_eq!(
+            d.status.slept.to_hex(),
+            Hsla::parse_hex("#7a8493").unwrap().to_hex()
+        );
+        assert_eq!(
+            d.status.neutral.to_hex(),
+            Hsla::parse_hex("#374151").unwrap().to_hex()
+        );
     }
 
     #[test]
@@ -242,19 +272,26 @@ mod tests {
         let dark = parse_theme(DARK_JSON, ThemeMode::Dark).unwrap();
         let light = parse_theme(LIGHT_JSON, ThemeMode::Light).unwrap();
         // cheap "not dark-baked" check: distinct background, and light fg darker than its bg.
-        assert_ne!(light.base.background.to_hex(), dark.base.background.to_hex());
+        assert_ne!(
+            light.base.background.to_hex(),
+            dark.base.background.to_hex()
+        );
         assert!(luminance(light.base.foreground) < luminance(light.base.background));
     }
 
     #[test]
     fn external_file_overrides_embedded() {
         use std::io::Write;
-        let dir = std::env::temp_dir().join(format!("lens-theme-test-override-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("lens-theme-test-override-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut modified: LensTheme = serde_json::from_str(DARK_JSON).unwrap();
         modified.base.background = Hsla::parse_hex("#123456").unwrap();
         let json = serde_json::to_string(&modified).unwrap();
-        std::fs::File::create(dir.join("lens-dark.json")).unwrap().write_all(json.as_bytes()).unwrap();
+        std::fs::File::create(dir.join("lens-dark.json"))
+            .unwrap()
+            .write_all(json.as_bytes())
+            .unwrap();
 
         let loaded = super::load_or_embedded(ThemeMode::Dark, Some(&dir)).expect("load ok");
         // External file wins: the loaded background matches the value written to disk (compared as
@@ -273,7 +310,10 @@ mod tests {
         use std::io::Write;
         let dir = std::env::temp_dir().join(format!("lens-theme-test-bad-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::File::create(dir.join("lens-dark.json")).unwrap().write_all(b"{ not json").unwrap();
+        std::fs::File::create(dir.join("lens-dark.json"))
+            .unwrap()
+            .write_all(b"{ not json")
+            .unwrap();
 
         // load_or_embedded() falls back to embedded (Ok, no panic); load() surfaces the Err.
         let loaded = super::load_or_embedded(ThemeMode::Dark, Some(&dir)).expect("falls back");
@@ -297,7 +337,11 @@ mod tests {
                 ("slept", t.status.slept),
             ] {
                 let ratio = contrast_ratio(c, surface);
-                assert!(ratio >= 3.0, "{} status {name} contrast {ratio:.2} < 3:1", t.name);
+                assert!(
+                    ratio >= 3.0,
+                    "{} status {name} contrast {ratio:.2} < 3:1",
+                    t.name
+                );
             }
         }
     }

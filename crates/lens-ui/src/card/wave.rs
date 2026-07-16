@@ -110,15 +110,13 @@ mod tests {
     fn status_color_total_over_all_waves() {
         let t: crate::theme::LensTheme =
             serde_json::from_str(include_str!("../theme/lens-dark.json")).unwrap();
-        for w in [
-            Wave::Ready,
-            Wave::Working,
-            Wave::NeedsInput,
-            Wave::Failed,
-            Wave::Slept,
-            Wave::Neutral,
-        ] {
-            let _c = w.status_color(&t); // resolves for every variant
-        }
+        // Every variant resolves to its corresponding status token (compile-time exhaustiveness is
+        // the real totality guard; this pins the mapping so a mis-wire is caught).
+        assert_eq!(Wave::Ready.status_color(&t), t.status.ready);
+        assert_eq!(Wave::Working.status_color(&t), t.status.working);
+        assert_eq!(Wave::NeedsInput.status_color(&t), t.status.needs_input);
+        assert_eq!(Wave::Failed.status_color(&t), t.status.failed);
+        assert_eq!(Wave::Slept.status_color(&t), t.status.slept);
+        assert_eq!(Wave::Neutral.status_color(&t), t.status.neutral);
     }
 }
