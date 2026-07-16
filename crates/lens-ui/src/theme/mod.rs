@@ -99,7 +99,18 @@ pub(crate) fn to_theme_config(lens: &LensTheme) -> ThemeConfig {
 /// Foreground-thread, pure (no I/O): install both globals. gpui-component widgets read
 /// `cx.theme()` on paint; our surfaces read `cx.lens_theme()`.
 pub(crate) fn apply(lens: LensTheme, cx: &mut App) {
-    Theme::global_mut(cx).apply_config(&Rc::new(to_theme_config(&lens)));
+    let config = Rc::new(to_theme_config(&lens));
+    let theme = Theme::global_mut(cx);
+    theme.apply_config(&config);
+    // apply_config sets colors + mode, but only overwrites highlight_theme when config.highlight is
+    // Some. We author no highlight, so pin it to gpui-component's mode default — matching "leave
+    // highlight → gpui-component defaults" and preventing a stale highlight from the previous mode
+    // surviving a cross-mode apply.
+    theme.highlight_theme = if lens.mode.is_dark() {
+        gpui_component::highlighter::HighlightTheme::default_dark()
+    } else {
+        gpui_component::highlighter::HighlightTheme::default_light()
+    };
     cx.set_global(lens);
 }
 
@@ -288,17 +299,22 @@ mod tests {
     async fn bridge_pushes_base_palette_and_survives_theme_change(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
             gpui_component::init(cx);
+            // Pin the starting mode OPPOSITE to the theme we apply, so asserting mode == Dark below
+            // deterministically proves apply() drove the mode (not OS/init luck).
+            gpui_component::Theme::change(ThemeMode::Light, None, cx);
+
             let lens = parse_theme(DARK_JSON, ThemeMode::Dark).unwrap();
             let (accent, background) = (lens.base.accent, lens.base.background);
             super::apply(lens, cx);
 
             // Capture the bridged values (Hsla is Copy) then drop the borrow so Theme::change can
             // take &mut cx below.
-            let (bridged_mode, bridged_bg, bridged_primary, bridged_primary_hover) = {
+            let (bridged_mode, bridged_bg, bridged_primary, bridged_primary_hover, hl_appearance) = {
                 let t = gpui_component::Theme::global(cx);
-                (t.mode, t.background, t.primary, t.primary_hover)
+                (t.mode, t.background, t.primary, t.primary_hover, t.highlight_theme.appearance)
             };
-            assert_eq!(bridged_mode, ThemeMode::Dark);
+            assert_eq!(bridged_mode, ThemeMode::Dark); // apply() flipped mode Light → Dark
+            assert_eq!(hl_appearance, ThemeMode::Dark); // highlight pinned to the active mode, not stale Light
             assert!(close(bridged_bg, background), "bridged bg {bridged_bg:?} not close to {background:?}");
             assert!(close(bridged_primary, accent), "bridged primary not close to accent");
             // a derived interaction family is non-trivial (hover differs from base primary).
