@@ -25,6 +25,7 @@ const INBOUND_SEND_TIMEOUT: Duration = Duration::from_millis(50);
 
 const BACKOFF_CAP: Duration = Duration::from_secs(30);
 const BACKOFF_BASE_MS: u64 = 100;
+const INSPECT_RING_CAP: usize = 32;
 
 #[derive(Clone, Copy, Debug)]
 pub struct AttachOptions {
@@ -83,7 +84,8 @@ impl AttachInspectState {
     }
 
     fn snapshot(&self, inbound_len: usize, outbound_len: usize) -> AttachInspect {
-        let recent = if self.enabled.load(Ordering::Relaxed) {
+        let enabled = self.enabled.load(Ordering::Relaxed);
+        let recent = if enabled {
             self.recent
                 .lock()
                 .map(|r| r.iter().cloned().collect())
@@ -91,7 +93,11 @@ impl AttachInspectState {
         } else {
             Vec::new()
         };
-        let last_close = self.last_close.lock().ok().and_then(|g| *g);
+        let last_close = if enabled {
+            self.last_close.lock().ok().and_then(|g| *g)
+        } else {
+            None
+        };
         AttachInspect {
             connected: self.connected.load(Ordering::Relaxed),
             inbound_len,
@@ -103,6 +109,37 @@ impl AttachInspectState {
             last_close,
             recent,
         }
+    }
+
+    fn record_event(&self, kind: &'static str) {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Ok(mut ring) = self.recent.lock() {
+            if ring.len() >= INSPECT_RING_CAP {
+                ring.pop_front();
+            }
+            ring.push_back(InspectEvent { kind });
+        }
+    }
+
+    fn on_connected(&self) {
+        self.connected.store(true, Ordering::Relaxed);
+        self.record_event("connect");
+    }
+
+    fn on_closed(&self, cause: CloseCause) {
+        self.connected.store(false, Ordering::Relaxed);
+        if self.enabled.load(Ordering::Relaxed) {
+            if let Ok(mut last) = self.last_close.lock() {
+                *last = Some(cause);
+            }
+            self.record_event("close");
+        }
+    }
+
+    fn on_saturation(&self) {
+        self.record_event("saturation");
     }
 }
 
@@ -304,7 +341,7 @@ async fn io_loop(
         }
     };
 
-    inspect.connected.store(true, Ordering::Relaxed);
+    inspect.on_connected();
 
     let (async_out_tx, mut async_out_rx) =
         tokio::sync::mpsc::channel::<WsOutbound>(ATTACH_CHANNEL_BOUND);
@@ -338,31 +375,50 @@ async fn io_loop(
                                     .bytes_in
                                     .fetch_add(b.len() as u64, Ordering::Relaxed);
                             }
-                            let is_close = matches!(classified, WsInbound::Closed(_));
-                            if !deliver_inbound(&inbound_tx, classified) {
-                                disconnect = true;
+                            let close_cause = match classified {
+                                WsInbound::Closed(c) => Some(c),
+                                other => {
+                                    if !deliver_inbound(&inbound_tx, other) {
+                                        disconnect = true;
+                                        inspect.on_saturation();
+                                        let cause = CloseCause::Network;
+                                        inspect.on_closed(cause);
+                                        let _ = deliver_inbound(
+                                            &inbound_tx,
+                                            WsInbound::Closed(cause),
+                                        );
+                                    }
+                                    None
+                                }
+                            };
+                            if let Some(cause) = close_cause {
                                 let _ = deliver_inbound(
                                     &inbound_tx,
-                                    WsInbound::Closed(CloseCause::Network),
+                                    WsInbound::Closed(cause),
                                 );
+                                inspect.on_closed(cause);
                                 break;
                             }
-                            if is_close {
+                            if disconnect {
                                 break;
                             }
                         }
                     }
                     Some(Err(_)) => {
+                        let cause = CloseCause::Network;
+                        inspect.on_closed(cause);
                         let _ = deliver_inbound(
                             &inbound_tx,
-                            WsInbound::Closed(CloseCause::Network),
+                            WsInbound::Closed(cause),
                         );
                         break;
                     }
                     None => {
+                        let cause = CloseCause::Network;
+                        inspect.on_closed(cause);
                         let _ = deliver_inbound(
                             &inbound_tx,
-                            WsInbound::Closed(CloseCause::Network),
+                            WsInbound::Closed(cause),
                         );
                         break;
                     }
@@ -378,9 +434,11 @@ async fn io_loop(
                         inspect.bytes_out.fetch_add(out_len, Ordering::Relaxed);
                         let frame = encode_outbound(&msg);
                         if sink.send(frame).await.is_err() {
+                            let cause = CloseCause::Network;
+                            inspect.on_closed(cause);
                             let _ = deliver_inbound(
                                 &inbound_tx,
-                                WsInbound::Closed(CloseCause::Network),
+                                WsInbound::Closed(cause),
                             );
                             break;
                         }
@@ -391,13 +449,9 @@ async fn io_loop(
         }
     }
 
-    inspect.connected.store(false, Ordering::Relaxed);
     let _ = sink.close().await;
     shutdown.store(true, Ordering::Relaxed);
     let _ = forwarder.join();
-    if disconnect {
-        let _ = deliver_inbound(&inbound_tx, WsInbound::Closed(CloseCause::Network));
-    }
 }
 
 #[cfg(test)]
@@ -435,5 +489,40 @@ mod tests {
         }
         b.reset();
         assert!(b.next_delay() <= d1);
+    }
+
+    #[test]
+    fn inspect_ring_records_connect_and_close_when_enabled() {
+        let state = AttachInspectState::new(8, 8);
+        state.enabled.store(true, Ordering::Relaxed);
+        state.on_connected();
+        state.on_closed(CloseCause::Network);
+        let snap = state.snapshot(0, 0);
+        assert_eq!(snap.recent.len(), 2);
+        assert_eq!(snap.recent[0].kind, "connect");
+        assert_eq!(snap.recent[1].kind, "close");
+        assert_eq!(snap.last_close, Some(CloseCause::Network));
+    }
+
+    #[test]
+    fn inspect_ring_stays_empty_when_disabled() {
+        let state = AttachInspectState::new(8, 8);
+        state.on_connected();
+        state.on_closed(CloseCause::Network);
+        let snap = state.snapshot(0, 0);
+        assert!(snap.recent.is_empty());
+        assert!(snap.last_close.is_none());
+    }
+
+    #[test]
+    fn inspect_ring_evicts_oldest_at_capacity() {
+        let state = AttachInspectState::new(8, 8);
+        state.enabled.store(true, Ordering::Relaxed);
+        for _ in 0..INSPECT_RING_CAP + 5 {
+            state.record_event("pulse");
+        }
+        let snap = state.snapshot(0, 0);
+        assert_eq!(snap.recent.len(), INSPECT_RING_CAP);
+        assert_eq!(snap.recent[0].kind, "pulse");
     }
 }
