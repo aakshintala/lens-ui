@@ -4,9 +4,11 @@ mod tokens;
 pub use tokens::{BaseTokens, StatusTokens};
 
 use anyhow::ensure;
+use gpui::App;
 use gpui::SharedString;
 use gpui_component::ThemeMode;
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 const DARK_JSON: &str = include_str!("lens-dark.json");
 const LIGHT_JSON: &str = include_str!("lens-light.json");
@@ -31,6 +33,47 @@ pub(crate) fn parse_theme(json: &str, expected: ThemeMode) -> anyhow::Result<Len
         expected
     );
     Ok(t)
+}
+
+/// Off-thread I/O: read + parse the external file for `mode`. Err on missing/unreadable/malformed.
+/// No fallback — the reload path uses this so a bad edit → Err → keep the current theme.
+pub(crate) fn load(mode: ThemeMode, dir: &Path) -> anyhow::Result<LensTheme> {
+    let file = if mode.is_dark() { "lens-dark.json" } else { "lens-light.json" };
+    let path = dir.join(file);
+    let s = std::fs::read_to_string(&path)?;
+    parse_theme(&s, mode)
+}
+
+/// Off-thread I/O: external file wins if present+valid; otherwise the embedded default.
+/// Returns Err only if the *embedded* default is bad (a build bug). Used at startup.
+pub(crate) fn load_or_embedded(mode: ThemeMode, dir: Option<&Path>) -> anyhow::Result<LensTheme> {
+    if let Some(dir) = dir {
+        match load(mode, dir) {
+            Ok(lens) => return Ok(lens),
+            Err(e) => eprintln!(
+                "lens-theme: {}/{} — using embedded default: {e}",
+                dir.display(),
+                if mode.is_dark() { "lens-dark.json" } else { "lens-light.json" }
+            ),
+        }
+    }
+    let embedded = if mode.is_dark() { DARK_JSON } else { LIGHT_JSON };
+    parse_theme(embedded, mode)
+}
+
+/// Resolve mode: LENS_THEME override (warn on unknown value) else the current gpui-component
+/// mode (synced from the OS by `gpui_component::init`).
+pub(crate) fn select_mode(cx: &App) -> ThemeMode {
+    use gpui_component::Theme;
+    match std::env::var("LENS_THEME").ok().as_deref() {
+        Some("light") => ThemeMode::Light,
+        Some("dark") => ThemeMode::Dark,
+        Some(other) => {
+            eprintln!("lens-theme: ignoring LENS_THEME={other:?}");
+            Theme::global(cx).mode
+        }
+        None => Theme::global(cx).mode,
+    }
 }
 
 #[cfg(test)]
@@ -93,6 +136,42 @@ mod tests {
         // cheap "not dark-baked" check: distinct background, and light fg darker than its bg.
         assert_ne!(light.base.background.to_hex(), dark.base.background.to_hex());
         assert!(luminance(light.base.foreground) < luminance(light.base.background));
+    }
+
+    #[test]
+    fn external_file_overrides_embedded() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("lens-theme-test-override-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut modified: LensTheme = serde_json::from_str(DARK_JSON).unwrap();
+        modified.base.background = Hsla::parse_hex("#123456").unwrap();
+        let json = serde_json::to_string(&modified).unwrap();
+        std::fs::File::create(dir.join("lens-dark.json")).unwrap().write_all(json.as_bytes()).unwrap();
+
+        let loaded = super::load_or_embedded(ThemeMode::Dark, Some(&dir)).expect("load ok");
+        // External file wins: the loaded background matches the value written to disk (compared as
+        // Hsla against a re-parse of the SAME json — gpui-component's hex<->Hsla is lossy per cycle,
+        // so never compare to_hex values that crossed the hex boundary a different number of times),
+        // and differs from the embedded default.
+        let from_file: LensTheme = serde_json::from_str(&json).unwrap();
+        let embedded: LensTheme = serde_json::from_str(DARK_JSON).unwrap();
+        assert_eq!(loaded.base.background, from_file.base.background);
+        assert_ne!(loaded.base.background, embedded.base.background);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bad_external_file_falls_back_to_embedded() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("lens-theme-test-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::File::create(dir.join("lens-dark.json")).unwrap().write_all(b"{ not json").unwrap();
+
+        // load_or_embedded() falls back to embedded (Ok, no panic); load() surfaces the Err.
+        let loaded = super::load_or_embedded(ThemeMode::Dark, Some(&dir)).expect("falls back");
+        assert_eq!(loaded.name, SharedString::from("Lens Dark"));
+        assert!(super::load(ThemeMode::Dark, &dir).is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
