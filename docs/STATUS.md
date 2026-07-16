@@ -55,10 +55,36 @@ and roll older "Recent" pointers off this page as they age.
     `AGENTS.md` now pins the gate to **workspace-wide** `cargo clippy --workspace --all-targets
     -- -D warnings` with a clean-before-push + fix-red-before-start rule (`1b75dd0`).
 
-- **▶ NEXT: `lens-ui` skeleton Plan 2 (§4–§7 + §3.5 Ready policy) — the §3 gate is DONE+merged;
-  write Plan 2 + execute (new session).** First rendering consumer of the §13.2 seams.
-  `lens-drive` is the headless Detailed-only precedent; real live-verify (N≥10 Summary cards +
-  promote/demote) is Plan 2's acceptance (deferred here — lens-drive can't drive the Summary path).
+- **✅ DONE (2026-07-15): `lens-ui` skeleton Plan 2 (§4–§7 + §3.5) EXECUTED + merged to `main`**
+  (branch `feat/lens-ui-shell-skeleton`, 11 commits, base ef60978; **push deferred — user call**).
+  The first rendering consumer of the state model. Plan **grok-4.5-authored + Opus-verified**
+  (4 gpui-structural corrections C1–C4 folded pre-exec: Task-cancels-on-drop, no-window-false-green,
+  stubbed-bounds, spawn-closure form); executed **subagent-driven** (composer-2.5 per task + **codex
+  cross-family seam review on Tasks 2 & 4** + **Opus whole-branch final = SHIP**). Shipped
+  `crates/lens-ui` (FleetStore two-mode fake/live · per-session coalescing async poller · dual-mode
+  SessionCard fold · §4.4 render-isolation: observe-own-entity + pinned-bounds `.cached` wrapper +
+  canvas paint/bounds instrumentation · wave ladder + §3.5 Ready monotonic-trigger/per-card-decay-
+  one-shot/focus-suppress · board↔focused recompose · `ContentTab`/`TabHandle` placeholder · `⌘.`
+  app-Action) + `crates/lens-app` (gpui-component `Root` bootstrap + `--session` live attach +
+  `--fleet-verify`). **D10-at-scale RETIRED: §6.1 hermetic acceptance (real window + canvas, all 6
+  groups non-vacuous) + N≥10 LIVE-VERIFY exit-0 vs omnigent 0.5.1** (10 sessions attached Summary,
+  seeds + promote/demote green; fail-closed exit-2). lens-ui 17 lib + 1 acceptance, workspace clippy
+  `-D warnings` + fmt clean, lens-core/client untouched. Cross-family seams earned their keep (codex
+  Task-2 F1 cached-bounds Critical + Task-4 F1 Failed-shown-as-NeedsInput / F2 stale-error-stuck-
+  Failed); F3 REJECTED (focus notify = intended layout notify, not §4.4 violation). Plan:
+  `docs/plans/2026-07-15-lens-ui-shell-skeleton.md`; memory [[grok45-as-plan-author]].
+  - **⚠ Two immediate follow-ups (Opus whole-branch flagged, both DEFERRED non-blocking):**
+    (1) `spawn_live_session` blocks the fg thread on stream-subscribe at window-init — fine at N=10
+    in the harness, **MUST go off-thread before opening N warm cards for a real user**; (2) **lens-ui
+    has no render benchmark** (AGENTS.md "every layer carries a benchmark") — deferred as the first
+    follow-up (nothing to regress against until the transcript slice adds real render cost; matches
+    the lens-client-benchmarks dedicated-plan precedent). Minor N1/N2 (Ready-before-Slept rung order;
+    Detailed `StatusChanged` doesn't clear stale error) are focused-only/transient, deferred.
+
+- **▶ NEXT: `lens-ui` transcript fan-out** — the first real consumer of the Detailed feed + the disk
+  `RowSource`/D23 render window (markdown + virtualization spikes both GO); plugs into the slot API
+  this skeleton publishes. Sibling parallel surfaces (terminal via `lens-terminal::open`, workspace,
+  permissions) can fan out against `ContentTab`/`TabHandle` now. First, land the two follow-ups above.
   - **✅ DONE (2026-07-15): §3 lens-core ActorFeed gate MERGED + pushed to `main`** (`f67e686..7e9a2e7`,
     10 code commits + plan). The merge-gated one-way-door milestone (§3.1–§3.4): unified `ActorFeed`
     FIFO (replaces `updates`+`summaries`), scheduler dual-mode + spawn-in-Summary, seed-on-spawn +
