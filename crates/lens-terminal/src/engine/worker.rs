@@ -1,8 +1,6 @@
 //! Engine worker run-loop — owns the non-`Send` [`VtEngine`] on a pinned OS thread.
 
-#[cfg(test)]
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -20,15 +18,6 @@ const CMD_CHANNEL_CAP: usize = 256;
 const DA_DSR_CHANNEL_CAP: usize = 64;
 /// Default min interval between frame builds (~60 Hz).
 const DEFAULT_BUILD_INTERVAL: Duration = Duration::from_millis(16);
-
-/// Test hook: the next N `build_frame` attempts in `maybe_publish` fail synthetically.
-#[cfg(test)]
-static TEST_BUILD_FAILURES: AtomicUsize = AtomicUsize::new(0);
-
-#[cfg(test)]
-pub(crate) fn test_inject_build_failures(count: usize) {
-    TEST_BUILD_FAILURES.store(count, Ordering::SeqCst);
-}
 
 pub(crate) enum EngineCommand {
     Feed(Vec<u8>),
@@ -70,6 +59,10 @@ pub(crate) fn spawn_worker(
     frame_ready: Arc<AtomicBool>,
     waker: WakerSlot,
     inspect: Arc<InspectShared>,
+    // Per-worker test hook: the next N `build_frame` attempts fail synthetically.
+    // Per-handle (not a process-global) so parallel tests can't consume each
+    // other's injected failures. Zero-cost in production (never read).
+    test_build_failures: Arc<AtomicUsize>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut engine = match VtEngine::new(&cfg, |_| {}) {
@@ -150,6 +143,7 @@ pub(crate) fn spawn_worker(
                 visible,
                 &mut force_build,
                 &mut last_build,
+                &test_build_failures,
             );
 
             if stopping {
@@ -165,6 +159,7 @@ pub(crate) fn spawn_worker(
                         visible,
                         &mut force_build,
                         &mut last_build,
+                        &test_build_failures,
                     );
                 }
                 break;
@@ -227,6 +222,8 @@ fn handle_command(
     clippy::too_many_arguments,
     reason = "publish gate threads many engine-owned handles"
 )]
+// `test_build_failures` is consumed only under `#[cfg(test)]`.
+#[cfg_attr(not(test), allow(unused_variables))]
 fn maybe_publish(
     engine: &mut VtEngine,
     frame_slot: &Arc<ArcSwapOption<Frame>>,
@@ -237,6 +234,7 @@ fn maybe_publish(
     visible: bool,
     force_build: &mut bool,
     last_build: &mut Instant,
+    test_build_failures: &Arc<AtomicUsize>,
 ) {
     if !*dirty || !visible {
         return;
@@ -251,9 +249,9 @@ fn maybe_publish(
 
     #[cfg(test)]
     {
-        let remaining = TEST_BUILD_FAILURES.load(Ordering::SeqCst);
+        let remaining = test_build_failures.load(Ordering::SeqCst);
         if remaining > 0 {
-            TEST_BUILD_FAILURES.store(remaining - 1, Ordering::SeqCst);
+            test_build_failures.store(remaining - 1, Ordering::SeqCst);
             eprintln!("lens-terminal engine: build_frame failed (test injection)");
             *dirty = true;
             if was_forced {

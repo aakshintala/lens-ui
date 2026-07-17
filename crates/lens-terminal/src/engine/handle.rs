@@ -1,6 +1,6 @@
 //! Send-safe handle to the non-`Send` engine worker.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -31,6 +31,10 @@ pub struct EngineHandle {
     da_dsr_rx: Receiver<Vec<u8>>,
     inspect: Arc<InspectShared>,
     join: Option<JoinHandle<()>>,
+    /// Per-handle build-failure injection counter (see `spawn_worker`). Test-only
+    /// — set via `test_inject_build_failures`, shared with this handle's worker.
+    #[cfg(test)]
+    test_build_failures: Arc<AtomicUsize>,
 }
 
 impl EngineHandle {
@@ -45,6 +49,7 @@ impl EngineHandle {
         let frame_ready = Arc::new(AtomicBool::new(false));
         let waker: WakerSlot = Arc::new(Mutex::new(None));
         let inspect = Arc::new(InspectShared::new(cfg.cols, cfg.rows, cfg.max_scrollback));
+        let test_build_failures = Arc::new(AtomicUsize::new(0));
 
         let join = worker::spawn_worker(
             cfg,
@@ -55,6 +60,7 @@ impl EngineHandle {
             Arc::clone(&frame_ready),
             Arc::clone(&waker),
             Arc::clone(&inspect),
+            Arc::clone(&test_build_failures),
         );
 
         Self {
@@ -65,6 +71,8 @@ impl EngineHandle {
             da_dsr_rx,
             inspect,
             join: Some(join),
+            #[cfg(test)]
+            test_build_failures,
         }
     }
 
@@ -116,6 +124,14 @@ impl EngineHandle {
 
     pub fn inspect(&self) -> EngineInspect {
         self.inspect.snapshot()
+    }
+
+    /// Test hook: the next `count` `build_frame` attempts on **this handle's**
+    /// worker fail synthetically. Per-handle (not a process-global) so parallel
+    /// tests cannot consume each other's injected failures.
+    #[cfg(test)]
+    pub(crate) fn test_inject_build_failures(&self, count: usize) {
+        self.test_build_failures.store(count, Ordering::SeqCst);
     }
 
     /// Bypass the publish throttle — intended for deterministic tests.
@@ -313,8 +329,6 @@ mod tests {
 
     #[test]
     fn build_failure_retries_on_next_pump() {
-        use crate::engine::worker;
-
         let h = EngineHandle::spawn(test_config());
         h.set_inspect_enabled(true);
         let woke = Arc::new(AtomicUsize::new(0));
@@ -331,7 +345,7 @@ mod tests {
         let wakes_before_failure = woke.load(Ordering::Relaxed);
         let built_before_failure = h.inspect().frames_built;
 
-        worker::test_inject_build_failures(1);
+        h.test_inject_build_failures(1);
         h.feed(b"\x1b[2J\x1b[HRE".to_vec()).expect("feed");
         h.build_now().expect("build_now");
         assert_eq!(
@@ -345,7 +359,7 @@ mod tests {
             "injected build failure must not wake"
         );
 
-        worker::test_inject_build_failures(0);
+        h.test_inject_build_failures(0);
         h.build_now().expect("build_now");
         let deadline = Instant::now() + Duration::from_secs(2);
         while h.inspect().frames_built <= built_before_failure {
