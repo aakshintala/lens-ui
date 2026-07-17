@@ -9,7 +9,11 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Open threads & next up
 
-- **▶ ACTIVE: shared terminal workstream — Slices 0/1a/1b merged; Slice 1c DONE + gate GREEN (perf "block" was a debug-build artifact); 1d not started.**
+- **▶ ACTIVE: shared terminal workstream — Slices 0/1a/1b merged; Slice 1c DONE + gate GREEN + flake fixed (perf "block" was a debug-build artifact); ▶ NEXT = Slice 1d (convergence).**
+  - **▶ SLICE 1d — NOT STARTED. Kickoff handoff: `docs/handoffs/2026-07-17-terminal-slice-1d-kickoff.md`;
+    plan `docs/plans/2026-07-16-terminal-slice-1d-convergence.md` (T1–T9, subagent-driven; T1–T7
+    composer-delegable, T8 demo + T9 live rider inline — T9 needs omnigent 0.5.1). Prereq: add
+    `async-channel = "2"` to `lens-terminal/Cargo.toml`.**
   - **✅ SLICE 1c (render) — DONE, `xtask gate` GREEN on `terminal-ws` (unpushed).** T1–T7 correctness
     (`874c817`→`ae12b8b`) + perf-block resolution (`63f490f`→`f4f0d15`). Real-window harness
     (`tests/render_realwindow.rs`, `harness=false`, `test-util`-gated, xtask executes on macOS **in
