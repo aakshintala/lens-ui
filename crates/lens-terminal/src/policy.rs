@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use lens_client::error::ClientError;
+use lens_client::ids::{SessionId, TerminalId};
 use lens_client::{AttachOptions, Client, TerminalCreate, TerminalResource, attach};
 
 use crate::bridge::{self, BridgeEvent};
@@ -97,6 +98,19 @@ fn map_resolve_error(err: ClientError) -> DetachedDetail {
     }
 }
 
+/// Pre-reconnect GET guard — confirms the terminal still exists before attach retry.
+#[expect(dead_code, reason = "consumed by Task 4 reconnect scheduling")]
+pub(crate) fn preflight_reconnect(
+    client: &Client,
+    session: &SessionId,
+    tid: &TerminalId,
+) -> Result<TerminalResource, DetachedDetail> {
+    client
+        .terminals(session.clone())
+        .get(tid)
+        .map_err(map_resolve_error)
+}
+
 /// Whether a listed terminal resource matches an [`OpenOrCreate`] key.
 pub(crate) fn matches_key(resource: &TerminalResource, key: &TerminalKey) -> bool {
     resource.metadata.terminal_name.as_deref() == Some(key.terminal_name.as_str())
@@ -144,6 +158,14 @@ mod tests {
                 terminal_transport: None,
             },
         }
+    }
+
+    #[test]
+    fn map_resolve_error_not_found_maps_to_terminal_gone() {
+        let err = ClientError::NotFound {
+            what: "terminal".into(),
+        };
+        assert_eq!(map_resolve_error(err), DetachedDetail::TerminalGone);
     }
 
     #[test]
