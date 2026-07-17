@@ -29,6 +29,18 @@ impl TerminalRuntime {
         self.engine.clone()
     }
 
+    pub(crate) fn attach_ref(&self) -> Option<&AttachHandle> {
+        self.attach.as_ref()
+    }
+
+    pub(crate) fn engine_ref(&self) -> Option<&Arc<EngineHandle>> {
+        self.engine.as_ref()
+    }
+
+    pub(crate) fn bridge_is_present(&self) -> bool {
+        self.bridge.is_some()
+    }
+
     /// Foreground-safe: take self's fields into a background task that joins.
     #[expect(dead_code, reason = "consumed by Slice 1d convergence (Task 3+)")]
     pub fn teardown_off_foreground(self, cx: &mut gpui::AsyncApp) {

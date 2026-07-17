@@ -33,6 +33,7 @@ use lens_client::WsOutbound;
 
 mod bridge;
 mod engine;
+mod inspect;
 mod policy;
 mod render;
 mod runtime;
@@ -247,6 +248,7 @@ pub struct Progress {
 
 pub use engine::frame::{CellStyle, Frame, FrameCell, FrameRow, Rgb, UnderlineStyle};
 pub use engine::{EngineConfig, EngineError, EngineHandle, EngineInspect, FeedError, VtEngine};
+pub use inspect::TerminalInspect;
 pub use render::inspect::{RenderInspect, RenderInspectEvent, RenderInspectEventKind};
 
 // ---------------------------------------------------------------------------
@@ -403,6 +405,43 @@ impl TerminalTab {
     /// Snapshot the render Inspect state (paint counters + recent-paints ring).
     pub fn render_inspect(&self) -> RenderInspect {
         self.render.inspect.snapshot()
+    }
+
+    /// Enable/disable attach + engine inspect rings (zero-cost when disabled).
+    pub fn set_inspect_enabled(&self, enabled: bool) {
+        if let Some(rt) = &self.runtime {
+            if let Some(a) = rt.attach_ref() {
+                a.set_inspect_enabled(enabled);
+            }
+            if let Some(e) = rt.engine_ref() {
+                e.set_inspect_enabled(enabled);
+            }
+        }
+    }
+
+    /// Snapshot convergence inspect state (lifecycle, transport, engine).
+    pub fn inspect(&self) -> TerminalInspect {
+        let attach = self
+            .runtime
+            .as_ref()
+            .and_then(|rt| rt.attach_ref().map(lens_client::AttachHandle::inspect));
+        let engine = self
+            .runtime
+            .as_ref()
+            .and_then(|rt| rt.engine_ref().map(|e| e.inspect()));
+        let bridge_alive = self
+            .runtime
+            .as_ref()
+            .is_some_and(runtime::TerminalRuntime::bridge_is_present);
+
+        TerminalInspect {
+            lifecycle: self.lifecycle,
+            output_gap: self.presentation.output_gap,
+            bridge_alive,
+            input_enabled: self.input_enabled,
+            attach,
+            engine,
+        }
     }
 
     /// Push a `Frame` into the render state (test/harness only — Slice 1d wires
@@ -999,6 +1038,47 @@ mod tests {
 
         tab.update(cx, |tab, cx| tab.set_visible(true, cx));
         wait_for_wake_count(after_first + 1, &wake_count, "show-after-hide");
+    }
+
+    #[gpui::test]
+    async fn inspect_disabled_child_rings_cheap(cx: &mut gpui::TestAppContext) {
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        engine.feed(b"cheap".to_vec()).expect("feed");
+        engine.build_now().expect("build_now");
+        let _ = wait_for_engine_frame(engine.as_ref());
+
+        let tab = cx.new(|cx| TerminalTab::with_engine_for_test(Arc::clone(&engine), cx));
+        tab.update(cx, |tab, _cx| {
+            let snap = tab.inspect();
+            assert_eq!(snap.lifecycle, Lifecycle::Live);
+            assert!(!snap.output_gap);
+            assert!(!snap.bridge_alive);
+            assert!(!snap.input_enabled);
+            assert!(snap.attach.is_none());
+            assert!(snap.engine.is_some());
+            let engine_snap = snap.engine.unwrap();
+            assert!(engine_snap.recent.is_empty());
+            assert!(engine_snap.bytes_fed > 0);
+        });
+    }
+
+    #[gpui::test]
+    async fn inspect_enabled_populates_engine(cx: &mut gpui::TestAppContext) {
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let tab = cx.new(|cx| TerminalTab::with_engine_for_test(Arc::clone(&engine), cx));
+
+        tab.update(cx, |tab, _cx| tab.set_inspect_enabled(true));
+        engine.feed(b"inspect-tab".to_vec()).expect("feed");
+        engine.build_now().expect("build_now");
+        let _ = wait_for_engine_frame(engine.as_ref());
+
+        tab.update(cx, |tab, _cx| {
+            let snap = tab.inspect();
+            let engine_snap = snap.engine.expect("engine inspect present");
+            assert!(engine_snap.frames_built >= 1);
+            assert!(engine_snap.bytes_fed > 0);
+            assert!(!engine_snap.recent.is_empty());
+        });
     }
 
     #[test]
