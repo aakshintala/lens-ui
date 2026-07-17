@@ -9,11 +9,30 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Open threads & next up
 
-- **▶ ACTIVE: shared terminal workstream — Slices 0/1a/1b merged; Slice 1c DONE + gate GREEN + flake fixed (perf "block" was a debug-build artifact); ▶ NEXT = Slice 1d (convergence).**
-  - **▶ SLICE 1d — NOT STARTED. Kickoff handoff: `docs/handoffs/2026-07-17-terminal-slice-1d-kickoff.md`;
-    plan `docs/plans/2026-07-16-terminal-slice-1d-convergence.md` (T1–T9, subagent-driven; T1–T7
-    composer-delegable, T8 demo + T9 live rider inline — T9 needs omnigent 0.5.1). Prereq: add
-    `async-channel = "2"` to `lens-terminal/Cargo.toml`.**
+- **▶ ACTIVE: shared terminal workstream — Slices 0/1a/1b merged; Slice 1c DONE; ▶ Slice 1d CODE DONE + FULLY REVIEWED + gate GREEN (unpushed on `terminal-ws`); ONLY the live-rider RUN vs omnigent 0.5.1 remains.**
+  - **▶ SLICE 1d (convergence) — ALL CODE DONE (T1–T9), gate GREEN, subagent-driven (composer-2.5 build +
+    cross-family review: Opus inline per-task + codex on T4 reconnect machine + codex whole-branch). 17 commits
+    `f4d3080..0e111e8` on `terminal-ws` (unpushed). Ledger `.superpowers/sdd/progress.md`.**
+    - **Shipped:** bridge thread (Select multiplex attach↔engine, OutboundSaturated/AttachDisconnected/
+      EngineStopped policy events); `TerminalRuntime` off-foreground teardown (panic-free unique-Arc stop);
+      `open()` C2 background discover/attach + foreground `cx.spawn` wake sampler (durable policy_tx survives
+      reconnect); close-code policy + single 30s `RetryWindow` + reconnect state machine (read-only downgrade
+      → read-only reconnect; preflight GET; transient-retryable); resize-before-input on connect+reconnect;
+      retained-engine reconnect-seed acceptance (viewport Frame equality + fail-closed scrollback delta);
+      `TerminalInspect`; standalone GPUI demo (handshake-before-GPUI); live rider harness (real-window,
+      4-phase: attach→painted-marker→abort→Reconnecting→reattach+output_gap).
+    - **Reviews earned their keep:** codex T4 caught 2 Critical (reconnect race + foreground-block) + 4
+      Important → hardened (foreground bridge-spawn eliminates the race; single window; read-only reconnect).
+      codex whole-branch caught 6 Important integration issues (engine-death stuck-Live; initial resize
+      skipped; rider false-green; abort machinery leaking into production; inspect not durable across
+      reconnect) → all folded.
+    - **⏳ REMAINING = the LIVE RUN of the rider vs a running omnigent 0.5.1** (`tests/terminal_live.rs`,
+      `--features live-tests,test-util`, real GPUI window). Code is hardened & ready; needs a live server +
+      a session-with-terminal + the user's display. Then merge `terminal-ws` → decision.
+    - **Deferred (roll-up in ledger):** 1b engine flake `hidden_tab_suppresses_publish_until_visible`
+      (pre-existing, timing under parallel load); EngineHandle::spawn readiness result (1b); thread-exhaustion
+      foreground-panic extreme edge; per-task lens-terminal clippy should include `--features test-util`
+      (missed T3's render_realwindow break for ~6 tasks).
   - **✅ SLICE 1c (render) — DONE, `xtask gate` GREEN on `terminal-ws` (unpushed).** T1–T7 correctness
     (`874c817`→`ae12b8b`) + perf-block resolution (`63f490f`→`f4f0d15`). Real-window harness
     (`tests/render_realwindow.rs`, `harness=false`, `test-util`-gated, xtask executes on macOS **in
