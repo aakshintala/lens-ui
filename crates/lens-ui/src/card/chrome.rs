@@ -130,7 +130,10 @@ fn action_button(
         .bg(accent.opacity(0.30))
         .border_1()
         .border_color(accent.opacity(0.55))
-        .on_click(on_click)
+        .on_click(move |ev, window, cx| {
+            cx.stop_propagation();
+            on_click(ev, window, cx);
+        })
         .child(label)
 }
 
@@ -255,7 +258,10 @@ pub fn render_card_chrome(
             div()
                 .id("card-kebab")
                 .cursor_pointer()
-                .on_click(on_kebab_toggle)
+                .on_click(move |ev, window, cx| {
+                    cx.stop_propagation();
+                    on_kebab_toggle(ev, window, cx);
+                })
                 .child("⋮"),
         );
 
@@ -341,7 +347,8 @@ pub fn render_card_chrome(
             .rounded(px(2.0))
             .overflow_hidden()
             .bg(pbar_track)
-            .child(div().h_full().w(relative(ctx_frac)).bg(border)),
+            .child(div().h_full().w(relative(ctx_frac)).bg(border))
+            .when(dim, |d| d.opacity(0.42)),
     );
 
     if let Some(phase) = sweep_phase {

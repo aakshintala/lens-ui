@@ -314,6 +314,21 @@ fn gate() -> Result<()> {
         "-D",
         "warnings",
     ])?;
+
+    // Demo feature matrix (dev-release path): keep the gated demo code + its test cfg honest.
+    run(&[
+        "clippy",
+        "-p",
+        "lens-app",
+        "-p",
+        "lens-ui",
+        "--all-targets",
+        "--features",
+        "demo",
+        "--",
+        "-D",
+        "warnings",
+    ])?;
     // lens-client's feature combos compile different target sets; the live-tests
     // clippy pass catches lints the bench build misses (memory lens-client-benchmarks).
     run(&[

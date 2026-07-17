@@ -9,7 +9,6 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
-#[cfg(any(feature = "demo", test))]
 use std::time::Duration;
 
 use crate::clock::UiClock;
@@ -32,6 +31,8 @@ pub struct SessionCardView {
     /// Per-wave self-notify driver (30fps sweep/spinner, 1Hz Scheduled), live only while
     /// the card's wave animates and is on-screen (approach ②).
     anim_task: Option<gpui::Task<()>>,
+    /// Last-started driver interval; respawn when the wave's cadence class changes.
+    anim_interval: Option<Duration>,
     pub render_count: Rc<Cell<usize>>,
     pub paint_count: Rc<Cell<usize>>,
     pub last_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
@@ -54,6 +55,7 @@ impl SessionCardView {
             session_id,
             kebab_open: false,
             anim_task: None,
+            anim_interval: None,
             render_count: Rc::new(Cell::new(0)),
             paint_count: Rc::new(Cell::new(0)),
             last_bounds: Rc::new(Cell::new(None)),
@@ -86,9 +88,11 @@ impl Render for SessionCardView {
             }
             None => true,
         };
-        let tick = anim_tick_for(wave).filter(|_| visible);
-        match (tick, self.anim_task.is_some()) {
-            (Some(interval), false) => {
+        let desired = anim_tick_for(wave).filter(|_| visible);
+        if desired != self.anim_interval {
+            self.anim_task = None; // drop cancels the old timer
+            self.anim_interval = desired;
+            if let Some(interval) = desired {
                 self.anim_task = Some(cx.spawn(async move |this, cx| {
                     loop {
                         cx.background_executor().timer(interval).await;
@@ -98,8 +102,6 @@ impl Render for SessionCardView {
                     }
                 }));
             }
-            (None, true) => self.anim_task = None,
-            _ => {}
         }
         let sweep = sweep_phase(wave, now_ms);
         let ring_color = wave.status_color(cx.lens_theme());
@@ -218,6 +220,16 @@ mod tests {
             div()
                 .child(mount_cached_card(self.view_a.clone()))
                 .child(mount_cached_card(self.view_b.clone()))
+        }
+    }
+
+    struct SingleCardBoard {
+        view: Entity<SessionCardView>,
+    }
+
+    impl Render for SingleCardBoard {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().child(mount_cached_card(self.view.clone()))
         }
     }
 
@@ -363,5 +375,69 @@ mod tests {
             "static sibling B must NOT re-render when A animates (§4.4)"
         );
         let _ = fleet;
+    }
+
+    #[gpui::test]
+    async fn anim_driver_respawns_on_cadence_class_change(cx: &mut gpui::TestAppContext) {
+        use lens_core::domain::scalars::{SessionLifecycle, SessionStatusValue};
+
+        let clock = Arc::new(crate::clock::ManualUiClock::new(0));
+        let sid = SessionId::new("cadence");
+
+        let (card, view, rc) = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::install_at_startup(cx);
+            let fleet = FleetStore::new(clock, cx);
+            let card = fleet.update(cx, |f, cx| f.spawn_fake_session(sid.clone(), cx));
+            card.update(cx, |c, _| {
+                c.status = SessionStatusValue::Idle;
+                c.lifecycle = SessionLifecycle::Active;
+                c.scheduled_wake_at = Some(60_000);
+                c.scheduled_started_at = Some(0);
+            });
+            let ui_clock = fleet.read(cx).clock();
+            let view =
+                cx.new(|cx| SessionCardView::new(card.clone(), ui_clock, fleet, sid.clone(), cx));
+            let rc = view.read(cx).render_count.clone();
+            (card, view, rc)
+        });
+
+        let (_board, vcx) = cx.add_window_view(|_, _| SingleCardBoard { view: view.clone() });
+
+        vcx.run_until_parked();
+        assert_eq!(rc.get(), 1, "initial mount");
+
+        // 1 Hz Scheduled driver: one extra render per second.
+        vcx.executor().advance_clock(Duration::from_millis(1000));
+        vcx.run_until_parked();
+        let after_1hz = rc.get();
+        assert!(
+            after_1hz > 1,
+            "Scheduled 1Hz driver should tick at least once (now={after_1hz})"
+        );
+
+        // Direct Scheduled → Working: driver must respawn at ~33ms, not keep 1Hz.
+        vcx.update(|_, cx| {
+            card.update(cx, |c, cx| {
+                c.status = SessionStatusValue::Running;
+                cx.notify();
+            });
+        });
+        vcx.run_until_parked();
+        let after_transition = rc.get();
+
+        for _ in 0..5 {
+            vcx.executor().advance_clock(Duration::from_millis(40));
+            vcx.run_until_parked();
+        }
+
+        let after_fast = rc.get();
+        let fast_delta = after_fast - after_transition;
+        assert!(
+            fast_delta > 3,
+            "Working ~30fps driver should produce >3 renders in 200ms (got {fast_delta}; \
+             after_1hz={after_1hz}, after_transition={after_transition}, after_fast={after_fast})"
+        );
+        let _ = view;
     }
 }
