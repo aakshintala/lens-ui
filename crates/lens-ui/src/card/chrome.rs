@@ -1,6 +1,6 @@
 use gpui::{
     App, AppContext, Context, Div, Hsla, InteractiveElement, IntoElement, ParentElement, Render,
-    SharedString, Styled, Window, div, prelude::*, px, relative, svg,
+    SharedString, Stateful, Styled, Window, div, prelude::*, px, relative, svg,
 };
 use lens_core::domain::usage::Cost;
 
@@ -106,6 +106,29 @@ fn ellipsize_line(text: impl Into<SharedString>) -> Div {
     div().overflow_hidden().text_ellipsis().child(text.into())
 }
 
+/// A top-right pill button (Wake / Retry). `on_click` is the wired handler.
+fn action_button(
+    id: &'static str,
+    label: &'static str,
+    accent: Hsla,
+    fg: Hsla,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .cursor_pointer()
+        .rounded(px(7.0))
+        .px_2()
+        .py(px(4.0))
+        .text_xs()
+        .text_color(fg)
+        .bg(accent.opacity(0.30))
+        .border_1()
+        .border_color(accent.opacity(0.55))
+        .on_click(on_click)
+        .child(label)
+}
+
 struct ReposTooltip(String);
 
 impl Render for ReposTooltip {
@@ -115,7 +138,7 @@ impl Render for ReposTooltip {
 }
 
 /// Card chrome inside the fixed 280×148 tile (§4.4 — reserved slots, no collapse).
-// Single internal call site (card/view.rs); the four `on_*` handlers are distinct captured closures
+// Single internal call site (card/view.rs); the five `on_*` handlers are distinct captured closures
 // that don't bundle cleanly, and `cx` is needed for theme tokens — a struct here would only add noise.
 #[allow(clippy::too_many_arguments)]
 pub fn render_card_chrome(
@@ -125,6 +148,7 @@ pub fn render_card_chrome(
     sweep_phase: Option<f32>,
     cx: &App,
     on_kebab_toggle: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+    on_wake: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
     on_sleep: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
     on_send: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
     on_retry: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
@@ -146,10 +170,33 @@ pub fn render_card_chrome(
     let pbar_track = gpui::white().opacity(0.06);
     let host = host_label(card);
 
+    let dim = wave == Wave::Slept;
     let activity = if wave == Wave::Failed {
-        "Retry".into()
+        card.last_task_error
+            .as_ref()
+            .map(|e| format!("✕ {}", e.message))
+            .unwrap_or_else(|| "failed".into())
     } else {
         card.activity_summary.clone()
+    };
+
+    // Slept → bright Wake; Failed → Retry. Both sit top-right, full-opacity even when dimmed.
+    let action: Option<Stateful<Div>> = match wave {
+        Wave::Slept => Some(action_button(
+            "card-wake",
+            "Wake",
+            t.status.slept,
+            overlay_fg,
+            on_wake,
+        )),
+        Wave::Failed => Some(action_button(
+            "card-retry",
+            "Retry",
+            t.status.failed,
+            overlay_fg,
+            on_retry,
+        )),
+        _ => None,
     };
 
     let mut root = div()
@@ -170,7 +217,7 @@ pub fn render_card_chrome(
         .flex_row()
         .items_start()
         .gap_2()
-        .child(render_icon_tile(wave, border))
+        .child(render_icon_tile(wave, border).when(dim, |t| t.opacity(0.42)))
         .child(
             div()
                 .flex_grow()
@@ -184,8 +231,10 @@ pub fn render_card_chrome(
                         .text_color(border)
                         .child(wave_status_line(wave, card)),
                 )
-                .child(ellipsize_line(title)),
+                .child(ellipsize_line(title))
+                .when(dim, |c| c.opacity(0.42)),
         )
+        .children(action)
         .child(
             div()
                 .id("card-kebab")
@@ -225,9 +274,14 @@ pub fn render_card_chrome(
 
     root = root
         .child(header)
-        .child(ellipsize_line(harness_model).text_xs().text_color(muted_fg))
-        .child({
-            let mut activity_slot = div()
+        .child(
+            ellipsize_line(harness_model)
+                .text_xs()
+                .text_color(muted_fg)
+                .when(dim, |d| d.opacity(0.42)),
+        )
+        .child(
+            div()
                 .id("card-activity")
                 .h(px(16.0))
                 .flex_shrink_0()
@@ -236,12 +290,9 @@ pub fn render_card_chrome(
                     SharedString::from(" ")
                 } else {
                     SharedString::from(activity.clone())
-                }));
-            if wave == Wave::Failed {
-                activity_slot = activity_slot.cursor_pointer().on_click(on_retry);
-            }
-            activity_slot
-        })
+                }))
+                .when(dim, |d| d.opacity(0.42)),
+        )
         .child(
             ellipsize_line(repos_row)
                 .id("card-repos")
@@ -251,7 +302,8 @@ pub fn render_card_chrome(
                         let tip = format_repos_tooltip(&repos_for_tooltip);
                         cx.new(|_| ReposTooltip(tip)).into()
                     }
-                }),
+                })
+                .when(dim, |d| d.opacity(0.42)),
         )
         .child(
             div()
@@ -262,7 +314,8 @@ pub fn render_card_chrome(
                 .text_color(muted_fg)
                 .child(ellipsize_line(host).max_w(px(80.0)))
                 .child(ellipsize_line(spend))
-                .child(ellipsize_line(ctx_pct)),
+                .child(ellipsize_line(ctx_pct))
+                .when(dim, |d| d.opacity(0.42)),
         );
 
     root = root.child(

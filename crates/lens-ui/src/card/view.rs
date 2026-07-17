@@ -127,6 +127,11 @@ impl Render for SessionCardView {
                             cx.notify();
                         }),
                         cx.listener(|view, _, _, cx| {
+                            let fleet = view.fleet.clone();
+                            let sid = view.session_id.clone();
+                            fleet.update(cx, |f, _| f.wake_session(&sid));
+                        }),
+                        cx.listener(|view, _, _, cx| {
                             view.kebab_open = false;
                             view.send_command(SessionCommand::Sleep, cx);
                         }),
@@ -141,13 +146,9 @@ impl Render for SessionCardView {
                             );
                         }),
                         cx.listener(|view, _, _, cx| {
-                            view.send_command(
-                                SessionCommand::Send {
-                                    text: String::new(),
-                                    model_override: None,
-                                },
-                                cx,
-                            );
+                            let fleet = view.fleet.clone();
+                            let sid = view.session_id.clone();
+                            fleet.update(cx, |f, _| f.retry_session(&sid));
                         }),
                     ))
                     .child(
