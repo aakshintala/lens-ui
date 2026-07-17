@@ -134,10 +134,22 @@ fn run_demo() {
 
             // Size the demo window so the 8 cards land as a centered 4×2 grid
             // (4×280 card + 3×28 gap + 56 padding + 48 nav rail ≈ 1300px wide).
-            let bounds =
+            let mut bounds =
                 gpui::Bounds::centered(None, gpui::size(gpui::px(1340.0), gpui::px(860.0)), cx);
+            // Stagger + title so two demo windows can be told apart in an A/B (LENS_DEMO_LABEL).
+            if let Some(dx) = std::env::var("LENS_DEMO_DX")
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok())
+            {
+                bounds.origin.x += gpui::px(dx);
+                bounds.origin.y += gpui::px(dx);
+            }
             let window_options = WindowOptions {
                 window_bounds: Some(gpui::WindowBounds::Windowed(bounds)),
+                titlebar: Some(gpui::TitlebarOptions {
+                    title: std::env::var("LENS_DEMO_LABEL").ok().map(Into::into),
+                    ..Default::default()
+                }),
                 ..Default::default()
             };
             cx.open_window(window_options, move |window, cx| {
@@ -263,7 +275,14 @@ fn demo_preset_cards(now: i64) -> [SessionCard; 8] {
     // Wake far enough out that the demo card stays Scheduled through a visual pass
     // (short spans age past wake against wall-clock and decay to Idle mid-viewing).
     // The Scheduled activity line is the live countdown override — no static summary.
-    scheduled.scheduled_wake_at = Some(now + 45 * 60 * 1000);
+    // Default 45m so the card stays Scheduled through a full visual pass; override
+    // with LENS_DEMO_WAKE_SECS (e.g. =60) to watch the countdown ring visibly deplete.
+    let wake_secs = std::env::var("LENS_DEMO_WAKE_SECS")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(45 * 60);
+    scheduled.scheduled_wake_at = Some(now + wake_secs * 1000);
     scheduled.scheduled_started_at = Some(now);
 
     [

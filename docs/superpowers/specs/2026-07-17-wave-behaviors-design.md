@@ -234,3 +234,11 @@ here. All are on `feat/lens-app-multi-session`, gate-green.
   neighbors' breathe animations don't bleed), `28px` padding, `justify_center` + `content_start`.
   The demo window is sized (`run_demo`, demo-only) so the 8 cards land as a centered 4×2.
   A responsive/scrolling grid still rides with B6 (§8a.4).
+- **Fast-wave frame cap 30fps → 20fps** (`anim_tick_ms_fast` 33→50ms; supersedes §8's
+  "≈30fps / tick≈33ms" and the §9 measurement's 30fps assumption). Post-build perf triage
+  (`docs/spikes/2026-07-17-wave-build-perf.md`, RESOLVED) showed the overage is the **per-frame
+  full-tree re-render**, not the sweep/spinner paint (those cost ~1%), so CPU scales ~linearly
+  with frame rate. 20fps cuts steady-state CPU ~35% (≈13.8%→8.95% for 5 fast cards, back at the
+  §9 8.8% budget) and is **on-device indistinguishable from 30fps** (labeled A/B). The sweep's
+  translation — not the spinner's rotation — is the frame-rate-sensitive element; it stays smooth
+  to 20fps. 1 Hz Scheduled + still-wave gate unchanged.

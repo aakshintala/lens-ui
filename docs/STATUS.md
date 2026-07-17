@@ -21,11 +21,16 @@ and roll older "Recent" pointers off this page as they age.
   needed. Gate GREEN; codex cross-family review clean (1 Low declined — NoopTextSystem false-green). Spec
   `2026-07-17-wave-behaviors-design.md` **§11** records the as-built amendments. Handoff:
   `docs/handoffs/2026-07-17-wave-build-visual-pass-merged.md`.
-  - **Open (non-blocking):** (1) **perf/sweep triage** — canvas-era CPU ~30% over the div-era spike budget
-    (~2.3%/animating card vs 1.7%; cadence exact), accept vs scoped sweep/spinner profile w/ Instruments +
-    sweep-feather slant limit + skew-sign — `docs/spikes/2026-07-17-wave-build-perf.md`; (2) **B6
-    carry-forward** — viewport re-entry can leave a card stuck non-animating (unreachable in this
-    non-scrolling build; fix rides with B6's scroll container, never notify from the paint closure).
+  - **✅ perf/sweep triage RESOLVED (2026-07-17 follow-up):** attribution overturned the suspect —
+    the overage is the **per-frame full-tree re-render**, NOT the sweep/spinner paint (those ~1%).
+    CPU scales ~linearly with frame rate, so **shipped fast-wave cap 30fps→20fps** (`anim_tick_ms_fast`
+    33→50ms): ~35% CPU cut (13.8%→8.95% for 5 fast cards, back at the §9 8.8% budget), on-device
+    **indistinguishable from 30fps** (labeled A/B). Perceptual finding: the *sweep* (band translation),
+    not the spinner (small rotation), is the frame-rate-sensitive element. Deferred sweep-feather
+    slant limit + skew-sign untouched. Detail: `docs/spikes/2026-07-17-wave-build-perf.md` (RESOLVED).
+  - **Open (non-blocking):** **B6 carry-forward** — viewport re-entry can leave a card stuck
+    non-animating (unreachable in this non-scrolling build; fix rides with B6's scroll container,
+    never notify from the paint closure).
 
 - **✅ DONE (2026-07-16): `lens-ui` card/board audit vs shell spec §4–§5 + cheap fixes** (branch
   `feat/lens-app-multi-session`, commit `b367dbf`, branch-only). Audited `lens-app`/`lens-ui` against

@@ -41,8 +41,8 @@ pub fn wave_animates(wave: Wave) -> bool {
     sweep_period(wave).is_some() || matches!(wave, Wave::Working | Wave::Scheduled)
 }
 
-/// Frame cap per wave: 30fps for the sweep/spinner class, 1 Hz for the Scheduled
-/// countdown, `None` for still waves. (`demo` feature can override the 30fps value — Task 10.)
+/// Frame cap per wave: 20fps for the sweep/spinner class, 1 Hz for the Scheduled
+/// countdown, `None` for still waves. (`demo` feature can override the fast value — Task 10.)
 pub fn anim_tick_for(wave: Wave) -> Option<Duration> {
     if matches!(wave, Wave::Scheduled) {
         return Some(Duration::from_millis(1000));
@@ -54,7 +54,11 @@ pub fn anim_tick_for(wave: Wave) -> Option<Duration> {
 }
 
 /// The fast-class frame cap in ms. Overridable ONLY under the `demo` feature (Task 10);
-/// the shipped build is a hard 33ms (≈30fps).
+/// the shipped build is a hard 50ms (20fps). Dropped from 30fps after the perf triage
+/// (2026-07-17): the per-frame full-tree re-render — not the sweep/spinner paint — is the
+/// cost, and 20fps is on-device indistinguishable from 30fps (the sweep's translation is
+/// the frame-rate-sensitive element; it stays smooth to 20fps, jarring only by ~10fps).
+/// 30fps→20fps cut steady-state CPU ~35% (≈13.8%→9% for 5 fast cards), back at the §9 budget.
 fn anim_tick_ms_fast() -> u64 {
     #[cfg(feature = "demo")]
     {
@@ -66,7 +70,7 @@ fn anim_tick_ms_fast() -> u64 {
             return ms;
         }
     }
-    33
+    50
 }
 
 const RING_PERIOD_MS: i64 = 2400;
@@ -218,7 +222,7 @@ pub fn format_wake_countdown(remaining_ms: i64) -> String {
 }
 
 /// Depleting arc around the 44px tile, drawn full→empty as `fraction` goes 1→0.
-/// `canvas` + `arc_to` stroke (gpui has no conic-gradient). NOT in the 30fps loop — 1 Hz.
+/// `canvas` + `arc_to` stroke (gpui has no conic-gradient). NOT in the fast loop — 1 Hz.
 pub fn render_countdown_ring(status: Hsla, fraction: f32) -> impl IntoElement {
     let frac = fraction.clamp(0.0, 1.0);
     canvas(
@@ -359,11 +363,11 @@ mod tests {
         use std::time::Duration;
         assert_eq!(
             anim_tick_for(Wave::NeedsInput),
-            Some(Duration::from_millis(33))
+            Some(Duration::from_millis(50))
         );
         assert_eq!(
             anim_tick_for(Wave::Working),
-            Some(Duration::from_millis(33))
+            Some(Duration::from_millis(50))
         );
         assert_eq!(
             anim_tick_for(Wave::Scheduled),

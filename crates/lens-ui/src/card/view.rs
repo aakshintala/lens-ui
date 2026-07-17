@@ -28,7 +28,7 @@ pub struct SessionCardView {
     fleet: Entity<FleetStore>,
     session_id: SessionId,
     kebab_open: bool,
-    /// Per-wave self-notify driver (30fps sweep/spinner, 1Hz Scheduled), live only while
+    /// Per-wave self-notify driver (20fps sweep/spinner, 1Hz Scheduled), live only while
     /// the card's wave animates and is on-screen (approach ②).
     anim_task: Option<gpui::Task<()>>,
     /// Last-started driver interval; respawn when the wave's cadence class changes.
@@ -416,7 +416,7 @@ mod tests {
             "Scheduled 1Hz driver should tick at least once (now={after_1hz})"
         );
 
-        // Direct Scheduled → Working: driver must respawn at ~33ms, not keep 1Hz.
+        // Direct Scheduled → Working: driver must respawn at ~50ms (20fps), not keep 1Hz.
         vcx.update(|_, cx| {
             card.update(cx, |c, cx| {
                 c.status = SessionStatusValue::Running;
@@ -427,7 +427,7 @@ mod tests {
         let after_transition = rc.get();
 
         for _ in 0..5 {
-            vcx.executor().advance_clock(Duration::from_millis(40));
+            vcx.executor().advance_clock(Duration::from_millis(50));
             vcx.run_until_parked();
         }
 
@@ -435,7 +435,7 @@ mod tests {
         let fast_delta = after_fast - after_transition;
         assert!(
             fast_delta > 3,
-            "Working ~30fps driver should produce >3 renders in 200ms (got {fast_delta}; \
+            "Working ~20fps driver should produce >3 renders in 250ms (got {fast_delta}; \
              after_1hz={after_1hz}, after_transition={after_transition}, after_fast={after_fast})"
         );
         let _ = view;

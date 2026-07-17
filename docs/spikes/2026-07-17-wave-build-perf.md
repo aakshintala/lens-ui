@@ -1,5 +1,18 @@
 # Wave Build (B1–B5) — Post-build Perf Re-measure (Task 11)
 
+> **RESOLVED (2026-07-17, follow-up session).** The overage triage below is closed. Attribution
+> (demo-gated `LENS_PERF_NO_SWEEP`/`NO_SPINNER_ROT` toggles + a frame-rate sweep) **overturned the
+> prime suspect**: disabling *both* the canvas sweep paint and the spinner re-transform bought only
+> ~1% of ~13% — they are NOT the cost. The cost is the **per-frame full `SessionCardView::render`
+> tree rebuild**; CPU scales ~linearly with frame rate (30fps 13.8% → 20fps 9.0% → 15fps 7.65% →
+> 10fps 5.8%, for 5 fast cards). **Fix shipped: fast-wave cap 30fps → 20fps** (`anim_tick_ms_fast`
+> 33→50ms) — a ~35% CPU cut that lands back at the §9 8.8% budget (measured 8.95% default).
+> On-device A/B (labeled 20 vs 30fps windows): **indistinguishable**. Key perceptual finding — the
+> **sweep** (a band *translating* ~280px) is the frame-rate-sensitive element, NOT the spinner (a
+> tiny 22px rotation); the sweep stays smooth to 20fps and only jars by ~10fps, while the spinner is
+> fine even at 10fps. The doc's proposed sweep/spinner reductions were therefore correctly declined
+> (near-zero value, real visual risk). The sweep-feather item (b) is untouched and still deferred.
+
 **Date:** 2026-07-17 · **Build:** `feat/lens-app-multi-session` @ Task 10 (`5dd3f8f`)
 **Binary:** `cargo build --release -p lens-app --features demo` → `target/release/lens-app --demo`
 **Rig:** same machine as the animation spike (`docs/spikes/2026-07-17-wave-animation.md`); `top -l N -s 1 -pid <pid> -stats cpu,power`; per-card FPS from the `paint-instr` stderr counters (`spawn_demo_paint_instrumentation`, `--features demo`).
