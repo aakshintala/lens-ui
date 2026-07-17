@@ -9,27 +9,23 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Open threads & next up
 
-- **✅ CODE-COMPLETE (2026-07-17): Wave Build B1–B5** (branch `feat/lens-app-multi-session`, HEAD
-  `a698a9a`, branch-only, NOT merged/pushed — user call). Executed the 11-task plan
-  `docs/superpowers/plans/2026-07-17-wave-build-b1-b5.md` subagent-driven (composer-2.5 build +
-  codex/Opus cross-family review). Shipped: Lucide glyph `AssetSource` + B1 tinted-glyph tile, B2
-  context-window pbar, B5 Slept child-dim + Wake/Retry pills (wired to no-op `FleetStore` seams), Working
-  rotating `loader-circle` spinner, canvas `paint_path` skewed-parallelogram sweep, Scheduled canvas
-  countdown ring + live "wakes in Xm Ys", viewport-gated per-wave anim driver (30fps/1Hz, §4.4-isolated),
-  `demo` cargo feature-gate. Gate GREEN (fmt + workspace clippy default **and** `--features demo` + 57
-  lens-ui tests + drift). Whole-branch reviewed by **two families** (Opus SHIP vs codex FIX-FIRST → all
-  4 findings fixed: cadence-change respawn, Slept-dim pbar, Wake/Retry `stop_propagation`, demo gate
-  matrix; codex verify-the-fixes clean).
-  - **PRIMARY REMAINING GATE = on-device VISUAL pass (user):** `cargo run -p lens-app --release
-    --features demo -- --demo` → confirm glyph tint (**risk #1**: if glyphs are invisible the Lucide
-    SVGs need `fill` not `stroke`), sweep look/skew-sign, countdown ring, Slept-dim + bright Wake/Retry,
-    dark+light + `⌘⇧T` reload loop (`LENS_THEME_DIR=crates/lens-ui/src/theme`).
-  - **Triage findings:** (a) perf — canvas-era CPU ~30% over the div-era spike budget (~2.3%/animating
-    card vs 1.7%; cadence itself is exactly right on-device), accept vs scoped sweep/spinner profile —
-    `docs/spikes/2026-07-17-wave-build-perf.md`; (b) sweep feather not uniform across the slant (gpui
-    2-stop AABB-gradient limit) — both overlap → one on-device sweep pass. **B6 carry-forward:** viewport
-    re-entry can leave a card stuck non-animating (unreachable in this non-scrolling build; fix rides with
-    B6's scroll container). SDD ledger: `.superpowers/sdd/progress.md` (PLAN 4 section).
+- **✅ DONE + MERGED + PUSHED (2026-07-17): Wave Build B1–B5** (`main` HEAD `7396afc` == `origin/main`).
+  The 11-task build (Lucide glyph `AssetSource` + B1 tinted-glyph tile, B2 context pbar, B5 Slept dim +
+  Wake/Retry seams, Working `loader-circle` spinner, canvas `paint_path` sweep, Scheduled countdown ring +
+  live "wakes in Xm Ys", viewport-gated 30fps/1Hz anim driver, `demo` feature-gate) **plus the on-device
+  visual acceptance pass** are complete and integrated. Visual pass fixes (commit `7396afc`): line-height
+  ascender-clip fix + card 148→160, **context bar recolored to utilization threshold** (green≤50/amber≤75/red,
+  deviates from mockup — spec §11), **repo row → Lucide folder/git-branch SVG icons** (was 📁/⑂) + gated
+  themed overflow tooltip, harness·model into header meta + tile centered vs 3-line stack, title hover
+  tooltip, board grid gap/padding/centering (4×2 demo). RISK #1 (glyph tint) PASSED — no `fill` change
+  needed. Gate GREEN; codex cross-family review clean (1 Low declined — NoopTextSystem false-green). Spec
+  `2026-07-17-wave-behaviors-design.md` **§11** records the as-built amendments. Handoff:
+  `docs/handoffs/2026-07-17-wave-build-visual-pass-merged.md`.
+  - **Open (non-blocking):** (1) **perf/sweep triage** — canvas-era CPU ~30% over the div-era spike budget
+    (~2.3%/animating card vs 1.7%; cadence exact), accept vs scoped sweep/spinner profile w/ Instruments +
+    sweep-feather slant limit + skew-sign — `docs/spikes/2026-07-17-wave-build-perf.md`; (2) **B6
+    carry-forward** — viewport re-entry can leave a card stuck non-animating (unreachable in this
+    non-scrolling build; fix rides with B6's scroll container, never notify from the paint closure).
 
 - **✅ DONE (2026-07-16): `lens-ui` card/board audit vs shell spec §4–§5 + cheap fixes** (branch
   `feat/lens-app-multi-session`, commit `b367dbf`, branch-only). Audited `lens-app`/`lens-ui` against
