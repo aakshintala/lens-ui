@@ -39,13 +39,16 @@ use lens_terminal::render_test_api::{
 /// enough to trip on a ~2× regression. The 120fps product line (8.3ms) is the
 /// ceiling all of these clear.
 ///
-/// Observed release p95 (this hardware, fg≈bg): ascii ~0.9ms, wide-200×50
-/// ~3.2ms, wide-400×100 ~4.8ms, pathological ~3.2ms.
+/// Observed release p95 (this hardware): ascii ~0.9–1.3ms, wide-200×50
+/// ~3.2–3.7ms, wide-400×100 ~4.8–6.2ms, pathological ~2.9–3.3ms (the upper end
+/// is under full-gate system load, which adds ~30% to the heavy per-cell phases
+/// — budgets carry margin for it so the gate does not flap).
 const BUDGET_ASCII_MS: f64 = 3.0;
 const BUDGET_WIDE_200_MS: f64 = 5.5;
 /// 400×100: the absolute 8.3ms target was re-scoped to Slice 4, but release
-/// already meets it — this budget locks that in (no longer an interim ceiling).
-const BUDGET_WIDE_400_MS: f64 = 6.5;
+/// already meets it — this budget locks in sub-8.3 (no longer a 20ms interim)
+/// while clearing the ~6.2ms observed under gate load with margin.
+const BUDGET_WIDE_400_MS: f64 = 8.0;
 /// Pathological (100%-wide, 50%-emoji) regression guard — a tripwire against
 /// gross per-cell degradation, not a target.
 const BUDGET_PATHOLOGICAL_MS: f64 = 6.0;
