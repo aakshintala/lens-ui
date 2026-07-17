@@ -14,6 +14,8 @@ name = "lens-terminal-demo"
 path = "src/main.rs"
 
 [dependencies]
-# `lens-terminal`'s first consumer. The standalone GPUI window (real `open()` +
-# `TerminalTab` render) is wired in Slice 1d; Slice 0 only establishes the crate.
+gpui = "0.2.2"
+gpui-component = "0.5.1"
+lens-client = { path = "../lens-client" }
 lens-terminal = { path = "../lens-terminal" }
+url = "2"
