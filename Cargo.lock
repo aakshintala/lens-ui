@@ -3393,6 +3393,7 @@ dependencies = [
  "async-channel 2.5.0",
  "criterion",
  "crossbeam-channel",
+ "futures",
  "gpui",
  "lens-client",
  "libghostty-vt",

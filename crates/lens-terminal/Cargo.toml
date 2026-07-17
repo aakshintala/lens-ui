@@ -18,6 +18,7 @@ thiserror = "2"
 libghostty-vt = { path = "../../vendor/libghostty-rs/libghostty-vt" }
 arc-swap = "1"
 crossbeam-channel = "0.5"
+futures = "0.3"
 
 [features]
 bench = []

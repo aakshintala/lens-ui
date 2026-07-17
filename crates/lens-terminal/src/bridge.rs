@@ -1,11 +1,4 @@
 //! Bridge thread: multiplexes attach I/O ↔ engine (Slice 1d).
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "spawn_bridge wired by Slice 1d runtime convergence (Task 2+)"
-    )
-)]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

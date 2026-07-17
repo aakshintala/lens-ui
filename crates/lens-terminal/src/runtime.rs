@@ -9,9 +9,9 @@ use crate::engine::EngineHandle;
 
 /// Owned by TerminalTab. Foreground may only `take()` this and hand it off.
 pub(crate) struct TerminalRuntime {
-    bridge: Option<BridgeHandle>,
-    attach: Option<AttachHandle>,
-    engine: Option<Arc<EngineHandle>>,
+    pub(crate) bridge: Option<BridgeHandle>,
+    pub(crate) attach: Option<AttachHandle>,
+    pub(crate) engine: Option<Arc<EngineHandle>>,
 }
 
 impl TerminalRuntime {

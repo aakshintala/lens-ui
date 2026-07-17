@@ -37,11 +37,9 @@ impl TabRenderState {
         }
     }
 
-    /// Replace the frame to paint on the next render. In 1c the only frame
-    /// source is the test path; Slice 1d writes `latest_frame` from the engine
-    /// wake sampler. `test-util`-gated so it isn't dead code in the 1c build.
-    #[cfg(any(test, feature = "test-util"))]
-    pub fn set_frame(&mut self, frame: Arc<Frame>) {
+    /// Replace the frame to paint on the next render. Slice 1d's engine wake
+    /// sampler is the production writer; `set_frame_for_test` delegates here.
+    pub(crate) fn set_frame(&mut self, frame: Arc<Frame>) {
         self.latest_frame = Some(frame);
     }
 

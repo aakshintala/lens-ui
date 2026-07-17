@@ -29,6 +29,7 @@ use std::sync::Arc;
 
 mod bridge;
 mod engine;
+mod policy;
 mod render;
 mod runtime;
 
@@ -61,6 +62,9 @@ use gpui::{App, Context, Entity, EventEmitter, FocusHandle, IntoElement, Render,
 use lens_client::Client;
 use lens_client::ids::{SessionId, TerminalId};
 use serde::{Deserialize, Serialize};
+
+use bridge::BridgeEvent;
+use policy::{AttachedParts, discover_and_attach, identity_title_from_resource};
 
 // ---------------------------------------------------------------------------
 // Public identity + access values (frozen names).
@@ -186,6 +190,16 @@ pub enum Lifecycle {
     Detached,
 }
 
+/// Why a tab entered [`Lifecycle::Detached`]. Presentation detail — not a lifecycle variant payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DetachedDetail {
+    TerminalGone,
+    ClientDetached,
+    Unauthorized,
+    RetriesExhausted,
+    DiscoveryFailed,
+}
+
 // ---------------------------------------------------------------------------
 // Presentation snapshot (returned by `TerminalTab::presentation`).
 // ---------------------------------------------------------------------------
@@ -204,6 +218,12 @@ pub struct Presentation {
     pub reported_title: Option<String>,
     /// OSC progress — presentation state, not an OS side effect.
     pub progress: Option<Progress>,
+    /// Set after a reconnect gap (Slice 1d policy); false at open.
+    pub output_gap: bool,
+    /// Populated when lifecycle is [`Lifecycle::Detached`].
+    pub detached_detail: Option<DetachedDetail>,
+    /// Whether the host may offer an explicit reattach action.
+    pub reattach_available: bool,
 }
 
 /// Terminal-local progress (OSC 9;4 style). Presentation only.
@@ -268,18 +288,11 @@ pub struct TerminalTab {
     /// canvas builder. Slice 1d makes the engine the source of `latest_frame`.
     render: render::state::TabRenderState,
 
-    // Captured at `open()`; consumed by the transport (Slice 1a) + convergence
-    // (Slice 1d) that drive off-thread discovery/attach. `#[expect]` (not
-    // `#[allow]`) so the lint fires the moment a later slice starts reading
-    // these — a self-clearing reminder to drop the attribute.
-    #[expect(dead_code, reason = "consumed by Slice 1a transport + 1d convergence")]
+    // Captured at `open()`; consumed by off-thread discovery/attach (Slice 1d).
     target: TerminalTarget,
-    #[expect(dead_code, reason = "consumed by Slice 1a transport + 1d convergence")]
     client: Arc<Client>,
-    #[expect(dead_code, reason = "consumed by Slice 1a transport + 1d convergence")]
     options: TerminalOpenOptions,
 
-    #[expect(dead_code, reason = "consumed by Slice 1d convergence (Task 3+)")]
     runtime: Option<runtime::TerminalRuntime>,
 }
 
@@ -290,24 +303,12 @@ impl TerminalTab {
         options: TerminalOpenOptions,
         cx: &mut Context<Self>,
     ) -> Self {
-        let identity_title = identity_title_of(&target);
         // Slice 1d kicks off off-thread discovery/attach here; Slice 0 only
         // freezes the "returns in Starting" invariant.
         Self {
             focus_handle: cx.focus_handle(),
             lifecycle: Lifecycle::Starting,
-            presentation: Presentation {
-                lifecycle: Lifecycle::Starting,
-                access: match options.access {
-                    AccessIntent::ReadOnly => AccessMode::ReadOnly,
-                    // `Automatic` resolves to the server-authoritative mode once
-                    // attached; before attach it presents read-only.
-                    AccessIntent::Automatic => AccessMode::ReadOnly,
-                },
-                identity_title,
-                reported_title: None,
-                progress: None,
-            },
+            presentation: starting_presentation(&target, &options),
             render: render::state::TabRenderState::new(),
             target,
             client,
@@ -349,6 +350,121 @@ impl TerminalTab {
         self.render.set_frame(frame);
         cx.notify();
     }
+
+    fn on_attached(&mut self, parts: AttachedParts, cx: &mut Context<Self>) {
+        let AttachedParts {
+            resource,
+            runtime,
+            wake_tx,
+            wake_rx,
+            policy_rx,
+        } = parts;
+
+        if let Some(engine) = runtime.engine.as_ref() {
+            engine.set_waker(Box::new(move || {
+                let _ = wake_tx.try_send(());
+            }));
+        }
+
+        self.runtime = Some(runtime);
+        self.lifecycle = Lifecycle::Live;
+        self.presentation.lifecycle = Lifecycle::Live;
+        self.presentation.access = access_mode_for(&self.options);
+        self.presentation.identity_title = identity_title_from_resource(&resource);
+        // Retained open captures — consumed by Task 4 reconnect / reattach policy.
+        let _ = (&self.target, self.client.as_ref());
+        cx.emit(TerminalEvent::PresentationChanged);
+        cx.notify();
+
+        spawn_foreground_sampler(wake_rx, policy_rx, cx);
+    }
+
+    fn on_detach(&mut self, detail: DetachedDetail, cx: &mut Context<Self>) {
+        self.lifecycle = Lifecycle::Detached;
+        self.presentation.lifecycle = Lifecycle::Detached;
+        self.presentation.detached_detail = Some(detail);
+        self.presentation.reattach_available = matches!(detail, DetachedDetail::ClientDetached);
+        cx.emit(TerminalEvent::PresentationChanged);
+        cx.notify();
+    }
+
+    fn sample_latest_frame_from_engine(&mut self) {
+        if let Some(rt) = &self.runtime
+            && let Some(engine) = &rt.engine
+            && let Some(f) = engine.latest_frame()
+        {
+            self.render.set_frame(f);
+        }
+    }
+
+    fn apply_bridge_event(&mut self, ev: BridgeEvent, cx: &mut Context<Self>) {
+        // TODO(Task 4): full CloseCause policy + RetryWindow + reconnect
+        let next = match ev {
+            BridgeEvent::Closed(_) => Lifecycle::Detached,
+            BridgeEvent::FeedSaturated
+            | BridgeEvent::OutboundSaturated
+            | BridgeEvent::AttachDisconnected => Lifecycle::Reconnecting,
+        };
+        self.lifecycle = next;
+        self.presentation.lifecycle = next;
+        cx.emit(TerminalEvent::PresentationChanged);
+        cx.notify();
+    }
+}
+
+fn access_mode_for(options: &TerminalOpenOptions) -> AccessMode {
+    match options.access {
+        AccessIntent::ReadOnly => AccessMode::ReadOnly,
+        AccessIntent::Automatic => AccessMode::Write,
+    }
+}
+
+fn spawn_foreground_sampler(
+    wake_rx: async_channel::Receiver<()>,
+    policy_rx: async_channel::Receiver<BridgeEvent>,
+    cx: &mut Context<TerminalTab>,
+) {
+    use futures::FutureExt;
+
+    cx.spawn(async move |weak, cx| {
+        loop {
+            futures::select! {
+                r = wake_rx.recv().fuse() => {
+                    match r {
+                        Ok(()) => {
+                            while wake_rx.try_recv().is_ok() {}
+                            if weak
+                                .update(cx, |tab, cx| {
+                                    tab.sample_latest_frame_from_engine();
+                                    cx.notify();
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                ev = policy_rx.recv().fuse() => {
+                    match ev {
+                        Ok(ev) => {
+                            if weak
+                                .update(cx, |tab, cx| {
+                                    tab.apply_bridge_event(ev, cx);
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
+    })
+    .detach();
 }
 
 impl EventEmitter<TerminalEvent> for TerminalTab {}
@@ -377,7 +493,39 @@ pub fn open(
     options: TerminalOpenOptions,
     cx: &mut App,
 ) -> Entity<TerminalTab> {
-    cx.new(|cx| TerminalTab::starting(target, client, options, cx))
+    let entity = cx
+        .new(|cx| TerminalTab::starting(target.clone(), Arc::clone(&client), options.clone(), cx));
+    let weak = entity.downgrade();
+    cx.spawn(async move |cx| {
+        let outcome = cx
+            .background_executor()
+            .spawn(async move { discover_and_attach(client, target, options) })
+            .await;
+        let _ = weak.update(cx, |tab, cx| match outcome {
+            Ok(parts) => tab.on_attached(parts, cx),
+            Err(detail) => tab.on_detach(detail, cx),
+        });
+    })
+    .detach();
+    entity
+}
+
+fn starting_presentation(target: &TerminalTarget, options: &TerminalOpenOptions) -> Presentation {
+    Presentation {
+        lifecycle: Lifecycle::Starting,
+        access: match options.access {
+            AccessIntent::ReadOnly => AccessMode::ReadOnly,
+            // `Automatic` resolves to the server-authoritative mode once
+            // attached; before attach it presents read-only.
+            AccessIntent::Automatic => AccessMode::ReadOnly,
+        },
+        identity_title: identity_title_of(target),
+        reported_title: None,
+        progress: None,
+        output_gap: false,
+        detached_detail: None,
+        reattach_available: false,
+    }
 }
 
 fn identity_title_of(target: &TerminalTarget) -> String {
@@ -451,5 +599,20 @@ mod tests {
         let json = serde_json::to_string(&t).unwrap();
         let back: TerminalTarget = serde_json::from_str(&json).unwrap();
         assert_eq!(back, t);
+    }
+
+    #[test]
+    fn starting_presentation_has_policy_defaults() {
+        let target = TerminalTarget::OpenOrCreate {
+            session_id: SessionId::new("sess_1"),
+            key: TerminalKey {
+                terminal_name: "main".into(),
+                session_key: "k".into(),
+            },
+        };
+        let p = starting_presentation(&target, &TerminalOpenOptions::default());
+        assert!(!p.output_gap);
+        assert!(p.detached_detail.is_none());
+        assert!(!p.reattach_available);
     }
 }
