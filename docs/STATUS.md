@@ -31,10 +31,12 @@ and roll older "Recent" pointers off this page as they age.
     paint-order flip → fixed `730fc83`**); release-calibrated per-phase budgets (ascii 3.0 / wide-200
     5.5 / wide-400 8.0 / pathological 6.0ms — carry ~30% gate-load margin so no flap). Plan:
     `docs/plans/2026-07-16-terminal-slice-1c-perf-resolution.md`.
-    **⚠ Pre-existing engine flake now hits the gate:** `engine::handle` timing tests
-    (`build_failure_retries_on_next_pump`, `stop_publishes_final_frame_before_join`) fail intermittently
-    under full-suite parallelism (pass 23/23 in isolation). NOT from 1c (render-only change). The gate
-    flaked once on it, passed green on re-run. **Fix-or-mark before relying on unattended green.**
+    **✅ Engine gate flake FIXED.** Both `engine::handle` flakes
+    (`build_failure_retries_on_next_pump` + `stop_publishes_final_frame_before_join`) shared ONE root
+    cause: a process-global `static TEST_BUILD_FAILURES` the fault-injection test set, which any
+    concurrent test's worker consumed (its own build then wrongly succeeded; bystanders lost a frame).
+    Moved injection to a per-handle `Arc<AtomicUsize>` shared only with that handle's worker — no
+    cross-test contamination, zero-cost in production. 120/120 clean stress runs.
   - **✅ SLICE 0 (surface freeze) DONE + merged** (`fdba839`→`635eaa7`): froze the opaque public
     names/seam invariants `lens-ui` binds to (`open`/`TerminalTarget`/`AccessIntent`/`TerminalKey`/
     `TerminalOpenOptions`, 7-variant `Lifecycle`, `TerminalHostEvent`/`TerminalEvent`, opaque `Frame`,
