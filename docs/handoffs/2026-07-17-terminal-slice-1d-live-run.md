@@ -1,8 +1,16 @@
-# Handoff — Terminal Slice 1d: live-rider RUN (the only thing left)
+# Handoff — Terminal Slice 1d: live-rider RUN ✅ DONE (2026-07-17)
+
+> **RESOLVED 2026-07-17 — the live rider PASSED all 4 phases vs omnigent 0.5.1.**
+> Slice 1d is now COMPLETE (code + reviews + gate + live run). The two blockers below
+> were both OMNIGENT-OPERATIONAL, never rider bugs. The working recipe + the resolved
+> design question are captured in memory `omnigent-terminal-attach-live-run` and
+> summarized in the box at the end of this file (**"How it was actually resolved"**).
+> The rest of this doc is preserved as the original investigation record. Staying on
+> `terminal-ws` through the rest of the workstream — no merge yet (user's call).
 
 **Slice 1d code is DONE, fully reviewed, and gate-green** on `terminal-ws` (unpushed).
-The ONE remaining task is *running* the live rider against a real omnigent 0.5.1
-terminal — which is blocked on **omnigent operational setup + one design question**,
+The ONE remaining task was *running* the live rider against a real omnigent 0.5.1
+terminal — which was blocked on **omnigent operational setup + one design question**,
 NOT on any Lens code. This session built + reviewed all of 1d and attempted the live
 run; it hit an omnigent wall and stopped for a fresh session to investigate.
 
@@ -105,6 +113,56 @@ cargo test -p lens-terminal --features live-tests,test-util --test terminal_live
 
 ## Do NOT redo
 
-All 1d code + reviews are complete and committed. Do not re-review or rebuild the tasks. The next
-session's job is ONLY: investigate the agent-terminal question, stand up a working omnigent terminal,
-run the rider to a PASS, then (user's call) merge `terminal-ws` → main.
+All 1d code + reviews are complete and committed. Do not re-review or rebuild the tasks.
+
+---
+
+## ✅ How it was actually resolved (2026-07-17)
+
+**Blocker #3 (the design question) — ANSWERED in our favor.** The runner CAN spawn a bare shell PTY
+separate from the agent TUI. `runner/app.py:16228` generic-launch path builds
+`TerminalEnvSpec(command=spec.get("command", "bash"))` → a tmux-backed shell that echoes normally,
+**zero LLM cost**. The catch: the server (`sessions.py:17565`) gates `POST …/resources/terminals` on
+the session agent's **`terminals:` block** — you can only create a terminal whose name the spec
+declares (the native-bootstrap exemption launches the agent TUI, which we do NOT want). No shipped
+omnigent agent declares a plain shell, so you supply a tiny one.
+
+**The recipe that worked (zero LLM cost):**
+
+1. **Ephemeral agent bundle** (a *directory* with `config.yaml`, not a lone `*.yaml`):
+   ```yaml
+   spec_version: 1
+   name: rider-shell
+   executor:
+     type: omnigent
+     config: { harness: claude-sdk }
+   terminals:
+     shell: { command: zsh }     # MAPPING form — the `shell: zsh` string shorthand is rejected
+                                  # by the server upload validator (inner loader accepts it, server doesn't)
+   ```
+   YAML-shape gotchas, in the order they bit: bundle must be a dir w/ `config.yaml`; `terminals.shell`
+   must be a mapping; executor must be `type: omnigent` + nested `config.harness` (flat `harness:` fails
+   spec validation). Use **zsh** not bash — macOS bash prints the "default interactive shell is now zsh"
+   warning blob into the PTY.
+2. **Launch** (own runner, no LLM turn, REPL kept alive):
+   ```
+   sleep 100000 | omnigent run <bundle-dir> --server http://127.0.0.1:6767 > run.log 2>&1 &
+   ```
+   `--server` uploads the bundle as an ephemeral agent + spawns its OWN local runner (you don't need the
+   pre-existing `omnigent host` daemon). The piped `sleep` holds stdin open so the interactive REPL
+   doesn't EOF and tear the runner down. No `-p` ⇒ no LLM turn. Grab the new `conv_…` from
+   `GET /v1/sessions` (agent_name `rider-shell`).
+3. **Run the rider** — it `open()`-creates the declared shell terminal itself (idempotent):
+   ```
+   LENS_OMNIGENT_URL=http://127.0.0.1:6767 LENS_OMNIGENT_SESSION_ID=<conv> \
+   LENS_OMNIGENT_TERMINAL_NAME=shell LENS_OMNIGENT_SESSION_KEY=main \
+   cargo test -p lens-terminal --features live-tests,test-util --test terminal_live -- --nocapture
+   ```
+   → `terminal_live: PASS` (P1 attach→Live · P2 marker painted · P3 abort→Reconnecting · P4
+   reattach→Live+output_gap).
+
+**Cleanup:** the throwaway rider-shell run was killed (torn down its session/runner); the omnigent
+**server + host daemon were left online** for future live riders (terminal + state-model). Stop them
+anytime with `omnigent server stop`.
+
+Full durable record: memory `omnigent-terminal-attach-live-run`.

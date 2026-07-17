@@ -9,10 +9,10 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Open threads & next up
 
-- **▶ ACTIVE: shared terminal workstream — Slices 0/1a/1b merged; Slice 1c DONE; ▶ Slice 1d CODE DONE + FULLY REVIEWED + gate GREEN (unpushed on `terminal-ws`); ONLY the live-rider RUN vs omnigent 0.5.1 remains.**
-  - **▶ SLICE 1d (convergence) — ALL CODE DONE (T1–T9), gate GREEN, subagent-driven (composer-2.5 build +
+- **▶ ACTIVE: shared terminal workstream — Slices 0/1a/1b merged; Slice 1c DONE; ✅ Slice 1d COMPLETE — CODE DONE + FULLY REVIEWED + gate GREEN + LIVE-RIDER RUN PASSED vs omnigent 0.5.1 (2026-07-17). Staying on `terminal-ws` (unpushed) through the rest of the workstream — no merge yet, user's call.**
+  - **✅ SLICE 1d (convergence) — ALL CODE DONE (T1–T9), gate GREEN, AND live rider PASSED, subagent-driven (composer-2.5 build +
     cross-family review: Opus inline per-task + codex on T4 reconnect machine + codex whole-branch). 17 commits
-    `f4d3080..0e111e8` on `terminal-ws` (unpushed). Ledger `.superpowers/sdd/progress.md`.**
+    `f4d3080..39ee7b3` on `terminal-ws` (unpushed). Ledger `.superpowers/sdd/progress.md`.**
     - **Shipped:** bridge thread (Select multiplex attach↔engine, OutboundSaturated/AttachDisconnected/
       EngineStopped policy events); `TerminalRuntime` off-foreground teardown (panic-free unique-Arc stop);
       `open()` C2 background discover/attach + foreground `cx.spawn` wake sampler (durable policy_tx survives
@@ -26,14 +26,19 @@ and roll older "Recent" pointers off this page as they age.
       codex whole-branch caught 6 Important integration issues (engine-death stuck-Live; initial resize
       skipped; rider false-green; abort machinery leaking into production; inspect not durable across
       reconnect) → all folded.
-    - **⏳ REMAINING = the LIVE RUN of the rider vs a running omnigent 0.5.1** (`tests/terminal_live.rs`,
-      `--features live-tests,test-util`, real GPUI window). Code is hardened & ready. A live-run attempt this
-      session got server+host online but hit two OMNIGENT-OPERATIONAL blockers (NOT rider bugs): (1) existing
-      sessions bound to offline runners (`runner_unavailable`) — need a session on an online runner; (2) the
-      rider's `echo LENSMARKER` marker assumes a SHELL terminal, but omnigent session terminals run the AGENT
-      TUI (`\r` risks a billable turn) — open Q: does `TerminalCreate` launch a bare shell terminal? **Fresh-
-      session driver: [`docs/handoffs/2026-07-17-terminal-slice-1d-live-run.md`](./handoffs/2026-07-17-terminal-slice-1d-live-run.md)**
-      (findings + investigate-first recipe). Then merge `terminal-ws` → user's call.
+    - **✅ LIVE RUN DONE (2026-07-17) — rider PASSED all 4 phases vs omnigent 0.5.1** (`tests/terminal_live.rs`,
+      `--features live-tests,test-util`, real GPUI window): P1 attach→Live · P2 `echo LENSMARK_<pid>\r` to a
+      real **zsh** PTY + proved a PAINTED frame carried the marker · P3 abort-attach→Reconnecting · P4
+      reattach→Live+`output_gap`. **Both OMNIGENT-OPERATIONAL blockers from the prior attempt resolved (never
+      rider bugs):** (1) the design Q is ANSWERED — a declared `terminals:` entry spawns a real tmux-backed
+      bare shell (default `command`) SEPARATE from the agent TUI (`runner/app.py:16228`), gated server-side on
+      the agent spec's `terminals:` block (`sessions.py:17565`); no billable turn; (2) the recipe = an ephemeral
+      `rider-shell` agent bundle declaring `terminals.shell.command: zsh`, launched `omnigent run <bundle>
+      --server` (spawns its own runner, `sleep`-held stdin keeps the REPL alive), rider `open()` open-or-creates
+      the declared PTY. Full recipe + yaml-shape gotchas in memory [[omnigent-terminal-attach-live-run]]; the
+      throwaway session was torn down, server+host daemon left online for future riders. Handoff
+      [`docs/handoffs/2026-07-17-terminal-slice-1d-live-run.md`](./handoffs/2026-07-17-terminal-slice-1d-live-run.md).
+      Merge `terminal-ws` → user's call (staying on branch through the rest of the workstream).
     - **Deferred (roll-up in ledger):** 1b engine flake `hidden_tab_suppresses_publish_until_visible`
       (pre-existing, timing under parallel load); EngineHandle::spawn readiness result (1b); thread-exhaustion
       foreground-panic extreme edge; per-task lens-terminal clippy should include `--features test-util`
