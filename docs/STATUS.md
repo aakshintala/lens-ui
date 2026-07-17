@@ -42,17 +42,30 @@ and roll older "Recent" pointers off this page as they age.
     xtask-gate-scope; whole-branch-review-needs-a-builder). Filed **SPEC-GAPS #10** (keyboard shortcuts +
     macOS app menu — Cmd+Q dead). Color values are placeholders → **one end-of-build tuning pass** (the
     reload loop makes it cheap).
-  - **▶ NEXT: wave build (B1–B5)** — completes the card (icon-tile replaces the throwaway pill), tunes
-    colors via the manual reload loop. Then board packing (B6–B8). **Full theming machinery §18
-    (importers/picker/hot-reload/registry) = later standalone (step 9, least urgent).** Sequencing:
-    ~~theming schema~~ → **waves** → board packing → light checkpoint → transcript →
-    composer/elicitation → panes/terminal/editor → shell polish → theming machinery.
+  - **✅ WAVE STATES `Scheduled` + `AwaitingReview` SHIPPED (2026-07-16, branch `feat/lens-app-multi-session`
+    @ `f1f0d6e`, branch-only).** Handoff `docs/handoffs/2026-07-16-wave-states-shipped.md`; spec
+    `docs/superpowers/specs/2026-07-16-wave-states-scheduled-awaitingreview-design.md`. **Structural
+    contract only:** `Wave` 6→8, two Lens-owned card fields (`awaiting_review`, source-agnostic
+    `scheduled_wake_at`), 8-step ladder (`NeedsInput>Failed>Working>AwaitingReview>Scheduled>Ready>
+    Slept>Neutral`), 2 placeholder colors (both themes), 2 `--demo` cards, 9 tests. composer author +
+    codex/gpt-5.6-sol review (ran tests). **Deferred INTO B1–B5:** wave *behaviors* (AwaitingReview
+    pulse+deep-link, Scheduled dim+countdown) + poller repaint timer at `scheduled_wake_at`. Producers
+    (Lens MCP server) = new **SPEC-GAPS #11**, with the **remote-agent→local-Mac MCP transport** flagged
+    as the load-bearing open risk.
+  - **▶ NEXT: wave build (B1–B5)** — completes the card (icon-tile replaces the throwaway pill, renders
+    **all 8 waves**), adds the wave behaviors above, tunes colors via the manual reload loop. Then board
+    packing (B6–B8). **Full theming machinery §18 (importers/picker/hot-reload/registry) = later
+    standalone (step 9, least urgent).** Sequencing: ~~theming schema~~ → **waves** → board packing →
+    light checkpoint → transcript → composer/elicitation → panes/terminal/editor → shell polish →
+    theming machinery.
 
-- **📋 SPEC-GAPS backlog (2026-07-13):** nine independent, un-specced/partial
+- **📋 SPEC-GAPS backlog (2026-07-13):** independent, un-specced/partial
   subsystems parked in [`SPEC-GAPS.md`](./SPEC-GAPS.md) — app release/signing/update,
   omnigent bundling, Lens observability, secrets lifecycle, ~~TUI-native harness toggle~~
   (**#5 now spec'd, see below**), first-run product UX, settings surface, data lifecycle,
-  multi-machine identity. Each gets its own spec→plan cycle; **8 gaps remain** un-specced.
+  multi-machine identity, keyboard-shortcuts/macOS-menu (#10), **Lens-owned MCP producer
+  layer (#11 — 2026-07-16, feeds the two new wave states; ⚠ remote-agent→local-Mac MCP
+  transport open risk)**. Each gets its own spec→plan cycle; **10 gaps remain** un-specced.
 
 - **✅ DONE (2026-07-12): state-model P3-3b EXECUTED + merged to `main`** (branch
   `state-model-p3-3b`, 16 commits, base 02d6d96; **push deferred — user call**). All 6 code/doc
