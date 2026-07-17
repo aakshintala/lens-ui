@@ -121,6 +121,7 @@ impl Render for SessionCardView {
                         wave,
                         kebab_open,
                         sweep,
+                        now_ms,
                         cx,
                         cx.listener(|view, _, _, cx| {
                             view.kebab_open = !view.kebab_open;

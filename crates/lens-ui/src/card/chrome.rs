@@ -80,7 +80,7 @@ fn host_label(card: &SessionCard) -> String {
         .unwrap_or_else(|| "—".into())
 }
 
-fn render_icon_tile(wave: Wave, status: Hsla) -> Div {
+fn render_icon_tile(wave: Wave, status: Hsla, now_ms: i64) -> Div {
     // Faint status-tinted surface (mockup: color-mix(status 14%, bg2)) — NOT a solid fill.
     let mut tile = div()
         .flex_shrink_0()
@@ -96,8 +96,7 @@ fn render_icon_tile(wave: Wave, status: Hsla) -> Div {
     if let Some(path) = wave_icon_path(wave) {
         tile = tile.child(svg().path(path).w(px(21.0)).h(px(21.0)).text_color(status));
     } else {
-        // Working → spinner (Task 5 makes this rotate; a static ring until then).
-        tile = tile.child(render_working_spinner(status));
+        tile = tile.child(render_working_spinner(status, now_ms));
     }
     tile
 }
@@ -146,6 +145,7 @@ pub fn render_card_chrome(
     wave: Wave,
     kebab_open: bool,
     sweep_phase: Option<f32>,
+    now_ms: i64,
     cx: &App,
     on_kebab_toggle: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
     on_wake: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
@@ -217,7 +217,7 @@ pub fn render_card_chrome(
         .flex_row()
         .items_start()
         .gap_2()
-        .child(render_icon_tile(wave, border).when(dim, |t| t.opacity(0.42)))
+        .child(render_icon_tile(wave, border, now_ms).when(dim, |t| t.opacity(0.42)))
         .child(
             div()
                 .flex_grow()

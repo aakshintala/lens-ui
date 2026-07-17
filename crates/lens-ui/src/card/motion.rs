@@ -1,6 +1,10 @@
+use std::f32::consts::TAU;
 use std::time::Duration;
 
-use gpui::{Hsla, IntoElement, ParentElement, Styled, div, linear_color_stop, linear_gradient, px};
+use gpui::{
+    Hsla, IntoElement, ParentElement, Styled, Transformation, div, linear_color_stop,
+    linear_gradient, px, radians, svg,
+};
 
 use super::model::{CARD_WIDTH_PX, SessionCard};
 use super::wave::Wave;
@@ -24,9 +28,17 @@ pub fn sweep_phase(wave: Wave, now_ms: i64) -> Option<f32> {
     Some(now_ms.rem_euclid(period_ms) as f32 / period_ms as f32)
 }
 
-/// True for any wave that runs a per-frame animation (drives the 30fps timer).
+const SPIN_PERIOD_MS: i64 = 2000;
+
+/// Spinner rotation fraction (0..1) at `now_ms` — pure fn of the clock (period 2.0s).
+/// i64 modulo BEFORE the f32 cast (epoch-millis overflow — see `sweep_phase`).
+pub fn spin_phase(now_ms: i64) -> f32 {
+    now_ms.rem_euclid(SPIN_PERIOD_MS) as f32 / SPIN_PERIOD_MS as f32
+}
+
+/// True for any wave that runs a per-frame (or per-second) animation.
 pub fn wave_animates(wave: Wave) -> bool {
-    sweep_period(wave).is_some()
+    sweep_period(wave).is_some() || matches!(wave, Wave::Working | Wave::Scheduled)
 }
 
 const RING_PERIOD_MS: i64 = 2400;
@@ -73,15 +85,15 @@ pub fn render_sweep_overlay(status_color: Hsla, phase: f32) -> impl IntoElement 
     )
 }
 
-/// Working-state indicator — STATIC placeholder for the spike (a rotating spinner needs
-/// a bundled SVG asset, which the crate does not ship; deferred to the build's asset
-/// task). Rendered as a static ring so Working doesn't run its own animation loop.
-pub fn render_working_spinner(color: Hsla) -> impl IntoElement {
-    div()
-        .size(px(22.0))
-        .rounded_full()
-        .border_2()
-        .border_color(color.opacity(0.6))
+/// Rotating Lucide `loader-circle`, tinted to the working color, angle from the clock.
+/// Rotation is render-only (no layout/hitbox effect) — pivots around the element center.
+pub fn render_working_spinner(status: Hsla, now_ms: i64) -> impl IntoElement {
+    svg()
+        .path("icons/loader-circle.svg")
+        .w(px(22.0))
+        .h(px(22.0))
+        .text_color(status)
+        .with_transformation(Transformation::rotate(radians(spin_phase(now_ms) * TAU)))
 }
 
 /// Expanding ring outside the card clip (NeedsInput / Failed), positioned at `phase`.
@@ -168,6 +180,28 @@ mod tests {
     #[test]
     fn working_has_no_static_glyph() {
         assert_eq!(wave_icon_path(Wave::Working), None);
+    }
+
+    #[test]
+    fn spin_phase_advances_and_wraps() {
+        assert_eq!(spin_phase(0), 0.0);
+        assert!((spin_phase(1000) - 0.5).abs() < 1e-4, "half period");
+        assert!(spin_phase(2000).abs() < 1e-4, "wraps at 2s");
+    }
+
+    #[test]
+    fn spin_phase_survives_epoch_millis() {
+        // i64-modulo-before-cast: a real epoch value must not quantize to a frozen phase.
+        let a = spin_phase(1_700_000_000_123);
+        let b = spin_phase(1_700_000_000_123 + 500);
+        assert!((a - b).abs() > 1e-3, "phase must advance at epoch scale");
+    }
+
+    #[test]
+    fn working_animates_now() {
+        assert!(wave_animates(Wave::Working));
+        assert!(!wave_animates(Wave::Slept));
+        assert!(!wave_animates(Wave::Neutral));
     }
 
     #[test]
