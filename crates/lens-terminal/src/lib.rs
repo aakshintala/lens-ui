@@ -36,12 +36,22 @@ mod render;
 /// with `--features test-util`. Kept out of the default public API.
 #[cfg(any(test, feature = "test-util"))]
 pub mod render_test_api {
-    pub use crate::render::fixtures::{ascii_frame, mixed_ascii_wide_frame, sgr_frame};
+    pub use crate::render::fixtures::{
+        ascii_frame, dense_wide_emoji_frame, mixed_ascii_wide_frame, pathological_wide_emoji_frame,
+        sgr_frame,
+    };
     pub use crate::render::metrics::{
         CellMetrics, MenloGateResult, menlo_gate_ok, per_row_alignment_ok,
     };
     pub use crate::render::paint::{RenderStats, paint_frame};
     pub use crate::render::state::TabRenderState;
+}
+
+/// Fixtures for Criterion `Frame`-construction benches (`bench` feature). Only
+/// the builders — never `paint_frame` (I12: paint stays out of the public API).
+#[cfg(feature = "bench")]
+pub mod render_bench_api {
+    pub use crate::render::fixtures::{ascii_frame, dense_wide_emoji_frame};
 }
 
 use gpui::prelude::*;

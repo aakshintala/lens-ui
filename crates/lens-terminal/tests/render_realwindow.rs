@@ -20,16 +20,28 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use gpui::{
     Application, Bounds, Context, FocusHandle, IntoElement, Render, TitlebarOptions, Window,
-    WindowBounds, WindowOptions, canvas, prelude::*, px, size,
+    WindowBounds, WindowOptions, canvas, point, prelude::*, px, size,
 };
 use lens_terminal::Frame;
 use lens_terminal::render_test_api::{
-    CellMetrics, RenderStats, TabRenderState, ascii_frame, menlo_gate_ok, mixed_ascii_wide_frame,
-    sgr_frame,
+    CellMetrics, RenderStats, TabRenderState, ascii_frame, dense_wide_emoji_frame, menlo_gate_ok,
+    mixed_ascii_wide_frame, paint_frame, pathological_wide_emoji_frame, sgr_frame,
 };
+
+/// Fail-closed paint p95 budgets. The absolute 8.3ms @400×100 is re-scoped to
+/// Slice 4; 1c holds an interim 20.0ms ceiling there (open risk: PerCell dense
+/// wide/emoji ~16.5ms in the spike).
+const BUDGET_MS: f64 = 8.3;
+const BUDGET_400_INTERIM_MS: f64 = 20.0;
+/// Generous ceiling for the pathological (100%-wide, 50%-emoji) regression
+/// guard — not a target, just a tripwire against gross per-cell degradation.
+const BUDGET_PATHOLOGICAL_MS: f64 = 30.0;
+const WARMUP: usize = 60;
+const MEASURE: usize = 120;
 
 fn main() {
     Application::new().run(move |cx| {
@@ -54,15 +66,18 @@ fn main() {
     });
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
     ResolveMenlo,
     MenloGate,
     PaintAscii,
     PaintWideRouting,
     PaintSgr,
+    PerfAscii200x50,
+    PerfWide200x50,
+    PerfWide400x100,
+    PerfPathological200x50,
     Done,
-    // Tasks 8: PerfAscii200x50, PerfWide200x50, PerfWide400x100.
 }
 
 struct HarnessView {
@@ -70,9 +85,13 @@ struct HarnessView {
     metrics: Rc<RefCell<Option<CellMetrics>>>,
     focus: FocusHandle,
     state: TabRenderState,
-    /// Which paint phase's frame is currently loaded (guards the two-frame
-    /// dance from reading the previous phase's stats).
+    /// Which paint/perf phase's frame is currently loaded (guards the two-frame
+    /// dance + one-time perf-frame build).
     setup_phase: Option<Phase>,
+    /// Per-paint durations for the current perf phase (warmup + measure).
+    samples: Rc<RefCell<Vec<Duration>>>,
+    /// The perf phase's frame, built once on phase entry.
+    perf_frame: Rc<RefCell<Option<Arc<Frame>>>>,
 }
 
 impl HarnessView {
@@ -83,6 +102,8 @@ impl HarnessView {
             focus: cx.focus_handle(),
             state: TabRenderState::new(),
             setup_phase: None,
+            samples: Rc::new(RefCell::new(Vec::new())),
+            perf_frame: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -151,17 +172,116 @@ impl Render for HarnessView {
                         fail(&format!("PaintSgr stats bad: {stats:?}"));
                     }
                     println!("render_realwindow: PaintSgr OK ({stats:?})");
-                    *self.phase.borrow_mut() = Phase::Done;
+                    *self.phase.borrow_mut() = Phase::PerfAscii200x50;
                 }
                 self.state
                     .render_element(&self.focus, "harness", "PaintSgr", window, cx)
                     .into_any_element()
             }
+            Phase::PerfAscii200x50 => self
+                .run_perf_phase(
+                    phase,
+                    || ascii_frame(200, 50, 'a'),
+                    BUDGET_MS,
+                    Phase::PerfWide200x50,
+                )
+                .into_any_element(),
+            Phase::PerfWide200x50 => self
+                .run_perf_phase(
+                    phase,
+                    || dense_wide_emoji_frame(200, 50),
+                    BUDGET_MS,
+                    Phase::PerfWide400x100,
+                )
+                .into_any_element(),
+            Phase::PerfWide400x100 => self
+                .run_perf_phase(
+                    phase,
+                    || dense_wide_emoji_frame(400, 100),
+                    BUDGET_400_INTERIM_MS,
+                    Phase::PerfPathological200x50,
+                )
+                .into_any_element(),
+            // Regression guard only (not representative). Generous ceiling.
+            Phase::PerfPathological200x50 => self
+                .run_perf_phase(
+                    phase,
+                    || pathological_wide_emoji_frame(200, 50),
+                    BUDGET_PATHOLOGICAL_MS,
+                    Phase::Done,
+                )
+                .into_any_element(),
         }
     }
 }
 
+fn percentile_ms(samples: &[Duration], p: f64) -> f64 {
+    let mut v: Vec<f64> = samples.iter().map(|d| d.as_secs_f64() * 1000.0).collect();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let idx = ((v.len() as f64 - 1.0) * p).round() as usize;
+    v[idx.min(v.len() - 1)]
+}
+
 impl HarnessView {
+    /// Time `paint_frame` end-to-end in the real window across WARMUP+MEASURE
+    /// paints, then fail-close on the measured p95 vs `budget_ms`. This — not
+    /// the spike's paint-closure-CPU number — is the perf verdict (C1/C5). The
+    /// frame is built once on phase entry; only the `paint_frame` call is timed.
+    fn run_perf_phase(
+        &mut self,
+        phase: Phase,
+        make_frame: impl FnOnce() -> Frame,
+        budget_ms: f64,
+        next: Phase,
+    ) -> impl IntoElement {
+        if self.setup_phase != Some(phase) {
+            *self.perf_frame.borrow_mut() = Some(Arc::new(make_frame()));
+            self.samples.borrow_mut().clear();
+            self.setup_phase = Some(phase);
+        }
+        let metrics_cell = Rc::clone(&self.metrics);
+        let samples_cell = Rc::clone(&self.samples);
+        let frame_cell = Rc::clone(&self.perf_frame);
+        let phase_cell = Rc::clone(&self.phase);
+        canvas(
+            |_, _, _| {},
+            move |bounds, _prepaint, window, cx| {
+                let m = metrics_cell.borrow();
+                let Some(metrics) = m.as_ref() else {
+                    return;
+                };
+                let f = frame_cell.borrow();
+                let Some(frame) = f.as_ref() else {
+                    return;
+                };
+                let t0 = Instant::now();
+                let _stats = paint_frame(
+                    frame,
+                    point(bounds.origin.x, bounds.origin.y),
+                    metrics,
+                    window,
+                    cx,
+                );
+                let dt = t0.elapsed();
+
+                let mut samples = samples_cell.borrow_mut();
+                samples.push(dt);
+                if samples.len() >= WARMUP + MEASURE {
+                    let p95 = percentile_ms(&samples[WARMUP..], 0.95);
+                    eprintln!("SMOKE {phase:?} p95_ms={p95:.3} budget_ms={budget_ms}");
+                    if p95 > budget_ms {
+                        fail(&format!(
+                            "{phase:?} p95 {p95:.3}ms > budget {budget_ms}ms (do not raise the 200x50 budget — optimize)"
+                        ));
+                    }
+                    drop(samples);
+                    *phase_cell.borrow_mut() = next;
+                }
+            },
+        )
+        .size_full()
+    }
+
     /// Manual canvas for the non-paint gate phases (assertions run in the paint
     /// closure, which only sees `&mut App`, so state is shared via `Rc`).
     fn gate_canvas(&self, phase: Phase) -> impl IntoElement {

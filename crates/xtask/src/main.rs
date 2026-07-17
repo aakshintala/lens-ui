@@ -354,6 +354,24 @@ fn gate() -> Result<()> {
         "xtask",
     ])?;
 
+    // Real-window render harness (Slice 1c C1/C5): EXECUTE on macOS — the
+    // Menlo/paint/perf assertions need a real GPUI text system (gpui's
+    // NoopTextSystem fakes them). Fail-closed paint p95 budgets live here, so
+    // this runs (not `--no-run`), gated by `test-util`.
+    if cfg!(target_os = "macos") {
+        run(&[
+            "test",
+            "-p",
+            "lens-terminal",
+            "--test",
+            "render_realwindow",
+            "--features",
+            "test-util",
+        ])?;
+    } else {
+        println!("gate: skip render_realwindow (macOS-only real GPUI text system)");
+    }
+
     // Bench harness must still COMPILE (bit-rot guard); criterion sampling is
     // deliberately NOT run here (minutes of wall-clock).
     run(&[

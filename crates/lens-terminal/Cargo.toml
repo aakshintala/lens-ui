@@ -34,6 +34,11 @@ name = "engine"
 harness = false
 required-features = ["bench"]
 
+[[bench]]
+name = "render"
+harness = false
+required-features = ["bench"]
+
 # Real-window render harness (Slice 1c C1/C5). `harness = false` → a plain
 # `fn main()` that opens a real GPUI window and drives Menlo/paint/perf
 # assertions from a canvas paint callback (gpui's NoopTextSystem is useless for
