@@ -1,3 +1,11 @@
+> **⚠ SUPERSEDED / RESOLVED (2026-07-17).** The "per-cell perf block" below was a
+> **debug-build measurement artifact** — the gate ran the harness in debug (~5.4×
+> slower than release). In release the per-cell path meets the 120fps budget with
+> headroom; shaping is ~0.06ms, so the per-glyph shape cache / C-a reopen
+> recommended here is **retired**. See
+> `docs/plans/2026-07-16-terminal-slice-1c-perf-resolution.md` for the resolution.
+> The blocker narrative below is kept for history only.
+
 # Handoff — Terminal Slice 1c: correctness DONE, per-cell perf BLOCKS merge
 
 Resume artifact for the **per-cell paint perf blocker** that stops Slice 1c from

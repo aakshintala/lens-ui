@@ -9,26 +9,32 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Open threads & next up
 
-- **▶ ACTIVE: shared terminal workstream — Slices 0/1a/1b merged; Slice 1c correctness DONE, ⛔ BLOCKED on per-cell paint perf (does NOT merge); 1d not started.**
-  - **⚠ SLICE 1c (render) — T1–T7 done + green + committed on `terminal-ws` (unpushed), T8 perf gate RED by design → 1c UNMERGED.**
-    Commits `874c817`→`ae12b8b`. Real-window harness (`tests/render_realwindow.rs`, `harness=false`,
-    `test-util`-gated, xtask executes on macOS): **Menlo gate PASSES on this hardware**; `Frame` paint
-    (PerRow/PerCell routing + debug-guard that PerRow never gets a wide cell), full SGR +
-    `underline_quad_color` (I10a) + invisible-width (I10b), render Inspect ring; `TerminalTab` renders
-    via shared `TabRenderState::render_element` (I6). Clippy clean `-D warnings` (normal + `test-util`).
+- **▶ ACTIVE: shared terminal workstream — Slices 0/1a/1b merged; Slice 1c DONE + gate GREEN (perf "block" was a debug-build artifact); 1d not started.**
+  - **✅ SLICE 1c (render) — DONE, `xtask gate` GREEN on `terminal-ws` (unpushed).** T1–T7 correctness
+    (`874c817`→`ae12b8b`) + perf-block resolution (`63f490f`→`f4f0d15`). Real-window harness
+    (`tests/render_realwindow.rs`, `harness=false`, `test-util`-gated, xtask executes on macOS **in
+    `--release`**): **Menlo gate PASSES**; `Frame` paint (PerRow/PerCell routing + debug-guard that
+    PerRow never gets a wide cell), full SGR + `underline_quad_color` (I10a) + invisible-width (I10b),
+    render Inspect ring; `TerminalTab` renders via shared `TabRenderState::render_element` (I6). Clippy
+    clean `-D warnings` (normal + `test-util`).
     **2 plan deviations (both user-approved, in commit msgs):** (1) `render_test_api` gated on
-    `test-util` not `cfg(test)` — integration tests link the normal build; (2) **Menlo gate drops the
-    emoji's-own-left-edge probe** — real hardware: ASCII grid/box-drawing/CJK/post-emoji-resync all
-    exact, only the emoji left edge drifts 2.857px under per-row shaping, which the renderer never uses
-    for emoji (wide rows → per-cell). **⛔ BLOCKER (T8):** end-to-end p95 with NO shape cache (dropped
-    per plan C-a): ASCII 200×50 **6.3ms** ✓, dense-wide 200×50 **18.0ms** ✗ (budget 8.3), dense-wide
-    400×100 **48.4ms** ✗ (interim 20). Uncached per-cell runs `shape_line`+`paint` per cell/frame
-    (~3.5µs/cell); the 2.77ms verdict that justified dropping the cache was per-ROW ASCII, not
-    per-cell. **User call: keep budgets firm, fail 1c, escalate.** Fix candidate = per-glyph shape
-    cache keyed on grapheme+style (≠ the dropped broken whole-row cache; reopens C-a). Handoff:
-    `docs/handoffs/2026-07-16-terminal-slice-1c-percell-perf-block.md`. Pathological 100%-wide/50%-emoji
-    fixture kept as a regression guard (≤30ms). Pre-existing 1b flake:
-    `engine::handle::tests::stop_publishes_final_frame_before_join` (timing, intermittent under full-suite).
+    `test-util` not `cfg(test)`; (2) Menlo gate drops the emoji's-own-left-edge probe (real hardware:
+    ASCII grid/box-drawing/CJK/post-emoji-resync all exact; emoji left edge drifts 2.857px under
+    per-row shaping, which the renderer never uses for emoji — wide rows → per-cell).
+    **⛔→✅ The "per-cell perf block" was a DEBUG-BUILD ARTIFACT.** The gate measured the harness in
+    **debug** (~5.4× slower per-cell than release, from unoptimised `Font` clones). The 8.3ms budget is
+    a 120fps *product* target; in **release** (what ships) every workload meets it: dense-wide 200×50
+    **2.5–3.7ms**, 400×100 **4.8–6.2ms** (beats the *absolute* 8.3, not just the 20ms interim),
+    pathological **2.4–3.3ms**. Shaping is ~0.06ms — the recommended per-glyph shape cache / **C-a
+    reopen is RETIRED** (never the bottleneck). Fixes: gate now runs `--release` (`b1cc3e2`);
+    resolve-once-per-row cleanup (`ad7e049`; **codex/gpt-5.5 review caught a per-cell decoration
+    paint-order flip → fixed `730fc83`**); release-calibrated per-phase budgets (ascii 3.0 / wide-200
+    5.5 / wide-400 8.0 / pathological 6.0ms — carry ~30% gate-load margin so no flap). Plan:
+    `docs/plans/2026-07-16-terminal-slice-1c-perf-resolution.md`.
+    **⚠ Pre-existing engine flake now hits the gate:** `engine::handle` timing tests
+    (`build_failure_retries_on_next_pump`, `stop_publishes_final_frame_before_join`) fail intermittently
+    under full-suite parallelism (pass 23/23 in isolation). NOT from 1c (render-only change). The gate
+    flaked once on it, passed green on re-run. **Fix-or-mark before relying on unattended green.**
   - **✅ SLICE 0 (surface freeze) DONE + merged** (`fdba839`→`635eaa7`): froze the opaque public
     names/seam invariants `lens-ui` binds to (`open`/`TerminalTarget`/`AccessIntent`/`TerminalKey`/
     `TerminalOpenOptions`, 7-variant `Lifecycle`, `TerminalHostEvent`/`TerminalEvent`, opaque `Frame`,
