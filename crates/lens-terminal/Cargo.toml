@@ -25,12 +25,14 @@ bench = []
 # Exposes `render_test_api` for the real-window harness. Integration tests link
 # the crate's normal build (not cfg(test)), so the harness runs with this on.
 test-util = []
+live-tests = ["lens-client/live-tests"]
 
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false }
 gpui = { version = "0.2.2", features = ["test-support"] }
 lens-client = { path = "../lens-client", features = ["test-util"] }
 serde_json = "1"
+url = "2"
 
 [[bench]]
 name = "engine"
@@ -52,3 +54,11 @@ name = "render_realwindow"
 path = "tests/render_realwindow.rs"
 harness = false
 required-features = ["test-util"]
+
+# Live open()+paint+reconnect rider (Slice 1d). `harness = false` → real GPUI
+# window; env-gated skip vs fail; not part of default `cargo test --workspace`.
+[[test]]
+name = "terminal_live"
+path = "tests/terminal_live.rs"
+harness = false
+required-features = ["live-tests", "test-util"]

@@ -407,6 +407,35 @@ impl TerminalTab {
         self.render.inspect.snapshot()
     }
 
+    #[cfg(feature = "live-tests")]
+    pub fn debug_send_input_for_test(&self, bytes: Vec<u8>) {
+        if let Some(rt) = &self.runtime
+            && let Some(a) = rt.attach_ref()
+        {
+            let _ = a.outbound.try_send(lens_client::WsOutbound::Input(bytes));
+        }
+    }
+
+    #[cfg(feature = "live-tests")]
+    pub fn debug_abort_attach_for_test(&mut self, cx: &mut Context<Self>) {
+        // Take ONLY the attach (leave the bridge running so it observes Closed(Network)
+        // and drives policy → Reconnecting). Abort off-foreground (abort_for_test joins the I/O thread).
+        if let Some(rt) = &mut self.runtime
+            && let Some(a) = rt.take_attach()
+        {
+            cx.background_executor()
+                .spawn(async move {
+                    a.abort_for_test();
+                })
+                .detach();
+        }
+    }
+
+    #[cfg(feature = "live-tests")]
+    pub fn debug_latest_frame_for_test(&self) -> Option<std::sync::Arc<Frame>> {
+        self.render.latest_frame.clone()
+    }
+
     /// Enable/disable attach + engine inspect rings (zero-cost when disabled).
     pub fn set_inspect_enabled(&self, enabled: bool) {
         if let Some(rt) = &self.runtime {

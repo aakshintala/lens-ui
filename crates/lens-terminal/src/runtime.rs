@@ -33,6 +33,11 @@ impl TerminalRuntime {
         self.attach.as_ref()
     }
 
+    #[cfg_attr(not(feature = "live-tests"), allow(dead_code))]
+    pub(crate) fn take_attach(&mut self) -> Option<AttachHandle> {
+        self.attach.take()
+    }
+
     pub(crate) fn engine_ref(&self) -> Option<&Arc<EngineHandle>> {
         self.engine.as_ref()
     }

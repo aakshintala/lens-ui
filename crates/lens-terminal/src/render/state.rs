@@ -38,7 +38,13 @@ impl TabRenderState {
     }
 
     /// Replace the frame to paint on the next render. Slice 1d's engine wake
-    /// sampler is the production writer; `set_frame_for_test` delegates here.
+    /// sampler is the production writer; harness hosts call this directly.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn set_frame(&mut self, frame: Arc<Frame>) {
+        self.latest_frame = Some(frame);
+    }
+
+    #[cfg(not(any(test, feature = "test-util")))]
     pub(crate) fn set_frame(&mut self, frame: Arc<Frame>) {
         self.latest_frame = Some(frame);
     }
