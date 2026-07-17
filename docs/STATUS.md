@@ -27,8 +27,13 @@ and roll older "Recent" pointers off this page as they age.
       skipped; rider false-green; abort machinery leaking into production; inspect not durable across
       reconnect) → all folded.
     - **⏳ REMAINING = the LIVE RUN of the rider vs a running omnigent 0.5.1** (`tests/terminal_live.rs`,
-      `--features live-tests,test-util`, real GPUI window). Code is hardened & ready; needs a live server +
-      a session-with-terminal + the user's display. Then merge `terminal-ws` → decision.
+      `--features live-tests,test-util`, real GPUI window). Code is hardened & ready. A live-run attempt this
+      session got server+host online but hit two OMNIGENT-OPERATIONAL blockers (NOT rider bugs): (1) existing
+      sessions bound to offline runners (`runner_unavailable`) — need a session on an online runner; (2) the
+      rider's `echo LENSMARKER` marker assumes a SHELL terminal, but omnigent session terminals run the AGENT
+      TUI (`\r` risks a billable turn) — open Q: does `TerminalCreate` launch a bare shell terminal? **Fresh-
+      session driver: [`docs/handoffs/2026-07-17-terminal-slice-1d-live-run.md`](./handoffs/2026-07-17-terminal-slice-1d-live-run.md)**
+      (findings + investigate-first recipe). Then merge `terminal-ws` → user's call.
     - **Deferred (roll-up in ledger):** 1b engine flake `hidden_tab_suppresses_publish_until_visible`
       (pre-existing, timing under parallel load); EngineHandle::spawn readiness result (1b); thread-exhaustion
       foreground-panic extreme edge; per-task lens-terminal clippy should include `--features test-util`
