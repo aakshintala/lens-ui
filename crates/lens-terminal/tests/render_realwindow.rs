@@ -32,14 +32,23 @@ use lens_terminal::render_test_api::{
     mixed_ascii_wide_frame, paint_frame, pathological_wide_emoji_frame, sgr_frame,
 };
 
-/// Fail-closed paint p95 budgets. The absolute 8.3ms @400×100 is re-scoped to
-/// Slice 4; 1c holds an interim 20.0ms ceiling there (open risk: PerCell dense
-/// wide/emoji ~16.5ms in the spike).
-const BUDGET_MS: f64 = 8.3;
-const BUDGET_400_INTERIM_MS: f64 = 20.0;
-/// Generous ceiling for the pathological (100%-wide, 50%-emoji) regression
-/// guard — not a target, just a tripwire against gross per-cell degradation.
-const BUDGET_PATHOLOGICAL_MS: f64 = 30.0;
+/// Fail-closed paint p95 budgets, calibrated to measured **release** p95 (the
+/// gate runs `--release`; debug is ~5.4× slower and unrepresentative — see
+/// docs/plans/2026-07-16-terminal-slice-1c-perf-resolution.md). Each budget sits
+/// above the observed p95 tail with headroom for a load transient, yet low
+/// enough to trip on a ~2× regression. The 120fps product line (8.3ms) is the
+/// ceiling all of these clear.
+///
+/// Observed release p95 (this hardware, fg≈bg): ascii ~0.9ms, wide-200×50
+/// ~3.2ms, wide-400×100 ~4.8ms, pathological ~3.2ms.
+const BUDGET_ASCII_MS: f64 = 3.0;
+const BUDGET_WIDE_200_MS: f64 = 5.5;
+/// 400×100: the absolute 8.3ms target was re-scoped to Slice 4, but release
+/// already meets it — this budget locks that in (no longer an interim ceiling).
+const BUDGET_WIDE_400_MS: f64 = 6.5;
+/// Pathological (100%-wide, 50%-emoji) regression guard — a tripwire against
+/// gross per-cell degradation, not a target.
+const BUDGET_PATHOLOGICAL_MS: f64 = 6.0;
 const WARMUP: usize = 60;
 const MEASURE: usize = 120;
 
@@ -182,7 +191,7 @@ impl Render for HarnessView {
                 .run_perf_phase(
                     phase,
                     || ascii_frame(200, 50, 'a'),
-                    BUDGET_MS,
+                    BUDGET_ASCII_MS,
                     Phase::PerfWide200x50,
                 )
                 .into_any_element(),
@@ -190,7 +199,7 @@ impl Render for HarnessView {
                 .run_perf_phase(
                     phase,
                     || dense_wide_emoji_frame(200, 50),
-                    BUDGET_MS,
+                    BUDGET_WIDE_200_MS,
                     Phase::PerfWide400x100,
                 )
                 .into_any_element(),
@@ -198,7 +207,7 @@ impl Render for HarnessView {
                 .run_perf_phase(
                     phase,
                     || dense_wide_emoji_frame(400, 100),
-                    BUDGET_400_INTERIM_MS,
+                    BUDGET_WIDE_400_MS,
                     Phase::PerfPathological200x50,
                 )
                 .into_any_element(),
@@ -271,7 +280,7 @@ impl HarnessView {
                     eprintln!("SMOKE {phase:?} p95_ms={p95:.3} budget_ms={budget_ms}");
                     if p95 > budget_ms {
                         fail(&format!(
-                            "{phase:?} p95 {p95:.3}ms > budget {budget_ms}ms (do not raise the 200x50 budget — optimize)"
+                            "{phase:?} p95 {p95:.3}ms > budget {budget_ms}ms (release-calibrated; investigate a regression before raising — see the perf-resolution plan)"
                         ));
                     }
                     drop(samples);
