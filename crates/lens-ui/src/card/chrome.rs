@@ -8,7 +8,8 @@ use crate::theme::ActiveLensTheme;
 
 use super::model::{ConnectionOverlay, RepoRef, SessionCard};
 use super::motion::{
-    render_sweep_overlay, render_working_spinner, wave_icon_path, wave_status_line,
+    countdown_fraction, format_wake_countdown, render_countdown_ring, render_sweep_overlay,
+    render_working_spinner, wave_icon_path, wave_status_line,
 };
 use super::wave::Wave;
 
@@ -80,7 +81,7 @@ fn host_label(card: &SessionCard) -> String {
         .unwrap_or_else(|| "—".into())
 }
 
-fn render_icon_tile(wave: Wave, status: Hsla, now_ms: i64) -> Div {
+fn render_icon_tile(wave: Wave, status: Hsla, now_ms: i64, countdown: Option<f32>) -> Div {
     // Faint status-tinted surface (mockup: color-mix(status 14%, bg2)) — NOT a solid fill.
     let mut tile = div()
         .flex_shrink_0()
@@ -93,6 +94,11 @@ fn render_icon_tile(wave: Wave, status: Hsla, now_ms: i64) -> Div {
         .flex()
         .items_center()
         .justify_center();
+    if wave == Wave::Scheduled
+        && let Some(frac) = countdown
+    {
+        tile = tile.child(render_countdown_ring(status, frac));
+    }
     if let Some(path) = wave_icon_path(wave) {
         tile = tile.child(svg().path(path).w(px(21.0)).h(px(21.0)).text_color(status));
     } else {
@@ -180,6 +186,16 @@ pub fn render_card_chrome(
         card.activity_summary.clone()
     };
 
+    let countdown = countdown_fraction(card.scheduled_started_at, card.scheduled_wake_at, now_ms);
+    // Scheduled activity line = the live countdown (overrides activity_summary).
+    let activity = if wave == Wave::Scheduled {
+        card.scheduled_wake_at
+            .map(|w| format_wake_countdown(w - now_ms))
+            .unwrap_or_else(|| activity.clone())
+    } else {
+        activity
+    };
+
     // Slept → bright Wake; Failed → Retry. Both sit top-right, full-opacity even when dimmed.
     let action: Option<Stateful<Div>> = match wave {
         Wave::Slept => Some(action_button(
@@ -217,7 +233,7 @@ pub fn render_card_chrome(
         .flex_row()
         .items_start()
         .gap_2()
-        .child(render_icon_tile(wave, border, now_ms).when(dim, |t| t.opacity(0.42)))
+        .child(render_icon_tile(wave, border, now_ms, countdown).when(dim, |t| t.opacity(0.42)))
         .child(
             div()
                 .flex_grow()

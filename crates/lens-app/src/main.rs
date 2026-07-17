@@ -222,6 +222,7 @@ fn demo_preset_cards(now: i64) -> [SessionCard; 8] {
     let mut scheduled = base("demo-scheduled", "Follow-up check scheduled");
     scheduled.status = SessionStatusValue::Idle;
     scheduled.scheduled_wake_at = Some(now + 2 * 60 * 1000);
+    scheduled.scheduled_started_at = Some(now);
     scheduled.activity_summary = "wakes in ~2m".into();
 
     [

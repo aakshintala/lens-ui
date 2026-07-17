@@ -59,6 +59,9 @@ pub struct SessionCard {
     /// forwarded omnigent `scheduled_until` populates this same field). `Scheduled`
     /// renders only while this is in the future.
     pub scheduled_wake_at: Option<i64>,
+    /// §2 waves: epoch-ms when the current schedule began — the countdown-ring denominator
+    /// (`(wake − now) / (wake − started)`). Set alongside `scheduled_wake_at`.
+    pub scheduled_started_at: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -104,6 +107,7 @@ impl SessionCard {
             is_focused: false,
             awaiting_review: false,
             scheduled_wake_at: None,
+            scheduled_started_at: None,
         }
     }
 

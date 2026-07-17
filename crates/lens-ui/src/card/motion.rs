@@ -161,6 +161,79 @@ pub fn wave_icon_path(wave: Wave) -> Option<&'static str> {
     })
 }
 
+/// Remaining fraction (0..1) of a scheduled wake window; `None` if either bound is missing.
+pub fn countdown_fraction(
+    started_at: Option<i64>,
+    wake_at: Option<i64>,
+    now_ms: i64,
+) -> Option<f32> {
+    let (start, wake) = (started_at?, wake_at?);
+    let span = wake - start;
+    if span <= 0 {
+        return Some(0.0);
+    }
+    let remaining = (wake - now_ms).max(0) as f32 / span as f32;
+    Some(remaining.clamp(0.0, 1.0))
+}
+
+/// Live countdown label. `remaining_ms <= 0` → "waking…".
+pub fn format_wake_countdown(remaining_ms: i64) -> String {
+    if remaining_ms <= 0 {
+        return "waking…".into();
+    }
+    let secs = (remaining_ms + 999) / 1000; // ceil to whole seconds
+    if secs >= 60 {
+        format!("wakes in {}m {:02}s", secs / 60, secs % 60)
+    } else {
+        format!("wakes in {secs}s")
+    }
+}
+
+/// Depleting arc around the 44px tile, drawn full→empty as `fraction` goes 1→0.
+/// `canvas` + `arc_to` stroke (gpui has no conic-gradient). NOT in the 30fps loop — 1 Hz.
+pub fn render_countdown_ring(status: Hsla, fraction: f32) -> impl IntoElement {
+    let frac = fraction.clamp(0.0, 1.0);
+    canvas(
+        move |_, _, _| (),
+        move |bounds: Bounds<gpui::Pixels>, _, window, _| {
+            if frac <= 0.0 {
+                return;
+            }
+            window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                let stroke = px(2.0);
+                let center = bounds.center();
+                let radius = (bounds.size.width.min(bounds.size.height) - stroke) / 2.0;
+                let sweep_deg = frac * 360.0;
+                // 0° = top, clockwise.
+                let polar = |deg: f32| {
+                    let r = deg.to_radians();
+                    point(center.x + radius * r.sin(), center.y - radius * r.cos())
+                };
+                let mut b = PathBuilder::stroke(stroke);
+                b.move_to(polar(0.0));
+                if sweep_deg >= 359.9 {
+                    // full ring = two half-arcs (single arc_to can't close 360°).
+                    b.arc_to(point(radius, radius), px(0.0), true, true, polar(180.0));
+                    b.arc_to(point(radius, radius), px(0.0), true, true, polar(0.0));
+                } else {
+                    b.arc_to(
+                        point(radius, radius),
+                        px(0.0),
+                        sweep_deg > 180.0,
+                        true,
+                        polar(sweep_deg),
+                    );
+                }
+                if let Ok(path) = b.build() {
+                    window.paint_path(path, status);
+                }
+            });
+        },
+    )
+    .absolute()
+    .inset(px(-4.0))
+}
+
 /// Short status line beside the tile glyph.
 pub fn wave_status_line(wave: Wave, card: &SessionCard) -> &'static str {
     use lens_core::domain::scalars::SessionStatusValue;
@@ -251,6 +324,33 @@ mod tests {
         assert!(wave_animates(Wave::Working));
         assert!(!wave_animates(Wave::Slept));
         assert!(!wave_animates(Wave::Neutral));
+    }
+
+    #[test]
+    fn countdown_fraction_depletes() {
+        let start = 10_000;
+        let wake = 10_000 + 180_000; // 3m window
+        assert_eq!(
+            countdown_fraction(Some(start), Some(wake), start),
+            Some(1.0)
+        );
+        assert_eq!(countdown_fraction(Some(start), Some(wake), wake), Some(0.0));
+        let mid = countdown_fraction(Some(start), Some(wake), start + 90_000).unwrap();
+        assert!((mid - 0.5).abs() < 1e-3);
+        // past wake clamps to 0; missing bound → None.
+        assert_eq!(
+            countdown_fraction(Some(start), Some(wake), wake + 5_000),
+            Some(0.0)
+        );
+        assert_eq!(countdown_fraction(None, Some(wake), start), None);
+    }
+
+    #[test]
+    fn format_wake_countdown_shapes() {
+        assert_eq!(format_wake_countdown(179_000), "wakes in 2m 59s");
+        assert_eq!(format_wake_countdown(45_000), "wakes in 45s");
+        assert_eq!(format_wake_countdown(0), "waking…");
+        assert_eq!(format_wake_countdown(-1), "waking…");
     }
 
     #[test]
