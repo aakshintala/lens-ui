@@ -37,6 +37,12 @@ pub struct EngineHandle {
     test_build_failures: Arc<AtomicUsize>,
 }
 
+impl std::fmt::Debug for EngineHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EngineHandle").finish_non_exhaustive()
+    }
+}
+
 impl EngineHandle {
     pub fn spawn(cfg: EngineConfig) -> Self {
         let worker::WorkerChannels {

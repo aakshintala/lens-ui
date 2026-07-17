@@ -30,6 +30,7 @@ use std::sync::Arc;
 mod bridge;
 mod engine;
 mod render;
+mod runtime;
 
 /// Test-only view onto the private `render` module for the real-window harness
 /// (`tests/render_realwindow.rs`). Gated on `test-util` because integration
@@ -277,6 +278,9 @@ pub struct TerminalTab {
     client: Arc<Client>,
     #[expect(dead_code, reason = "consumed by Slice 1a transport + 1d convergence")]
     options: TerminalOpenOptions,
+
+    #[expect(dead_code, reason = "consumed by Slice 1d convergence (Task 3+)")]
+    runtime: Option<runtime::TerminalRuntime>,
 }
 
 impl TerminalTab {
@@ -308,6 +312,7 @@ impl TerminalTab {
             target,
             client,
             options,
+            runtime: None,
         }
     }
 
