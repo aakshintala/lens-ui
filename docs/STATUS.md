@@ -52,12 +52,26 @@ and roll older "Recent" pointers off this page as they age.
     pulse+deep-link, Scheduled dim+countdown) + poller repaint timer at `scheduled_wake_at`. Producers
     (Lens MCP server) = new **SPEC-GAPS #11**, with the **remote-agent→local-Mac MCP transport** flagged
     as the load-bearing open risk.
-  - **▶ NEXT: wave build (B1–B5)** — completes the card (icon-tile replaces the throwaway pill, renders
-    **all 8 waves**), adds the wave behaviors above, tunes colors via the manual reload loop. Then board
-    packing (B6–B8). **Full theming machinery §18 (importers/picker/hot-reload/registry) = later
-    standalone (step 9, least urgent).** Sequencing: ~~theming schema~~ → **waves** → board packing →
-    light checkpoint → transcript → composer/elicitation → panes/terminal/editor → shell polish →
-    theming machinery.
+  - **✅ WAVE BEHAVIORS DESIGN LOCKED + ANIMATION SPIKE DONE (2026-07-17, branch `feat/lens-app-multi-session`
+    @ `114e242`, branch-only).** Handoff `docs/handoffs/2026-07-17-wave-behaviors-spike-done.md`; design
+    SSOT `docs/superpowers/specs/2026-07-17-wave-behaviors-design.md` (+ tunable mockup
+    `docs/design/renders/wave-states-motion.html`); spike verdict `docs/spikes/2026-07-17-wave-animation.md`.
+    **Strategy B — motion *character* encodes class:** sweep=attention (NeedsInput/Failed +ring / Awaiting/
+    Ready), spinner=Working, depleting countdown-ring=Scheduled, still=Slept(dim+Wake)/Idle. Glyphs final.
+    **Animation spike = GO:** `.cached()` cards repaint under self-notify, §4.4 isolation holds. **Driver
+    LOCKED = frame-capped (30fps) timer self-notify, NOT `.with_animation`** (which was 21%/5cards); measured
+    ~1.7% CPU/visible-card @30fps, floor 0.3%; + viewport-gate bounds cost to screen. Fixed an **f32
+    epoch-millis precision bug** (froze the phase — i64 modulo before f32 cast). Spike **seed** landed the
+    icon-tile (B1)+sweep+30fps driver in the real card path (committed, NOT final). 3 carried gotchas:
+    canvas-`paint_path` sweep (div band is flat), Working spinner needs a bundled SVG asset, board doesn't
+    scroll (B6). See memory [[wave-animation-spike]].
+  - **▶ NEXT: `writing-plans` for wave build B1–B5** (NEW session) — from spec `2026-07-17-wave-behaviors-design.md`
+    + the handoff. Structural shell (B1 icon-tile/B2 pbar/B4 layout/B5 slept-Wake+failed-Retry) +
+    productionize the animation system (timer driver/viewport-gate/canvas sweep/countdown ring/spinner
+    asset/tests), then execute subagent-driven. Then board packing (B6–B8, needs scroll). **Full theming
+    machinery §18 = later standalone.** Sequencing: ~~theming~~ → ~~wave design+spike~~ → **wave build** →
+    board packing → light checkpoint → transcript → composer/elicitation → panes/terminal/editor → shell
+    polish → theming machinery.
 
 - **📋 SPEC-GAPS backlog (2026-07-13):** independent, un-specced/partial
   subsystems parked in [`SPEC-GAPS.md`](./SPEC-GAPS.md) — app release/signing/update,
