@@ -26,6 +26,7 @@
 //!   title/lifecycle/access/progress).
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
 use lens_client::WsOutbound;
@@ -64,10 +65,14 @@ use gpui::prelude::*;
 use gpui::{App, Context, Entity, EventEmitter, FocusHandle, IntoElement, Render, Window};
 use lens_client::Client;
 use lens_client::ids::{SessionId, TerminalId};
+use lens_client::{AttachOptions, TerminalResource, attach};
 use serde::{Deserialize, Serialize};
 
-use bridge::BridgeEvent;
-use policy::{AttachedParts, discover_and_attach, identity_title_from_resource};
+use bridge::{BridgeEvent, spawn_bridge};
+use policy::{
+    AttachedParts, PolicyAction, PolicyState, RetryWindow, discover_and_attach,
+    identity_title_from_resource, preflight_reconnect,
+};
 
 // ---------------------------------------------------------------------------
 // Public identity + access values (frozen names).
@@ -298,12 +303,13 @@ pub struct TerminalTab {
 
     runtime: Option<runtime::TerminalRuntime>,
 
+    policy: PolicyState,
+    policy_tx: Option<async_channel::Sender<BridgeEvent>>,
+    current_session: Option<SessionId>,
+    current_tid: Option<TerminalId>,
+
     /// Flipped by [`apply_newest_size_before_input`] on (re)connect; Slice 2 input
     /// gates on this.
-    #[expect(
-        dead_code,
-        reason = "written by apply_newest_size_before_input; read in Slice 2"
-    )]
     input_enabled: bool,
 }
 
@@ -325,6 +331,10 @@ impl TerminalTab {
             client,
             options,
             runtime: None,
+            policy: PolicyState::new(),
+            policy_tx: None,
+            current_session: None,
+            current_tid: None,
             input_enabled: false,
         }
     }
@@ -361,6 +371,10 @@ impl TerminalTab {
                 attach: None,
                 engine: Some(engine),
             }),
+            policy: PolicyState::new(),
+            policy_tx: None,
+            current_session: None,
+            current_tid: None,
             input_enabled: false,
         }
     }
@@ -406,6 +420,7 @@ impl TerminalTab {
             wake_tx,
             wake_rx,
             policy_rx,
+            policy_tx,
         } = parts;
 
         if let Some(engine) = runtime.engine.as_ref() {
@@ -414,24 +429,61 @@ impl TerminalTab {
             }));
         }
 
+        self.current_session = Some(resource.session_id.clone());
+        self.current_tid = Some(resource.id.clone());
+        self.policy_tx = Some(policy_tx);
         self.runtime = Some(runtime);
         self.lifecycle = Lifecycle::Live;
         self.presentation.lifecycle = Lifecycle::Live;
         self.presentation.access = access_mode_for(&self.options);
         self.presentation.identity_title = identity_title_from_resource(&resource);
-        // Retained open captures — consumed by Task 4 reconnect / reattach policy.
-        let _ = (&self.target, self.client.as_ref());
         cx.emit(TerminalEvent::PresentationChanged);
         cx.notify();
 
         spawn_foreground_sampler(wake_rx, policy_rx, cx);
     }
 
-    fn on_detach(&mut self, detail: DetachedDetail, cx: &mut Context<Self>) {
+    fn teardown_transport_off_foreground(&mut self) {
+        if let Some(rt) = &mut self.runtime {
+            let (bridge, attach) = rt.take_transport();
+            let _ = std::thread::Builder::new()
+                .name("lens-terminal-transport-teardown".into())
+                .spawn(move || {
+                    if let Some(b) = bridge {
+                        b.join();
+                    }
+                    if let Some(a) = attach {
+                        a.close();
+                    }
+                });
+        }
+    }
+
+    fn teardown_runtime_full(&mut self, cx: &mut Context<Self>) {
+        if let Some(rt) = self.runtime.take() {
+            cx.spawn(async move |_weak, cx| {
+                cx.background_executor()
+                    .spawn(async move {
+                        rt.teardown_blocking();
+                    })
+                    .await;
+            })
+            .detach();
+        }
+    }
+
+    fn set_detached_presentation(&mut self, detail: DetachedDetail, reattach_available: bool) {
         self.lifecycle = Lifecycle::Detached;
         self.presentation.lifecycle = Lifecycle::Detached;
         self.presentation.detached_detail = Some(detail);
-        self.presentation.reattach_available = matches!(detail, DetachedDetail::ClientDetached);
+        self.presentation.reattach_available = reattach_available;
+        self.input_enabled = false;
+    }
+
+    fn on_detach(&mut self, detail: DetachedDetail, cx: &mut Context<Self>) {
+        let reattach_available = matches!(detail, DetachedDetail::ClientDetached);
+        self.teardown_runtime_full(cx);
+        self.set_detached_presentation(detail, reattach_available);
         cx.emit(TerminalEvent::PresentationChanged);
         cx.notify();
     }
@@ -462,18 +514,181 @@ impl TerminalTab {
     }
 
     fn apply_bridge_event(&mut self, ev: BridgeEvent, cx: &mut Context<Self>) {
-        // TODO(Task 4): full CloseCause policy + RetryWindow + reconnect
-        let next = match ev {
-            BridgeEvent::Closed(_) => Lifecycle::Detached,
+        use lens_client::CloseCause;
+
+        let action = match ev {
+            BridgeEvent::Closed(cause) => self.policy.on_close(cause, Instant::now()),
             BridgeEvent::FeedSaturated
             | BridgeEvent::OutboundSaturated
-            | BridgeEvent::AttachDisconnected => Lifecycle::Reconnecting,
+            | BridgeEvent::AttachDisconnected => {
+                self.policy.on_close(CloseCause::Network, Instant::now())
+            }
         };
-        self.lifecycle = next;
-        self.presentation.lifecycle = next;
+
+        match action {
+            PolicyAction::StopDetached {
+                detail,
+                reattach_available,
+            } => {
+                if reattach_available {
+                    self.teardown_transport_off_foreground();
+                } else {
+                    self.teardown_runtime_full(cx);
+                }
+                self.set_detached_presentation(detail, reattach_available);
+                cx.emit(TerminalEvent::PresentationChanged);
+                cx.notify();
+            }
+            PolicyAction::DowngradeReadOnly => {
+                self.presentation.access = AccessMode::ReadOnly;
+                self.input_enabled = false;
+                // TODO: refresh + read_only reattach
+                cx.emit(TerminalEvent::PresentationChanged);
+                cx.notify();
+            }
+            PolicyAction::Retry { delay } => {
+                self.lifecycle = Lifecycle::Reconnecting;
+                self.presentation.lifecycle = Lifecycle::Reconnecting;
+                self.input_enabled = false;
+                cx.emit(TerminalEvent::PresentationChanged);
+                cx.notify();
+                self.teardown_transport_off_foreground();
+                self.schedule_reconnect(delay, cx);
+            }
+        }
+    }
+
+    fn reconnect_session_and_tid(&self) -> (SessionId, TerminalId) {
+        match &self.target {
+            TerminalTarget::Existing {
+                session_id,
+                terminal_id,
+            } => (session_id.clone(), terminal_id.clone()),
+            TerminalTarget::OpenOrCreate { .. } => (
+                self.current_session
+                    .clone()
+                    .expect("current_session set at attach"),
+                self.current_tid.clone().expect("current_tid set at attach"),
+            ),
+        }
+    }
+
+    fn schedule_reconnect(&mut self, first_delay: Duration, cx: &mut Context<Self>) {
+        let client = Arc::clone(&self.client);
+        let (session, tid) = self.reconnect_session_and_tid();
+        let engine = self
+            .runtime
+            .as_ref()
+            .and_then(runtime::TerminalRuntime::engine_arc)
+            .expect("engine retained during reconnect");
+        let policy_tx = self
+            .policy_tx
+            .clone()
+            .expect("policy_tx retained from initial attach");
+        let read_only = matches!(self.presentation.access, AccessMode::ReadOnly);
+
+        cx.spawn(async move |weak, cx| {
+            let mut window = RetryWindow::new();
+            let mut next = Some(first_delay);
+            loop {
+                let delay = match next.take().or_else(|| window.next_delay(Instant::now())) {
+                    Some(d) => d,
+                    None => {
+                        let _ = weak.update(cx, |tab, cx| {
+                            tab.on_detach(DetachedDetail::RetriesExhausted, cx);
+                        });
+                        break;
+                    }
+                };
+
+                let attempt = cx
+                    .background_executor()
+                    .spawn({
+                        let client = Arc::clone(&client);
+                        let engine = Arc::clone(&engine);
+                        let policy_tx = policy_tx.clone();
+                        let session = session.clone();
+                        let tid = tid.clone();
+                        async move {
+                            std::thread::sleep(delay);
+                            let resource = preflight_reconnect(client.as_ref(), &session, &tid)
+                                .map_err(ReconnectOutcome::Fatal)?;
+                            let attach = attach(
+                                client.as_ref(),
+                                &session,
+                                &tid,
+                                AttachOptions { read_only },
+                            )
+                            .map_err(|_| ReconnectOutcome::Retryable)?;
+                            let bridge = spawn_bridge(
+                                attach.inbound.clone(),
+                                attach.outbound.clone(),
+                                engine,
+                                policy_tx,
+                            );
+                            Ok::<_, ReconnectOutcome>((resource, attach, bridge))
+                        }
+                    })
+                    .await;
+
+                match attempt {
+                    Ok((resource, attach, bridge)) => {
+                        let _ = weak.update(cx, |tab, cx| {
+                            tab.on_reconnect_success(resource, attach, bridge, cx);
+                        });
+                        break;
+                    }
+                    Err(ReconnectOutcome::Fatal(detail)) => {
+                        let _ = weak.update(cx, |tab, cx| tab.on_detach(detail, cx));
+                        break;
+                    }
+                    Err(ReconnectOutcome::Retryable) => {}
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn on_reconnect_success(
+        &mut self,
+        resource: TerminalResource,
+        attach: lens_client::AttachHandle,
+        bridge: bridge::BridgeHandle,
+        cx: &mut Context<Self>,
+    ) {
+        let outbound = attach.outbound.clone();
+        let read_only = matches!(self.presentation.access, AccessMode::ReadOnly);
+        let write_allowed = !read_only;
+
+        if let Some(rt) = &mut self.runtime {
+            let engine = rt.engine_arc().expect("engine retained during reconnect");
+            let snap = engine.inspect();
+            rt.install_transport(bridge, attach);
+            self.policy.retry.reset();
+            apply_newest_size_before_input(
+                engine.as_ref(),
+                &outbound,
+                snap.cols,
+                snap.rows,
+                write_allowed,
+                &mut self.input_enabled,
+            );
+        }
+
+        self.current_session = Some(resource.session_id.clone());
+        self.current_tid = Some(resource.id.clone());
+        self.lifecycle = Lifecycle::Live;
+        self.presentation.lifecycle = Lifecycle::Live;
+        self.presentation.output_gap = true;
+        self.presentation.identity_title = identity_title_from_resource(&resource);
         cx.emit(TerminalEvent::PresentationChanged);
         cx.notify();
     }
+}
+
+enum ReconnectOutcome {
+    Fatal(DetachedDetail),
+    Retryable,
 }
 
 fn access_mode_for(options: &TerminalOpenOptions) -> AccessMode {
@@ -593,13 +808,6 @@ fn starting_presentation(target: &TerminalTarget, options: &TerminalOpenOptions)
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Task 4 reconnect resize-before-input; tested in Slice 1d T5"
-    )
-)]
 fn apply_newest_size_before_input(
     engine: &EngineHandle,
     outbound: &Sender<WsOutbound>,

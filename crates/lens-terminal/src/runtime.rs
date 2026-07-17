@@ -15,6 +15,20 @@ pub(crate) struct TerminalRuntime {
 }
 
 impl TerminalRuntime {
+    /// Take bridge + attach for off-foreground teardown, leaving the engine in place (reconnect).
+    pub fn take_transport(&mut self) -> (Option<BridgeHandle>, Option<AttachHandle>) {
+        (self.bridge.take(), self.attach.take())
+    }
+
+    pub fn install_transport(&mut self, bridge: BridgeHandle, attach: AttachHandle) {
+        self.bridge = Some(bridge);
+        self.attach = Some(attach);
+    }
+
+    pub fn engine_arc(&self) -> Option<Arc<EngineHandle>> {
+        self.engine.clone()
+    }
+
     /// Foreground-safe: take self's fields into a background task that joins.
     #[expect(dead_code, reason = "consumed by Slice 1d convergence (Task 3+)")]
     pub fn teardown_off_foreground(self, cx: &mut gpui::AsyncApp) {
@@ -28,7 +42,7 @@ impl TerminalRuntime {
         .detach();
     }
 
-    fn teardown_blocking(mut self) {
+    pub(crate) fn teardown_blocking(mut self) {
         // 1. signal+join bridge (stops feeding / da_dsr forward)
         if let Some(b) = self.bridge.take() {
             b.join();
