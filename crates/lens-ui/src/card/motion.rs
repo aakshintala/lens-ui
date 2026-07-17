@@ -2,11 +2,11 @@ use std::f32::consts::TAU;
 use std::time::Duration;
 
 use gpui::{
-    Hsla, IntoElement, ParentElement, Styled, Transformation, div, linear_color_stop,
-    linear_gradient, px, radians, svg,
+    Bounds, ContentMask, Hsla, IntoElement, ParentElement, PathBuilder, Styled, Transformation,
+    canvas, div, linear_color_stop, linear_gradient, point, px, radians, svg,
 };
 
-use super::model::{CARD_WIDTH_PX, SessionCard};
+use super::model::SessionCard;
 use super::wave::Wave;
 
 /// Sweep period for waves that use the attention band (§3 motion sheet).
@@ -47,42 +47,72 @@ pub fn ring_phase(now_ms: i64) -> f32 {
     now_ms.rem_euclid(RING_PERIOD_MS) as f32 / RING_PERIOD_MS as f32
 }
 
-// Peak alpha of the moving highlight — soft so text stays legible.
-const SWEEP_ALPHA: f32 = 0.20;
-// Gradient angle: 90° = horizontal feather across the band width (the diagonal lives
-// in the band shape once we move to a canvas path; div version stays vertical).
-const SWEEP_ANGLE: f32 = 90.0;
+// Peak alpha of the moving highlight = status × (24% × amplitude 0.4) — mockup value; soft
+// so text stays legible. Tunable in the end-of-build pass.
+const SWEEP_PEAK_ALPHA: f32 = 0.096;
+// Skew of the band (degrees), matching the mockup's skewX(-14deg).
+const SWEEP_SKEW_DEG: f32 = 14.0;
+// Band width as a fraction of card width.
+const SWEEP_BAND_FRAC: f32 = 0.48;
 
-/// Clipped sweep overlay positioned at `phase` (0..1). No `with_animation` — the card
-/// view's 30fps timer re-renders us with a fresh clock-derived phase (frame-capped,
-/// occlusion-cheap). Two half-bands fake a two-sided feather (gpui gradients are 2-stop).
-pub fn render_sweep_overlay(status_color: Hsla, phase: f32) -> impl IntoElement {
-    let band_w = CARD_WIDTH_PX * 0.42;
-    let card_w = CARD_WIDTH_PX;
-    let peak = status_color.opacity(SWEEP_ALPHA);
-    let edge = status_color.opacity(0.0);
-    let left = -band_w + phase * (card_w + band_w);
+/// Clipped sweep overlay at `phase` (0..1), drawn as a skewed gradient parallelogram via
+/// `canvas` + `paint_path`. No `with_animation` — the card view's timer re-renders us with a
+/// fresh clock-derived phase. Two half-bands fake a symmetric feather (gpui gradients are 2-stop).
+pub fn render_sweep_overlay(status: Hsla, phase: f32) -> impl IntoElement {
+    let peak = status.opacity(SWEEP_PEAK_ALPHA);
+    let edge = status.opacity(0.0);
 
-    div().absolute().size_full().overflow_hidden().child(
-        div()
-            .absolute()
-            .top_0()
-            .h_full()
-            .w(px(band_w))
-            .left(px(left))
-            .flex()
-            .flex_row()
-            .child(div().h_full().flex_1().bg(linear_gradient(
-                SWEEP_ANGLE,
-                linear_color_stop(edge, 0.0),
-                linear_color_stop(peak, 1.0),
-            )))
-            .child(div().h_full().flex_1().bg(linear_gradient(
-                SWEEP_ANGLE,
-                linear_color_stop(peak, 0.0),
-                linear_color_stop(edge, 1.0),
-            ))),
+    canvas(
+        move |_, _, _| (),
+        move |bounds: Bounds<gpui::Pixels>, _, window, _| {
+            window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                let h = f32::from(bounds.size.height);
+                let card_w = f32::from(bounds.size.width);
+                let band_w = card_w * SWEEP_BAND_FRAC;
+                let skew = h * SWEEP_SKEW_DEG.to_radians().tan();
+
+                // Center-x of the band as it travels from fully off-left to fully off-right.
+                // The parallelogram's true horizontal extent includes the top shear, so the
+                // travel endpoints must account for `skew` — otherwise the band pops in as a
+                // visible wedge at the phase wrap (1→0) instead of entering off-screen.
+                let cx_start = -band_w * 0.5 - skew.max(0.0);
+                let cx_end = card_w + band_w * 0.5 - skew.min(0.0);
+                let cx = cx_start + phase * (cx_end - cx_start);
+                let x = |dx: f32| bounds.origin.x + px(dx);
+                let top = bounds.origin.y;
+                let bot = bounds.origin.y + px(h);
+
+                // A parallelogram spanning [left..right] at the bottom, sheared right by `skew`
+                // at the top. `half` builds one gradient half.
+                let mut half = |x0: f32, x1: f32, from: Hsla, to: Hsla| {
+                    let mut b = PathBuilder::fill();
+                    b.move_to(point(x(x0), bot));
+                    b.line_to(point(x(x0 + skew), top));
+                    b.line_to(point(x(x1 + skew), top));
+                    b.line_to(point(x(x1), bot));
+                    b.close();
+                    if let Ok(path) = b.build() {
+                        window.paint_path(
+                            path,
+                            linear_gradient(
+                                90.0,
+                                linear_color_stop(from, 0.0),
+                                linear_color_stop(to, 1.0),
+                            ),
+                        );
+                    }
+                };
+
+                let left = cx - band_w * 0.5;
+                let mid = cx;
+                let right = cx + band_w * 0.5;
+                half(left, mid, edge, peak);
+                half(mid, right, peak, edge);
+            });
+        },
     )
+    .absolute()
+    .size_full()
 }
 
 /// Rotating Lucide `loader-circle`, tinted to the working color, angle from the clock.
@@ -194,6 +224,25 @@ mod tests {
         // i64-modulo-before-cast: a real epoch value must not quantize to a frozen phase.
         let a = spin_phase(1_700_000_000_123);
         let b = spin_phase(1_700_000_000_123 + 500);
+        assert!((a - b).abs() > 1e-3, "phase must advance at epoch scale");
+    }
+
+    #[test]
+    fn sweep_phase_is_a_clock_ratio() {
+        // 1.0s period for the loud pair; midpoint at 500ms.
+        assert!((sweep_phase(Wave::NeedsInput, 500).unwrap() - 0.5).abs() < 1e-4);
+        assert_eq!(sweep_phase(Wave::NeedsInput, 0), Some(0.0));
+        // 1.5s for the soft pair.
+        assert!((sweep_phase(Wave::Ready, 750).unwrap() - 0.5).abs() < 1e-4);
+        // non-sweep waves → None.
+        assert_eq!(sweep_phase(Wave::Working, 123), None);
+        assert_eq!(sweep_phase(Wave::Slept, 123), None);
+    }
+
+    #[test]
+    fn sweep_phase_survives_epoch_millis() {
+        let a = sweep_phase(Wave::NeedsInput, 1_700_000_000_123).unwrap();
+        let b = sweep_phase(Wave::NeedsInput, 1_700_000_000_123 + 100).unwrap();
         assert!((a - b).abs() > 1e-3, "phase must advance at epoch scale");
     }
 
