@@ -358,9 +358,15 @@ fn gate() -> Result<()> {
     // Menlo/paint/perf assertions need a real GPUI text system (gpui's
     // NoopTextSystem fakes them). Fail-closed paint p95 budgets live here, so
     // this runs (not `--no-run`), gated by `test-util`.
+    //
+    // `--release` is load-bearing: the p95 budgets are 120fps *product* targets
+    // and must be measured in the shipping profile. Debug is ~5.4× slower on the
+    // per-cell path (unoptimised `Font` clones), which fabricated the Slice 1c
+    // "perf block" — see docs/plans/2026-07-16-terminal-slice-1c-perf-resolution.md.
     if cfg!(target_os = "macos") {
         run(&[
             "test",
+            "--release",
             "-p",
             "lens-terminal",
             "--test",
