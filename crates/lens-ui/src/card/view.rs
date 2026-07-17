@@ -5,15 +5,29 @@ use gpui::{
 use lens_core::actor::SessionCommand;
 use lens_core::domain::ids::SessionId;
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::clock::UiClock;
 use crate::fleet::store::FleetStore;
+use crate::theme::ActiveLensTheme as _;
 
 use super::chrome::render_card_chrome;
 use super::model::{CARD_HEIGHT_PX, CARD_WIDTH_PX, SessionCard};
+use super::motion::{render_expanding_ring, ring_phase, sweep_phase, wave_animates};
 use super::wave::derive_wave;
+
+/// Animation tick interval (ms) — the frame-rate cap. Default 33ms ≈ 30fps; overridable
+/// via `LENS_ANIM_MS` for the spike's cap-vs-native measurement.
+fn anim_tick_ms() -> u64 {
+    std::env::var("LENS_ANIM_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(33)
+}
 
 /// §4.4: skeleton card chrome uses gpui `div`/text only — no gpui-component widget
 /// inside the tile — so cache-key/bounds risk from component internals is N/A.
@@ -23,6 +37,8 @@ pub struct SessionCardView {
     fleet: Entity<FleetStore>,
     session_id: SessionId,
     kebab_open: bool,
+    /// 30fps self-notify driver, live only while the card's wave animates (approach ②).
+    anim_task: Option<gpui::Task<()>>,
     pub render_count: Rc<Cell<usize>>,
     pub paint_count: Rc<Cell<usize>>,
     pub last_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
@@ -44,6 +60,7 @@ impl SessionCardView {
             fleet,
             session_id,
             kebab_open: false,
+            anim_task: None,
             render_count: Rc::new(Cell::new(0)),
             paint_count: Rc::new(Cell::new(0)),
             last_bounds: Rc::new(Cell::new(None)),
@@ -66,54 +83,84 @@ impl Render for SessionCardView {
         let kebab_open = self.kebab_open;
         let paint_count = self.paint_count.clone();
         let last_bounds = self.last_bounds.clone();
+        // 30fps self-notify driver — live only while this card's wave animates (approach ②).
+        // Frame-capped (LENS_ANIM_MS) + self-notify → §4.4-safe and ~4× cheaper than
+        // native-refresh `.with_animation`.
+        let animating = wave_animates(wave);
+        if animating && self.anim_task.is_none() {
+            let tick = Duration::from_millis(anim_tick_ms());
+            self.anim_task = Some(cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(tick).await;
+                    if this.update(cx, |_, cx| cx.notify()).is_err() {
+                        break;
+                    }
+                }
+            }));
+        } else if !animating && self.anim_task.is_some() {
+            self.anim_task = None;
+        }
+        let sweep = sweep_phase(wave, now_ms);
+        let ring_color = wave.status_color(cx.lens_theme());
+        let ring = ring_phase(now_ms);
+        if std::env::var("LENS_ANIM_DBG").is_ok() && matches!(wave, super::wave::Wave::NeedsInput) {
+            eprintln!("DBG now_ms={now_ms} sweep={sweep:?}");
+        }
 
         div()
             .id(("session-card", self.card.entity_id()))
+            .relative()
             .w(px(CARD_WIDTH_PX))
             .h(px(CARD_HEIGHT_PX))
-            .child(render_card_chrome(
-                card,
-                wave,
-                kebab_open,
-                cx,
-                cx.listener(|view, _, _, cx| {
-                    view.kebab_open = !view.kebab_open;
-                    cx.notify();
-                }),
-                cx.listener(|view, _, _, cx| {
-                    view.kebab_open = false;
-                    view.send_command(SessionCommand::Sleep, cx);
-                }),
-                cx.listener(|view, _, _, cx| {
-                    view.kebab_open = false;
-                    view.send_command(
-                        SessionCommand::Send {
-                            text: String::new(),
-                            model_override: None,
-                        },
-                        cx,
-                    );
-                }),
-                cx.listener(|view, _, _, cx| {
-                    view.send_command(
-                        SessionCommand::Send {
-                            text: String::new(),
-                            model_override: None,
-                        },
-                        cx,
-                    );
-                }),
-            ))
+            .child(render_expanding_ring(wave, ring_color, ring))
             .child(
-                canvas(
-                    |_, _, _| (),
-                    move |bounds, _, _, _| {
-                        paint_count.set(paint_count.get() + 1);
-                        last_bounds.set(Some(bounds));
-                    },
-                )
-                .absolute()
-                .size_full(),
+                div()
+                    .size_full()
+                    .child(render_card_chrome(
+                        card,
+                        wave,
+                        kebab_open,
+                        sweep,
+                        cx,
+                        cx.listener(|view, _, _, cx| {
+                            view.kebab_open = !view.kebab_open;
+                            cx.notify();
+                        }),
+                        cx.listener(|view, _, _, cx| {
+                            view.kebab_open = false;
+                            view.send_command(SessionCommand::Sleep, cx);
+                        }),
+                        cx.listener(|view, _, _, cx| {
+                            view.kebab_open = false;
+                            view.send_command(
+                                SessionCommand::Send {
+                                    text: String::new(),
+                                    model_override: None,
+                                },
+                                cx,
+                            );
+                        }),
+                        cx.listener(|view, _, _, cx| {
+                            view.send_command(
+                                SessionCommand::Send {
+                                    text: String::new(),
+                                    model_override: None,
+                                },
+                                cx,
+                            );
+                        }),
+                    ))
+                    .child(
+                        canvas(
+                            |_, _, _| (),
+                            move |bounds, _, _, _| {
+                                paint_count.set(paint_count.get() + 1);
+                                last_bounds.set(Some(bounds));
+                            },
+                        )
+                        .absolute()
+                        .size_full(),
+                    ),
             )
     }
 }
@@ -127,6 +174,30 @@ pub fn mount_cached_card(view: Entity<SessionCardView>) -> AnyView {
         .w(px(CARD_WIDTH_PX))
         .h(px(CARD_HEIGHT_PX));
     AnyView::from(view).cached(style)
+}
+
+/// Demo spike: stderr dump of per-card render/paint counters every ~2s.
+pub fn spawn_demo_paint_instrumentation(
+    card_views: &HashMap<SessionId, Entity<SessionCardView>>,
+    cx: &mut gpui::App,
+) {
+    let views: Vec<_> = card_views.values().cloned().collect();
+    cx.spawn(async move |cx| {
+        loop {
+            cx.background_executor().timer(Duration::from_secs(2)).await;
+            for view in &views {
+                let _ = view.update(cx, |v, _| {
+                    eprintln!(
+                        "paint-instr session={} render={} paint={}",
+                        v.session_id.as_str(),
+                        v.render_count.get(),
+                        v.paint_count.get(),
+                    );
+                });
+            }
+        }
+    })
+    .detach();
 }
 
 #[cfg(test)]

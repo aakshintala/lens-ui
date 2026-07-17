@@ -129,6 +129,8 @@ fn run_demo() {
                 cx.notify();
             });
             let board = cx.new(|cx| BoardView::mount(fleet.clone(), placeholder_tab(cx), None, cx));
+            let card_views = board.read(cx).card_views_for_test().clone();
+            lens_ui::card::spawn_demo_paint_instrumentation(&card_views, cx);
             let any: gpui::AnyView = board.into();
             cx.new(|cx| Root::new(any, window, cx))
         })
@@ -137,8 +139,28 @@ fn run_demo() {
     });
 }
 
-/// Six preset cards, one per wave state.
+/// Eight preset cards (one per wave state), replicated `LENS_DEMO_N` times (default 1).
 fn demo_cards(now: i64) -> Vec<SessionCard> {
+    let replicas = std::env::var("LENS_DEMO_N")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(1);
+    let presets = demo_preset_cards(now);
+    let mut out = Vec::with_capacity(presets.len() * replicas);
+    for rep in 0..replicas {
+        for mut card in presets.iter().cloned() {
+            if rep > 0 {
+                card.session_id = SessionId::new(format!("{}-r{rep}", card.session_id.as_str()));
+            }
+            out.push(card);
+        }
+    }
+    out
+}
+
+/// One replica of the eight wave-state demo cards.
+fn demo_preset_cards(now: i64) -> [SessionCard; 8] {
     let base = |id: &str, title: &str| {
         let mut c = SessionCard::new(SessionId::new(id));
         c.harness = Some("claude-sdk".into());
@@ -196,7 +218,7 @@ fn demo_cards(now: i64) -> Vec<SessionCard> {
     scheduled.scheduled_wake_at = Some(now + 2 * 60 * 1000);
     scheduled.activity_summary = "wakes in ~2m".into();
 
-    vec![
+    [
         needs_input,
         ready,
         working,

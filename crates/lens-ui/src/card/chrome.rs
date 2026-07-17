@@ -2,12 +2,12 @@ use gpui::{
     App, AppContext, Context, Div, Hsla, InteractiveElement, IntoElement, ParentElement, Render,
     SharedString, Styled, Window, div, prelude::*, px,
 };
-use lens_core::domain::scalars::SessionStatusValue;
 use lens_core::domain::usage::Cost;
 
 use crate::theme::ActiveLensTheme;
 
 use super::model::{ConnectionOverlay, RepoRef, SessionCard};
+use super::motion::{render_sweep_overlay, render_working_spinner, wave_glyph, wave_status_line};
 use super::wave::Wave;
 
 pub fn format_repos_row(repos: &[RepoRef]) -> String {
@@ -35,17 +35,6 @@ pub fn format_repos_tooltip(repos: &[RepoRef]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-fn status_label(status: SessionStatusValue) -> &'static str {
-    match status {
-        SessionStatusValue::Idle => "IDLE",
-        SessionStatusValue::Launching => "LAUNCHING",
-        SessionStatusValue::Running => "RUNNING",
-        SessionStatusValue::Waiting => "WAITING",
-        SessionStatusValue::Failed => "FAILED",
-        SessionStatusValue::Unknown => "UNKNOWN",
-    }
 }
 
 fn format_harness_model(card: &SessionCard) -> String {
@@ -81,26 +70,22 @@ fn host_label(card: &SessionCard) -> String {
         .unwrap_or_else(|| "—".into())
 }
 
-/// Short state label for the colored status pill.
-fn wave_label(wave: Wave, status: SessionStatusValue) -> &'static str {
-    match wave {
-        Wave::NeedsInput => "NEEDS INPUT",
-        Wave::Ready => "READY",
-        Wave::Working => "WORKING",
-        Wave::Failed => "FAILED",
-        Wave::Slept => "SLEPT",
-        Wave::AwaitingReview => "AWAITING REVIEW",
-        Wave::Scheduled => "SCHEDULED",
-        Wave::Neutral => status_label(status),
+fn render_icon_tile(wave: Wave, border: Hsla) -> Div {
+    let mut tile = div()
+        .flex_shrink_0()
+        .w(px(44.0))
+        .h(px(44.0))
+        .rounded_md()
+        .bg(border)
+        .flex()
+        .items_center()
+        .justify_center();
+    if wave == Wave::Working {
+        tile = tile.child(render_working_spinner(border));
+    } else {
+        tile = tile.text_xl().child(wave_glyph(wave));
     }
-}
-
-/// Contrasting text color for the filled pill (dark on bright waves, light on grey).
-fn pill_text_color(wave: Wave) -> Hsla {
-    match wave {
-        Wave::Neutral | Wave::Slept => gpui::rgb(0xe5e7eb).into(),
-        _ => gpui::rgb(0x0b1220).into(),
-    }
+    tile
 }
 
 fn ellipsize_line(text: impl Into<SharedString>) -> Div {
@@ -123,6 +108,7 @@ pub fn render_card_chrome(
     card: &SessionCard,
     wave: Wave,
     kebab_open: bool,
+    sweep_phase: Option<f32>,
     cx: &App,
     on_kebab_toggle: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
     on_sleep: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
@@ -162,27 +148,26 @@ pub fn render_card_chrome(
         .border_color(border)
         .overflow_hidden();
 
-    // Header: a filled state pill (wave color + label) + title + kebab.
+    // Header: 44px icon-tile + stacked status / title + kebab.
     let mut header = div()
         .flex()
         .flex_row()
-        .items_center()
-        .gap_1()
-        .child(
-            div()
-                .flex_shrink_0()
-                .px_2()
-                .py(px(1.0))
-                .rounded_full()
-                .bg(border)
-                .text_color(pill_text_color(wave))
-                .text_xs()
-                .child(wave_label(wave, card.status)),
-        )
+        .items_start()
+        .gap_2()
+        .child(render_icon_tile(wave, border))
         .child(
             div()
                 .flex_grow()
                 .overflow_hidden()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(border)
+                        .child(wave_status_line(wave, card)),
+                )
                 .child(ellipsize_line(title)),
         )
         .child(
@@ -263,6 +248,10 @@ pub fn render_card_chrome(
                 .child(ellipsize_line(spend))
                 .child(ellipsize_line(ctx_pct)),
         );
+
+    if let Some(phase) = sweep_phase {
+        root = root.child(render_sweep_overlay(border, phase));
+    }
 
     if card.connection_overlay != ConnectionOverlay::Connected {
         let label = match card.connection_overlay {

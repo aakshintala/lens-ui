@@ -123,42 +123,47 @@ scheduled `#8b9bf5`, awaiting_review `#c084fc`. The 4-way distinguishability
 via the reload loop (`⌘⇧T`, `LENS_THEME_DIR=crates/lens-ui/src/theme`), for both
 dark + light.
 
-## 8. Animation architecture — approach ② (recommended), PENDING SPIKE
+## 8. Animation architecture — LOCKED (spike-proven, `docs/spikes/2026-07-17-wave-animation.md`)
 
 **Constraints:** (1) each card is mounted `.cached(style)` (keyed on bounds); (2) §4.4
 forbids notifying `FleetStore`/siblings — the `session_card_view_observes_own_card_only`
-isolation test must stay green; (3) static cards (Idle/Slept/Neutral/Scheduled) must not
-burn frames.
+isolation test must stay green; (3) static cards must not burn frames.
 
-**Approach ② — self-notify loop driven by `UiClock`.** Animating cards call
-`window.request_animation_frame()`, which (per gpui 0.2.2 source) captures
-`current_view()` and `cx.notify(card_entity)` on the next frame — **self-repaint only,
-§4.4-safe by construction**. Phase (sweep offset, spinner angle, countdown fraction) is a
-**pure function of `clock.now_millis()`**, matching the existing `derive_wave` +
-Ready-decay dual-clock pattern → deterministically testable with `ManualUiClock`. Static
-cards schedule nothing (zero cost).
+**Spike verdict = GO.** Proven on-device: `.cached()` cards *do* repaint under
+`cx.notify(card_entity)` (via `request_animation_frame`), `paint == render` every frame,
+and §4.4 isolation holds (static neighbors stayed flat while a card animated at 120fps —
+a ~1400× paint separation).
 
-- gpui's built-in `.with_animation` (`AnimationElement`) *also* uses
-  `request_animation_frame` internally and computes delta from elapsed `Instant` — same
-  primitive, less code, but wall-clock (not `UiClock`) so not test-controllable. Trade
-  decided in the plan; both converge on the same repaint primitive.
-- **Approach ① fallback:** built-in `.with_animation`. **Approach ③ rejected:** a shared
-  ticker entity all cards observe re-renders *all* cards → fails §4.4.
+**Driver = frame-capped timer self-notify (approach ②), NOT `.with_animation`.** The cost
+data forced this: gpui's built-in `.with_animation` costs ~21% CPU for 5 cards because its
+per-frame `request_layout` machinery is the hog. A timer-driven self-notify is ~40% cheaper
+even before the fps cap.
+- Per animating card: a `cx.spawn` loop —
+  `background_executor().timer(tick).await → this.update(cx, |_,cx| cx.notify())` — held in
+  an `Option<Task<()>>` that is **live only while the card's wave animates** (drop = cancel).
+- **Frame cap ≈ 30fps** (`tick ≈ 33ms`). Saves ~40% vs native 120Hz; imperceptible.
+- **Phase = pure fn of `UiClock::now_millis()`** → deterministically testable with
+  `ManualUiClock`. ⚠ **Do the period modulo in i64 before casting to f32** — epoch-millis
+  exceeds f32's mantissa and the phase freezes otherwise (spike gotcha #1).
+- **Viewport-gate (build task):** only visible cards animate → cost bounded by screen
+  capacity (~15 cards), NOT fleet size. **Approach ③ rejected:** a shared ticker all cards
+  observe → re-renders all → fails §4.4.
 
-**The one unproven thing (why we spike first):** does `cx.notify(card_entity)` (via
-`request_animation_frame`) actually invalidate and repaint the `.cached(style)` wrapper
-each frame, or does the cache freeze the animation? If the cache freezes it, pivot
-(drop `.cached()` for animating cards, or force invalidation) — documented in the spike.
+**Measured cost (release, moving animation):** idle floor 0.3%; **~1.7% CPU per visible
+animating card @30fps**; 5 cards = 8.8%. Managed by cap + viewport-gate.
 
-**The spike must establish (on-device):**
-(a) a self-scheduled repaint actually re-paints a `.cached()` card each frame;
-(b) the isolation test stays green with a neighbor animating (drive the assertion off the
-    card view's existing `paint_count` — static cards' counts stay flat);
-(c) sustained **CPU% and GPU%** at 1 / 5 / 10 / 20 simultaneously-animating cards (also
-    seeds the deferred lens-ui render benchmark).
+**Countdown ring (Scheduled) is NOT in this loop** — 1 Hz redraw + one wake at
+`scheduled_wake_at`; drawn via `canvas` arc (no conic-gradient in gpui).
 
-**Countdown ring is NOT in the 60fps loop** — 1 Hz redraw + one wake at
-`scheduled_wake_at`. It sidesteps the cache-repaint question entirely.
+### 8a. Build gotchas carried from the spike
+1. **f32 epoch-millis precision** — i64 modulo before f32 cast (froze the whole animation).
+2. **Sweep fidelity** — the div 2-stop gradient is a flat vertical bar; the real technique is
+   **`canvas` + `window.paint_path`** (a skewed gradient parallelogram, `PathBuilder::fill()`,
+   respects the clip mask), asset-free. Deferred to build tuning.
+3. **Working spinner** — gpui-component `Spinner` needs `icons/loader.svg`, which the crate
+   does NOT ship; bundle an SVG + `AssetSource`, or draw a canvas/rotated-svg arc. Currently
+   a static ring placeholder.
+4. **Board scroll (B6)** — the demo/board doesn't scroll; N>~2 clips cards. Out of this scope.
 
 ## 9. Testing approach
 
