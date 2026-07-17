@@ -180,32 +180,31 @@ pub(super) fn resolve_cell_paint(
     }
 }
 
-/// Paint per-cell background quads (wide cells span two columns). Uses
-/// `resolve_cell_paint` so inverse's swapped background shows. Returns the
-/// number of quads painted.
-fn paint_backgrounds(
-    frame: &Frame,
-    origin: Point<Pixels>,
+/// Paint one row's background quads from its pre-resolved cells (wide cells
+/// span two columns; `resolve_cell_paint` already applied inverse's swap).
+/// Returns the number of quads painted. Cells with no background are skipped.
+fn paint_row_backgrounds(
+    row: &FrameRow,
+    resolved: &[ResolvedCellPaint],
+    y: Pixels,
+    origin_x: Pixels,
     metrics: &CellMetrics,
     window: &mut Window,
 ) -> u32 {
     let mut n = 0u32;
-    for (row_i, row) in frame.grid.iter().enumerate() {
-        let y = origin.y + metrics.cell_h * (row_i as f32);
-        for cell in &row.cells {
-            let Some(bg) = resolve_cell_paint(cell, frame.default_bg, metrics).bg else {
-                continue;
-            };
-            let x = origin.x + metrics.cell_w * f32::from(cell.col);
-            let width = if cell.wide {
-                metrics.cell_w * 2.0
-            } else {
-                metrics.cell_w
-            };
-            let rect = Bounds::new(point(x, y), size(width, metrics.cell_h));
-            window.paint_quad(fill(rect, rgb_to_rgba(bg)));
-            n += 1;
-        }
+    for (cell, res) in row.cells.iter().zip(resolved) {
+        let Some(bg) = res.bg else {
+            continue;
+        };
+        let x = origin_x + metrics.cell_w * f32::from(cell.col);
+        let width = if cell.wide {
+            metrics.cell_w * 2.0
+        } else {
+            metrics.cell_w
+        };
+        let rect = Bounds::new(point(x, y), size(width, metrics.cell_h));
+        window.paint_quad(fill(rect, rgb_to_rgba(bg)));
+        n += 1;
     }
     n
 }
@@ -254,12 +253,13 @@ fn push_run(
     }
 }
 
-/// Assemble a row's `(text, runs)` for per-row shaping. Gap columns and
-/// invisible cells become width-preserving spaces so glyphs stay on the grid
-/// (I10b). No `Window` needed — shared with the invisible-width test.
+/// Assemble a row's `(text, runs)` for per-row shaping from its pre-resolved
+/// cells. Gap columns and invisible cells become width-preserving spaces so
+/// glyphs stay on the grid (I10b). No `Window` needed — shared with the
+/// invisible-width test.
 fn assemble_row(
     row: &FrameRow,
-    default_bg: Rgb,
+    resolved: &[ResolvedCellPaint],
     metrics: &CellMetrics,
 ) -> Option<(String, Vec<TextRun>)> {
     if row.cells.is_empty() {
@@ -270,14 +270,13 @@ fn assemble_row(
     let mut runs: Vec<TextRun> = Vec::new();
     let mut expected_col = 0u16;
 
-    for cell in &row.cells {
+    for (cell, res) in row.cells.iter().zip(resolved) {
         while expected_col < cell.col {
             push_run(&mut text, &mut runs, " ", &metrics.font, white, None, None);
             expected_col += 1;
         }
-        let resolved = resolve_cell_paint(cell, default_bg, metrics);
         let width_cells = if cell.wide { 2u16 } else { 1u16 };
-        if resolved.skip_glyph {
+        if res.skip_glyph {
             for _ in 0..width_cells {
                 push_run(&mut text, &mut runs, " ", &metrics.font, white, None, None);
             }
@@ -286,10 +285,10 @@ fn assemble_row(
                 &mut text,
                 &mut runs,
                 &cell.grapheme,
-                &resolved.font,
-                rgb_to_hsla(resolved.fg),
-                resolved.underline,
-                resolved.strikethrough,
+                &res.font,
+                rgb_to_hsla(res.fg),
+                res.underline,
+                res.strikethrough,
             );
         }
         expected_col = cell.col.saturating_add(width_cells);
@@ -308,7 +307,7 @@ fn assemble_row(
 /// path must never panic in release).
 pub(super) fn shape_row_line(
     row: &FrameRow,
-    default_bg: Rgb,
+    resolved: &[ResolvedCellPaint],
     metrics: &CellMetrics,
     window: &Window,
 ) -> Option<ShapedLine> {
@@ -316,7 +315,7 @@ pub(super) fn shape_row_line(
         !row.cells.iter().any(|c| c.wide),
         "per-row shaping received a wide cell; wide rows must route to per-cell (row_needs_per_cell)"
     );
-    let (text, runs) = assemble_row(row, default_bg, metrics)?;
+    let (text, runs) = assemble_row(row, resolved, metrics)?;
     Some(
         window
             .text_system()
@@ -374,39 +373,39 @@ fn paint_decoration_quads(
     }
 }
 
-/// Paint the decoration quads (overline / quad underlines) for every cell in a
-/// row. Shared by both placement paths.
+/// Paint one row's decoration quads (overline / quad underlines) from its
+/// pre-resolved cells. Shared by both placement paths; painted after glyphs so
+/// they sit on top.
 fn paint_row_decorations(
     row: &FrameRow,
+    resolved: &[ResolvedCellPaint],
     y: Pixels,
     origin_x: Pixels,
-    default_bg: Rgb,
     metrics: &CellMetrics,
     window: &mut Window,
 ) {
-    for cell in &row.cells {
-        let resolved = resolve_cell_paint(cell, default_bg, metrics);
-        if resolved.overline || resolved.underline_quad_kind != UnderlineQuadKind::None {
+    for (cell, res) in row.cells.iter().zip(resolved) {
+        if res.overline || res.underline_quad_kind != UnderlineQuadKind::None {
             let x = origin_x + metrics.cell_w * f32::from(cell.col);
-            paint_decoration_quads(cell, &resolved, point(x, y), metrics, window);
+            paint_decoration_quads(cell, res, point(x, y), metrics, window);
         }
     }
 }
 
-/// Shape + paint one row per-row, then its decoration quads. Returns
-/// `(shapes, paint_errors)`.
+/// Shape + paint one narrow row as a single line. Decorations + backgrounds are
+/// painted by the caller (`paint_frame`). Returns `(shapes, paint_errors)`.
 fn paint_per_row_row(
     row: &FrameRow,
+    resolved: &[ResolvedCellPaint],
     y: Pixels,
     origin_x: Pixels,
-    default_bg: Rgb,
     metrics: &CellMetrics,
     window: &mut Window,
     cx: &mut App,
 ) -> (u32, u32) {
     let mut errors = 0u32;
     let mut shapes = 0u32;
-    if let Some(shaped) = shape_row_line(row, default_bg, metrics, window) {
+    if let Some(shaped) = shape_row_line(row, resolved, metrics, window) {
         shapes = 1;
         errors += u32::from(
             shaped
@@ -414,36 +413,35 @@ fn paint_per_row_row(
                 .is_err(),
         );
     }
-    paint_row_decorations(row, y, origin_x, default_bg, metrics, window);
     (shapes, errors)
 }
 
-/// Shape + paint each cell at its exact `col * cell_w`, then decoration quads.
-/// Used for rows containing wide/emoji cells. Skips blank + invisible cells'
-/// glyphs (I10b). Returns `(shapes, paint_errors)`.
+/// Shape + paint each glyph at its exact `col * cell_w`. Used for rows
+/// containing wide/emoji cells. Skips blank + invisible cells' glyphs (I10b).
+/// Decorations + backgrounds are painted by the caller (`paint_frame`). Returns
+/// `(shapes, paint_errors)`.
 fn paint_per_cell_row(
     row: &FrameRow,
+    resolved: &[ResolvedCellPaint],
     y: Pixels,
     origin_x: Pixels,
-    default_bg: Rgb,
     metrics: &CellMetrics,
     window: &mut Window,
     cx: &mut App,
 ) -> (u32, u32) {
     let mut shapes = 0u32;
     let mut errors = 0u32;
-    for cell in &row.cells {
-        let resolved = resolve_cell_paint(cell, default_bg, metrics);
-        let x = origin_x + metrics.cell_w * f32::from(cell.col);
-        if !resolved.skip_glyph && cell.grapheme != " " {
+    for (cell, res) in row.cells.iter().zip(resolved) {
+        if !res.skip_glyph && cell.grapheme != " " {
+            let x = origin_x + metrics.cell_w * f32::from(cell.col);
             let text = SharedString::from(cell.grapheme.clone());
             let run = TextRun {
                 len: text.len(),
-                font: resolved.font.clone(),
-                color: rgb_to_hsla(resolved.fg),
+                font: res.font.clone(),
+                color: rgb_to_hsla(res.fg),
                 background_color: None,
-                underline: resolved.underline,
-                strikethrough: resolved.strikethrough,
+                underline: res.underline,
+                strikethrough: res.strikethrough,
             };
             let shaped = window
                 .text_system()
@@ -454,9 +452,6 @@ fn paint_per_cell_row(
                     .paint(point(x, y), metrics.cell_h, window, cx)
                     .is_err(),
             );
-        }
-        if resolved.overline || resolved.underline_quad_kind != UnderlineQuadKind::None {
-            paint_decoration_quads(cell, &resolved, point(x, y), metrics, window);
         }
     }
     (shapes, errors)
@@ -485,24 +480,43 @@ pub fn paint_frame(
     );
     window.paint_quad(fill(grid_bounds, rgb_to_rgba(frame.default_bg)));
 
-    let cells_bg = paint_backgrounds(frame, origin, metrics, window);
-
+    let mut cells_bg = 0u32;
     let mut shapes = 0u32;
     let mut per_row_rows = 0u32;
     let mut per_cell_rows = 0u32;
     let mut paint_errors = 0u32;
 
+    // Resolve each cell's SGR paint ONCE per row and share it across the
+    // background, glyph, and decoration passes (previously re-resolved 2–3× per
+    // cell — a `Font` clone + HSLA conversion each time). Painting a row's bg
+    // before its glyphs (rather than all-backgrounds-then-all-glyphs) is
+    // visually identical: rows are vertically disjoint, so no row's glyph ever
+    // underlaps another row's background. `resolved` is a scratch buffer reused
+    // across rows.
+    let mut resolved: Vec<ResolvedCellPaint> = Vec::new();
     for (row_i, row) in frame.grid.iter().enumerate() {
         let y = origin.y + metrics.cell_h * (row_i as f32);
+
+        resolved.clear();
+        resolved.extend(
+            row.cells
+                .iter()
+                .map(|cell| resolve_cell_paint(cell, frame.default_bg, metrics)),
+        );
+
+        cells_bg += paint_row_backgrounds(row, &resolved, y, origin.x, metrics, window);
+
         let (s, e) = if row_needs_per_cell(row) {
             per_cell_rows += 1;
-            paint_per_cell_row(row, y, origin.x, frame.default_bg, metrics, window, cx)
+            paint_per_cell_row(row, &resolved, y, origin.x, metrics, window, cx)
         } else {
             per_row_rows += 1;
-            paint_per_row_row(row, y, origin.x, frame.default_bg, metrics, window, cx)
+            paint_per_row_row(row, &resolved, y, origin.x, metrics, window, cx)
         };
         shapes += s;
         paint_errors += e;
+
+        paint_row_decorations(row, &resolved, y, origin.x, metrics, window);
     }
 
     RenderStats {
@@ -547,7 +561,13 @@ mod tests {
     }
 
     fn assemble_row_text_for_test(row: &FrameRow) -> String {
-        assemble_row(row, Rgb { r: 0, g: 0, b: 0 }, &dummy_metrics_fonts())
+        let m = dummy_metrics_fonts();
+        let resolved: Vec<ResolvedCellPaint> = row
+            .cells
+            .iter()
+            .map(|c| resolve_cell_paint(c, Rgb { r: 0, g: 0, b: 0 }, &m))
+            .collect();
+        assemble_row(row, &resolved, &m)
             .map(|(t, _)| t)
             .unwrap_or_default()
     }
