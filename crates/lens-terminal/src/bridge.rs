@@ -17,6 +17,7 @@ pub(crate) enum BridgeEvent {
     FeedSaturated,
     OutboundSaturated,
     AttachDisconnected,
+    EngineStopped,
 }
 
 pub(crate) struct BridgeHandle {
@@ -105,7 +106,10 @@ fn bridge_loop(
             },
             i if i == da_idx => match oper.recv(&da_dsr_rx) {
                 Ok(bytes) => forward_da_dsr(&outbound, bytes, stop, &policy_tx),
-                Err(_) => LoopExit::Stop,
+                Err(_) => {
+                    let _ = policy_tx.try_send(BridgeEvent::EngineStopped);
+                    LoopExit::Stop
+                }
             },
             _ => unreachable!(),
         };
@@ -128,7 +132,10 @@ fn handle_inbound(
                 let _ = policy_tx.try_send(BridgeEvent::FeedSaturated);
                 LoopExit::Stop
             }
-            Err(FeedError::Stopped) => LoopExit::Stop,
+            Err(FeedError::Stopped) => {
+                let _ = policy_tx.try_send(BridgeEvent::EngineStopped);
+                LoopExit::Stop
+            }
         },
         WsInbound::Text(_) => LoopExit::Continue,
         WsInbound::Closed(cause) => {

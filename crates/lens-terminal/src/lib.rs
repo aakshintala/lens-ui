@@ -207,6 +207,7 @@ pub enum DetachedDetail {
     Unauthorized,
     RetriesExhausted,
     DiscoveryFailed,
+    EngineStopped,
 }
 
 // ---------------------------------------------------------------------------
@@ -313,6 +314,8 @@ pub struct TerminalTab {
     /// Flipped by [`apply_newest_size_before_input`] on (re)connect; Slice 2 input
     /// gates on this.
     input_enabled: bool,
+    /// Desired attach + engine inspect enablement; restored on reconnect.
+    inspect_enabled: bool,
 }
 
 impl TerminalTab {
@@ -338,6 +341,7 @@ impl TerminalTab {
             current_session: None,
             current_tid: None,
             input_enabled: false,
+            inspect_enabled: false,
         }
     }
 
@@ -378,6 +382,7 @@ impl TerminalTab {
             current_session: None,
             current_tid: None,
             input_enabled: false,
+            inspect_enabled: false,
         }
     }
 
@@ -408,12 +413,16 @@ impl TerminalTab {
     }
 
     #[cfg(feature = "live-tests")]
-    pub fn debug_send_input_for_test(&self, bytes: Vec<u8>) {
+    pub fn debug_send_input_for_test(&self, bytes: Vec<u8>) -> bool {
         if let Some(rt) = &self.runtime
             && let Some(a) = rt.attach_ref()
         {
-            let _ = a.outbound.try_send(lens_client::WsOutbound::Input(bytes));
+            return a
+                .outbound
+                .try_send(lens_client::WsOutbound::Input(bytes))
+                .is_ok();
         }
+        false
     }
 
     #[cfg(feature = "live-tests")]
@@ -437,7 +446,8 @@ impl TerminalTab {
     }
 
     /// Enable/disable attach + engine inspect rings (zero-cost when disabled).
-    pub fn set_inspect_enabled(&self, enabled: bool) {
+    pub fn set_inspect_enabled(&mut self, enabled: bool) {
+        self.inspect_enabled = enabled;
         if let Some(rt) = &self.runtime {
             if let Some(a) = rt.attach_ref() {
                 a.set_inspect_enabled(enabled);
@@ -482,6 +492,8 @@ impl TerminalTab {
     }
 
     fn on_attached(&mut self, parts: AttachedParts, cx: &mut Context<Self>) {
+        // TODO(1b follow-up): EngineHandle::spawn should return a readiness result
+        // so init failure never flashes Live.
         let AttachedParts {
             resource,
             runtime,
@@ -497,6 +509,13 @@ impl TerminalTab {
             }));
         }
 
+        let outbound = runtime
+            .attach_ref()
+            .expect("attached runtime has attach")
+            .outbound
+            .clone();
+        let engine = runtime.engine_arc().expect("attached runtime has engine");
+
         self.current_session = Some(resource.session_id.clone());
         self.current_tid = Some(resource.id.clone());
         self.policy_tx = Some(policy_tx);
@@ -505,6 +524,18 @@ impl TerminalTab {
         self.presentation.lifecycle = Lifecycle::Live;
         self.presentation.access = access_mode_for(&self.options);
         self.presentation.identity_title = identity_title_from_resource(&resource);
+
+        let snap = engine.inspect();
+        let write_allowed = !matches!(self.presentation.access, AccessMode::ReadOnly);
+        apply_newest_size_before_input(
+            engine.as_ref(),
+            &outbound,
+            snap.cols,
+            snap.rows,
+            write_allowed,
+            &mut self.input_enabled,
+        );
+
         cx.emit(TerminalEvent::PresentationChanged);
         cx.notify();
 
@@ -589,6 +620,10 @@ impl TerminalTab {
 
         let action = match ev {
             BridgeEvent::Closed(cause) => self.policy.on_close(cause, Instant::now()),
+            BridgeEvent::EngineStopped => PolicyAction::StopDetached {
+                detail: DetachedDetail::EngineStopped,
+                reattach_available: false,
+            },
             BridgeEvent::FeedSaturated
             | BridgeEvent::OutboundSaturated
             | BridgeEvent::AttachDisconnected => {
@@ -758,6 +793,14 @@ impl TerminalTab {
             self.policy_tx.clone().expect("policy_tx retained"),
         );
         rt.install_transport(bridge, attach);
+        if self.inspect_enabled {
+            if let Some(a) = rt.attach_ref() {
+                a.set_inspect_enabled(true);
+            }
+            if let Some(e) = rt.engine_ref() {
+                e.set_inspect_enabled(true);
+            }
+        }
         self.policy.retry.reset();
         apply_newest_size_before_input(
             engine.as_ref(),

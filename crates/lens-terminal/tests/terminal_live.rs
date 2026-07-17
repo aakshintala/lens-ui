@@ -46,7 +46,6 @@ use lens_terminal::{
 
 const OVERALL_DEADLINE: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
-const MARKER: &str = "LENSMARKER";
 
 struct LiveConfig {
     base_url: String,
@@ -76,9 +75,10 @@ fn main() {
 
     let target = config.target;
     let options = TerminalOpenOptions::default();
+    let marker = format!("LENSMARK_{}", std::process::id());
 
     Application::new().run(move |cx: &mut App| {
-        cx.open_window(
+        match cx.open_window(
             WindowOptions {
                 titlebar: Some(TitlebarOptions {
                     title: Some("lens-terminal terminal_live".into()),
@@ -95,11 +95,16 @@ fn main() {
             move |_window, cx| {
                 let tab = open(target, client, options, cx);
                 tab.update(cx, |tab, _| tab.set_render_inspect_enabled(true));
-                spawn_driver(tab.clone(), cx);
+                spawn_driver(tab.clone(), marker.clone(), cx);
                 tab
             },
-        )
-        .expect("open_window");
+        ) {
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("terminal_live FAIL: open_window: {e}");
+                std::process::exit(1);
+            }
+        }
         cx.activate(true);
     });
 }
@@ -178,17 +183,17 @@ fn fail_phase(phase: &str) -> ! {
     std::process::exit(1);
 }
 
-fn frame_contains_marker(frame: &Frame) -> bool {
+fn frame_contains_marker(frame: &Frame, marker: &str) -> bool {
     for row in &frame.grid {
         let text: String = row.cells.iter().map(|c| c.grapheme.as_str()).collect();
-        if text.contains(MARKER) {
+        if text.contains(marker) {
             return true;
         }
     }
     false
 }
 
-fn spawn_driver(tab: Entity<TerminalTab>, cx: &mut App) {
+fn spawn_driver(tab: Entity<TerminalTab>, marker: String, cx: &mut App) {
     cx.spawn(async move |cx| {
         let weak = tab.downgrade();
         let deadline = Instant::now() + OVERALL_DEADLINE;
@@ -211,13 +216,16 @@ fn spawn_driver(tab: Entity<TerminalTab>, cx: &mut App) {
         }
 
         // P2 — input + paint: echo marker and prove a new paint landed.
-        let paints_before = weak
-            .update(cx, |tab, _| tab.render_inspect().frames_painted)
-            .unwrap_or(0);
-        let _ = weak.update(cx, |tab, _| {
-            tab.debug_send_input_for_test(format!("echo {MARKER}\r").into_bytes());
-        });
+        let sent = weak
+            .update(cx, |tab, _| {
+                tab.debug_send_input_for_test(format!("echo {marker}\r").into_bytes())
+            })
+            .unwrap_or(false);
+        if !sent {
+            fail_phase("P2 input+paint: debug_send_input_for_test failed");
+        }
 
+        let mut paints_at_marker = None;
         let mut p2_ok = false;
         while Instant::now() < deadline {
             let (has_marker, paints) = weak
@@ -225,11 +233,17 @@ fn spawn_driver(tab: Entity<TerminalTab>, cx: &mut App) {
                     let paints = tab.render_inspect().frames_painted;
                     let has_marker = tab
                         .debug_latest_frame_for_test()
-                        .is_some_and(|f| frame_contains_marker(&f));
+                        .is_some_and(|f| frame_contains_marker(&f, &marker));
                     (has_marker, paints)
                 })
-                .unwrap_or((false, paints_before));
-            if has_marker && paints > paints_before {
+                .unwrap_or((false, 0));
+
+            if has_marker && paints_at_marker.is_none() {
+                paints_at_marker = Some(paints);
+            }
+            if let Some(at_marker) = paints_at_marker
+                && paints > at_marker
+            {
                 p2_ok = true;
                 break;
             }

@@ -1,11 +1,12 @@
 //! Convergence introspection snapshot (Slice 1d Task 9).
 
 use lens_client::AttachInspect;
+use serde::Serialize;
 
 use crate::Lifecycle;
 
 /// Point-in-time terminal tab snapshot for introspection tooling.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct TerminalInspect {
     pub lifecycle: Lifecycle,
     pub output_gap: bool,

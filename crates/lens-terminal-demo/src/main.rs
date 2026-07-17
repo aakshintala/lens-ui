@@ -73,12 +73,17 @@ fn main() {
     Application::new().run(move |cx: &mut App| {
         gpui_component::init(cx);
 
-        cx.open_window(WindowOptions::default(), move |window, cx| {
+        match cx.open_window(WindowOptions::default(), move |window, cx| {
             let tab = open(target, client, options, cx);
             let any: gpui::AnyView = tab.into();
             cx.new(|cx| Root::new(any, window, cx))
-        })
-        .ok();
+        }) {
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("lens-terminal-demo: open_window: {e}");
+                std::process::exit(1);
+            }
+        }
         cx.activate(true);
     });
 }

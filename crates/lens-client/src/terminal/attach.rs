@@ -59,10 +59,7 @@ pub struct AttachHandle {
     shutdown: Arc<AtomicBool>,
     /// When set, shutdown skips graceful `sink.close()` and delivers
     /// `WsInbound::Closed(Network)` so live tests can simulate abrupt loss.
-    #[cfg_attr(
-        not(feature = "live-tests"),
-        expect(dead_code, reason = "written only by abort_for_test")
-    )]
+    #[cfg(feature = "live-tests")]
     abort: Arc<AtomicBool>,
     inspect: Arc<AttachInspectState>,
     _handle: Option<JoinHandle<()>>,
@@ -231,12 +228,14 @@ pub fn attach(
     let (inbound_tx, inbound_rx) = bounded(ATTACH_CHANNEL_BOUND);
     let (outbound_tx, outbound_rx) = bounded(ATTACH_CHANNEL_BOUND);
     let shutdown = Arc::new(AtomicBool::new(false));
+    #[cfg(feature = "live-tests")]
     let abort = Arc::new(AtomicBool::new(false));
     let inspect = Arc::new(AttachInspectState::new(
         ATTACH_CHANNEL_BOUND,
         ATTACH_CHANNEL_BOUND,
     ));
     let thread_shutdown = Arc::clone(&shutdown);
+    #[cfg(feature = "live-tests")]
     let thread_abort = Arc::clone(&abort);
     let thread_inspect = Arc::clone(&inspect);
 
@@ -253,6 +252,7 @@ pub fn attach(
                     return;
                 }
             };
+            #[cfg(feature = "live-tests")]
             rt.block_on(io_loop(
                 ws_url,
                 conn,
@@ -262,6 +262,15 @@ pub fn attach(
                 thread_abort,
                 thread_inspect,
             ));
+            #[cfg(not(feature = "live-tests"))]
+            rt.block_on(io_loop(
+                ws_url,
+                conn,
+                inbound_tx,
+                outbound_rx,
+                thread_shutdown,
+                thread_inspect,
+            ));
         })
         .map_err(|e| ClientError::ThreadSpawn(e.to_string()))?;
 
@@ -269,6 +278,7 @@ pub fn attach(
         inbound: inbound_rx,
         outbound: outbound_tx,
         shutdown,
+        #[cfg(feature = "live-tests")]
         abort,
         inspect,
         _handle: Some(handle),
@@ -378,7 +388,7 @@ async fn io_loop(
     inbound_tx: Sender<WsInbound>,
     outbound_rx: Receiver<WsOutbound>,
     shutdown: Arc<AtomicBool>,
-    abort: Arc<AtomicBool>,
+    #[cfg(feature = "live-tests")] abort: Arc<AtomicBool>,
     inspect: Arc<AttachInspectState>,
 ) {
     let mut inbound_tx = Some(inbound_tx);
@@ -401,6 +411,7 @@ async fn io_loop(
     let connect = tokio::select! {
         result = connect_async(request) => result,
         () = wait_shutdown(&shutdown) => {
+            #[cfg(feature = "live-tests")]
             if abort.load(Ordering::Relaxed) {
                 let cause = CloseCause::Network;
                 inspect.on_closed(cause);
@@ -408,6 +419,8 @@ async fn io_loop(
             } else {
                 signal_inbound_gone(&mut inbound_tx);
             }
+            #[cfg(not(feature = "live-tests"))]
+            signal_inbound_gone(&mut inbound_tx);
             return;
         }
     };
@@ -443,11 +456,16 @@ async fn io_loop(
     let mut drop_inbound = false;
     loop {
         if shutdown.load(Ordering::Relaxed) {
+            #[cfg(feature = "live-tests")]
             if abort.load(Ordering::Relaxed) {
                 let cause = CloseCause::Network;
                 inspect.on_closed(cause);
                 let _ = deliver_inbound(&mut inbound_tx, WsInbound::Closed(cause));
             } else {
+                drop_inbound = true;
+            }
+            #[cfg(not(feature = "live-tests"))]
+            {
                 drop_inbound = true;
             }
             break;
@@ -537,6 +555,14 @@ async fn io_loop(
     drop(async_out_rx);
     let _ = forwarder.join();
 
+    #[cfg(not(feature = "live-tests"))]
+    {
+        tokio::select! {
+            _ = sink.close() => {}
+            () = sleep(GRACEFUL_CLOSE_TIMEOUT) => {}
+        }
+    }
+    #[cfg(feature = "live-tests")]
     if !abort.load(Ordering::Relaxed) {
         tokio::select! {
             _ = sink.close() => {}

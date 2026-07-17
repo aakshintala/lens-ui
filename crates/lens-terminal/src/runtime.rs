@@ -33,7 +33,7 @@ impl TerminalRuntime {
         self.attach.as_ref()
     }
 
-    #[cfg_attr(not(feature = "live-tests"), allow(dead_code))]
+    #[cfg(feature = "live-tests")]
     pub(crate) fn take_attach(&mut self) -> Option<AttachHandle> {
         self.attach.take()
     }
