@@ -3390,6 +3390,7 @@ name = "lens-terminal"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "async-channel 2.5.0",
  "criterion",
  "crossbeam-channel",
  "gpui",

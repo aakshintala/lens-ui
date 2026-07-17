@@ -10,6 +10,7 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+async-channel = "2"
 gpui = "0.2.2"
 lens-client = { path = "../lens-client" }
 serde = { version = "1", features = ["derive"] }

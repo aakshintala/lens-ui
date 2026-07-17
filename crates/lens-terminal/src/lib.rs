@@ -27,6 +27,7 @@
 
 use std::sync::Arc;
 
+mod bridge;
 mod engine;
 mod render;
 
