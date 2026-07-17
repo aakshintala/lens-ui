@@ -68,6 +68,7 @@ impl Client {
     }
 
     /// Offline test stub — no network I/O. Hidden from the public API surface.
+    #[cfg(any(test, feature = "test-util"))]
     #[doc(hidden)]
     pub fn stub_for_test() -> Self {
         Self {
