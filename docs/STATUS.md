@@ -9,7 +9,20 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Open threads & next up
 
-- **▶ ACTIVE: shared terminal workstream — Slices 0/1a/1b merged; Slice 1c DONE; ✅ Slice 1d COMPLETE — CODE DONE + FULLY REVIEWED + gate GREEN + LIVE-RIDER RUN PASSED vs omnigent 0.5.1 (2026-07-17). Staying on `terminal-ws` (unpushed) through the rest of the workstream — no merge yet, user's call.**
+- **▶ ACTIVE: shared terminal workstream — Slices 0/1a/1b merged; Slice 1c DONE; Slice 1d COMPLETE (live-proven); ▶ Slice 2 DESIGN DONE + double cross-family reviewed (2026-07-17). `terminal-ws` now PUSHED to `origin/terminal-ws` (backup; no `main` merge — user's call). Next session: writing-plans for Slice 2 (start 2a∥2d).**
+  - **▶ SLICE 2 (interaction) — DESIGN DONE + REVIEWED, not yet planned.** Spec
+    [`docs/specs/2026-07-17-terminal-slice-2-interaction-design.md`](./specs/2026-07-17-terminal-slice-2-interaction-design.md)
+    (commits `79d7f90`→`9c569ea`). Phases **2a input/IME/focus/read-only ∥ 2d OSC-output → 2b clipboard/OSC52
+    → 2c mouse**. **Architecture = Option A** (single-owner engine thread + ONE ordered command stream,
+    encode-on-owner), chosen over Option B (shared-mutex/`unsafe` literal-Ghostty) — grounded in Ghostty
+    source read @ pinned `a887df42`. Cross-family review (grok-4.5 + gpt-5.6-sol, both source-verified) →
+    verdict revise-before-planning, ALL findings folded: retracted the false "live-mode = Ghostty" claim
+    (→ ordered ingress+input stream, Feed-chunked, no drain-ahead); off-fg **never-block-fg** backpressure
+    (blocking the shared GPUI fg would freeze the app + stall C3 teardown); 2 **binding gaps** scoped as
+    FFI-or-defer (`on_*` has NO progress/notification effect; NO `mouse_shift_capture` getter);
+    read-only local-scroll + focus-report suppression; format-aware mouse coalescing; OSC 52 full spec.
+    Memory [[terminal-slice-2-design-ghostty-precedent]]. **Handoff (self-contained driver for the planning
+    session): [`docs/handoffs/2026-07-17-terminal-slice-2-planning.md`](./handoffs/2026-07-17-terminal-slice-2-planning.md).**
   - **✅ SLICE 1d (convergence) — ALL CODE DONE (T1–T9), gate GREEN, AND live rider PASSED, subagent-driven (composer-2.5 build +
     cross-family review: Opus inline per-task + codex on T4 reconnect machine + codex whole-branch). 17 commits
     `f4d3080..39ee7b3` on `terminal-ws` (unpushed). Ledger `.superpowers/sdd/progress.md`.**
