@@ -418,7 +418,13 @@ fn paint_per_row_row(
 
 /// Shape + paint each glyph at its exact `col * cell_w`. Used for rows
 /// containing wide/emoji cells. Skips blank + invisible cells' glyphs (I10b).
-/// Decorations + backgrounds are painted by the caller (`paint_frame`). Returns
+/// Backgrounds are painted by the caller (`paint_frame`); decorations are
+/// painted here **interleaved** — each cell's glyph then its own decoration
+/// quads, before the next cell's glyph. This ordering is load-bearing: a glyph
+/// with negative left/right bearing (e.g. italic) can ink into an adjacent
+/// cell's decoration band, and gpui orders overlapping primitives by paint
+/// order. Batching all glyphs before all decorations would flip that stacking
+/// for such neighbours (caught in cross-family review). Returns
 /// `(shapes, paint_errors)`.
 fn paint_per_cell_row(
     row: &FrameRow,
@@ -432,8 +438,8 @@ fn paint_per_cell_row(
     let mut shapes = 0u32;
     let mut errors = 0u32;
     for (cell, res) in row.cells.iter().zip(resolved) {
+        let x = origin_x + metrics.cell_w * f32::from(cell.col);
         if !res.skip_glyph && cell.grapheme != " " {
-            let x = origin_x + metrics.cell_w * f32::from(cell.col);
             let text = SharedString::from(cell.grapheme.clone());
             let run = TextRun {
                 len: text.len(),
@@ -452,6 +458,9 @@ fn paint_per_cell_row(
                     .paint(point(x, y), metrics.cell_h, window, cx)
                     .is_err(),
             );
+        }
+        if res.overline || res.underline_quad_kind != UnderlineQuadKind::None {
+            paint_decoration_quads(cell, res, point(x, y), metrics, window);
         }
     }
     (shapes, errors)
@@ -508,15 +517,19 @@ pub fn paint_frame(
 
         let (s, e) = if row_needs_per_cell(row) {
             per_cell_rows += 1;
+            // Per-cell paints its glyphs AND decorations interleaved (ordering
+            // matters for bearing-overlapping neighbours — see the fn doc).
             paint_per_cell_row(row, &resolved, y, origin.x, metrics, window, cx)
         } else {
             per_row_rows += 1;
-            paint_per_row_row(row, &resolved, y, origin.x, metrics, window, cx)
+            let r = paint_per_row_row(row, &resolved, y, origin.x, metrics, window, cx);
+            // Per-row: the whole line shapes as one primitive, so all its
+            // decorations paint after it (matches the pre-refactor order).
+            paint_row_decorations(row, &resolved, y, origin.x, metrics, window);
+            r
         };
         shapes += s;
         paint_errors += e;
-
-        paint_row_decorations(row, &resolved, y, origin.x, metrics, window);
     }
 
     RenderStats {
