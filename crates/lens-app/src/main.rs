@@ -183,7 +183,29 @@ fn demo_cards(now: i64) -> Vec<SessionCard> {
 
     let neutral = base("demo-neutral", "Fresh session — no activity yet");
 
-    vec![needs_input, ready, working, failed, slept, neutral]
+    let mut awaiting_review = base(
+        "demo-awaiting-review",
+        "Review the draft spec on the Canvas",
+    );
+    awaiting_review.status = SessionStatusValue::Idle;
+    awaiting_review.awaiting_review = true;
+    awaiting_review.activity_summary = "awaiting your review".into();
+
+    let mut scheduled = base("demo-scheduled", "Follow-up check scheduled");
+    scheduled.status = SessionStatusValue::Idle;
+    scheduled.scheduled_wake_at = Some(now + 2 * 60 * 1000);
+    scheduled.activity_summary = "wakes in ~2m".into();
+
+    vec![
+        needs_input,
+        ready,
+        working,
+        failed,
+        slept,
+        neutral,
+        awaiting_review,
+        scheduled,
+    ]
 }
 
 fn prepare_live(config: &Config) -> Result<LivePrep, String> {

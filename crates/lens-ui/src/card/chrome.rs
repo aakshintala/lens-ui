@@ -89,6 +89,8 @@ fn wave_label(wave: Wave, status: SessionStatusValue) -> &'static str {
         Wave::Working => "WORKING",
         Wave::Failed => "FAILED",
         Wave::Slept => "SLEPT",
+        Wave::AwaitingReview => "AWAITING REVIEW",
+        Wave::Scheduled => "SCHEDULED",
         Wave::Neutral => status_label(status),
     }
 }

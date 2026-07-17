@@ -52,6 +52,13 @@ pub struct SessionCard {
     pub ready_reschedule: bool,
     /// §4.4: focus glow suppression — set by FleetStore on focus/blur only.
     pub is_focused: bool,
+    /// §2 waves: soft async attention — agent parked a Canvas review via the Lens
+    /// `await_review` MCP tool. Lens-owned; cleared when the human's comments return.
+    pub awaiting_review: bool,
+    /// §2 waves: epoch-ms of a Lens-owned scheduled wake (source-agnostic — a future
+    /// forwarded omnigent `scheduled_until` populates this same field). `Scheduled`
+    /// renders only while this is in the future.
+    pub scheduled_wake_at: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -95,6 +102,8 @@ impl SessionCard {
             seeded: false,
             ready_reschedule: false,
             is_focused: false,
+            awaiting_review: false,
+            scheduled_wake_at: None,
         }
     }
 

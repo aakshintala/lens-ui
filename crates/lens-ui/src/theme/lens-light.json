@@ -42,6 +42,8 @@
     "needs_input": "#d9701f",
     "failed": "#d43d3d",
     "slept": "#6b7280",
-    "neutral": "#eab308"
+    "neutral": "#eab308",
+    "scheduled": "#6366f1",
+    "awaiting_review": "#9333ea"
   }
 }

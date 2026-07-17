@@ -11,20 +11,44 @@ pub enum Wave {
     Failed,
     Slept,
     Neutral,
+    AwaitingReview,
+    Scheduled,
 }
 
 /// Priority ladder for card status glow (shell §5.1). Ready uses `UiClock` window
 /// math; the decay wake is a separate gpui executor timer (dual-clock — see poller).
 pub fn derive_wave(card: &SessionCard, now_ms: i64, is_focused: bool) -> Wave {
+    // 1. NeedsInput — hard block wins.
     if card.needs_attention
         && card.status != SessionStatusValue::Failed
         && card.last_task_error.is_none()
     {
         return Wave::NeedsInput;
     }
+    // 2. Failed.
     if card.status == SessionStatusValue::Failed || card.last_task_error.is_some() {
         return Wave::Failed;
     }
+    // 3. Working — active now (latent schedule/review is background).
+    if matches!(
+        card.status,
+        SessionStatusValue::Running | SessionStatusValue::Launching | SessionStatusValue::Waiting
+    ) {
+        return Wave::Working;
+    }
+    // 4. AwaitingReview — soft async attention; settles here after the turn ends,
+    //    above Ready so a just-finished review-parked turn does not flash Ready.
+    if card.awaiting_review {
+        return Wave::AwaitingReview;
+    }
+    // 5. Scheduled — Active + idle + a future wake (self-clears once now passes it).
+    if card.lifecycle == SessionLifecycle::Active
+        && card.status == SessionStatusValue::Idle
+        && card.scheduled_wake_at.is_some_and(|t| t > now_ms)
+    {
+        return Wave::Scheduled;
+    }
+    // 6. Ready — just finished, glance (idle + recent completion, unfocused).
     if card.status == SessionStatusValue::Idle
         && card
             .last_completed_at
@@ -33,12 +57,7 @@ pub fn derive_wave(card: &SessionCard, now_ms: i64, is_focused: bool) -> Wave {
     {
         return Wave::Ready;
     }
-    if matches!(
-        card.status,
-        SessionStatusValue::Running | SessionStatusValue::Launching | SessionStatusValue::Waiting
-    ) {
-        return Wave::Working;
-    }
+    // 7. Slept.
     if card.lifecycle == SessionLifecycle::Slept {
         return Wave::Slept;
     }
@@ -56,6 +75,8 @@ impl Wave {
             Wave::Failed => t.status.failed,
             Wave::Slept => t.status.slept,
             Wave::Neutral => t.status.neutral,
+            Wave::AwaitingReview => t.status.awaiting_review,
+            Wave::Scheduled => t.status.scheduled,
         }
     }
 }
@@ -107,6 +128,82 @@ mod tests {
     }
 
     #[test]
+    fn awaiting_review_below_needs_input() {
+        let mut card = SessionCard::new(SessionId::new("s"));
+        card.status = SessionStatusValue::Idle;
+        card.needs_attention = true;
+        card.awaiting_review = true;
+        assert_eq!(derive_wave(&card, 0, false), Wave::NeedsInput);
+    }
+
+    #[test]
+    fn awaiting_review_below_failed() {
+        let mut card = SessionCard::new(SessionId::new("s"));
+        card.status = SessionStatusValue::Failed;
+        card.awaiting_review = true;
+        assert_eq!(derive_wave(&card, 0, false), Wave::Failed);
+    }
+
+    #[test]
+    fn working_beats_awaiting_review() {
+        let mut card = SessionCard::new(SessionId::new("s"));
+        card.status = SessionStatusValue::Running;
+        card.awaiting_review = true;
+        assert_eq!(derive_wave(&card, 0, false), Wave::Working);
+    }
+
+    #[test]
+    fn settles_to_awaiting_review_after_turn_ends() {
+        let mut card = SessionCard::new(SessionId::new("s"));
+        card.status = SessionStatusValue::Idle;
+        card.awaiting_review = true;
+        card.last_completed_at = Some(1_000);
+        assert_eq!(
+            derive_wave(&card, 1_000 + 60_000, false),
+            Wave::AwaitingReview
+        );
+    }
+
+    #[test]
+    fn scheduled_requires_future_wake() {
+        let mut card = SessionCard::new(SessionId::new("s"));
+        card.status = SessionStatusValue::Idle;
+        card.scheduled_wake_at = Some(1_000);
+        assert_ne!(derive_wave(&card, 2_000, false), Wave::Scheduled);
+        card.scheduled_wake_at = Some(5_000);
+        assert_eq!(derive_wave(&card, 2_000, false), Wave::Scheduled);
+    }
+
+    #[test]
+    fn scheduled_beats_ready() {
+        let now = 10_000_i64;
+        let mut card = SessionCard::new(SessionId::new("s"));
+        card.status = SessionStatusValue::Idle;
+        card.scheduled_wake_at = Some(now + 10_000);
+        card.last_completed_at = Some(now);
+        assert_eq!(derive_wave(&card, now, false), Wave::Scheduled);
+    }
+
+    #[test]
+    fn scheduled_below_working() {
+        let now = 10_000_i64;
+        let mut card = SessionCard::new(SessionId::new("s"));
+        card.status = SessionStatusValue::Running;
+        card.scheduled_wake_at = Some(now + 10_000);
+        assert_eq!(derive_wave(&card, now, false), Wave::Working);
+    }
+
+    #[test]
+    fn scheduled_requires_active_not_slept() {
+        let now = 10_000_i64;
+        let mut card = SessionCard::new(SessionId::new("s"));
+        card.status = SessionStatusValue::Idle;
+        card.lifecycle = SessionLifecycle::Slept;
+        card.scheduled_wake_at = Some(now + 10_000);
+        assert_eq!(derive_wave(&card, now, false), Wave::Slept);
+    }
+
+    #[test]
     fn status_color_total_over_all_waves() {
         let t: crate::theme::LensTheme =
             serde_json::from_str(include_str!("../theme/lens-dark.json")).unwrap();
@@ -118,5 +215,10 @@ mod tests {
         assert_eq!(Wave::Failed.status_color(&t), t.status.failed);
         assert_eq!(Wave::Slept.status_color(&t), t.status.slept);
         assert_eq!(Wave::Neutral.status_color(&t), t.status.neutral);
+        assert_eq!(
+            Wave::AwaitingReview.status_color(&t),
+            t.status.awaiting_review
+        );
+        assert_eq!(Wave::Scheduled.status_color(&t), t.status.scheduled);
     }
 }

@@ -113,6 +113,10 @@ pub struct StatusTokens {
     pub slept: Hsla,
     #[serde(with = "hex_hsla")]
     pub neutral: Hsla,
+    #[serde(with = "hex_hsla")]
+    pub scheduled: Hsla,
+    #[serde(with = "hex_hsla")]
+    pub awaiting_review: Hsla,
 }
 
 #[cfg(test)]
@@ -124,7 +128,8 @@ mod tests {
     fn hex_round_trips_through_status_tokens() {
         let json = r##"{
             "ready": "#4c8dff", "working": "#36c98a", "needs_input": "#ff8a3d",
-            "failed": "#ff5d5d", "slept": "#7a8493", "neutral": "#374151"
+            "failed": "#ff5d5d", "slept": "#7a8493", "neutral": "#374151",
+            "scheduled": "#8b9bf5", "awaiting_review": "#c084fc"
         }"##;
         let s: StatusTokens = serde_json::from_str(json).expect("parse");
         // parse_hex → field → to_hex → parse_hex is stable for a sample token.
