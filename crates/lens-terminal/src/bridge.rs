@@ -167,7 +167,10 @@ fn forward_da_dsr(
                 }
                 thread::sleep(Duration::from_millis(1));
             }
-            Err(TrySendError::Disconnected(_)) => return LoopExit::Stop,
+            Err(TrySendError::Disconnected(_)) => {
+                let _ = policy_tx.try_send(BridgeEvent::AttachDisconnected);
+                return LoopExit::Stop;
+            }
         }
     }
 }
@@ -277,5 +280,28 @@ mod tests {
         };
         assert!(matches!(ev, BridgeEvent::OutboundSaturated));
         bridge.join(); // confirmed join after saturation exit
+    }
+
+    #[test]
+    fn outbound_disconnect_emits_attach_disconnected_and_joins() {
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let (_inbound_tx, inbound_rx) = crossbeam_channel::bounded(8);
+        let (outbound_tx, outbound_rx) = crossbeam_channel::bounded(8);
+        drop(outbound_rx);
+        let (policy_tx, policy_rx) = async_channel::bounded(8);
+        let bridge = spawn_bridge(inbound_rx, outbound_tx, Arc::clone(&engine), policy_tx);
+
+        engine.feed(b"\x1b[c".to_vec()).unwrap();
+        engine.build_now().ok();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let ev = loop {
+            if let Ok(ev) = policy_rx.try_recv() {
+                break ev;
+            }
+            assert!(Instant::now() < deadline, "expected AttachDisconnected");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(matches!(ev, BridgeEvent::AttachDisconnected));
+        bridge.join();
     }
 }
