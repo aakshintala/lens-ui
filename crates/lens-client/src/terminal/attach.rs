@@ -57,6 +57,13 @@ pub struct AttachHandle {
     pub inbound: Receiver<WsInbound>,
     pub outbound: Sender<WsOutbound>,
     shutdown: Arc<AtomicBool>,
+    /// When set, shutdown skips graceful `sink.close()` and delivers
+    /// `WsInbound::Closed(Network)` so live tests can simulate abrupt loss.
+    #[cfg_attr(
+        not(feature = "live-tests"),
+        expect(dead_code, reason = "written only by abort_for_test")
+    )]
+    abort: Arc<AtomicBool>,
     inspect: Arc<AttachInspectState>,
     _handle: Option<JoinHandle<()>>,
 }
@@ -159,9 +166,19 @@ impl AttachHandle {
             .snapshot(self.inbound.len(), self.outbound.len())
     }
 
-    #[cfg(any(test, feature = "test-util"))]
     pub fn set_inspect_enabled(&self, enabled: bool) {
         self.inspect.enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Abruptly tear down attach I/O without the graceful WS close handshake.
+    /// Consumes the handle like [`Self::close`]; for live integration tests only.
+    #[cfg(feature = "live-tests")]
+    pub fn abort_for_test(mut self) {
+        self.abort.store(true, Ordering::Relaxed);
+        self.signal_shutdown();
+        if let Some(h) = self._handle.take() {
+            let _ = h.join();
+        }
     }
 
     fn signal_shutdown(&self) {
@@ -214,11 +231,13 @@ pub fn attach(
     let (inbound_tx, inbound_rx) = bounded(ATTACH_CHANNEL_BOUND);
     let (outbound_tx, outbound_rx) = bounded(ATTACH_CHANNEL_BOUND);
     let shutdown = Arc::new(AtomicBool::new(false));
+    let abort = Arc::new(AtomicBool::new(false));
     let inspect = Arc::new(AttachInspectState::new(
         ATTACH_CHANNEL_BOUND,
         ATTACH_CHANNEL_BOUND,
     ));
     let thread_shutdown = Arc::clone(&shutdown);
+    let thread_abort = Arc::clone(&abort);
     let thread_inspect = Arc::clone(&inspect);
 
     let handle = std::thread::Builder::new()
@@ -240,6 +259,7 @@ pub fn attach(
                 inbound_tx,
                 outbound_rx,
                 thread_shutdown,
+                thread_abort,
                 thread_inspect,
             ));
         })
@@ -249,6 +269,7 @@ pub fn attach(
         inbound: inbound_rx,
         outbound: outbound_tx,
         shutdown,
+        abort,
         inspect,
         _handle: Some(handle),
     })
@@ -357,6 +378,7 @@ async fn io_loop(
     inbound_tx: Sender<WsInbound>,
     outbound_rx: Receiver<WsOutbound>,
     shutdown: Arc<AtomicBool>,
+    abort: Arc<AtomicBool>,
     inspect: Arc<AttachInspectState>,
 ) {
     let mut inbound_tx = Some(inbound_tx);
@@ -379,7 +401,13 @@ async fn io_loop(
     let connect = tokio::select! {
         result = connect_async(request) => result,
         () = wait_shutdown(&shutdown) => {
-            signal_inbound_gone(&mut inbound_tx);
+            if abort.load(Ordering::Relaxed) {
+                let cause = CloseCause::Network;
+                inspect.on_closed(cause);
+                let _ = deliver_inbound(&mut inbound_tx, WsInbound::Closed(cause));
+            } else {
+                signal_inbound_gone(&mut inbound_tx);
+            }
             return;
         }
     };
@@ -415,7 +443,13 @@ async fn io_loop(
     let mut drop_inbound = false;
     loop {
         if shutdown.load(Ordering::Relaxed) {
-            drop_inbound = true;
+            if abort.load(Ordering::Relaxed) {
+                let cause = CloseCause::Network;
+                inspect.on_closed(cause);
+                let _ = deliver_inbound(&mut inbound_tx, WsInbound::Closed(cause));
+            } else {
+                drop_inbound = true;
+            }
             break;
         }
         tokio::select! {
@@ -503,9 +537,11 @@ async fn io_loop(
     drop(async_out_rx);
     let _ = forwarder.join();
 
-    tokio::select! {
-        _ = sink.close() => {}
-        () = sleep(GRACEFUL_CLOSE_TIMEOUT) => {}
+    if !abort.load(Ordering::Relaxed) {
+        tokio::select! {
+            _ = sink.close() => {}
+            () = sleep(GRACEFUL_CLOSE_TIMEOUT) => {}
+        }
     }
     drop(sink);
     drop(stream);
