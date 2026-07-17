@@ -16,18 +16,8 @@ use crate::theme::ActiveLensTheme as _;
 
 use super::chrome::render_card_chrome;
 use super::model::{CARD_HEIGHT_PX, CARD_WIDTH_PX, SessionCard};
-use super::motion::{render_expanding_ring, ring_phase, sweep_phase, wave_animates};
+use super::motion::{anim_tick_for, render_expanding_ring, ring_phase, sweep_phase};
 use super::wave::derive_wave;
-
-/// Animation tick interval (ms) — the frame-rate cap. Default 33ms ≈ 30fps; overridable
-/// via `LENS_ANIM_MS` for the spike's cap-vs-native measurement.
-fn anim_tick_ms() -> u64 {
-    std::env::var("LENS_ANIM_MS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .filter(|&n| n >= 1)
-        .unwrap_or(33)
-}
 
 /// §4.4: skeleton card chrome uses gpui `div`/text only — no gpui-component widget
 /// inside the tile — so cache-key/bounds risk from component internals is N/A.
@@ -37,7 +27,8 @@ pub struct SessionCardView {
     fleet: Entity<FleetStore>,
     session_id: SessionId,
     kebab_open: bool,
-    /// 30fps self-notify driver, live only while the card's wave animates (approach ②).
+    /// Per-wave self-notify driver (30fps sweep/spinner, 1Hz Scheduled), live only while
+    /// the card's wave animates and is on-screen (approach ②).
     anim_task: Option<gpui::Task<()>>,
     pub render_count: Rc<Cell<usize>>,
     pub paint_count: Rc<Cell<usize>>,
@@ -75,7 +66,7 @@ impl SessionCardView {
 }
 
 impl Render for SessionCardView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.render_count.set(self.render_count.get() + 1);
         let card = self.card.read(cx);
         let now_ms = self.clock.now_millis();
@@ -83,22 +74,30 @@ impl Render for SessionCardView {
         let kebab_open = self.kebab_open;
         let paint_count = self.paint_count.clone();
         let last_bounds = self.last_bounds.clone();
-        // 30fps self-notify driver — live only while this card's wave animates (approach ②).
-        // Frame-capped (LENS_ANIM_MS) + self-notify → §4.4-safe and ~4× cheaper than
-        // native-refresh `.with_animation`.
-        let animating = wave_animates(wave);
-        if animating && self.anim_task.is_none() {
-            let tick = Duration::from_millis(anim_tick_ms());
-            self.anim_task = Some(cx.spawn(async move |this, cx| {
-                loop {
-                    cx.background_executor().timer(tick).await;
-                    if this.update(cx, |_, cx| cx.notify()).is_err() {
-                        break;
+        // Viewport gate: gpui does not auto-cull off-screen Div children, so an off-screen
+        // card's timer would keep re-rendering it. Only animate while visible. First frame
+        // (no bounds yet) counts as visible; it self-corrects next frame.
+        let visible = match self.last_bounds.get() {
+            Some(b) => {
+                let viewport = gpui::Bounds::new(gpui::Point::default(), window.viewport_size());
+                b.intersects(&viewport)
+            }
+            None => true,
+        };
+        let tick = anim_tick_for(wave).filter(|_| visible);
+        match (tick, self.anim_task.is_some()) {
+            (Some(interval), false) => {
+                self.anim_task = Some(cx.spawn(async move |this, cx| {
+                    loop {
+                        cx.background_executor().timer(interval).await;
+                        if this.update(cx, |_, cx| cx.notify()).is_err() {
+                            break;
+                        }
                     }
-                }
-            }));
-        } else if !animating && self.anim_task.is_some() {
-            self.anim_task = None;
+                }));
+            }
+            (None, true) => self.anim_task = None,
+            _ => {}
         }
         let sweep = sweep_phase(wave, now_ms);
         let ring_color = wave.status_color(cx.lens_theme());

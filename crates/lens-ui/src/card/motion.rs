@@ -41,6 +41,24 @@ pub fn wave_animates(wave: Wave) -> bool {
     sweep_period(wave).is_some() || matches!(wave, Wave::Working | Wave::Scheduled)
 }
 
+/// Frame cap per wave: 30fps for the sweep/spinner class, 1 Hz for the Scheduled
+/// countdown, `None` for still waves. (`demo` feature can override the 30fps value — Task 10.)
+pub fn anim_tick_for(wave: Wave) -> Option<Duration> {
+    if matches!(wave, Wave::Scheduled) {
+        return Some(Duration::from_millis(1000));
+    }
+    if wave_animates(wave) {
+        return Some(Duration::from_millis(anim_tick_ms_fast()));
+    }
+    None
+}
+
+/// The fast-class frame cap in ms. Overridable ONLY under the `demo` feature (Task 10);
+/// the shipped build is a hard 33ms (≈30fps).
+fn anim_tick_ms_fast() -> u64 {
+    33
+}
+
 const RING_PERIOD_MS: i64 = 2400;
 /// Expanding-ring phase (0..1) for the loud pair. i64 modulo first (see `sweep_phase`).
 pub fn ring_phase(now_ms: i64) -> f32 {
@@ -324,6 +342,25 @@ mod tests {
         assert!(wave_animates(Wave::Working));
         assert!(!wave_animates(Wave::Slept));
         assert!(!wave_animates(Wave::Neutral));
+    }
+
+    #[test]
+    fn anim_tick_cadence_per_wave() {
+        use std::time::Duration;
+        assert_eq!(
+            anim_tick_for(Wave::NeedsInput),
+            Some(Duration::from_millis(33))
+        );
+        assert_eq!(
+            anim_tick_for(Wave::Working),
+            Some(Duration::from_millis(33))
+        );
+        assert_eq!(
+            anim_tick_for(Wave::Scheduled),
+            Some(Duration::from_millis(1000))
+        );
+        assert_eq!(anim_tick_for(Wave::Slept), None);
+        assert_eq!(anim_tick_for(Wave::Neutral), None);
     }
 
     #[test]
