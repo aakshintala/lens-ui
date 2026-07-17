@@ -27,6 +27,9 @@
 
 use std::sync::Arc;
 
+use crossbeam_channel::Sender;
+use lens_client::WsOutbound;
+
 mod bridge;
 mod engine;
 mod policy;
@@ -294,6 +297,14 @@ pub struct TerminalTab {
     options: TerminalOpenOptions,
 
     runtime: Option<runtime::TerminalRuntime>,
+
+    /// Flipped by [`apply_newest_size_before_input`] on (re)connect; Slice 2 input
+    /// gates on this.
+    #[expect(
+        dead_code,
+        reason = "written by apply_newest_size_before_input; read in Slice 2"
+    )]
+    input_enabled: bool,
 }
 
 impl TerminalTab {
@@ -314,6 +325,43 @@ impl TerminalTab {
             client,
             options,
             runtime: None,
+            input_enabled: false,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_engine_for_test(engine: Arc<EngineHandle>, cx: &mut Context<Self>) -> Self {
+        let target = TerminalTarget::OpenOrCreate {
+            session_id: SessionId::new("test_sess"),
+            key: TerminalKey {
+                terminal_name: "main".into(),
+                session_key: "k".into(),
+            },
+        };
+        let options = TerminalOpenOptions::default();
+        Self {
+            focus_handle: cx.focus_handle(),
+            lifecycle: Lifecycle::Live,
+            presentation: Presentation {
+                lifecycle: Lifecycle::Live,
+                access: AccessMode::Write,
+                identity_title: identity_title_of(&target),
+                reported_title: None,
+                progress: None,
+                output_gap: false,
+                detached_detail: None,
+                reattach_available: false,
+            },
+            render: render::state::TabRenderState::new(),
+            target,
+            client: Arc::new(Client::stub_for_test()),
+            options,
+            runtime: Some(runtime::TerminalRuntime {
+                bridge: None,
+                attach: None,
+                engine: Some(engine),
+            }),
+            input_enabled: false,
         }
     }
 
@@ -397,6 +445,22 @@ impl TerminalTab {
         }
     }
 
+    /// Forward visibility to the engine worker; repaint when shown.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "host visibility; Slice 2 host wiring")
+    )]
+    pub(crate) fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if let Some(rt) = &self.runtime
+            && let Some(engine) = &rt.engine
+        {
+            let _ = engine.set_visible(visible);
+        }
+        if visible {
+            cx.notify();
+        }
+    }
+
     fn apply_bridge_event(&mut self, ev: BridgeEvent, cx: &mut Context<Self>) {
         // TODO(Task 4): full CloseCause policy + RetryWindow + reconnect
         let next = match ev {
@@ -471,6 +535,7 @@ impl EventEmitter<TerminalEvent> for TerminalTab {}
 
 impl Render for TerminalTab {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sample_latest_frame_from_engine();
         // The one shared canvas builder (I6). No frame yet → modeled
         // placeholder (`identity — lifecycle`); a frame → full-snapshot paint.
         // Never panics.
@@ -528,6 +593,26 @@ fn starting_presentation(target: &TerminalTarget, options: &TerminalOpenOptions)
     }
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Task 4 reconnect resize-before-input; tested in Slice 1d T5"
+    )
+)]
+fn apply_newest_size_before_input(
+    engine: &EngineHandle,
+    outbound: &Sender<WsOutbound>,
+    cols: u16,
+    rows: u16,
+    write_allowed: bool,
+    input_enabled: &mut bool,
+) {
+    let _ = engine.resize(cols, rows);
+    let _ = outbound.send(WsOutbound::Resize { cols, rows });
+    *input_enabled = write_allowed;
+}
+
 fn identity_title_of(target: &TerminalTarget) -> String {
     match target {
         TerminalTarget::OpenOrCreate { key, .. } => {
@@ -547,7 +632,141 @@ fn identity_title_of(target: &TerminalTarget) -> String {
 // covered below.
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use lens_client::WsOutbound;
+
     use super::*;
+    use crate::engine::vt::EngineConfig;
+
+    fn test_cfg() -> EngineConfig {
+        EngineConfig {
+            cols: 20,
+            rows: 3,
+            max_scrollback: 100,
+            cell_w_px: 8,
+            cell_h_px: 16,
+        }
+    }
+
+    fn wait_for_engine_frame(engine: &EngineHandle) -> Arc<Frame> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if let Some(f) = engine.latest_frame() {
+                return f;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        panic!("timeout waiting for engine frame");
+    }
+
+    fn wait_for_wake_count(at_least: usize, counter: &AtomicUsize, label: &str) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while counter.load(SeqCst) < at_least {
+            if Instant::now() >= deadline {
+                panic!("{label}: wake count stuck at {}", counter.load(SeqCst));
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[gpui::test]
+    async fn sample_updates_tab_latest_frame(cx: &mut gpui::TestAppContext) {
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        engine.feed(b"Hi".to_vec()).expect("feed");
+        engine.build_now().expect("build_now");
+        let _ = wait_for_engine_frame(engine.as_ref());
+
+        let tab = cx.new(|cx| TerminalTab::with_engine_for_test(Arc::clone(&engine), cx));
+        tab.update(cx, |tab, _cx| {
+            tab.sample_latest_frame_from_engine();
+            assert!(tab.render.latest_frame.is_some());
+            let f = tab.render.latest_frame.as_ref().unwrap();
+            assert!(
+                f.grid[0]
+                    .cells
+                    .iter()
+                    .any(|c| c.grapheme == "H" || c.grapheme == "i")
+            );
+        });
+    }
+
+    #[test]
+    fn resize_before_input_orders_engine_and_outbound() {
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let (outbound_tx, outbound_rx) = crossbeam_channel::bounded(4);
+        let mut input_enabled = false;
+        apply_newest_size_before_input(
+            engine.as_ref(),
+            &outbound_tx,
+            120,
+            40,
+            true,
+            &mut input_enabled,
+        );
+        let first = outbound_rx.try_recv().unwrap();
+        assert_eq!(
+            first,
+            WsOutbound::Resize {
+                cols: 120,
+                rows: 40
+            }
+        );
+        assert!(outbound_rx.try_recv().is_err(), "no Input before enable");
+        assert!(input_enabled);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let snap = engine.inspect();
+            if snap.cols == 120 && snap.rows == 40 {
+                assert_eq!((snap.cols, snap.rows), (120, 40));
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "engine resize not applied: cols={} rows={}",
+                    snap.cols, snap.rows
+                );
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        if let Ok(owned) = Arc::try_unwrap(engine) {
+            owned.stop();
+        }
+    }
+
+    #[gpui::test]
+    async fn tab_set_visible_forwards_to_engine(cx: &mut gpui::TestAppContext) {
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let wake_count = Arc::new(AtomicUsize::new(0));
+        {
+            let n = Arc::clone(&wake_count);
+            engine.set_waker(Box::new(move || {
+                n.fetch_add(1, SeqCst);
+            }));
+        }
+
+        let tab = cx.new(|cx| TerminalTab::with_engine_for_test(Arc::clone(&engine), cx));
+
+        // Prime: visible publish wakes at least once.
+        engine.feed(b"XY".to_vec()).expect("feed");
+        engine.build_now().expect("build_now");
+        let _ = wait_for_engine_frame(engine.as_ref());
+        wait_for_wake_count(1, &wake_count, "initial publish");
+        let after_first = wake_count.load(SeqCst);
+
+        tab.update(cx, |tab, cx| tab.set_visible(false, cx));
+
+        engine.feed(b"ZZ".to_vec()).expect("feed");
+        engine.build_now().expect("build_now");
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(wake_count.load(SeqCst), after_first, "no wake while hidden");
+
+        tab.update(cx, |tab, cx| tab.set_visible(true, cx));
+        wait_for_wake_count(after_first + 1, &wake_count, "show-after-hide");
+    }
 
     #[test]
     fn tab_render_state_starts_empty() {
