@@ -73,70 +73,76 @@ fn main() {
         }
     };
 
-    Application::new().run(move |cx: &mut App| {
-        gpui_component::init(cx);
-        lens_ui::theme::install_at_startup(cx);
+    Application::new()
+        .with_assets(lens_ui::assets::LensAssets)
+        .run(move |cx: &mut App| {
+            gpui_component::init(cx);
+            lens_ui::theme::install_at_startup(cx);
 
-        let clock = Arc::new(WallUiClock) as Arc<dyn UiClock>;
-        let fleet = FleetStore::new_live(clock, cx);
-        lens_ui::shortcuts::register(&fleet, cx);
+            let clock = Arc::new(WallUiClock) as Arc<dyn UiClock>;
+            let fleet = FleetStore::new_live(clock, cx);
+            lens_ui::shortcuts::register(&fleet, cx);
 
-        cx.open_window(WindowOptions::default(), move |window, cx| {
-            if let Some(prep) = live_prep {
-                fleet.update(cx, |fleet, cx| {
-                    for sid in prep.session_ids {
-                        if let Err(e) = fleet.spawn_live_session(
-                            &prep.conn,
-                            &prep.client,
-                            sid.clone(),
-                            &prep.data_dir,
-                            cx,
-                        ) {
-                            eprintln!("lens-app: spawn_live_session {sid}: {e}");
+            cx.open_window(WindowOptions::default(), move |window, cx| {
+                if let Some(prep) = live_prep {
+                    fleet.update(cx, |fleet, cx| {
+                        for sid in prep.session_ids {
+                            if let Err(e) = fleet.spawn_live_session(
+                                &prep.conn,
+                                &prep.client,
+                                sid.clone(),
+                                &prep.data_dir,
+                                cx,
+                            ) {
+                                eprintln!("lens-app: spawn_live_session {sid}: {e}");
+                            }
                         }
-                    }
-                });
-            }
-            let board = cx.new(|cx| BoardView::mount(fleet.clone(), placeholder_tab(cx), None, cx));
-            let any: gpui::AnyView = board.into();
-            cx.new(|cx| Root::new(any, window, cx))
-        })
-        .ok();
-        cx.activate(true);
-    });
+                    });
+                }
+                let board =
+                    cx.new(|cx| BoardView::mount(fleet.clone(), placeholder_tab(cx), None, cx));
+                let any: gpui::AnyView = board.into();
+                cx.new(|cx| Root::new(any, window, cx))
+            })
+            .ok();
+            cx.activate(true);
+        });
 }
 
 /// `--demo`: paint six cards in the six wave states (no live server needed) so the
 /// status language is visible at a glance. Cards carry no poller/commands — clicking
 /// one still toggles focus (and suppresses that card's glow while focused).
 fn run_demo() {
-    Application::new().run(|cx: &mut App| {
-        gpui_component::init(cx);
-        lens_ui::theme::install_at_startup(cx);
+    Application::new()
+        .with_assets(lens_ui::assets::LensAssets)
+        .run(|cx: &mut App| {
+            gpui_component::init(cx);
+            lens_ui::theme::install_at_startup(cx);
 
-        let clock = Arc::new(WallUiClock) as Arc<dyn UiClock>;
-        let now = clock.now_millis();
-        let fleet = FleetStore::new_live(clock, cx);
-        lens_ui::shortcuts::register(&fleet, cx);
+            let clock = Arc::new(WallUiClock) as Arc<dyn UiClock>;
+            let now = clock.now_millis();
+            let fleet = FleetStore::new_live(clock, cx);
+            lens_ui::shortcuts::register(&fleet, cx);
 
-        cx.open_window(WindowOptions::default(), move |window, cx| {
-            fleet.update(cx, |f, cx| {
-                for card in demo_cards(now) {
-                    let id = card.session_id.clone();
-                    let entity = cx.new(|_| card);
-                    f.cards.insert(id, entity);
-                }
-                cx.notify();
-            });
-            let board = cx.new(|cx| BoardView::mount(fleet.clone(), placeholder_tab(cx), None, cx));
-            let card_views = board.read(cx).card_views_for_test().clone();
-            lens_ui::card::spawn_demo_paint_instrumentation(&card_views, cx);
-            let any: gpui::AnyView = board.into();
-            cx.new(|cx| Root::new(any, window, cx))
-        })
-        .ok();
-        cx.activate(true);
-    });
+            cx.open_window(WindowOptions::default(), move |window, cx| {
+                fleet.update(cx, |f, cx| {
+                    for card in demo_cards(now) {
+                        let id = card.session_id.clone();
+                        let entity = cx.new(|_| card);
+                        f.cards.insert(id, entity);
+                    }
+                    cx.notify();
+                });
+                let board =
+                    cx.new(|cx| BoardView::mount(fleet.clone(), placeholder_tab(cx), None, cx));
+                let card_views = board.read(cx).card_views_for_test().clone();
+                lens_ui::card::spawn_demo_paint_instrumentation(&card_views, cx);
+                let any: gpui::AnyView = board.into();
+                cx.new(|cx| Root::new(any, window, cx))
+            })
+            .ok();
+            cx.activate(true);
+        });
 }
 
 /// Eight preset cards (one per wave state), replicated `LENS_DEMO_N` times (default 1).

@@ -1,4 +1,5 @@
 pub mod actions;
+pub mod assets;
 pub mod board;
 pub mod card;
 pub mod clock;
