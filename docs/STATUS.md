@@ -28,6 +28,11 @@ and roll older "Recent" pointers off this page as they age.
     **indistinguishable from 30fps** (labeled A/B). Perceptual finding: the *sweep* (band translation),
     not the spinner (small rotation), is the frame-rate-sensitive element. Deferred sweep-feather
     slant limit + skew-sign untouched. Detail: `docs/spikes/2026-07-17-wave-build-perf.md` (RESOLVED).
+  - **✅ card body status wash RESTORED (2026-07-17 follow-up):** the SSOT card background wash
+    (`board-home.html:48`) was dropped in the B-build (card had border only, no `.bg()`). Restored
+    with a per-wave treatment (`chrome.rs` `wave_wash`): sweep waves = full-body gradient 24%,
+    Working/Scheduled = flat 14%, Idle = flat 8%, Slept = none (dim + outline). pane-ui-match
+    intensity; gpui has no radial so the gradient is a 135° linear approx. Spec §11 amended.
   - **Open (non-blocking):** **B6 carry-forward** — viewport re-entry can leave a card stuck
     non-animating (unreachable in this non-scrolling build; fix rides with B6's scroll container,
     never notify from the paint closure).

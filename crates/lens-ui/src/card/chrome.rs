@@ -1,6 +1,6 @@
 use gpui::{
     App, Div, Hsla, InteractiveElement, IntoElement, ParentElement, SharedString, Stateful, Styled,
-    Window, div, prelude::*, px, relative, svg,
+    Window, div, linear_color_stop, linear_gradient, prelude::*, px, relative, svg,
 };
 use lens_core::domain::usage::Cost;
 
@@ -168,6 +168,65 @@ fn action_button(
         .child(label)
 }
 
+/// Per-wave wash over the card body (status-colored fill behind the content).
+/// - Sweep waves → `Gradient` (pairs with the moving sweep = the "wave effect").
+/// - Working/Scheduled → `Flat` uniform tint (a static gradient reads dull with no sweep).
+/// - Neutral/Idle → `Flat` but very faint.
+/// - Slept → `None` (dim + colored outline only).
+enum Wash {
+    None,
+    Flat(f32),
+    Gradient { peak: f32, spread: f32 },
+}
+
+// pane-ui-match intensities (tunable end-of-pass). Gradient spreads full-body (1.0), not a corner.
+const WASH_GRADIENT_ALPHA: f32 = 0.24;
+const WASH_GRADIENT_SPREAD: f32 = 1.0;
+const WASH_FLAT_ALPHA: f32 = 0.14;
+const WASH_FAINT_ALPHA: f32 = 0.08;
+
+fn wave_wash(wave: Wave) -> Wash {
+    match wave {
+        Wave::NeedsInput | Wave::Failed | Wave::AwaitingReview | Wave::Ready => Wash::Gradient {
+            peak: wash_tunable("LENS_CARD_WASH", WASH_GRADIENT_ALPHA),
+            spread: wash_tunable("LENS_CARD_WASH_SPREAD", WASH_GRADIENT_SPREAD),
+        },
+        Wave::Working | Wave::Scheduled => {
+            Wash::Flat(wash_tunable("LENS_CARD_WASH_FLAT", WASH_FLAT_ALPHA))
+        }
+        Wave::Neutral => Wash::Flat(wash_tunable("LENS_CARD_WASH_FAINT", WASH_FAINT_ALPHA)),
+        Wave::Slept => Wash::None,
+    }
+}
+
+/// Apply the wave's wash as the card background. `status` is the wave's status color.
+fn apply_wash(root: Div, wave: Wave, status: Hsla) -> Div {
+    match wave_wash(wave) {
+        Wash::None => root,
+        Wash::Flat(a) => root.bg(status.opacity(a)),
+        Wash::Gradient { peak, spread } => root.bg(linear_gradient(
+            135.0,
+            linear_color_stop(status.opacity(peak), 0.0),
+            linear_color_stop(status.opacity(0.0), spread),
+        )),
+    }
+}
+
+/// Demo-only wash-intensity override (`_var`); the shipped build uses `default`.
+fn wash_tunable(_var: &str, default: f32) -> f32 {
+    #[cfg(feature = "demo")]
+    {
+        if let Some(v) = std::env::var(_var)
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .filter(|v| (0.0..=1.0).contains(v))
+        {
+            return v;
+        }
+    }
+    default
+}
+
 /// Card chrome inside the fixed 280×160 tile (§4.4 — reserved slots, no collapse).
 // Single internal call site (card/view.rs); the five `on_*` handlers are distinct captured closures
 // that don't bundle cleanly, and `cx` is needed for theme tokens — a struct here would only add noise.
@@ -261,6 +320,10 @@ pub fn render_card_chrome(
         .border_2()
         .border_color(border)
         .overflow_hidden();
+    // Status-colored wash behind the content, per-wave (gradient / flat / none). The gradient
+    // is a 135° top-left→bottom-right linear approximation of the SSOT corner radial (gpui has
+    // no radial); pane-ui-match uses full spread so it covers the body, not just the corner.
+    root = apply_wash(root, wave, border);
 
     // Header: 44px icon-tile + stacked status / title + kebab.
     let mut header = div()

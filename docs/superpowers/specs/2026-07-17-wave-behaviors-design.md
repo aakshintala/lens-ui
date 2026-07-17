@@ -234,6 +234,16 @@ here. All are on `feat/lens-app-multi-session`, gate-green.
   neighbors' breathe animations don't bleed), `28px` padding, `justify_center` + `content_start`.
   The demo window is sized (`run_demo`, demo-only) so the 8 cards land as a centered 4×2.
   A responsive/scrolling grid still rides with B6 (§8a.4).
+- **Card body status wash — RESTORED + per-wave** (`chrome.rs` `wave_wash`/`apply_wash`). The
+  card-structure SSOT (`board-home.html:48`) specifies a status-colored background wash
+  (`radial-gradient(...color-mix(status 12%), transparent 58%), bg1`) that the B-build dropped —
+  the card had only a border, no `.bg()`. Restored, with a deliberate **per-wave** treatment (the
+  uniform 12% SSOT radial did not distinguish animated vs static cards) and a fuller pane-ui-match
+  intensity: **sweep waves** (NeedsInput/Failed/AwaitingReview/Ready) = full-body gradient (24%,
+  135° top-left→bottom-right — a linear approximation, gpui 0.2.2 has NO radial); **Working/
+  Scheduled** = flat uniform tint (14%, no gradient — a static gradient reads dull without a
+  sweep); **Idle/Neutral** = flat 8% (very faint); **Slept** = no body wash (dim + colored outline
+  only). Demo-tunable via `LENS_CARD_WASH`/`_SPREAD`/`_FLAT`/`_FAINT`.
 - **Fast-wave frame cap 30fps → 20fps** (`anim_tick_ms_fast` 33→50ms; supersedes §8's
   "≈30fps / tick≈33ms" and the §9 measurement's 30fps assumption). Post-build perf triage
   (`docs/spikes/2026-07-17-wave-build-perf.md`, RESOLVED) showed the overage is the **per-frame
