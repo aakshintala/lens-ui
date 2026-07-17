@@ -52,12 +52,13 @@ impl TerminalRuntime {
             a.close();
         }
         // 3. bridge.join already dropped its engine Arc clone
-        // 4. unique Arc → stop (consumes EngineHandle)
-        if let Some(engine) = self.engine.take() {
-            let owned =
-                Arc::try_unwrap(engine).expect("engine Arc must be unique after bridge join");
+        // 4. normally unique Arc → stop; tolerate a transient extra clone
+        if let Some(engine) = self.engine.take()
+            && let Ok(owned) = Arc::try_unwrap(engine)
+        {
             owned.stop();
         }
+        // If not unique, Arc drop alone; worker Drop detaches.
     }
 }
 

@@ -70,8 +70,8 @@ use serde::{Deserialize, Serialize};
 
 use bridge::{BridgeEvent, spawn_bridge};
 use policy::{
-    AttachedParts, PolicyAction, PolicyState, RetryWindow, discover_and_attach,
-    identity_title_from_resource, preflight_reconnect,
+    AttachedParts, PolicyAction, PolicyState, discover_and_attach, identity_title_from_resource,
+    preflight_reconnect,
 };
 
 // ---------------------------------------------------------------------------
@@ -443,19 +443,22 @@ impl TerminalTab {
         spawn_foreground_sampler(wake_rx, policy_rx, cx);
     }
 
-    fn teardown_transport_off_foreground(&mut self) {
+    fn teardown_transport_off_foreground(&mut self, cx: &mut Context<Self>) {
         if let Some(rt) = &mut self.runtime {
             let (bridge, attach) = rt.take_transport();
-            let _ = std::thread::Builder::new()
-                .name("lens-terminal-transport-teardown".into())
-                .spawn(move || {
-                    if let Some(b) = bridge {
-                        b.join();
-                    }
-                    if let Some(a) = attach {
-                        a.close();
-                    }
-                });
+            cx.spawn(async move |_weak, cx| {
+                cx.background_executor()
+                    .spawn(async move {
+                        if let Some(b) = bridge {
+                            b.join();
+                        }
+                        if let Some(a) = attach {
+                            a.close();
+                        }
+                    })
+                    .await;
+            })
+            .detach();
         }
     }
 
@@ -531,7 +534,7 @@ impl TerminalTab {
                 reattach_available,
             } => {
                 if reattach_available {
-                    self.teardown_transport_off_foreground();
+                    self.teardown_transport_off_foreground(cx);
                 } else {
                     self.teardown_runtime_full(cx);
                 }
@@ -542,9 +545,13 @@ impl TerminalTab {
             PolicyAction::DowngradeReadOnly => {
                 self.presentation.access = AccessMode::ReadOnly;
                 self.input_enabled = false;
-                // TODO: refresh + read_only reattach
+                self.teardown_transport_off_foreground(cx);
+                self.policy.retry.reset();
+                self.lifecycle = Lifecycle::Reconnecting;
+                self.presentation.lifecycle = Lifecycle::Reconnecting;
                 cx.emit(TerminalEvent::PresentationChanged);
                 cx.notify();
+                self.schedule_reconnect(Duration::ZERO, cx);
             }
             PolicyAction::Retry { delay } => {
                 self.lifecycle = Lifecycle::Reconnecting;
@@ -552,7 +559,7 @@ impl TerminalTab {
                 self.input_enabled = false;
                 cx.emit(TerminalEvent::PresentationChanged);
                 cx.notify();
-                self.teardown_transport_off_foreground();
+                self.teardown_transport_off_foreground(cx);
                 self.schedule_reconnect(delay, cx);
             }
         }
@@ -576,28 +583,23 @@ impl TerminalTab {
     fn schedule_reconnect(&mut self, first_delay: Duration, cx: &mut Context<Self>) {
         let client = Arc::clone(&self.client);
         let (session, tid) = self.reconnect_session_and_tid();
-        let engine = self
-            .runtime
-            .as_ref()
-            .and_then(runtime::TerminalRuntime::engine_arc)
-            .expect("engine retained during reconnect");
-        let policy_tx = self
-            .policy_tx
-            .clone()
-            .expect("policy_tx retained from initial attach");
         let read_only = matches!(self.presentation.access, AccessMode::ReadOnly);
 
         cx.spawn(async move |weak, cx| {
-            let mut window = RetryWindow::new();
-            let mut next = Some(first_delay);
+            let mut first = Some(first_delay);
             loop {
-                let delay = match next.take().or_else(|| window.next_delay(Instant::now())) {
-                    Some(d) => d,
-                    None => {
-                        let _ = weak.update(cx, |tab, cx| {
-                            tab.on_detach(DetachedDetail::RetriesExhausted, cx);
-                        });
-                        break;
+                let delay = if let Some(d) = first.take() {
+                    d
+                } else {
+                    match weak.update(cx, |tab, _| tab.policy.retry.next_delay(Instant::now())) {
+                        Ok(Some(d)) => d,
+                        Ok(None) => {
+                            let _ = weak.update(cx, |tab, cx| {
+                                tab.on_detach(DetachedDetail::RetriesExhausted, cx);
+                            });
+                            break;
+                        }
+                        Err(_) => break,
                     }
                 };
 
@@ -605,14 +607,25 @@ impl TerminalTab {
                     .background_executor()
                     .spawn({
                         let client = Arc::clone(&client);
-                        let engine = Arc::clone(&engine);
-                        let policy_tx = policy_tx.clone();
                         let session = session.clone();
                         let tid = tid.clone();
                         async move {
                             std::thread::sleep(delay);
-                            let resource = preflight_reconnect(client.as_ref(), &session, &tid)
-                                .map_err(ReconnectOutcome::Fatal)?;
+                            let resource =
+                                match preflight_reconnect(client.as_ref(), &session, &tid) {
+                                    Ok(r) => r,
+                                    Err(DetachedDetail::TerminalGone) => {
+                                        return Err(ReconnectOutcome::Fatal(
+                                            DetachedDetail::TerminalGone,
+                                        ));
+                                    }
+                                    Err(DetachedDetail::Unauthorized) => {
+                                        return Err(ReconnectOutcome::Fatal(
+                                            DetachedDetail::Unauthorized,
+                                        ));
+                                    }
+                                    Err(_) => return Err(ReconnectOutcome::Retryable),
+                                };
                             let attach = attach(
                                 client.as_ref(),
                                 &session,
@@ -620,21 +633,15 @@ impl TerminalTab {
                                 AttachOptions { read_only },
                             )
                             .map_err(|_| ReconnectOutcome::Retryable)?;
-                            let bridge = spawn_bridge(
-                                attach.inbound.clone(),
-                                attach.outbound.clone(),
-                                engine,
-                                policy_tx,
-                            );
-                            Ok::<_, ReconnectOutcome>((resource, attach, bridge))
+                            Ok::<_, ReconnectOutcome>((resource, attach))
                         }
                     })
                     .await;
 
                 match attempt {
-                    Ok((resource, attach, bridge)) => {
+                    Ok((resource, attach)) => {
                         let _ = weak.update(cx, |tab, cx| {
-                            tab.on_reconnect_success(resource, attach, bridge, cx);
+                            tab.on_reconnect_success(resource, attach, cx);
                         });
                         break;
                     }
@@ -653,7 +660,6 @@ impl TerminalTab {
         &mut self,
         resource: TerminalResource,
         attach: lens_client::AttachHandle,
-        bridge: bridge::BridgeHandle,
         cx: &mut Context<Self>,
     ) {
         let outbound = attach.outbound.clone();
@@ -663,6 +669,12 @@ impl TerminalTab {
         if let Some(rt) = &mut self.runtime {
             let engine = rt.engine_arc().expect("engine retained during reconnect");
             let snap = engine.inspect();
+            let bridge = spawn_bridge(
+                attach.inbound.clone(),
+                attach.outbound.clone(),
+                Arc::clone(&engine),
+                self.policy_tx.clone().expect("policy_tx retained"),
+            );
             rt.install_transport(bridge, attach);
             self.policy.retry.reset();
             apply_newest_size_before_input(
@@ -817,7 +829,7 @@ fn apply_newest_size_before_input(
     input_enabled: &mut bool,
 ) {
     let _ = engine.resize(cols, rows);
-    let _ = outbound.send(WsOutbound::Resize { cols, rows });
+    let _ = outbound.try_send(WsOutbound::Resize { cols, rows });
     *input_enabled = write_allowed;
 }
 
