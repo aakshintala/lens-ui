@@ -1,6 +1,6 @@
 use gpui::{
     App, AppContext, Context, Div, Hsla, InteractiveElement, IntoElement, ParentElement, Render,
-    SharedString, Styled, Window, div, prelude::*, px, svg,
+    SharedString, Styled, Window, div, prelude::*, px, relative, svg,
 };
 use lens_core::domain::usage::Cost;
 
@@ -60,6 +60,14 @@ fn format_ctx_pct(context_window: Option<u64>, last_total_tokens: Option<u64>) -
     match (context_window, last_total_tokens) {
         (Some(w), Some(t)) if w > 0 => format!("{}%", (t.saturating_mul(100) / w).min(100)),
         _ => "—".into(),
+    }
+}
+
+/// Fill fraction (0.0..1.0) for the context-window progress bar.
+fn ctx_fraction(context_window: Option<u64>, last_total_tokens: Option<u64>) -> f32 {
+    match (context_window, last_total_tokens) {
+        (Some(w), Some(t)) if w > 0 => (t as f32 / w as f32).clamp(0.0, 1.0),
+        _ => 0.0,
     }
 }
 
@@ -134,6 +142,8 @@ pub fn render_card_chrome(
     let repos_for_tooltip = card.repos.clone();
     let spend = format_spend(&card.cumulative_cost);
     let ctx_pct = format_ctx_pct(card.context_window, card.last_total_tokens);
+    let ctx_frac = ctx_fraction(card.context_window, card.last_total_tokens);
+    let pbar_track = gpui::white().opacity(0.06);
     let host = host_label(card);
 
     let activity = if wave == Wave::Failed {
@@ -255,6 +265,16 @@ pub fn render_card_chrome(
                 .child(ellipsize_line(ctx_pct)),
         );
 
+    root = root.child(
+        div()
+            .h(px(4.0))
+            .w_full()
+            .rounded(px(2.0))
+            .overflow_hidden()
+            .bg(pbar_track)
+            .child(div().h_full().w(relative(ctx_frac)).bg(border)),
+    );
+
     if let Some(phase) = sweep_phase {
         root = root.child(render_sweep_overlay(border, phase));
     }
@@ -308,5 +328,22 @@ mod tests {
     #[test]
     fn repos_empty_shows_dash() {
         assert_eq!(format_repos_row(&[]), "—");
+    }
+
+    #[test]
+    fn ctx_fraction_clamps_and_ratios() {
+        assert_eq!(ctx_fraction(Some(200_000), Some(50_000)), 0.25);
+        assert_eq!(
+            ctx_fraction(Some(100), Some(250)),
+            1.0,
+            "over-full clamps to 1"
+        );
+        assert_eq!(ctx_fraction(None, Some(10)), 0.0, "no window → 0");
+        assert_eq!(
+            ctx_fraction(Some(0), Some(10)),
+            0.0,
+            "zero window → 0 (no div-by-0)"
+        );
+        assert_eq!(ctx_fraction(Some(200_000), None), 0.0, "no tokens → 0");
     }
 }
