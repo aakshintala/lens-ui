@@ -662,30 +662,43 @@ impl TerminalTab {
         attach: lens_client::AttachHandle,
         cx: &mut Context<Self>,
     ) {
-        let outbound = attach.outbound.clone();
         let read_only = matches!(self.presentation.access, AccessMode::ReadOnly);
         let write_allowed = !read_only;
 
-        if let Some(rt) = &mut self.runtime {
-            let engine = rt.engine_arc().expect("engine retained during reconnect");
-            let snap = engine.inspect();
-            let bridge = spawn_bridge(
-                attach.inbound.clone(),
-                attach.outbound.clone(),
-                Arc::clone(&engine),
-                self.policy_tx.clone().expect("policy_tx retained"),
-            );
-            rt.install_transport(bridge, attach);
-            self.policy.retry.reset();
-            apply_newest_size_before_input(
-                engine.as_ref(),
-                &outbound,
-                snap.cols,
-                snap.rows,
-                write_allowed,
-                &mut self.input_enabled,
-            );
-        }
+        let Some(rt) = &mut self.runtime else {
+            // Unreachable in the current design (no events arrive during the reconnect
+            // window), but NEVER drop an AttachHandle on the gpui foreground — its Drop
+            // joins the I/O thread synchronously.
+            cx.spawn(async move |_w, cx| {
+                cx.background_executor()
+                    .spawn(async move {
+                        attach.close();
+                    })
+                    .await;
+            })
+            .detach();
+            return;
+        };
+
+        let outbound = attach.outbound.clone();
+        let engine = rt.engine_arc().expect("engine retained during reconnect");
+        let snap = engine.inspect();
+        let bridge = spawn_bridge(
+            attach.inbound.clone(),
+            attach.outbound.clone(),
+            Arc::clone(&engine),
+            self.policy_tx.clone().expect("policy_tx retained"),
+        );
+        rt.install_transport(bridge, attach);
+        self.policy.retry.reset();
+        apply_newest_size_before_input(
+            engine.as_ref(),
+            &outbound,
+            snap.cols,
+            snap.rows,
+            write_allowed,
+            &mut self.input_enabled,
+        );
 
         self.current_session = Some(resource.session_id.clone());
         self.current_tid = Some(resource.id.clone());
