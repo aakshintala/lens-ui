@@ -99,8 +99,20 @@ parent `opacity`, so the button can stay full-opacity.)
 ## 5. Glyphs (finalized this pass — NOT deferred)
 
 🔔 NeedsInput · ⚠ Failed · spinner Working · ⌾ AwaitingReview · ⏰ Scheduled · ✓ Ready ·
-☾ Slept · ☕ Idle. Unicode/emoji now; a bespoke icon set is later polish (a build
-artifact, per STATUS). The spike verifies emoji render correctly in gpui text.
+☾ Slept · ☕ Idle — these are the glyph *choices*.
+
+**Icon set = Lucide SVGs, bundled via `AssetSource` (LOCKED 2026-07-17, overrides the
+earlier "emoji now").** Rationale: the Working spinner already forces `AssetSource` + a
+bundled SVG (gpui-component ships no icon SVGs — spike gotcha #3), and gpui-component's
+`IconName`/`Icon` already *expects* Lucide-named SVGs ("Icons from Lucide", its README).
+So we bundle all 8 from one MIT/ISC set and get **monochrome, status-color-tintable**
+marks — emoji can't be tinted and fight the status-colored tile (§1–§2: tile color
+carries status, glyph is the secondary mark). Lucide names: `bell` (NeedsInput),
+`triangle-alert` (Failed), `loader-circle` (Working spinner), `eye`/`circle-dot`
+(AwaitingReview), `alarm-clock` (Scheduled), `check` (Ready), `moon` (Slept), `coffee`
+(Idle). A bespoke icon set later is a pure SVG swap, not an infra change. **Spinner
+mechanism:** rotate `loader-circle.svg` via `with_transformation`, angle driven by the
+same phase-from-clock as the sweep (NOT `.with_animation`) — one driver.
 
 ## 6. Structural shell (B1/B2/B4/B5) — port from the render SSOT
 
@@ -174,6 +186,15 @@ animating card @30fps**; 5 cards = 8.8%. Managed by cap + viewport-gate.
   animating neighbor must not bump a static card's `paint_count`.
 - **On-device:** the spike's CPU/GPU + visual-smoothness pass; end-of-build color tuning
   via the reload loop.
+- **Perf/energy completion gate (REQUIRED — end of the whole build, not a footnote):**
+  re-run the spike's exact rig — release build, `top -l N -s 1 -pid <pid> -stats
+  cpu,power` for CPU% + energy-impact, FPS from paint-count deltas — at the default
+  8-card demo (+ `LENS_DEMO_N=2` for headroom). **Regression budget** (from the spike, so
+  it's a gate not a vibe check): idle floor ~0.3%, ~1.7% CPU per visible animating card
+  @30fps, ~8.8% for 5. If the productionized custom draw (canvas `paint_path` sweep,
+  canvas countdown arc, rotated spinner SVG) pushes materially past that, it's a finding,
+  not a pass. Full-scale (>8 cards, scrolling) rides with B6 — this build validates the
+  visible set only.
 
 ## 10. Out of scope (this build)
 
