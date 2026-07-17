@@ -56,6 +56,16 @@ pub fn anim_tick_for(wave: Wave) -> Option<Duration> {
 /// The fast-class frame cap in ms. Overridable ONLY under the `demo` feature (Task 10);
 /// the shipped build is a hard 33ms (≈30fps).
 fn anim_tick_ms_fast() -> u64 {
+    #[cfg(feature = "demo")]
+    {
+        if let Some(ms) = std::env::var("LENS_ANIM_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n| n >= 1)
+        {
+            return ms;
+        }
+    }
     33
 }
 

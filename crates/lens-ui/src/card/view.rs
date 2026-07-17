@@ -5,9 +5,11 @@ use gpui::{
 use lens_core::actor::SessionCommand;
 use lens_core::domain::ids::SessionId;
 use std::cell::Cell;
+#[cfg(feature = "demo")]
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
+#[cfg(any(feature = "demo", test))]
 use std::time::Duration;
 
 use crate::clock::UiClock;
@@ -102,9 +104,6 @@ impl Render for SessionCardView {
         let sweep = sweep_phase(wave, now_ms);
         let ring_color = wave.status_color(cx.lens_theme());
         let ring = ring_phase(now_ms);
-        if std::env::var("LENS_ANIM_DBG").is_ok() && matches!(wave, super::wave::Wave::NeedsInput) {
-            eprintln!("DBG now_ms={now_ms} sweep={sweep:?}");
-        }
 
         div()
             .id(("session-card", self.card.entity_id()))
@@ -178,6 +177,7 @@ pub fn mount_cached_card(view: Entity<SessionCardView>) -> AnyView {
 }
 
 /// Demo spike: stderr dump of per-card render/paint counters every ~2s.
+#[cfg(feature = "demo")]
 pub fn spawn_demo_paint_instrumentation(
     card_views: &HashMap<SessionId, Entity<SessionCardView>>,
     cx: &mut gpui::App,

@@ -7,13 +7,17 @@ use lens_client::sessions::{GetOpts, SessionSnapshot, SessionStatus};
 use lens_client::{Auth, Client, Connection};
 use lens_core::actor::ActorStores;
 use lens_core::domain::ids::AgentId;
-use lens_core::domain::scalars::{ErrorInfo, SessionLifecycle, SessionStatusValue};
+use lens_core::domain::scalars::SessionStatusValue;
+#[cfg(feature = "demo")]
+use lens_core::domain::scalars::{ErrorInfo, SessionLifecycle};
 use lens_core::domain::session::SessionState;
+#[cfg(feature = "demo")]
 use lens_core::domain::usage::Cost;
 use lens_core::persist::{
     ConnectionRecord, ControlStore, SqliteControlStore, SqliteTranscriptStore,
 };
 use lens_ui::board::BoardView;
+#[cfg(feature = "demo")]
 use lens_ui::card::model::SessionCard;
 use lens_ui::clock::{UiClock, WallUiClock};
 use lens_ui::fleet::store::FleetStore;
@@ -56,10 +60,13 @@ fn main() {
         process::exit(exit);
     }
 
+    #[cfg(feature = "demo")]
     if config.demo {
         run_demo();
         return;
     }
+    #[cfg(not(feature = "demo"))]
+    let _ = &config.demo;
 
     let live_prep = if config.session_ids.is_empty() {
         None
@@ -112,6 +119,7 @@ fn main() {
 /// `--demo`: paint six cards in the six wave states (no live server needed) so the
 /// status language is visible at a glance. Cards carry no poller/commands — clicking
 /// one still toggles focus (and suppresses that card's glow while focused).
+#[cfg(feature = "demo")]
 fn run_demo() {
     Application::new()
         .with_assets(lens_ui::assets::LensAssets)
@@ -146,6 +154,7 @@ fn run_demo() {
 }
 
 /// Eight preset cards (one per wave state), replicated `LENS_DEMO_N` times (default 1).
+#[cfg(feature = "demo")]
 fn demo_cards(now: i64) -> Vec<SessionCard> {
     let replicas = std::env::var("LENS_DEMO_N")
         .ok()
@@ -166,6 +175,7 @@ fn demo_cards(now: i64) -> Vec<SessionCard> {
 }
 
 /// One replica of the eight wave-state demo cards.
+#[cfg(feature = "demo")]
 fn demo_preset_cards(now: i64) -> [SessionCard; 8] {
     let base = |id: &str, title: &str| {
         let mut c = SessionCard::new(SessionId::new(id));
@@ -270,7 +280,10 @@ fn parse_config() -> Result<Config, String> {
     let mut data_dir: Option<PathBuf> = None;
     let mut fleet_verify = false;
     let mut fleet_count: usize = 10;
+    #[cfg(feature = "demo")]
     let mut demo = false;
+    #[cfg(not(feature = "demo"))]
+    let demo = false;
     let mut i = 0;
 
     while i < args.len() {
@@ -283,6 +296,7 @@ fn parse_config() -> Result<Config, String> {
                 fleet_verify = true;
                 i += 1;
             }
+            #[cfg(feature = "demo")]
             "--demo" => {
                 demo = true;
                 i += 1;
