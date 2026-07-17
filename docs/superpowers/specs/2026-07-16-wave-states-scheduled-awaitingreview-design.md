@@ -12,6 +12,17 @@ The *producers* that feed these fields — the Lens-owned MCP server (`await_rev
 Supersedes nothing; extends `card/wave.rs` (the 6-wave ladder shipped with the
 §18 theming substrate, handoff `2026-07-16-theming-substrate-shipped.md`).
 
+**Build boundary (2026-07-16):** the *structural contract* — §2.1 fields, §2.2
+ladder, §2.3 **tokens only** (two `StatusTokens` fields + both JSONs +
+`status_color` arms, placeholder colors), §2.4 demo cards, §3 tests — is a single
+composer slice that lands **first**, so B1's icon-tile renders all 8 waves
+uniformly. **Deferred out of that slice:** (a) the §2.3 **wave *behaviors*** (pulse
+/ dim / countdown affordance / Canvas deep-link) fold into the **B1–B5** wave build
+where all 8 waves get their glow/pulse/radial treatment as one system; (b) the §2.2
+**poller repaint timer** at `scheduled_wake_at` ships with the scheduler (#11) or a
+tiny follow-on — the demo uses a static future timestamp and needs no timer to
+render `Scheduled`.
+
 ---
 
 ## 1. Motivation & feasibility verdict
