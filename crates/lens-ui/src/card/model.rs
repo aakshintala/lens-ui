@@ -7,7 +7,7 @@ use lens_core::domain::usage::Cost;
 use lens_core::reduce::StreamUpdate;
 
 pub const CARD_WIDTH_PX: f32 = 280.0;
-pub const CARD_HEIGHT_PX: f32 = 148.0;
+pub const CARD_HEIGHT_PX: f32 = 160.0;
 pub const READY_DECAY_MS: i64 = 5 * 60 * 1000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]

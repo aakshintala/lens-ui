@@ -120,11 +120,15 @@ Mechanical port from `board-home.html`, no open design questions:
 - **B1** — 44px status-colored **icon-tile** replaces the throwaway text pill (deletes
   `wave_label` / `pill_text_color` from `card/chrome.rs`; the tile hosts the glyph /
   spinner / countdown ring).
-- **B2** — context-window **progress bar** (`.pbar`, status-colored fill).
-- **B4** — layout order: **tile-left** + stacked STATUS / title / harness·model.
+- **B2** — context-window **progress bar** (`.pbar`). **Fill = utilization threshold color,
+  NOT the card's wave color** (as-built amendment, §11): green ≤50%, amber ≤75%, red above —
+  a budget signal independent of status. Track stays `white 0.06`.
+- **B4** — layout order: **tile-left** + stacked STATUS / title / harness·model. The
+  harness·model line sits **inside the header meta column** (aligned under the title, past
+  the tile), and the 44px tile is **vertically centered** against that 3-line stack (§11).
 - **B5** — **Slept** dim + Wake button; **Failed** Retry affordance (currently faked as
-  activity text). Real card is **280×148** (`CARD_WIDTH_PX`/`CARD_HEIGHT_PX`); the mockup
-  is 300×150.
+  activity text). Real card is **280×160** (`CARD_WIDTH_PX`/`CARD_HEIGHT_PX`; grown from 148
+  in the visual pass, §11); the mockup is 300×150.
 
 ## 7. Colors — placeholders, tuned at end of build
 
@@ -202,3 +206,31 @@ Board packing B6–B8 (adaptive grid, ordinal slots, group lanes); the Canvas de
 producer (SPEC-GAPS #11); the wake-*firing* scheduler (#11 — the wave only needs the
 repaint at T, not the firing); bespoke icon set; light-theme final tuning (folds into the
 one end-of-build pass).
+
+## 11. On-device visual pass — as-built amendments (2026-07-17)
+
+Decisions taken during the on-device visual acceptance pass. These **supersede the mockup**
+(`board-home.html`) where they conflict; the mockup remains the SSOT for anything not listed
+here. All are on `feat/lens-app-multi-session`, gate-green.
+
+- **Card height 148 → 160** (`CARD_HEIGHT_PX`). The 6-row stack + icon tile + pbar was too
+  tight at 148 once line-heights were corrected (below); 160 gives margin without collapse.
+- **Line-height fix** — gpui's `text_*` helpers set font-size but not line-height, so
+  `overflow_hidden` (required for ellipsis) shaved ascenders on single-line rows. `ellipsize_line`
+  now sets `line_height(1.4)`; the activity row uses `min_h(16)` + `text_xs`.
+- **Context bar = utilization threshold color** (not wave color): green ≤50%, amber ≤75%,
+  red above (`t.base.success/warning/danger`). See §6 B2.
+- **Repo row uses Lucide SVG glyphs** — `folder` + `git-branch` (bundled ISC, tinted via
+  `text_color`) replace the `📁`/`⑂` emoji/fork text, for consistency with the tile glyphs.
+  Rendered as a flex row (`repo_entry`/`render_repos_row`), not a formatted string. The
+  multi-repo overflow tooltip (`·+N`) uses the same glyphs and is **gated to `repos.len() > 1`**
+  (a single-repo tooltip only duplicates the visible line). Tooltips use gpui-component's
+  themed `Tooltip` box.
+- **Harness·model in the header meta** — moved into the title column (aligned under the title),
+  and the tile is vertically centered against the resulting 3-line stack. The wrapper carries
+  **no `overflow_hidden`** — the Scheduled countdown ring's `inset(-4)` canvas must not clip.
+- **Title tooltip** — the ellipsized title reveals its full text on hover (gated to a real title).
+- **Board grid** (`board/mod.rs`) — gap `28px` (≥ 2× the expanding-ring's 12px reach, so
+  neighbors' breathe animations don't bleed), `28px` padding, `justify_center` + `content_start`.
+  The demo window is sized (`run_demo`, demo-only) so the 8 cards land as a centered 4×2.
+  A responsive/scrolling grid still rides with B6 (§8a.4).

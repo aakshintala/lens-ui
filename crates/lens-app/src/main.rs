@@ -132,7 +132,15 @@ fn run_demo() {
             let fleet = FleetStore::new_live(clock, cx);
             lens_ui::shortcuts::register(&fleet, cx);
 
-            cx.open_window(WindowOptions::default(), move |window, cx| {
+            // Size the demo window so the 8 cards land as a centered 4×2 grid
+            // (4×280 card + 3×28 gap + 56 padding + 48 nav rail ≈ 1300px wide).
+            let bounds =
+                gpui::Bounds::centered(None, gpui::size(gpui::px(1340.0), gpui::px(860.0)), cx);
+            let window_options = WindowOptions {
+                window_bounds: Some(gpui::WindowBounds::Windowed(bounds)),
+                ..Default::default()
+            };
+            cx.open_window(window_options, move |window, cx| {
                 fleet.update(cx, |f, cx| {
                     for card in demo_cards(now) {
                         let id = card.session_id.clone();
@@ -183,6 +191,10 @@ fn demo_preset_cards(now: i64) -> [SessionCard; 8] {
         c.llm_model = Some("opus".into());
         c.workspace = Some("lens".into());
         c.git_branch = Some("main".into());
+        c.repos = vec![lens_ui::card::model::RepoRef {
+            name: "lens".into(),
+            branch: Some("feat/multi-session".into()),
+        }];
         c.context_window = Some(200_000);
         c.last_total_tokens = Some(48_000);
         c.cumulative_cost = Cost {
@@ -207,6 +219,7 @@ fn demo_preset_cards(now: i64) -> [SessionCard; 8] {
     let mut working = base("demo-working", "Refactor the session poller");
     working.status = SessionStatusValue::Running;
     working.activity_summary = "running the test suite…".into();
+    working.last_total_tokens = Some(130_000); // ~65% → amber ctx bar
 
     let mut failed = base("demo-failed", "cargo build");
     failed.status = SessionStatusValue::Failed;
@@ -214,6 +227,7 @@ fn demo_preset_cards(now: i64) -> [SessionCard; 8] {
         code: "build_error".into(),
         message: "E0432: unresolved import".into(),
     });
+    failed.last_total_tokens = Some(180_000); // ~90% → red ctx bar
 
     let mut slept = base("demo-slept", "Archived brainstorm");
     slept.status = SessionStatusValue::Idle;
@@ -228,12 +242,29 @@ fn demo_preset_cards(now: i64) -> [SessionCard; 8] {
     awaiting_review.status = SessionStatusValue::Idle;
     awaiting_review.awaiting_review = true;
     awaiting_review.activity_summary = "awaiting your review".into();
+    // Multi-repo card: inline row collapses to `·+2`, hover reveals the full list.
+    awaiting_review.repos = vec![
+        lens_ui::card::model::RepoRef {
+            name: "lens".into(),
+            branch: Some("feat/multi-session".into()),
+        },
+        lens_ui::card::model::RepoRef {
+            name: "omnigent".into(),
+            branch: Some("main".into()),
+        },
+        lens_ui::card::model::RepoRef {
+            name: "docs".into(),
+            branch: None,
+        },
+    ];
 
     let mut scheduled = base("demo-scheduled", "Follow-up check scheduled");
     scheduled.status = SessionStatusValue::Idle;
-    scheduled.scheduled_wake_at = Some(now + 2 * 60 * 1000);
+    // Wake far enough out that the demo card stays Scheduled through a visual pass
+    // (short spans age past wake against wall-clock and decay to Idle mid-viewing).
+    // The Scheduled activity line is the live countdown override — no static summary.
+    scheduled.scheduled_wake_at = Some(now + 45 * 60 * 1000);
     scheduled.scheduled_started_at = Some(now);
-    scheduled.activity_summary = "wakes in ~2m".into();
 
     [
         needs_input,

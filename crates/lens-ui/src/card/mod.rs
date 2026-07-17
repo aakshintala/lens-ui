@@ -4,7 +4,7 @@ pub mod motion;
 pub mod view;
 pub mod wave;
 
-pub use chrome::{format_repos_row, format_repos_tooltip, render_card_chrome};
+pub use chrome::render_card_chrome;
 pub use model::{
     CARD_HEIGHT_PX, CARD_WIDTH_PX, ConnectionOverlay, READY_DECAY_MS, RepoRef, SessionCard,
 };

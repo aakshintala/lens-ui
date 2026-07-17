@@ -7,7 +7,7 @@ use std::borrow::Cow;
 
 /// Every glyph path served by `LensAssets`. Keep in sync with the files under
 /// `assets/icons/`; `card::motion::wave_icon_path` returns members of this set.
-pub const ICON_PATHS: [&str; 8] = [
+pub const ICON_PATHS: [&str; 10] = [
     "icons/bell.svg",
     "icons/triangle-alert.svg",
     "icons/loader-circle.svg",
@@ -16,6 +16,8 @@ pub const ICON_PATHS: [&str; 8] = [
     "icons/moon.svg",
     "icons/coffee.svg",
     "icons/circle-dot.svg",
+    "icons/folder.svg",
+    "icons/git-branch.svg",
 ];
 
 /// Compile-time-embedded (path, bytes) table for the bundled Lucide SVGs.
@@ -45,6 +47,14 @@ const ICON_BYTES: &[(&str, &[u8])] = &[
     (
         "icons/circle-dot.svg",
         include_bytes!("../assets/icons/circle-dot.svg"),
+    ),
+    (
+        "icons/folder.svg",
+        include_bytes!("../assets/icons/folder.svg"),
+    ),
+    (
+        "icons/git-branch.svg",
+        include_bytes!("../assets/icons/git-branch.svg"),
     ),
 ];
 
@@ -86,9 +96,9 @@ mod tests {
     }
 
     #[test]
-    fn list_icons_dir_returns_all_eight() {
+    fn list_icons_dir_returns_all_ten() {
         let listed = LensAssets.list("icons/").expect("list ok");
-        assert_eq!(listed.len(), 8, "listed: {listed:?}");
+        assert_eq!(listed.len(), 10, "listed: {listed:?}");
     }
 
     #[test]

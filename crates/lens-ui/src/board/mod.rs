@@ -150,7 +150,19 @@ impl BoardView {
     fn render_board_grid(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut session_ids: Vec<_> = self.card_views.keys().cloned().collect();
         session_ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-        let mut grid = div().id("board-grid").flex().flex_wrap().gap_2();
+        // gap ≥ 2× the expanding-ring reach (12px each side, motion.rs) so the breathe
+        // animation of adjacent cards doesn't bleed; padding lifts the top row off the edge;
+        // justify_center + content_start centers the columns and pins rows to the top.
+        let mut grid = div()
+            .id("board-grid")
+            .flex()
+            .flex_wrap()
+            .flex_grow()
+            .h_full()
+            .content_start()
+            .justify_center()
+            .gap(px(28.0))
+            .p(px(28.0));
         for id in session_ids {
             if self.card_views.contains_key(&id) {
                 grid = grid.child(self.render_card_tile(id, cx));
