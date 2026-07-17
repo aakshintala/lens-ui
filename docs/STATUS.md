@@ -9,7 +9,26 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Open threads & next up
 
-- **▶ ACTIVE: shared terminal workstream — Slices 0 + 1a + 1b DONE + cross-family-reviewed + merged to `terminal-ws` 2026-07-16; next = 1c render layer → 1d convergence.**
+- **▶ ACTIVE: shared terminal workstream — Slices 0/1a/1b merged; Slice 1c correctness DONE, ⛔ BLOCKED on per-cell paint perf (does NOT merge); 1d not started.**
+  - **⚠ SLICE 1c (render) — T1–T7 done + green + committed on `terminal-ws` (unpushed), T8 perf gate RED by design → 1c UNMERGED.**
+    Commits `874c817`→`ae12b8b`. Real-window harness (`tests/render_realwindow.rs`, `harness=false`,
+    `test-util`-gated, xtask executes on macOS): **Menlo gate PASSES on this hardware**; `Frame` paint
+    (PerRow/PerCell routing + debug-guard that PerRow never gets a wide cell), full SGR +
+    `underline_quad_color` (I10a) + invisible-width (I10b), render Inspect ring; `TerminalTab` renders
+    via shared `TabRenderState::render_element` (I6). Clippy clean `-D warnings` (normal + `test-util`).
+    **2 plan deviations (both user-approved, in commit msgs):** (1) `render_test_api` gated on
+    `test-util` not `cfg(test)` — integration tests link the normal build; (2) **Menlo gate drops the
+    emoji's-own-left-edge probe** — real hardware: ASCII grid/box-drawing/CJK/post-emoji-resync all
+    exact, only the emoji left edge drifts 2.857px under per-row shaping, which the renderer never uses
+    for emoji (wide rows → per-cell). **⛔ BLOCKER (T8):** end-to-end p95 with NO shape cache (dropped
+    per plan C-a): ASCII 200×50 **6.3ms** ✓, dense-wide 200×50 **18.0ms** ✗ (budget 8.3), dense-wide
+    400×100 **48.4ms** ✗ (interim 20). Uncached per-cell runs `shape_line`+`paint` per cell/frame
+    (~3.5µs/cell); the 2.77ms verdict that justified dropping the cache was per-ROW ASCII, not
+    per-cell. **User call: keep budgets firm, fail 1c, escalate.** Fix candidate = per-glyph shape
+    cache keyed on grapheme+style (≠ the dropped broken whole-row cache; reopens C-a). Handoff:
+    `docs/handoffs/2026-07-16-terminal-slice-1c-percell-perf-block.md`. Pathological 100%-wide/50%-emoji
+    fixture kept as a regression guard (≤30ms). Pre-existing 1b flake:
+    `engine::handle::tests::stop_publishes_final_frame_before_join` (timing, intermittent under full-suite).
   - **✅ SLICE 0 (surface freeze) DONE + merged** (`fdba839`→`635eaa7`): froze the opaque public
     names/seam invariants `lens-ui` binds to (`open`/`TerminalTarget`/`AccessIntent`/`TerminalKey`/
     `TerminalOpenOptions`, 7-variant `Lifecycle`, `TerminalHostEvent`/`TerminalEvent`, opaque `Frame`,
