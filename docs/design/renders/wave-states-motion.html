@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lens — final wave board (all 8)</title>
+<style>
+  :root{
+    --bg:#07080b; --bg1:#0c0e13; --bg2:#12151c; --line:#222936;
+    --fg:#eef2f7; --muted:#9aa4b3;
+    --ready:#4c8dff; --working:#36c98a; --needs:#ff8a3d; --failed:#ff5d5d;
+    --slept:#7a8493; --neutral:#eab308; --scheduled:#8b9bf5; --review:#c084fc;
+    /* LOCKED */
+    --spd-urgent:1.0s; --spd-fast:1.5s; --spd-spin:2.0s; --spd-ring:2.4s; --amp:0.4;
+    --sched-loop:30s;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:radial-gradient(60% 45% at 50% 0%, #0b0d13, var(--bg)) fixed;
+    color:var(--fg);font:13px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;padding:30px 28px 70px}
+  h1{font-size:15px;font-weight:600;margin:0 0 4px}
+  .sub{color:var(--muted);font-size:12px;margin:0 0 26px;max-width:760px}
+  .board{display:grid;grid-template-columns:repeat(auto-fill,300px);gap:34px 26px;justify-content:center}
+  .slot{width:300px}
+  .cap{font-size:11px;color:var(--muted);margin:0 0 10px;text-align:center}
+  .cap b{color:var(--fg)}
+
+  .cardwrap{position:relative;width:300px;height:150px}
+  .ring{position:absolute;inset:0;border-radius:14px;border:2px solid var(--c);pointer-events:none;opacity:0;
+    animation:ringExpand var(--spd-ring) ease-out infinite}
+  @keyframes ringExpand{0%{inset:-2px;opacity:.9}70%{inset:-12px;opacity:0}100%{inset:-12px;opacity:0}}
+
+  .card{position:absolute;inset:0;border-radius:12px;border:2px solid var(--c);padding:11px;
+    display:flex;flex-direction:column;gap:6px;overflow:hidden;
+    background:radial-gradient(120% 130% at 0% 0%, color-mix(in srgb, var(--c) 11%, transparent), transparent 58%), var(--bg1);
+    box-shadow:0 0 18px -13px var(--c)}
+  .sweep{position:absolute;inset:0;overflow:hidden;border-radius:inherit;pointer-events:none}
+  .sweep::before{content:"";position:absolute;top:-25%;bottom:-25%;width:48%;left:-60%;
+    background:linear-gradient(100deg, transparent, color-mix(in srgb, var(--c) calc(24% * var(--amp)), transparent), transparent);
+    transform:skewX(-14deg);animation:sweep var(--wave) linear infinite}
+  @keyframes sweep{from{left:-60%}to{left:135%}}
+
+  .head{display:flex;gap:10px;align-items:flex-start;position:relative;z-index:1}
+  .tile{width:44px;height:44px;flex:none;border-radius:11px;display:flex;align-items:center;justify-content:center;
+    font-size:21px;color:var(--c);background:color-mix(in srgb, var(--c) 14%, var(--bg2));
+    border:1px solid color-mix(in srgb, var(--c) 30%, transparent);position:relative}
+  .spinner{width:24px;height:24px;border-radius:50%;border:3px solid color-mix(in srgb,var(--c) 22%, transparent);
+    border-top-color:var(--c);animation:spin var(--spd-spin) linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  @property --p{syntax:'<angle>';inherits:false;initial-value:0deg}
+  .cring{position:absolute;inset:-4px;border-radius:50%;
+    background:conic-gradient(var(--c) var(--p,360deg), color-mix(in srgb,var(--c) 16%, transparent) 0);
+    -webkit-mask:radial-gradient(farthest-side,transparent calc(100% - 2px),#000 0);mask:radial-gradient(farthest-side,transparent calc(100% - 2px),#000 0)}
+  .restart{position:absolute;bottom:11px;right:11px;z-index:3;font-size:10px;color:var(--muted);
+    background:var(--bg2);border:1px solid var(--line);border-radius:6px;padding:2px 8px;cursor:pointer}
+
+  .meta{min-width:0;flex:1}
+  .status{font-size:10px;font-weight:700;letter-spacing:.06em;color:var(--c);text-transform:uppercase}
+  .title{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .hm{font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .act{font-size:11px;color:var(--muted);height:15px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;position:relative;z-index:1}
+  .act b{color:color-mix(in srgb,var(--c) 70%, var(--fg))}
+  .pbar{height:4px;border-radius:2px;background:rgba(255,255,255,.06);overflow:hidden;position:relative;z-index:1}
+  .pbar i{display:block;height:100%;background:var(--c)}
+  .foot{display:flex;justify-content:space-between;font-size:10px;color:var(--muted);margin-top:auto;position:relative;z-index:1}
+  .wake{position:absolute;top:11px;right:11px;z-index:3;font-size:11px;color:var(--fg);
+    background:color-mix(in srgb,var(--slept) 30%, var(--bg2));border:1px solid color-mix(in srgb,var(--slept) 55%, transparent);
+    border-radius:7px;padding:4px 12px;cursor:pointer}
+  .faded{opacity:.42}
+
+  .s-needs{--c:var(--needs)} .s-failed{--c:var(--failed)} .s-review{--c:var(--review)}
+  .s-ready{--c:var(--ready)} .s-working{--c:var(--working)} .s-sched{--c:var(--scheduled)}
+  .s-slept{--c:var(--slept)} .s-neutral{--c:var(--neutral)}
+</style>
+</head>
+<body>
+  <h1>Lens — final wave board</h1>
+  <p class="sub">Strategy B: rotation = machine working · linear sweep = your attention wanted · countdown ring = self-driving. All locked decisions applied. Colors are current placeholders (end-of-build tuning pass).</p>
+  <div class="board" id="board"></div>
+<script>
+const cards=[
+  {cls:"s-needs",  glyph:"🔔", status:"Needs input",    title:"refactor auth guard",  hm:"claude-sdk · opus-4.8", act:"awaiting your reply", pct:0,  wave:"urgent", ring:true},
+  {cls:"s-failed", glyph:"⚠",  status:"Failed",          title:"migrate schema v4",    hm:"codex · gpt-5.5",       act:"Retry", pct:0,  wave:"urgent", ring:true},
+  {cls:"s-review", glyph:"⌾",  status:"Awaiting review", title:"canvas: landing copy", hm:"claude-sdk · opus-4.8", act:"review ready in Canvas", pct:100, wave:"fast"},
+  {cls:"s-ready",  glyph:"✓",  status:"Ready",           title:"add bench harness",    hm:"claude-sdk · sonnet-5", act:"finished 40s ago", pct:100, wave:"fast"},
+  {cls:"s-working",spinner:true,status:"Working",        title:"port card chrome",     hm:"composer-2.5",          act:"editing wave.rs…", pct:61},
+  {cls:"s-sched",  glyph:"⏰", status:"Scheduled",       title:"nightly dep audit",    hm:"claude-sdk · haiku",    act:"wakes in <b>3m</b>", pct:28, cring:true},
+  {cls:"s-slept",  glyph:"☾",  status:"Slept",           title:"old spike branch",     hm:"claude-sdk · opus-4.8", act:"", pct:14, slept:true},
+  {cls:"s-neutral",glyph:"☕", status:"Idle",            title:"scratch session",      hm:"claude-sdk · sonnet-5", act:"", pct:0},
+];
+const caps={
+  "s-needs":"<b>NeedsInput</b> · sweep 1.0s + ring","s-failed":"<b>Failed</b> · sweep 1.0s + ring",
+  "s-review":"<b>AwaitingReview</b> · sweep 1.5s","s-ready":"<b>Ready</b> · sweep 1.5s",
+  "s-working":"<b>Working</b> · spinner, no sweep","s-sched":"<b>Scheduled</b> · deplete ring",
+  "s-slept":"<b>Slept</b> · dim + Wake","s-neutral":"<b>Neutral/Idle</b> · still",
+};
+const spd={urgent:"--spd-urgent",fast:"--spd-fast"};
+const board=document.getElementById("board");
+for(const c of cards){
+  const slot=document.createElement("div"); slot.className="slot";
+  const waveStyle=c.wave?`--wave:var(${spd[c.wave]})`:"";
+  const tile=c.spinner?`<div class="spinner"></div>`:`${c.cring?'<div class="cring"></div>':''}${c.glyph}`;
+  const dim=c.slept?"faded":"";
+  slot.innerHTML=`
+    <p class="cap">${caps[c.cls]}</p>
+    <div class="cardwrap ${c.cls}">
+      ${c.ring?`<div class="ring"></div>`:""}
+      <div class="card" style="${waveStyle}">
+        ${c.wave?`<div class="sweep"></div>`:""}
+        ${c.slept?`<button class="wake">Wake</button>`:""}
+        ${c.cring?`<button class="restart">restart 3m</button>`:""}
+        <div class="${dim}" style="display:flex;flex-direction:column;gap:6px;flex:1">
+          <div class="head">
+            <div class="tile">${tile}</div>
+            <div class="meta"><div class="status">${c.status}</div><div class="title">${c.title}</div><div class="hm">${c.hm}</div></div>
+          </div>
+          ${c.slept?"":`<div class="act">${c.act||"&nbsp;"}</div>`}
+          <div class="pbar"><i style="width:${c.pct}%"></i></div>
+          <div class="foot"><span>host-01</span><span>~$0.42</span><span>${c.pct}%</span></div>
+        </div>
+      </div>
+    </div>`;
+  board.appendChild(slot);
+}
+
+// --- real 3-minute countdown for the Scheduled card ---
+const DURATION=180; // seconds
+const cring=board.querySelector(".s-sched .cring");
+const act=board.querySelector(".s-sched .act");
+let target=performance.now()+DURATION*1000;
+function fmt(rem){
+  rem=Math.max(0,Math.ceil(rem));
+  if(rem<=0) return "waking…";
+  if(rem>=60){const m=Math.floor(rem/60),s=rem%60;return `wakes in <b>${m}m ${s.toString().padStart(2,"0")}s</b>`;}
+  return `wakes in <b>${rem}s</b>`;
+}
+function tick(now){
+  const remMs=target-now;
+  const frac=Math.max(0,Math.min(1,remMs/(DURATION*1000)));
+  cring.style.setProperty("--p",(frac*360).toFixed(2)+"deg");
+  act.innerHTML=fmt(remMs/1000);
+  if(remMs>0) requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+board.querySelector(".s-sched .restart").addEventListener("click",()=>{
+  target=performance.now()+DURATION*1000; requestAnimationFrame(tick);
+});
+</script>
+</body>
+</html>
