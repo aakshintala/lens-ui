@@ -104,18 +104,19 @@ pub fn render_expanding_ring(wave: Wave, status_color: Hsla, phase: f32) -> impl
     slot
 }
 
-/// Glyph label for the header tile (emoji spike — bespoke icons deferred).
-pub fn wave_glyph(wave: Wave) -> &'static str {
-    match wave {
-        Wave::NeedsInput => "🔔",
-        Wave::Failed => "⚠",
-        Wave::Working => "",
-        Wave::AwaitingReview => "⌾",
-        Wave::Scheduled => "⏰",
-        Wave::Ready => "✓",
-        Wave::Slept => "☾",
-        Wave::Neutral => "☕",
-    }
+/// Lucide glyph asset path for the tile, tinted at the call site via `text_color`.
+/// `None` for `Working` — it renders the rotating spinner instead (see `render_working_spinner`).
+pub fn wave_icon_path(wave: Wave) -> Option<&'static str> {
+    Some(match wave {
+        Wave::NeedsInput => "icons/bell.svg",
+        Wave::Failed => "icons/triangle-alert.svg",
+        Wave::AwaitingReview => "icons/circle-dot.svg",
+        Wave::Scheduled => "icons/alarm-clock.svg",
+        Wave::Ready => "icons/check.svg",
+        Wave::Slept => "icons/moon.svg",
+        Wave::Neutral => "icons/coffee.svg",
+        Wave::Working => return None,
+    })
 }
 
 /// Short status line beside the tile glyph.
@@ -137,5 +138,54 @@ pub fn wave_status_line(wave: Wave, card: &SessionCard) -> &'static str {
             SessionStatusValue::Failed => "FAILED",
             SessionStatusValue::Unknown => "UNKNOWN",
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wave_icon_path_maps_every_glyph_wave() {
+        assert_eq!(wave_icon_path(Wave::NeedsInput), Some("icons/bell.svg"));
+        assert_eq!(
+            wave_icon_path(Wave::Failed),
+            Some("icons/triangle-alert.svg")
+        );
+        assert_eq!(
+            wave_icon_path(Wave::AwaitingReview),
+            Some("icons/circle-dot.svg")
+        );
+        assert_eq!(
+            wave_icon_path(Wave::Scheduled),
+            Some("icons/alarm-clock.svg")
+        );
+        assert_eq!(wave_icon_path(Wave::Ready), Some("icons/check.svg"));
+        assert_eq!(wave_icon_path(Wave::Slept), Some("icons/moon.svg"));
+        assert_eq!(wave_icon_path(Wave::Neutral), Some("icons/coffee.svg"));
+    }
+
+    #[test]
+    fn working_has_no_static_glyph() {
+        assert_eq!(wave_icon_path(Wave::Working), None);
+    }
+
+    #[test]
+    fn every_glyph_path_is_a_bundled_asset() {
+        for wave in [
+            Wave::NeedsInput,
+            Wave::Failed,
+            Wave::AwaitingReview,
+            Wave::Scheduled,
+            Wave::Ready,
+            Wave::Slept,
+            Wave::Neutral,
+        ] {
+            let path = wave_icon_path(wave).unwrap();
+            assert!(
+                crate::assets::ICON_PATHS.contains(&path),
+                "{wave:?} → {path} not in ICON_PATHS"
+            );
+        }
     }
 }

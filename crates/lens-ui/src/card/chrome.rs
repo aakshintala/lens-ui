@@ -1,13 +1,15 @@
 use gpui::{
     App, AppContext, Context, Div, Hsla, InteractiveElement, IntoElement, ParentElement, Render,
-    SharedString, Styled, Window, div, prelude::*, px,
+    SharedString, Styled, Window, div, prelude::*, px, svg,
 };
 use lens_core::domain::usage::Cost;
 
 use crate::theme::ActiveLensTheme;
 
 use super::model::{ConnectionOverlay, RepoRef, SessionCard};
-use super::motion::{render_sweep_overlay, render_working_spinner, wave_glyph, wave_status_line};
+use super::motion::{
+    render_sweep_overlay, render_working_spinner, wave_icon_path, wave_status_line,
+};
 use super::wave::Wave;
 
 pub fn format_repos_row(repos: &[RepoRef]) -> String {
@@ -70,20 +72,24 @@ fn host_label(card: &SessionCard) -> String {
         .unwrap_or_else(|| "—".into())
 }
 
-fn render_icon_tile(wave: Wave, border: Hsla) -> Div {
+fn render_icon_tile(wave: Wave, status: Hsla) -> Div {
+    // Faint status-tinted surface (mockup: color-mix(status 14%, bg2)) — NOT a solid fill.
     let mut tile = div()
         .flex_shrink_0()
         .w(px(44.0))
         .h(px(44.0))
-        .rounded_md()
-        .bg(border)
+        .rounded(px(11.0))
+        .bg(status.opacity(0.14))
+        .border_1()
+        .border_color(status.opacity(0.30))
         .flex()
         .items_center()
         .justify_center();
-    if wave == Wave::Working {
-        tile = tile.child(render_working_spinner(border));
+    if let Some(path) = wave_icon_path(wave) {
+        tile = tile.child(svg().path(path).w(px(21.0)).h(px(21.0)).text_color(status));
     } else {
-        tile = tile.text_xl().child(wave_glyph(wave));
+        // Working → spinner (Task 5 makes this rotate; a static ring until then).
+        tile = tile.child(render_working_spinner(status));
     }
     tile
 }
