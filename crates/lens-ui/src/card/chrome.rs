@@ -8,8 +8,8 @@ use crate::theme::ActiveLensTheme;
 
 use super::model::{ConnectionOverlay, RepoRef, SessionCard};
 use super::motion::{
-    countdown_fraction, format_wake_countdown, render_countdown_ring, render_sweep_overlay,
-    render_working_spinner, wave_icon_path, wave_status_line,
+    countdown_fraction, format_wake_countdown, pulse_alpha, render_countdown_ring,
+    render_sweep_overlay, render_working_spinner, wave_icon_path, wave_status_line,
 };
 use super::wave::Wave;
 
@@ -142,6 +142,65 @@ fn ellipsize_line(text: impl Into<SharedString>) -> Div {
         .child(text.into())
 }
 
+/// Monospace family for the "live machine data" lines (activity / error / countdown). A macOS
+/// system font resolved via gpui's CoreText provider — not bundled.
+const MONO: &str = "Menlo";
+
+/// Ellipsized monospace line — the live/ephemeral type treatment. Flex child that truncates
+/// (`min_w(0)` overrides the default auto min-width so the ellipsis engages inside the row).
+fn mono_line(text: impl Into<SharedString>) -> Div {
+    ellipsize_line(text)
+        .font_family(MONO)
+        .text_size(px(11.5))
+        .flex_grow()
+        .min_w(px(0.0))
+}
+
+/// The live/ephemeral activity row, styled per wave (spec §11): Working (or any live tool/todo) →
+/// pulsing status dot + mono; Failed → pulsing ✕ + mono error; Scheduled → status-colored mono
+/// countdown; other waves carry no live text → reserved blank slot (STATUS eyebrow carries it).
+/// The dot/✕ pulse rides the card's existing re-render (Working/Failed animate).
+fn render_activity(wave: Wave, text: &str, status: Hsla, now_ms: i64, dim: bool) -> Stateful<Div> {
+    let row = div()
+        .id("card-activity")
+        .min_h(px(16.0))
+        .flex_shrink_0()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(6.0))
+        .overflow_hidden()
+        .when(dim, |d| d.opacity(0.42));
+    if text.is_empty() {
+        return row;
+    }
+    let pulse = pulse_alpha(now_ms);
+    match wave {
+        Wave::Failed => row
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(15.0))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(status)
+                    .opacity(pulse)
+                    .child("✕"),
+            )
+            .child(mono_line(text.to_string())),
+        Wave::Scheduled => row.child(mono_line(text.to_string()).text_color(status)),
+        _ => row
+            .child(
+                div()
+                    .flex_none()
+                    .size(px(6.0))
+                    .rounded_full()
+                    .bg(status)
+                    .opacity(pulse),
+            )
+            .child(mono_line(text.to_string())),
+    }
+}
+
 /// A top-right pill button (Wake / Retry). `on_click` is the wired handler.
 fn action_button(
     id: &'static str,
@@ -272,9 +331,10 @@ pub fn render_card_chrome(
 
     let dim = wave == Wave::Slept;
     let activity = if wave == Wave::Failed {
+        // Bare message — the ✕ marker is rendered (and pulsed) separately in `render_activity`.
         card.last_task_error
             .as_ref()
-            .map(|e| format!("✕ {}", e.message))
+            .map(|e| e.message.clone())
             .unwrap_or_else(|| "failed".into())
     } else {
         card.activity_summary.clone()
@@ -315,7 +375,8 @@ pub fn render_card_chrome(
         .flex()
         .flex_col()
         .p_2()
-        .gap_1()
+        // Breathing room between the card's horizontal rows (header / activity / repos / meta).
+        .gap(px(6.0))
         .rounded_md()
         .border_2()
         .border_color(border)
@@ -356,7 +417,8 @@ pub fn render_card_chrome(
                         .gap(px(2.0))
                         .child(
                             div()
-                                .text_xs()
+                                .text_size(px(10.0))
+                                .font_weight(gpui::FontWeight::BOLD)
                                 .text_color(border)
                                 .child(wave_status_line(wave, card)),
                         )
@@ -376,7 +438,12 @@ pub fn render_card_chrome(
                                 })
                         })
                         // Harness · model aligns under the title (mockup `.model` sits in the header meta).
-                        .child(ellipsize_line(harness_model).text_xs().text_color(muted_fg))
+                        // Smallest tier: title (base) > status (text_xs) > harness·model (10px).
+                        .child(
+                            ellipsize_line(harness_model)
+                                .text_size(px(10.0))
+                                .text_color(muted_fg),
+                        )
                         .when(dim, |c| c.opacity(0.42)),
                 ),
         )
@@ -423,20 +490,7 @@ pub fn render_card_chrome(
 
     root = root
         .child(header)
-        .child(
-            div()
-                .id("card-activity")
-                .min_h(px(16.0))
-                .flex_shrink_0()
-                .overflow_hidden()
-                .text_xs()
-                .child(ellipsize_line(if activity.is_empty() {
-                    SharedString::from(" ")
-                } else {
-                    SharedString::from(activity.clone())
-                }))
-                .when(dim, |d| d.opacity(0.42)),
-        )
+        .child(render_activity(wave, &activity, border, now_ms, dim))
         .child(
             render_repos_row(&card.repos, muted_fg)
                 .id("card-repos")
@@ -465,10 +519,22 @@ pub fn render_card_chrome(
             div()
                 .flex()
                 .flex_row()
+                .items_center()
                 .justify_between()
                 .text_xs()
                 .text_color(muted_fg)
-                .child(ellipsize_line(host).max_w(px(80.0)))
+                // Host label as a pill (SSOT `.hostpill`): rounded, faint surface + border.
+                .child(
+                    ellipsize_line(host)
+                        .max_w(px(80.0))
+                        .px(px(6.0))
+                        .py(px(1.0))
+                        .rounded(px(6.0))
+                        .bg(t.base.muted)
+                        .border_1()
+                        .border_color(t.base.border)
+                        .text_color(t.base.foreground),
+                )
                 .child(ellipsize_line(spend))
                 .child(ellipsize_line(ctx_pct))
                 .when(dim, |d| d.opacity(0.42)),

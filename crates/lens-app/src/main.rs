@@ -220,7 +220,8 @@ fn demo_preset_cards(now: i64) -> [SessionCard; 8] {
     let mut needs_input = base("demo-needs-input", "Approve: run `rm -rf build/`?");
     needs_input.status = SessionStatusValue::Waiting;
     needs_input.needs_attention = true;
-    needs_input.activity_summary = "awaiting your approval".into();
+    // No activity line: real activity_summary is empty when waiting on the user (only live
+    // tools/todos populate it) — the STATUS eyebrow carries the meaning.
 
     let mut ready = base("demo-ready", "Finished — reply with a greeting");
     ready.status = SessionStatusValue::Idle;
@@ -253,7 +254,7 @@ fn demo_preset_cards(now: i64) -> [SessionCard; 8] {
     );
     awaiting_review.status = SessionStatusValue::Idle;
     awaiting_review.awaiting_review = true;
-    awaiting_review.activity_summary = "awaiting your review".into();
+    // No activity line (empty in real data — see needs_input above).
     // Multi-repo card: inline row collapses to `·+2`, hover reveals the full list.
     awaiting_review.repos = vec![
         lens_ui::card::model::RepoRef {

@@ -73,6 +73,14 @@ fn anim_tick_ms_fast() -> u64 {
     50
 }
 
+const PULSE_PERIOD_MS: i64 = 1400;
+/// Breathing opacity (0.4..1.0) for a "live" activity marker (Working dot / Failed ✕), from the
+/// clock. Rides the card's existing re-render (Working/Failed both animate). i64 modulo first.
+pub fn pulse_alpha(now_ms: i64) -> f32 {
+    let phase = now_ms.rem_euclid(PULSE_PERIOD_MS) as f32 / PULSE_PERIOD_MS as f32;
+    0.4 + 0.6 * (0.5 + 0.5 * (phase * TAU).cos())
+}
+
 const RING_PERIOD_MS: i64 = 2400;
 /// Expanding-ring phase (0..1) for the loud pair. i64 modulo first (see `sweep_phase`).
 pub fn ring_phase(now_ms: i64) -> f32 {

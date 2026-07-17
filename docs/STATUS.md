@@ -33,9 +33,19 @@ and roll older "Recent" pointers off this page as they age.
     with a per-wave treatment (`chrome.rs` `wave_wash`): sweep waves = full-body gradient 24%,
     Working/Scheduled = flat 14%, Idle = flat 8%, Slept = none (dim + outline). pane-ui-match
     intensity; gpui has no radial so the gradient is a 135° linear approx. Spec §11 amended.
-  - **Open (non-blocking):** **B6 carry-forward** — viewport re-entry can leave a card stuck
-    non-animating (unreachable in this non-scrolling build; fix rides with B6's scroll container,
-    never notify from the paint closure).
+  - **✅ card visual polish batch (2026-07-17 follow-up):** header 3-tier type hierarchy (title >
+    10px-bold STATUS eyebrow > 10px harness·model), row gap 4→6px, host **pill** (SSOT `.hostpill`),
+    and **per-wave activity line** (`render_activity`): Working=pulsing dot+mono, Failed=pulsing ✕
+    +mono, Scheduled=colored mono countdown, waiting/idle states **blank** (activity_summary is empty
+    in real data). All on-device dark-mode verified via screenshots. Spec §11 + render
+    `docs/design/renders/wave-card-activity-line.html`.
+  - **🐞 OPEN BUG — viewport re-entry animation freeze (was "B6 carry-forward", NOW LIVE):** entering
+    focused mode then returning to board leaves Working spinner + activity pulse **frozen**. Same
+    mechanism as handoff Follow-up 3 (stale `last_bounds` in `view.rs` render gate; paint closure
+    updates bounds without notifying → re-entry sees off-screen → driver never respawns) — but the
+    handoff **wrongly assumed it was unreachable** in the non-scrolling build; the focus↔board toggle
+    reaches it. **Next session** (dedicated). Handoff: `docs/handoffs/2026-07-17-viewport-reentry-freeze.md`.
+    Constraint: do NOT fix by notifying from the paint closure (breaks gpui render/paint separation).
 
 - **✅ DONE (2026-07-16): `lens-ui` card/board audit vs shell spec §4–§5 + cheap fixes** (branch
   `feat/lens-app-multi-session`, commit `b367dbf`, branch-only). Audited `lens-app`/`lens-ui` against

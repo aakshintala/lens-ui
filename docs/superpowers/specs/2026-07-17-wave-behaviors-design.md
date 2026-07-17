@@ -252,3 +252,20 @@ here. All are on `feat/lens-app-multi-session`, gate-green.
   §9 8.8% budget) and is **on-device indistinguishable from 30fps** (labeled A/B). The sweep's
   translation — not the spinner's rotation — is the frame-rate-sensitive element; it stays smooth
   to 20fps. 1 Hz Scheduled + still-wave gate unchanged.
+- **Header type hierarchy + host pill + row spacing** (`chrome.rs`). Three-tier header stack:
+  **title** (base) > **STATUS** eyebrow (10px **bold**, uppercase, status color) > **harness·model**
+  (10px, muted). Card **row gap 4→6px** for breathing room (identity stack stays tight at 2px, so it
+  reads as one group with a soft break before the detail rows). **Host label → pill** (SSOT
+  `.hostpill`, `board-home.html:72`: rounded, `base.muted` bg + `base.border`) — the build had
+  flattened it to plain text.
+- **Activity line — per-wave live treatment** (`chrome.rs` `render_activity`; render `wave-card-
+  activity-line.html`). Data finding: `activity_summary` (`lens-core summary.rs`) is populated ONLY
+  by a live in-progress todo (active-form) or in-flight tool name, else empty — so it carries real
+  content only while **actively working**, plus the Failed→error and Scheduled→countdown overrides.
+  Treatment (all live lines are **monospace**, "Menlo", = live machine data): **Working** (or any
+  wave with live activity) → pulsing status **dot** + mono; **Failed** → pulsing **✕** (15px bold,
+  status color) + mono error message (the ✕ replaces the old inline `✕ `); **Scheduled** →
+  countdown in the periwinkle status color, mono; **NeedsInput / Ready / AwaitingReview / Idle /
+  Slept** → **blank** (empty in real data — STATUS eyebrow carries it; reserved slot kept for equal
+  height). The dot/✕ pulse (`motion.rs pulse_alpha`, 1.4s) rides the card's existing 20fps
+  re-render. Demo `activity_summary` for the two waiting states was cleared to match real data.
