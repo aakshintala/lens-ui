@@ -299,4 +299,69 @@ mod tests {
             "card A view count unchanged after card B notify"
         );
     }
+
+    #[gpui::test]
+    async fn animating_card_does_not_render_a_static_sibling(cx: &mut gpui::TestAppContext) {
+        use lens_core::domain::scalars::SessionStatusValue;
+
+        let clock = Arc::new(crate::clock::ManualUiClock::new(0));
+        let sid_a = SessionId::new("anim");
+        let sid_b = SessionId::new("static");
+
+        let (fleet, view_a, view_b, rc_a, rc_b) = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::install_at_startup(cx);
+            let fleet = FleetStore::new(clock, cx);
+            let card_a = fleet.update(cx, |f, cx| f.spawn_fake_session(sid_a.clone(), cx));
+            let card_b = fleet.update(cx, |f, cx| f.spawn_fake_session(sid_b.clone(), cx));
+            card_a.update(cx, |c, _| c.status = SessionStatusValue::Running);
+            let ui_clock = fleet.read(cx).clock();
+            let view_a = cx.new(|cx| {
+                SessionCardView::new(
+                    card_a.clone(),
+                    ui_clock.clone(),
+                    fleet.clone(),
+                    sid_a.clone(),
+                    cx,
+                )
+            });
+            let view_b = cx.new(|cx| {
+                SessionCardView::new(card_b.clone(), ui_clock, fleet.clone(), sid_b.clone(), cx)
+            });
+            let rc_a = view_a.read(cx).render_count.clone();
+            let rc_b = view_b.read(cx).render_count.clone();
+            (fleet, view_a, view_b, rc_a, rc_b)
+        });
+
+        let (_board, vcx) = cx.add_window_view(|_, _| DualCardBoard {
+            view_a: view_a.clone(),
+            view_b: view_b.clone(),
+        });
+
+        vcx.run_until_parked();
+        let baseline_a = rc_a.get();
+        let baseline_b = rc_b.get();
+        assert_eq!(
+            (baseline_a, baseline_b),
+            (1, 1),
+            "initial mount renders both tiles once"
+        );
+
+        for _ in 0..5 {
+            vcx.executor().advance_clock(Duration::from_millis(40));
+            vcx.run_until_parked();
+        }
+
+        let count_a = view_a.read_with(cx, |v, _| v.render_count.get());
+        assert!(
+            count_a > baseline_a,
+            "animating card A must have re-rendered (baseline={baseline_a}, now={count_a})"
+        );
+        assert_eq!(
+            rc_b.get(),
+            baseline_b,
+            "static sibling B must NOT re-render when A animates (§4.4)"
+        );
+        let _ = fleet;
+    }
 }
