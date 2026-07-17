@@ -190,7 +190,7 @@ pub fn render_card_chrome(
     // Scheduled activity line = the live countdown (overrides activity_summary).
     let activity = if wave == Wave::Scheduled {
         card.scheduled_wake_at
-            .map(|w| format_wake_countdown(w - now_ms))
+            .map(|w| format_wake_countdown(w.saturating_sub(now_ms)))
             .unwrap_or_else(|| activity.clone())
     } else {
         activity

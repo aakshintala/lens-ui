@@ -168,11 +168,11 @@ pub fn countdown_fraction(
     now_ms: i64,
 ) -> Option<f32> {
     let (start, wake) = (started_at?, wake_at?);
-    let span = wake - start;
+    let span = wake.saturating_sub(start);
     if span <= 0 {
         return Some(0.0);
     }
-    let remaining = (wake - now_ms).max(0) as f32 / span as f32;
+    let remaining = wake.saturating_sub(now_ms).max(0) as f32 / span as f32;
     Some(remaining.clamp(0.0, 1.0))
 }
 
@@ -181,7 +181,7 @@ pub fn format_wake_countdown(remaining_ms: i64) -> String {
     if remaining_ms <= 0 {
         return "waking…".into();
     }
-    let secs = (remaining_ms + 999) / 1000; // ceil to whole seconds
+    let secs = remaining_ms / 1000 + (remaining_ms % 1000 != 0) as i64;
     if secs >= 60 {
         format!("wakes in {}m {:02}s", secs / 60, secs % 60)
     } else {
@@ -351,6 +351,27 @@ mod tests {
         assert_eq!(format_wake_countdown(45_000), "wakes in 45s");
         assert_eq!(format_wake_countdown(0), "waking…");
         assert_eq!(format_wake_countdown(-1), "waking…");
+    }
+
+    #[test]
+    fn countdown_fraction_extreme_bounds_no_panic() {
+        // Non-positive span from adversarial bounds must clamp to 0, not overflow.
+        assert_eq!(
+            countdown_fraction(Some(i64::MAX), Some(i64::MIN), 0),
+            Some(0.0)
+        );
+        // Huge valid span does not panic.
+        assert_eq!(
+            countdown_fraction(Some(i64::MIN), Some(i64::MAX), i64::MAX),
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn format_wake_countdown_no_overflow_at_i64_max() {
+        // Must not panic (debug) / wrap (release) at extreme remaining.
+        let s = format_wake_countdown(i64::MAX);
+        assert!(s.starts_with("wakes in "), "got {s}");
     }
 
     #[test]
