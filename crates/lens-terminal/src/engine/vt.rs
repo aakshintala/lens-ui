@@ -186,6 +186,13 @@ fn underline_from_ghostty(u: Underline) -> UnderlineStyle {
 }
 
 #[cfg(test)]
+impl VtEngine {
+    pub fn scrollback_rows_for_test(&self) -> usize {
+        self.terminal.scrollback_rows().unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
