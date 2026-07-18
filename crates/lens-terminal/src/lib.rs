@@ -35,10 +35,13 @@ use lens_client::WsOutbound;
 
 mod bridge;
 mod engine;
+mod input_gate;
 mod inspect;
 mod policy;
 mod render;
 mod runtime;
+
+pub use input_gate::write_input_allowed;
 
 /// Test-only view onto the private `render` module for the real-window harness
 /// (`tests/render_realwindow.rs`). Gated on `test-util` because integration
@@ -64,10 +67,48 @@ pub mod render_bench_api {
     pub use crate::render::fixtures::{ascii_frame, dense_wide_emoji_frame};
 }
 
+/// Engine input-path helpers for Criterion benches (`bench` feature).
+#[cfg(feature = "bench")]
+pub mod engine_bench_api {
+    use std::time::Duration;
+
+    use crate::engine::command::{KeyAction, KeyInput, KeyMods, LensKey};
+    use crate::engine::worker::EngineCommand;
+    use crate::{EngineError, EngineHandle, FeedError, VtEngine};
+
+    pub fn encode_arrow_up_press(engine: &mut VtEngine) -> Result<Vec<u8>, EngineError> {
+        engine.encode_key(&KeyInput {
+            action: KeyAction::Press,
+            key: LensKey::ArrowUp,
+            mods: KeyMods::default(),
+            utf8: None,
+            composing: false,
+            access_epoch: 0,
+            ack: None,
+        })
+    }
+
+    pub fn feed_app_cursor_mode_then_arrow_up(handle: &EngineHandle) -> Result<u64, FeedError> {
+        handle.feed(b"\x1b[?1h".to_vec())?;
+        handle.enqueue_input(EngineCommand::Key(KeyInput {
+            action: KeyAction::Press,
+            key: LensKey::ArrowUp,
+            mods: KeyMods::default(),
+            utf8: None,
+            composing: false,
+            access_epoch: 0,
+            ack: None,
+        }))?;
+        std::thread::sleep(Duration::from_millis(1));
+        Ok(handle.inspect().keys_encoded)
+    }
+}
+
 use gpui::prelude::*;
 use gpui::{
     App, Bounds, Context, Entity, EntityInputHandler, EventEmitter, FocusHandle, IntoElement,
-    KeyDownEvent, KeyUpEvent, Pixels, Render, UTF16Selection, Window,
+    KeyDownEvent, KeyUpEvent, Pixels, Render, ScrollWheelEvent, Subscription, UTF16Selection,
+    Window,
 };
 use lens_client::Client;
 use lens_client::ids::{SessionId, TerminalId};
@@ -75,7 +116,9 @@ use lens_client::{AttachOptions, TerminalResource, attach};
 use serde::{Deserialize, Serialize};
 
 use bridge::{BridgeEvent, spawn_bridge};
-use engine::command::{InputAck, KeyAction, KeyInput, LensKey};
+use engine::command::{KeyAction, KeyInput, LensKey, ScrollDelta};
+#[cfg(any(test, feature = "test-util"))]
+use engine::command::InputAck;
 use engine::key_map::{gpui_mods_to_key_mods, keydown_should_enqueue, keystroke_to_lens};
 use engine::worker::EngineCommand;
 use policy::{
@@ -330,6 +373,9 @@ pub struct TerminalTab {
     ime_preedit: Option<String>,
     /// Keys whose Press was enqueued — gates Release so suppressed presses never orphan.
     pressed_keys: HashSet<LensKey>,
+    focus_in_sub: Option<Subscription>,
+    focus_out_sub: Option<Subscription>,
+    focus_subs_armed: bool,
 }
 
 impl TerminalTab {
@@ -358,6 +404,9 @@ impl TerminalTab {
             inspect_enabled: false,
             ime_preedit: None,
             pressed_keys: HashSet::new(),
+            focus_in_sub: None,
+            focus_out_sub: None,
+            focus_subs_armed: false,
         }
     }
 
@@ -401,6 +450,9 @@ impl TerminalTab {
             inspect_enabled: false,
             ime_preedit: None,
             pressed_keys: HashSet::new(),
+            focus_in_sub: None,
+            focus_out_sub: None,
+            focus_subs_armed: false,
         }
     }
 
@@ -519,7 +571,53 @@ impl TerminalTab {
     }
 
     fn write_input_allowed(&self) -> bool {
-        self.input_enabled && matches!(self.presentation.access, AccessMode::Write)
+        write_input_allowed(self.presentation.access, self.input_enabled)
+    }
+
+    fn ensure_focus_subscriptions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.focus_subs_armed {
+            return;
+        }
+        self.focus_subs_armed = true;
+        let focus_handle = self.focus_handle.clone();
+        self.focus_in_sub = Some(cx.on_focus_in(&focus_handle, window, |this, _w, cx| {
+            this.on_focus_changed(true, cx);
+        }));
+        self.focus_out_sub = Some(cx.on_blur(&focus_handle, window, |this, _w, cx| {
+            this.on_focus_changed(false, cx);
+        }));
+    }
+
+    fn on_focus_changed(&mut self, focused: bool, _cx: &mut Context<Self>) {
+        let report = write_input_allowed(self.presentation.access, self.input_enabled);
+        let Some(rt) = &self.runtime else {
+            return;
+        };
+        let Some(engine) = &rt.engine else {
+            return;
+        };
+        let _ = engine.enqueue_input(EngineCommand::Focus {
+            focused,
+            report,
+            access_epoch: 0,
+        });
+    }
+
+    pub(crate) fn handle_scroll_wheel(
+        &mut self,
+        event: &ScrollWheelEvent,
+        _cx: &mut Context<Self>,
+    ) {
+        let Some(delta) = gpui_scroll_to_lens(event.delta) else {
+            return;
+        };
+        let Some(rt) = &self.runtime else {
+            return;
+        };
+        let Some(engine) = &rt.engine else {
+            return;
+        };
+        let _ = engine.enqueue_local_scroll(delta);
     }
 
     fn clear_input_composition_state(&mut self) {
@@ -854,6 +952,11 @@ impl TerminalTab {
                 cx.notify();
             }
             PolicyAction::DowngradeReadOnly => {
+                if let Some(rt) = &self.runtime
+                    && let Some(engine) = &rt.engine
+                {
+                    engine.bump_access_epoch();
+                }
                 self.presentation.access = AccessMode::ReadOnly;
                 self.input_enabled = false;
                 self.clear_input_composition_state();
@@ -1193,6 +1296,7 @@ impl EntityInputHandler for TerminalTab {
 
 impl Render for TerminalTab {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.ensure_focus_subscriptions(window, cx);
         self.sample_latest_frame_from_engine();
         // The one shared canvas builder (I6). No frame yet → modeled
         // placeholder (`identity — lifecycle`); a frame → full-snapshot paint.
@@ -1255,6 +1359,27 @@ fn starting_presentation(target: &TerminalTarget, options: &TerminalOpenOptions)
         output_gap: false,
         detached_detail: None,
         reattach_available: false,
+    }
+}
+
+fn gpui_scroll_to_lens(delta: gpui::ScrollDelta) -> Option<ScrollDelta> {
+    match delta {
+        gpui::ScrollDelta::Lines(p) => {
+            let lines = p.y.round() as i32;
+            if lines == 0 {
+                None
+            } else {
+                Some(ScrollDelta::Lines(-lines))
+            }
+        }
+        gpui::ScrollDelta::Pixels(p) => {
+            let lines = (-p.y / Pixels::from(16.0)).round() as i32;
+            if lines == 0 {
+                None
+            } else {
+                Some(ScrollDelta::Lines(lines))
+            }
+        }
     }
 }
 

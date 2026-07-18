@@ -90,13 +90,17 @@ impl TabRenderState {
         let mut el = div().track_focus(focus).size_full();
         if let Some(tab) = input_tab.clone() {
             let tab_down = tab.clone();
-            let tab_up = tab;
+            let tab_up = tab.clone();
+            let tab_scroll = tab;
             el = el
                 .on_key_down(move |event, window, cx| {
                     tab_down.update(cx, |tab, cx| tab.handle_key_down(event, window, cx));
                 })
                 .on_key_up(move |event, window, cx| {
                     tab_up.update(cx, |tab, cx| tab.handle_key_up(event, window, cx));
+                })
+                .on_scroll_wheel(move |event, _window, cx| {
+                    tab_scroll.update(cx, |tab, cx| tab.handle_scroll_wheel(event, cx));
                 });
         }
         match frame {

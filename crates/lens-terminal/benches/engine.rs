@@ -1,7 +1,10 @@
-//! Engine throughput benches — VT parse, frame build, scroll, reflow.
+//! Engine throughput benches — VT parse, frame build, scroll, reflow, input path.
+
+use std::sync::Arc;
 
 use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
-use lens_terminal::{EngineConfig, VtEngine};
+use lens_terminal::engine_bench_api::{encode_arrow_up_press, feed_app_cursor_mode_then_arrow_up};
+use lens_terminal::{EngineConfig, EngineHandle, VtEngine};
 
 const BENCH_COLS: u16 = 200;
 const BENCH_ROWS: u16 = 50;
@@ -86,11 +89,37 @@ fn bench_reflow(c: &mut Criterion) {
     });
 }
 
+fn bench_key_encode_arrow_up(c: &mut Criterion) {
+    c.bench_function("key_encode_arrow_up", |b| {
+        b.iter_batched(
+            || {
+                let mut engine = VtEngine::new(&bench_config(), |_| {}).expect("engine");
+                engine.feed(b"\x1b[?1h");
+                engine
+            },
+            |mut engine| black_box(encode_arrow_up_press(&mut engine).expect("encode")),
+            BatchSize::SmallInput,
+        );
+    });
+}
+
+fn bench_ordered_stream_feed_then_key_throughput(c: &mut Criterion) {
+    c.bench_function("ordered_stream_feed_then_key_throughput", |b| {
+        b.iter_batched(
+            || Arc::new(EngineHandle::spawn(bench_config())),
+            |handle| black_box(feed_app_cursor_mode_then_arrow_up(&handle).expect("throughput")),
+            BatchSize::SmallInput,
+        );
+    });
+}
+
 criterion_group!(
     engine,
     bench_vt_parse,
     bench_frame_construction,
     bench_scroll,
-    bench_reflow
+    bench_reflow,
+    bench_key_encode_arrow_up,
+    bench_ordered_stream_feed_then_key_throughput
 );
 criterion_main!(engine);

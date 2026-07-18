@@ -13,7 +13,7 @@ use libghostty_vt::terminal::{Point, PointCoordinate, PointSpace};
 use libghostty_vt::{Terminal, TerminalOptions};
 use thiserror::Error;
 
-use super::command::KeyInput;
+use super::command::{KeyInput, ScrollDelta};
 use super::frame::{CellStyle, CursorPos, Frame, FrameCell, FrameRow, Rgb, UnderlineStyle};
 use super::key_map::encode_key_pure;
 
@@ -92,6 +92,37 @@ impl VtEngine {
         let mut buf = Vec::new();
         encode_key_pure(&mut self.key_encoder, &mut self.key_event, input, &mut buf)?;
         Ok(buf)
+    }
+
+    /// Encode a focus gained/lost report when mode 1004 is enabled.
+    pub(crate) fn encode_focus_report(
+        &mut self,
+        focused: bool,
+    ) -> Result<Option<Vec<u8>>, EngineError> {
+        use libghostty_vt::focus::Event as FocusEv;
+        use libghostty_vt::terminal::Mode;
+        if !self.terminal.mode(Mode::FOCUS_EVENT)? {
+            return Ok(None);
+        }
+        let ev = if focused {
+            FocusEv::Gained
+        } else {
+            FocusEv::Lost
+        };
+        let mut buf = [0u8; 16];
+        let n = ev.encode(&mut buf)?;
+        Ok(Some(buf[..n].to_vec()))
+    }
+
+    /// Scroll the viewport locally (no PTY egress).
+    pub(crate) fn local_scroll(&mut self, delta: ScrollDelta) {
+        use libghostty_vt::terminal::ScrollViewport;
+        let scroll = match delta {
+            ScrollDelta::Lines(n) => ScrollViewport::Delta(n as isize),
+            ScrollDelta::Top => ScrollViewport::Top,
+            ScrollDelta::Bottom => ScrollViewport::Bottom,
+        };
+        self.terminal.scroll_viewport(scroll);
     }
 
     /// Feed server VT bytes into the terminal.

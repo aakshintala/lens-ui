@@ -13,6 +13,7 @@ use super::frame::Frame;
 use super::inspect::{EngineInspect, InspectShared};
 use super::vt::EngineConfig;
 use super::worker::{self, EngineCommand, TestChunkBarrier, WakerSlot};
+use crate::engine::command::ScrollDelta;
 
 /// Backpressure / lifecycle error when sending to a stopped or saturated engine.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -105,6 +106,7 @@ impl EngineHandle {
             #[cfg(not(any(test, feature = "test-util")))]
             Arc::new(AtomicBool::new(false)),
             Arc::clone(&chunk_barrier),
+            Arc::clone(&access_epoch),
         );
 
         Self {
@@ -155,6 +157,16 @@ impl EngineHandle {
     #[allow(dead_code, reason = "read-only downgrade wired in Task 6")]
     pub(crate) fn bump_access_epoch(&self) -> u64 {
         self.access_epoch.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// Enqueue viewport-only scroll (allowed in read-only; bypasses the input forwarder).
+    pub(crate) fn enqueue_local_scroll(&self, delta: ScrollDelta) -> Result<(), FeedError> {
+        self.cmd_tx
+            .try_send(EngineCommand::LocalScroll(delta))
+            .map_err(|e| match e {
+                TrySendError::Full(_) => FeedError::Full,
+                TrySendError::Disconnected(_) => FeedError::Stopped,
+            })
     }
 
     pub fn feed(&self, bytes: Vec<u8>) -> Result<(), FeedError> {
@@ -810,6 +822,133 @@ mod tests {
         .unwrap();
         let ack = ack_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(ack.encoded, b"\x1bOA");
+        h.stop();
+    }
+
+    #[test]
+    fn focus_report_suppressed_when_report_false_with_ack_barrier() {
+        let h = EngineHandle::spawn(test_config());
+        while h.egress_rx().try_recv().is_ok() {}
+        h.feed(b"\x1b[?1004h".to_vec()).expect("feed");
+        h.cmd_sender()
+            .send(EngineCommand::Focus {
+                focused: true,
+                report: false,
+                access_epoch: 0,
+            })
+            .expect("focus");
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+        h.cmd_sender()
+            .send(EngineCommand::Key(KeyInput {
+                action: KeyAction::Press,
+                key: LensKey::Z,
+                mods: KeyMods::default(),
+                utf8: Some("z".into()),
+                composing: false,
+                access_epoch: 0,
+                ack: Some(ack_tx),
+            }))
+            .expect("barrier key");
+        let ack = ack_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("barrier ack");
+        assert!(ack.accepted);
+        let mut egress = Vec::new();
+        while let Ok(b) = h.egress_rx().try_recv() {
+            egress.extend_from_slice(&b);
+        }
+        assert_eq!(egress, b"z");
+        h.stop();
+    }
+
+    #[test]
+    fn focus_report_emits_csi_i_when_mode_on_and_report_true() {
+        let h = EngineHandle::spawn(test_config());
+        while h.egress_rx().try_recv().is_ok() {}
+        h.feed(b"\x1b[?1004h".to_vec()).expect("feed");
+        h.cmd_sender()
+            .send(EngineCommand::Focus {
+                focused: true,
+                report: true,
+                access_epoch: 0,
+            })
+            .expect("focus");
+        let bytes = h
+            .egress_rx()
+            .recv_timeout(Duration::from_secs(2))
+            .expect("focus egress");
+        assert_eq!(bytes, b"\x1b[I");
+        h.stop();
+    }
+
+    #[test]
+    fn downgrade_revokes_queued_key_before_egress() {
+        let h = EngineHandle::spawn(test_config());
+        h.test_stall_worker();
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+        h.cmd_sender()
+            .send(EngineCommand::Key(KeyInput {
+                action: KeyAction::Press,
+                key: LensKey::Z,
+                mods: KeyMods::default(),
+                utf8: Some("z".into()),
+                composing: false,
+                access_epoch: 0,
+                ack: Some(ack_tx),
+            }))
+            .expect("queue key");
+        h.bump_access_epoch();
+        h.test_release_worker();
+        let ack = ack_rx.recv_timeout(Duration::from_secs(2)).expect("ack");
+        assert!(!ack.accepted);
+        assert!(h.egress_rx().try_recv().is_err());
+        h.stop();
+    }
+
+    fn grid_text(f: &Frame) -> String {
+        f.grid
+            .iter()
+            .flat_map(|row| row.cells.iter().map(|c| c.grapheme.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn local_scroll_allowed_in_read_only_without_egress() {
+        use crate::engine::command::ScrollDelta;
+
+        let h = EngineHandle::spawn(test_config());
+        for i in 0..30 {
+            h.feed(format!("L{i:02}\r\n").into_bytes()).expect("feed");
+        }
+        h.build_now().expect("build_now");
+        let before = wait_for_frame(&h);
+        let before_text = grid_text(&before);
+        assert!(
+            before_text.contains("L29"),
+            "viewport should show tail lines"
+        );
+
+        h.enqueue_local_scroll(ScrollDelta::Top).expect("scroll");
+        h.build_now().expect("build_now");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let after = loop {
+            if let Some(f) = h.latest_frame() {
+                let text = grid_text(&f);
+                if text.contains("L00") && !text.contains("L29") {
+                    break f;
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "timeout waiting for scroll top; last={:?}",
+                    h.latest_frame().map(|f| grid_text(&f))
+                );
+            }
+            h.build_now().ok();
+            thread::sleep(Duration::from_millis(1));
+        };
+        assert!(grid_text(&after).contains("L00"));
+        assert!(h.egress_rx().try_recv().is_err());
         h.stop();
     }
 

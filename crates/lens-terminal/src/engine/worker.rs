@@ -1,7 +1,7 @@
 //! Engine worker run-loop — owns the non-`Send` [`VtEngine`] on a pinned OS thread.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -100,16 +100,11 @@ pub(crate) struct UserEgressFull;
 pub(crate) enum EngineCommand {
     Feed(Vec<u8>),
     Key(KeyInput),
-    #[expect(dead_code, reason = "Slice 2a Task 1 — Focus arm wired in Task 6")]
     Focus {
         focused: bool,
         report: bool,
         access_epoch: u64,
     },
-    #[expect(
-        dead_code,
-        reason = "Slice 2a Task 1 — LocalScroll arm wired in Task 2"
-    )]
     LocalScroll(super::command::ScrollDelta),
     Resize(u16, u16),
     SetVisible(bool),
@@ -156,6 +151,7 @@ pub(crate) fn spawn_worker(
     #[cfg_attr(not(any(test, feature = "test-util")), allow(unused_variables))]
     worker_stall_gate: Arc<AtomicBool>,
     chunk_barrier: Arc<TestChunkBarrier>,
+    access_epoch: Arc<AtomicU64>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut engine = match VtEngine::new(&cfg, |_| {}) {
@@ -214,6 +210,7 @@ pub(crate) fn spawn_worker(
                         &mut pending,
                         &mut stopping,
                         &chunk_barrier,
+                        &access_epoch,
                     );
                 }
             }
@@ -236,6 +233,7 @@ pub(crate) fn spawn_worker(
                     &mut pending,
                     &mut stopping,
                     &chunk_barrier,
+                    &access_epoch,
                 );
             }
 
@@ -291,6 +289,7 @@ fn dispatch_command(
     pending: &mut VecDeque<EngineCommand>,
     stopping: &mut bool,
     chunk_barrier: &TestChunkBarrier,
+    access_epoch: &AtomicU64,
 ) {
     match cmd {
         EngineCommand::Feed(bytes) => handle_feed_chunked(
@@ -306,6 +305,7 @@ fn dispatch_command(
             pending,
             stopping,
             chunk_barrier,
+            access_epoch,
         ),
         EngineCommand::Stop => *stopping = true,
         other => handle_command(
@@ -317,6 +317,7 @@ fn dispatch_command(
             dirty,
             visible,
             force_build,
+            access_epoch,
         ),
     }
 }
@@ -338,6 +339,7 @@ fn handle_feed_chunked(
     pending: &mut VecDeque<EngineCommand>,
     stopping: &mut bool,
     chunk_barrier: &TestChunkBarrier,
+    access_epoch: &AtomicU64,
 ) {
     let total = bytes.len();
     let mut offset = 0usize;
@@ -348,6 +350,7 @@ fn handle_feed_chunked(
 
     while offset < total {
         if *stopping {
+            inspect.record_stop_preempt();
             return;
         }
 
@@ -372,6 +375,7 @@ fn handle_feed_chunked(
 
         probe_pending_during_feed(cmd_rx, pending, stopping);
         if *stopping {
+            inspect.record_stop_preempt();
             return;
         }
     }
@@ -388,6 +392,7 @@ fn handle_feed_chunked(
         force_build,
         stopping,
         chunk_barrier,
+        access_epoch,
     );
 }
 
@@ -399,6 +404,7 @@ fn feed_chunk(
     inspect: &InspectShared,
     dirty: &mut bool,
 ) {
+    inspect.record_feed_chunk();
     let n = chunk.len() as u64;
     engine.feed(chunk);
     inspect.record_bytes_fed(n);
@@ -443,6 +449,7 @@ fn drain_pending_after_feed(
     force_build: &mut bool,
     stopping: &mut bool,
     chunk_barrier: &TestChunkBarrier,
+    access_epoch: &AtomicU64,
 ) {
     while let Some(cmd) = pending.pop_front() {
         if *stopping {
@@ -462,6 +469,7 @@ fn drain_pending_after_feed(
             pending,
             stopping,
             chunk_barrier,
+            access_epoch,
         );
         if *stopping {
             return;
@@ -482,34 +490,76 @@ fn handle_command(
     dirty: &mut bool,
     visible: &mut bool,
     force_build: &mut bool,
+    access_epoch: &AtomicU64,
 ) {
+    let current_epoch = access_epoch.load(Ordering::Acquire);
+
     match cmd {
         EngineCommand::Feed(_) => {
             debug_assert!(false, "Feed must go through handle_feed_chunked");
         }
         EngineCommand::Key(mut input) => {
+            let cmd_epoch = input.access_epoch;
             let ack_tx = input.ack.take();
-            let (encoded, accepted) = match engine.encode_key(&input) {
-                Ok(bytes) if bytes.is_empty() => (bytes, true),
-                Ok(bytes) => match try_emit_user_input(egress_tx, &bytes) {
-                    Ok(()) => {
-                        inspect.record_user_egress_accepted();
-                        (bytes, true)
+            let (encoded, accepted) = if cmd_epoch != current_epoch {
+                (Vec::new(), false)
+            } else {
+                match engine.encode_key(&input) {
+                    Ok(bytes) if bytes.is_empty() => (bytes, true),
+                    Ok(bytes) => {
+                        inspect.record_keys_encoded();
+                        match try_emit_user_input(egress_tx, &bytes) {
+                            Ok(()) => {
+                                inspect.record_user_egress_accepted();
+                                (bytes, true)
+                            }
+                            Err(UserEgressFull) => {
+                                inspect.record_user_egress_rejected();
+                                // Never-drop: user input is atomically rejected (accepted:false), never drop-oldest (that policy is replies-only). Egress fills only when the bridge's forward_egress stalls on a full outbound; that path emits BridgeEvent::OutboundSaturated within 50ms (bridge.rs forward_egress) → reconnect. So saturation is surfaced to policy via the existing OutboundSaturated path (plan: "reuse OutboundSaturated with a clear comment") — no separate UserEgressSaturated event.
+                                (bytes, false)
+                            }
+                        }
                     }
-                    Err(UserEgressFull) => {
-                        inspect.record_user_egress_rejected();
-                        // Never-drop: user input is atomically rejected (accepted:false), never drop-oldest (that policy is replies-only). Egress fills only when the bridge's forward_egress stalls on a full outbound; that path emits BridgeEvent::OutboundSaturated within 50ms (bridge.rs forward_egress) → reconnect. So saturation is surfaced to policy via the existing OutboundSaturated path (plan: "reuse OutboundSaturated with a clear comment") — no separate UserEgressSaturated event.
-                        (bytes, false)
+                    Err(e) => {
+                        eprintln!("lens-terminal engine: encode_key failed: {e}");
+                        (Vec::new(), false)
                     }
-                },
-                Err(e) => {
-                    eprintln!("lens-terminal engine: encode_key failed: {e}");
-                    (Vec::new(), false)
                 }
             };
             if let Some(tx) = ack_tx {
                 let _ = tx.try_send(InputAck { encoded, accepted });
             }
+        }
+        EngineCommand::Focus {
+            focused,
+            report,
+            access_epoch: cmd_epoch,
+        } => {
+            if !report || cmd_epoch != current_epoch {
+                return;
+            }
+            match engine.encode_focus_report(focused) {
+                Ok(Some(bytes)) => {
+                    inspect.record_keys_encoded();
+                    match try_emit_user_input(egress_tx, &bytes) {
+                        Ok(()) => {
+                            inspect.record_user_egress_accepted();
+                        }
+                        Err(UserEgressFull) => {
+                            inspect.record_user_egress_rejected();
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("lens-terminal engine: encode_focus_report failed: {e}");
+                }
+            }
+        }
+        EngineCommand::LocalScroll(delta) => {
+            engine.local_scroll(delta);
+            *dirty = true;
+            *force_build = true;
         }
         EngineCommand::Resize(cols, rows) => {
             if let Err(e) = engine.resize(cols, rows) {
@@ -531,7 +581,6 @@ fn handle_command(
         EngineCommand::BuildNow => {
             *force_build = true;
         }
-        EngineCommand::Focus { .. } | EngineCommand::LocalScroll(_) => {}
         EngineCommand::Stop => {}
     }
 }

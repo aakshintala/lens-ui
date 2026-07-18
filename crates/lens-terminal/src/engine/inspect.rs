@@ -35,6 +35,9 @@ pub struct EngineInspect {
     pub egress_emitted: u64,
     pub user_egress_accepted: u64,
     pub user_egress_rejected: u64,
+    pub keys_encoded: u64,
+    pub feed_chunks: u64,
+    pub stop_preempts: u64,
     pub recent: Vec<InspectEvent>,
 }
 
@@ -52,6 +55,9 @@ pub(crate) struct InspectShared {
     egress_emitted: AtomicU64,
     user_egress_accepted: AtomicU64,
     user_egress_rejected: AtomicU64,
+    keys_encoded: AtomicU64,
+    feed_chunks: AtomicU64,
+    stop_preempts: AtomicU64,
     ring: Mutex<VecDeque<InspectEvent>>,
 }
 
@@ -69,6 +75,9 @@ impl InspectShared {
             egress_emitted: AtomicU64::new(0),
             user_egress_accepted: AtomicU64::new(0),
             user_egress_rejected: AtomicU64::new(0),
+            keys_encoded: AtomicU64::new(0),
+            feed_chunks: AtomicU64::new(0),
+            stop_preempts: AtomicU64::new(0),
             ring: Mutex::new(VecDeque::with_capacity(RING_CAP)),
         }
     }
@@ -118,6 +127,18 @@ impl InspectShared {
         self.user_egress_rejected.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_keys_encoded(&self) {
+        self.keys_encoded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_feed_chunk(&self) {
+        self.feed_chunks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_stop_preempt(&self) {
+        self.stop_preempts.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn set_visible(&self, visible: bool) {
         self.visible.store(visible, Ordering::Relaxed);
     }
@@ -155,6 +176,9 @@ impl InspectShared {
             egress_emitted: self.egress_emitted.load(Ordering::Relaxed),
             user_egress_accepted: self.user_egress_accepted.load(Ordering::Relaxed),
             user_egress_rejected: self.user_egress_rejected.load(Ordering::Relaxed),
+            keys_encoded: self.keys_encoded.load(Ordering::Relaxed),
+            feed_chunks: self.feed_chunks.load(Ordering::Relaxed),
+            stop_preempts: self.stop_preempts.load(Ordering::Relaxed),
             recent,
         }
     }
