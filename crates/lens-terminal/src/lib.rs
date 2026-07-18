@@ -944,6 +944,10 @@ impl TerminalTab {
             | BridgeEvent::AttachDisconnected => {
                 self.policy.on_close(CloseCause::Network, Instant::now())
             }
+            BridgeEvent::StaleInputDiscarded => {
+                // Task 3 wires presentation.
+                return;
+            }
         };
 
         match action {
@@ -1578,6 +1582,15 @@ mod tests {
 
         tab.update(cx, |tab, cx| tab.set_visible(true, cx));
         wait_for_wake_count(after_first + 1, &wake_count, "show-after-hide");
+    }
+
+    #[gpui::test]
+    async fn teardown_transport_bumps_access_epoch(cx: &mut gpui::TestAppContext) {
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let before = engine.access_epoch();
+        let tab = cx.new(|cx| TerminalTab::with_engine_for_test(Arc::clone(&engine), cx));
+        tab.update(cx, |tab, cx| tab.teardown_transport_off_foreground(cx));
+        assert_eq!(engine.access_epoch(), before + 1);
     }
 
     #[gpui::test]

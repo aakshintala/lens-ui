@@ -9,7 +9,7 @@ use crossbeam_channel::{Receiver, Select, Sender, TrySendError};
 use lens_client::{CloseCause, WsInbound, WsOutbound};
 
 use crate::engine::handle::{EngineHandle, FeedError};
-use crate::engine::worker::EgressFrame;
+use crate::engine::worker::{EgressFrame, EgressKind};
 
 /// Policy events emitted by the bridge thread (off gpui foreground).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -19,6 +19,10 @@ pub(crate) enum BridgeEvent {
     OutboundSaturated,
     AttachDisconnected,
     EngineStopped,
+    /// The bridge stopped with un-forwarded user `Input` still queued in its egress
+    /// channel; that residue was dropped (not replayed to any connection). Coalesced to
+    /// one per bridge stop. Reply/focus (`Other`) residue is dropped silently.
+    StaleInputDiscarded,
 }
 
 pub(crate) struct BridgeHandle {
@@ -124,6 +128,19 @@ fn bridge_loop(
             break;
         }
     }
+
+    // Best-effort drain-drop of per-bridge egress residue. A frame the worker pushes
+    // after this drain sees `Empty` lingers until the owned receiver is dropped on
+    // thread return; still never delivered elsewhere. The notice may undercount.
+    let mut dropped_input = false;
+    while let Ok(frame) = egress_rx.try_recv() {
+        if frame.kind == EgressKind::Input && !frame.bytes.is_empty() {
+            dropped_input = true;
+        }
+    }
+    if dropped_input {
+        let _ = policy_tx.try_send(BridgeEvent::StaleInputDiscarded);
+    }
 }
 
 fn handle_inbound(
@@ -191,6 +208,7 @@ mod tests {
     use super::*;
     use crate::engine::frame::Frame;
     use crate::engine::vt::EngineConfig;
+    use crate::engine::worker::EGRESS_CHANNEL_CAP;
 
     fn test_cfg() -> EngineConfig {
         EngineConfig {
@@ -330,5 +348,92 @@ mod tests {
         };
         assert!(matches!(ev, BridgeEvent::AttachDisconnected));
         bridge.join();
+    }
+
+    #[test]
+    fn stopped_bridge_drops_input_residue_and_surfaces_once() {
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let (egress_tx, egress_rx) = crossbeam_channel::bounded(EGRESS_CHANNEL_CAP);
+        egress_tx
+            .send(EgressFrame {
+                kind: EgressKind::Input,
+                bytes: b"ab".to_vec(),
+            })
+            .unwrap();
+        egress_tx
+            .send(EgressFrame {
+                kind: EgressKind::Input,
+                bytes: b"cd".to_vec(),
+            })
+            .unwrap();
+        egress_tx
+            .send(EgressFrame {
+                kind: EgressKind::Other,
+                bytes: b"\x1b[0n".to_vec(),
+            })
+            .unwrap();
+
+        let (_inbound_tx, inbound_rx) = crossbeam_channel::bounded(8);
+        let (outbound_tx, outbound_rx) = crossbeam_channel::bounded(1);
+        outbound_tx.send(WsOutbound::Input(vec![9])).unwrap();
+        let (policy_tx, policy_rx) = async_channel::bounded(8);
+        let bridge = spawn_bridge(
+            inbound_rx,
+            outbound_tx,
+            Arc::clone(&engine),
+            policy_tx,
+            egress_rx,
+        );
+
+        bridge.join();
+
+        let mut notices = 0;
+        while let Ok(ev) = policy_rx.try_recv() {
+            if matches!(ev, BridgeEvent::StaleInputDiscarded) {
+                notices += 1;
+            }
+        }
+        assert_eq!(notices, 1, "coalesced to one notice");
+        let forwarded: Vec<_> = std::iter::from_fn(|| outbound_rx.try_recv().ok()).collect();
+        assert!(forwarded.iter().all(|m| !matches!(
+            m,
+            WsOutbound::Input(b) if b == b"ab" || b == b"cd"
+        )));
+    }
+
+    #[test]
+    fn stopped_bridge_with_only_other_residue_is_silent() {
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let (egress_tx, egress_rx) = crossbeam_channel::bounded(EGRESS_CHANNEL_CAP);
+        egress_tx
+            .send(EgressFrame {
+                kind: EgressKind::Other,
+                bytes: b"\x1b[0n".to_vec(),
+            })
+            .unwrap();
+
+        let (_inbound_tx, inbound_rx) = crossbeam_channel::bounded(8);
+        let (outbound_tx, outbound_rx) = crossbeam_channel::bounded(1);
+        outbound_tx.send(WsOutbound::Input(vec![9])).unwrap();
+        let (policy_tx, policy_rx) = async_channel::bounded(8);
+        let bridge = spawn_bridge(
+            inbound_rx,
+            outbound_tx,
+            Arc::clone(&engine),
+            policy_tx,
+            egress_rx,
+        );
+
+        bridge.join();
+
+        assert!(
+            policy_rx.try_recv().is_err(),
+            "Other-only residue must not emit StaleInputDiscarded"
+        );
+        let forwarded: Vec<_> = std::iter::from_fn(|| outbound_rx.try_recv().ok()).collect();
+        assert!(forwarded.iter().all(|m| !matches!(
+            m,
+            WsOutbound::Input(b) if b == b"\x1b[0n"
+        )));
     }
 }

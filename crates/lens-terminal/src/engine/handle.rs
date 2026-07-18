@@ -140,6 +140,15 @@ impl EngineHandle {
         self.access_epoch.fetch_add(1, Ordering::AcqRel) + 1
     }
 
+    #[cfg(any(test, feature = "test-util"))]
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "used from #[cfg(test)] lib tests")
+    )]
+    pub(crate) fn access_epoch(&self) -> u64 {
+        self.access_epoch.load(Ordering::Acquire)
+    }
+
     /// Enqueue viewport-only scroll (allowed in read-only; bypasses the input forwarder).
     pub(crate) fn enqueue_local_scroll(&self, delta: ScrollDelta) -> Result<(), FeedError> {
         self.cmd_tx
@@ -947,6 +956,40 @@ mod tests {
             egress.extend_from_slice(&f.bytes);
         }
         assert_eq!(egress, b"z");
+        h.stop();
+    }
+
+    /// C2 Critical proof: stale-epoch keys held on `cmd_tx` during teardown must not
+    /// encode onto any egress channel. Without step 5 (`bump_access_epoch`), the
+    /// released Key would encode onto `rx1` (processed before the `SetEgress` swap in
+    /// FIFO order), so `rx1` would be non-empty — this test fails without the bump.
+    #[test]
+    fn upstream_key_revoked_by_epoch_bump_reaches_no_channel() {
+        let h = EngineHandle::spawn(test_config());
+        let rx1 = h.attach_test_egress();
+        h.test_stall_worker();
+        h.enqueue_input(EngineCommand::Key(KeyInput {
+            action: KeyAction::Press,
+            key: LensKey::A,
+            mods: KeyMods::default(),
+            utf8: Some("a".into()),
+            composing: false,
+            access_epoch: 0,
+            ack: None,
+        }))
+        .expect("enqueue key");
+        h.bump_access_epoch();
+        let rx2 = h.attach_test_egress();
+        h.test_release_worker();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if rx1.try_recv().is_ok() || rx2.try_recv().is_ok() {
+                panic!("stale-epoch key must not reach any egress channel");
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(rx1.try_recv().is_err(), "rx1 must stay empty");
+        assert!(rx2.try_recv().is_err(), "rx2 must stay empty");
         h.stop();
     }
 
