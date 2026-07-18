@@ -1,18 +1,15 @@
 //! GPUI physical-key strings → [`LensKey`], and pure Ghostty key encoding.
 
-#![expect(
-    dead_code,
-    reason = "Slice 2a Task 1 surface — encode_key_pure wired in Task 2"
-)]
-
 use libghostty_vt::error::Result;
-#[cfg(target_os = "macos")]
-use libghostty_vt::key::OptionAsAlt;
 use libghostty_vt::key::{Action, Encoder, Event, Key, Mods};
 
 use super::command::{KeyAction, KeyInput, KeyMods, LensKey};
 
 /// Map a gpui [`Keystroke`](gpui::Keystroke) physical `key` string to [`LensKey`].
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Slice 2a Task 1 surface — wired in Task 2")
+)]
 pub(crate) fn keystroke_to_lens(key: &str) -> LensKey {
     match key {
         "a" => LensKey::A,
@@ -95,6 +92,7 @@ pub(crate) fn keystroke_to_lens(key: &str) -> LensKey {
         "control" => LensKey::ControlLeft,
         "alt" => LensKey::AltLeft,
         "platform" => LensKey::MetaLeft,
+        // unreachable on macOS gpui (collapses keypad → "enter"/"0".."9"); retained for non-mac/synthetic events
         "numpad0" => LensKey::Numpad0,
         "numpad1" => LensKey::Numpad1,
         "numpad2" => LensKey::Numpad2,
@@ -139,6 +137,13 @@ pub(crate) fn apply_key_input_to_event(ev: &mut Event<'_>, input: &KeyInput) -> 
 }
 
 /// Encode `input` with a pre-configured encoder; composing → empty output.
+///
+/// Does not set macOS option-as-alt policy — the caller/terminal owns that via
+/// [`Encoder::set_macos_option_as_alt`] (Task 2 `encode_key` / `set_options_from_terminal`).
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Slice 2a Task 1 surface — wired in Task 2")
+)]
 pub(crate) fn encode_key_pure(
     enc: &mut Encoder<'_>,
     ev: &mut Event<'_>,
@@ -149,10 +154,6 @@ pub(crate) fn encode_key_pure(
     if input.composing {
         return Ok(());
     }
-    // Ghostty cannot infer macOS option-as-alt from terminal state; match platform
-    // behavior so Alt-modified events encode as ESC-prefixed sequences.
-    #[cfg(target_os = "macos")]
-    enc.set_macos_option_as_alt(OptionAsAlt::True);
     apply_key_input_to_event(ev, input)?;
     enc.encode_to_vec(ev, buf)
 }
@@ -372,6 +373,8 @@ impl From<KeyMods> for Mods {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    use libghostty_vt::key::OptionAsAlt;
     use libghostty_vt::key::{Encoder, Event, KittyKeyFlags};
 
     fn base_arrow() -> KeyInput {
@@ -422,6 +425,8 @@ mod tests {
     fn alt_printable_a_encodes_esc_prefixed() {
         let mut enc = Encoder::new().unwrap();
         enc.set_alt_esc_prefix(true);
+        #[cfg(target_os = "macos")]
+        enc.set_macos_option_as_alt(OptionAsAlt::True);
         let mut ev = Event::new().unwrap();
         let input = KeyInput {
             action: KeyAction::Press,
@@ -481,6 +486,41 @@ mod tests {
         encode_key_pure(&mut enc, &mut ev, &rep, &mut repeat).unwrap();
         assert_ne!(press, release, "Kitty release must differ from press");
         assert_ne!(press, repeat, "Kitty repeat must differ from press");
+        assert_eq!(press, b"\x1b[1;1:1A");
+        assert_eq!(release, b"\x1b[1;1:3A");
+        assert_eq!(repeat, b"\x1b[1;1:2A");
+    }
+
+    #[test]
+    fn keystroke_to_lens_maps_gpui_physical_strings() {
+        assert_eq!(keystroke_to_lens("up"), LensKey::ArrowUp);
+        assert_eq!(keystroke_to_lens("enter"), LensKey::Enter);
+        assert_eq!(keystroke_to_lens("tab"), LensKey::Tab);
+        assert_eq!(keystroke_to_lens("escape"), LensKey::Escape);
+        assert_eq!(keystroke_to_lens("backspace"), LensKey::Backspace);
+        assert_eq!(keystroke_to_lens("delete"), LensKey::Delete);
+        assert_eq!(keystroke_to_lens("space"), LensKey::Space);
+        assert_eq!(keystroke_to_lens("home"), LensKey::Home);
+        assert_eq!(keystroke_to_lens("end"), LensKey::End);
+        assert_eq!(keystroke_to_lens("a"), LensKey::A);
+        assert_eq!(keystroke_to_lens("z"), LensKey::Z);
+        assert_eq!(keystroke_to_lens("0"), LensKey::Digit0);
+        assert_eq!(keystroke_to_lens("9"), LensKey::Digit9);
+        assert_eq!(keystroke_to_lens("]"), LensKey::BracketRight);
+        assert_eq!(keystroke_to_lens(";"), LensKey::Semicolon);
+        assert_eq!(keystroke_to_lens("/"), LensKey::Slash);
+        assert_eq!(keystroke_to_lens("\\"), LensKey::Backslash);
+        assert_eq!(keystroke_to_lens("-"), LensKey::Minus);
+        assert_eq!(keystroke_to_lens("="), LensKey::Equal);
+        assert_eq!(keystroke_to_lens("f1"), LensKey::F1);
+        assert_eq!(keystroke_to_lens("f25"), LensKey::F25);
+        assert_eq!(keystroke_to_lens("f26"), LensKey::Unidentified);
+    }
+
+    #[test]
+    fn keystroke_to_lens_enter_is_regular_not_numpad() {
+        // macOS gpui collapses keypad Enter to "enter" (never "numpadenter").
+        assert_eq!(keystroke_to_lens("enter"), LensKey::Enter);
     }
 
     #[test]
