@@ -313,6 +313,8 @@ impl Drop for EngineHandle {
     /// [`EngineHandle::stop`] from a background task instead.
     fn drop(&mut self) {
         if self.join.is_some() {
+            #[cfg(test)]
+            self.chunk_barrier.release();
             self.signal_stop_nonblocking();
             let _ = self.input_forwarder.take();
             let _ = self.join.take();
@@ -698,18 +700,22 @@ mod tests {
 
     #[test]
     fn key_before_feed_sees_pre_feed_modes() {
+        // Input-vs-feed cross-path ordering is inherently concurrent (different
+        // threads) — this test pins the worker-level cmd_tx ordering contract,
+        // not the forwarder path.
         let h = EngineHandle::spawn(test_config());
         let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
-        h.enqueue_input(EngineCommand::Key(KeyInput {
-            action: KeyAction::Press,
-            key: LensKey::ArrowUp,
-            mods: KeyMods::default(),
-            utf8: None,
-            composing: false,
-            access_epoch: 0,
-            ack: Some(ack_tx),
-        }))
-        .unwrap();
+        h.cmd_sender()
+            .send(EngineCommand::Key(KeyInput {
+                action: KeyAction::Press,
+                key: LensKey::ArrowUp,
+                mods: KeyMods::default(),
+                utf8: None,
+                composing: false,
+                access_epoch: 0,
+                ack: Some(ack_tx),
+            }))
+            .expect("send key before feed");
         let mut mode_and_pad = Vec::with_capacity(64 * 1024);
         mode_and_pad.extend_from_slice(b"\x1b[?1h");
         mode_and_pad.resize(64 * 1024, b' ');
@@ -731,13 +737,55 @@ mod tests {
         h.cmd_sender().send(EngineCommand::Stop).unwrap();
         h.test_release_chunk_barrier();
         let deadline = Instant::now() + Duration::from_secs(2);
-        while h.cmd_sender().try_send(EngineCommand::BuildNow).is_ok() {
-            assert!(Instant::now() < deadline, "worker did not exit after Stop");
+        loop {
+            match h.cmd_sender().try_send(EngineCommand::BuildNow) {
+                Ok(()) => {}
+                Err(TrySendError::Disconnected(_)) => break,
+                Err(TrySendError::Full(_)) => {
+                    assert!(Instant::now() < deadline, "worker did not exit after Stop");
+                    thread::yield_now();
+                }
+            }
         }
         let fed = h.inspect().bytes_fed;
         h.stop();
         assert!(fed >= MAX_FEED_CHUNK as u64);
         assert!(fed < 64 * 1024);
+    }
+
+    #[test]
+    fn mid_feed_key_defers_until_after_feed() {
+        use crate::engine::worker::MAX_FEED_CHUNK;
+
+        let h = EngineHandle::spawn(test_config());
+        let mut feed = vec![b' '; MAX_FEED_CHUNK];
+        feed.extend_from_slice(b"\x1b[?1h");
+
+        h.test_arm_chunk_barrier();
+        h.feed(feed).unwrap();
+        h.test_wait_after_first_chunk();
+
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+        h.cmd_sender()
+            .send(EngineCommand::Key(KeyInput {
+                action: KeyAction::Press,
+                key: LensKey::ArrowUp,
+                mods: KeyMods::default(),
+                utf8: None,
+                composing: false,
+                access_epoch: 0,
+                ack: Some(ack_tx),
+            }))
+            .expect("send key during feed pause");
+
+        h.test_release_chunk_barrier();
+
+        let ack = ack_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("ack timeout");
+        assert_eq!(ack.encoded, b"\x1bOA");
+        assert!(ack.accepted);
+        h.stop();
     }
 
     #[test]
