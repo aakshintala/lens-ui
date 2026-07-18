@@ -87,8 +87,36 @@ These were folded from the gpt-5.6 review — the plans contain the tests; keep 
 - Ghostty reference: re-clone `ghostty-org/ghostty` @ `a887df42` into scratchpad if a citation needs
   re-verifying (prior clone was ephemeral).
 
-## First action
+## Progress (2026-07-17)
 
-Commit the serial re-cut (this handoff + the two edited plan docs + the Task-0 deletion), then execute
-**2a** task-by-task (composer-2.5 → per-task cross-family review → gate → commit on `terminal-ws`).
-When 2a is done + green, execute **2d** on top of it.
+- **Serial re-cut DONE + reviewed** (commits `41902ed` + `ef93567`).
+- **✅ 2a (input) EXECUTED + DONE** — commits `ef93567..78d8e0c` (incl. bridge panic fix `ec6f007`).
+  All 6 tasks via composer-2.5 + per-task gpt-5.6 review + fix waves + a broad whole-slice review.
+  **Gate green**: workspace fmt + clippy (no test-util) + lens-terminal clippy (test-util,live-tests) +
+  77 lens-terminal + 162 lens-client lib tests + `tests/input_realwindow.rs` all 8 phases validated on a
+  real macOS display (Tab→`\t`, Enter→`\r`, Shift+a→"A", ArrowUp→`\x1b[A`, all single-emit — no double-emit).
+  Full per-task log + all review findings/adjudications: ledger `.superpowers/sdd/progress.md` (Slice 2 section).
+
+## ⚠ NEXT SESSION — FIRST action: fix deferred Critical **C2** (before or as part of 2d)
+
+The broad 2a-slice review found one Critical too substantial/security-sensitive to patch at session end:
+**retained-engine egress survives the reconnect/downgrade boundary and is epoch-unrevocable.** The egress
+channel is an untyped shared `Vec<u8>`; bytes already queued past the worker can't be revoked by the worker's
+final-egress epoch check. Consequences: (a) on retained-engine reconnect a new bridge (`bridge.rs:39`) drains
+pre-disconnect user bytes → **stale input replays to the fresh connection**; (b) a Write→ReadOnly downgrade
+(`lib.rs:975/1102`) can't revoke write bytes already in egress → **stale write input replays after an
+unauthorized downgrade (read-only-enforcement bypass — security).** Candidate fix: **drain the egress channel
+when respawning a bridge onto a retained engine** (covers downgrade too, since downgrade = teardown + read-only
+reconnect). BUT requires a decision: **is input the user typed during `Reconnecting` flushed, or sent
+post-reconnect?** That touches 1d reconnect-input semantics — design first, then implement. NOT a quick patch.
+
+## Then: execute **2d** (presentation) on top of 2a
+
+`docs/superpowers/plans/2026-07-17-terminal-slice-2d-presentation.md` — self-contained, lands on 2a's committed
+code (declares its own presentation surface + `VtEngine::new` `presentation_tx` arity). Same flow:
+subagent-driven-development, composer-2.5 per task, per-task cross-family review (a family *other* than 2a's
+gpt-5.6 for diversity — grok-4.5 or gemini-3.5 via cursor-delegate), gate incl. `--features test-util`. Then 2b, 2c.
+
+## First action (this re-cut session — DONE)
+
+~~Commit the serial re-cut, then execute 2a task-by-task.~~ Completed — see Progress above.

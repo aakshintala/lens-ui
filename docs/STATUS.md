@@ -9,11 +9,20 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Open threads & next up
 
-- **▶ ACTIVE: shared terminal workstream — Slices 0/1a/1b merged; Slice 1c DONE; Slice 1d COMPLETE (live-proven); ▶ Slice 2 PLANNING DONE + gpt-5.6-reviewed (2026-07-17): Task-0 + 2a + 2d plans execution-ready. `terminal-ws` PUSHED to `origin/terminal-ws` (backup; no `main` merge — user's call). Next session: EXECUTE (Task 0 → 2a∥2d).**
-  - **▶ SLICE 2 (interaction) — PLANNING DONE, execution-ready (2026-07-17).** Design spec
+- **▶ ACTIVE: shared terminal workstream — Slices 0/1a/1b merged; 1c DONE; 1d COMPLETE (live-proven); Slice 2 RE-CUT TO SERIAL + ▶▶ 2a (input) EXECUTED + DONE (2026-07-17): all 6 tasks, gate-green, real-window keystroke-validated on display. `terminal-ws` PUSHED to `origin/terminal-ws` (backup; no `main` merge — user's call). ⚠ ONE deferred Critical (C2 egress-replay across reconnect/downgrade). NEXT SESSION: fix C2, then 2d (presentation) → 2b (clipboard) → 2c (mouse). Driver: `docs/handoffs/2026-07-17-terminal-slice-2-execution.md`.**
+  - **▶ SLICE 2 (interaction) — RE-CUT TO SERIAL; 2a EXECUTED + DONE (2026-07-17).** Design spec
     [`docs/specs/2026-07-17-terminal-slice-2-interaction-design.md`](./specs/2026-07-17-terminal-slice-2-interaction-design.md).
-    Three plans in `docs/superpowers/plans/2026-07-17-terminal-slice-2-{task0-foundation,2a-input,2d-presentation}.md`.
-    Phases **Task 0 (shared skeleton) → 2a input/IME/focus/read-only ∥ 2d OSC-output → 2b clipboard/OSC52 → 2c mouse**.
+    **Task 0 DELETED — dissolved into 2a/2d** (serial removes the parallel merge hazard at the root; 2d edits 2a's
+    committed code). Plans: `docs/superpowers/plans/2026-07-17-terminal-slice-2-{2a-input,2d-presentation}.md`.
+    Phases **2a input/IME/focus/read-only → 2d OSC-output → 2b clipboard/OSC52 → 2c mouse**, serial on `terminal-ws`.
+    **2a DONE**: all 6 tasks via composer-2.5 + per-task gpt-5.6 review + fix waves + broad-slice review; gate-green
+    (both clippy configs, 77 lens-terminal + 162 lens-client tests, real-window keystroke validated). Reviews caught
+    real bugs each task (macOS option-as-alt clobber, reversed epoch-revoke, Tab/Enter/Shift double-emit, worker
+    epoch TOCTOU, reply-evicts-user-egress). **⚠ DEFERRED Critical C2** (next session, #1): retained-engine egress
+    survives reconnect + is epoch-unrevocable → stale input replays across reconnect + a Write→ReadOnly downgrade
+    can't revoke already-queued write bytes (security). Root = untyped shared egress `Vec<u8>`; candidate fix =
+    drain egress on retained-engine bridge respawn, but needs a Reconnecting-input-semantics decision. Details in
+    the ledger `.superpowers/sdd/progress.md` + handoff.
     Architecture = Option A (single-owner engine + ONE ordered command stream). **Progress+notifications spike-resolved
     bucket-C (absent from pinned C ABI) → DEFERRED + parent matrix amended.** Plans: grok authored → Opus review →
     consolidated **gpt-5.6-sol-high** review ($1.67; 8 Critical + 11 Important) → folded + verified. **Merge-seam
