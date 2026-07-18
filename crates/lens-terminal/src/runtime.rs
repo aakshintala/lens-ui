@@ -69,7 +69,7 @@ impl TerminalRuntime {
             a.close();
         }
         // 3. bridge.join already dropped its engine Arc clone
-        // 4. normally unique Arc → stop; tolerate a transient extra clone
+        // 4. `EngineHandle::stop` severs the input forwarder then joins the worker (off-fg only).
         if let Some(engine) = self.engine.take()
             && let Ok(owned) = Arc::try_unwrap(engine)
         {

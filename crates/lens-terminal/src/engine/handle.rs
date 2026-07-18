@@ -1,6 +1,6 @@
 //! Send-safe handle to the non-`Send` engine worker.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -8,6 +8,7 @@ use arc_swap::ArcSwapOption;
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use thiserror::Error;
 
+use super::forwarder::InputForwarder;
 use super::frame::Frame;
 use super::inspect::{EngineInspect, InspectShared};
 use super::vt::EngineConfig;
@@ -25,6 +26,8 @@ pub enum FeedError {
 /// Send-safe facade over the pinned engine worker thread.
 pub struct EngineHandle {
     cmd_tx: Sender<EngineCommand>,
+    input_forwarder: Option<InputForwarder>,
+    access_epoch: Arc<AtomicU64>,
     frame_slot: Arc<ArcSwapOption<Frame>>,
     frame_ready: Arc<AtomicBool>,
     waker: WakerSlot,
@@ -51,11 +54,30 @@ impl EngineHandle {
             egress_tx,
             egress_rx,
         } = worker::worker_channels();
+        Self::spawn_from_parts(cfg, cmd_tx, cmd_rx, egress_tx, egress_rx)
+    }
+
+    #[cfg(test)]
+    fn spawn_with_cmd_cap(cfg: EngineConfig, cmd_cap: usize) -> Self {
+        let (cmd_tx, cmd_rx) = crossbeam_channel::bounded(cmd_cap);
+        let (egress_tx, egress_rx) = crossbeam_channel::bounded(64);
+        Self::spawn_from_parts(cfg, cmd_tx, cmd_rx, egress_tx, egress_rx)
+    }
+
+    fn spawn_from_parts(
+        cfg: EngineConfig,
+        cmd_tx: Sender<EngineCommand>,
+        cmd_rx: Receiver<EngineCommand>,
+        egress_tx: Sender<Vec<u8>>,
+        egress_rx: Receiver<Vec<u8>>,
+    ) -> Self {
         let frame_slot = Arc::new(ArcSwapOption::from(None));
         let frame_ready = Arc::new(AtomicBool::new(false));
         let waker: WakerSlot = Arc::new(Mutex::new(None));
         let inspect = Arc::new(InspectShared::new(cfg.cols, cfg.rows, cfg.max_scrollback));
         let test_build_failures = Arc::new(AtomicUsize::new(0));
+        let access_epoch = Arc::new(AtomicU64::new(0));
+        let input_forwarder = InputForwarder::spawn(cmd_tx.clone());
 
         let join = worker::spawn_worker(
             cfg,
@@ -71,6 +93,8 @@ impl EngineHandle {
 
         Self {
             cmd_tx,
+            input_forwarder: Some(input_forwarder),
+            access_epoch,
             frame_slot,
             frame_ready,
             waker,
@@ -80,6 +104,38 @@ impl EngineHandle {
             #[cfg(test)]
             test_build_failures,
         }
+    }
+
+    /// Enqueue a user-input command via the off-fg forwarder (never blocks the caller).
+    ///
+    /// Stamps the current [`access_epoch`](Self::bump_access_epoch) onto `Key` / `Focus` at
+    /// enqueue time.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "TerminalTab input path wired in Task 5+")
+    )]
+    pub(crate) fn enqueue_input(&self, mut cmd: EngineCommand) -> Result<(), FeedError> {
+        let epoch = self.access_epoch.load(Ordering::Acquire);
+        match &mut cmd {
+            EngineCommand::Key(input) => input.access_epoch = epoch,
+            EngineCommand::Focus {
+                access_epoch: cmd_epoch,
+                ..
+            } => *cmd_epoch = epoch,
+            _ => {}
+        }
+        let forwarder = self.input_forwarder.as_ref().ok_or(FeedError::Stopped)?;
+        forwarder.try_enqueue(cmd).map_err(|()| FeedError::Stopped)
+    }
+
+    /// Bump the access epoch and purge pending local input (read-only downgrade).
+    #[allow(dead_code, reason = "read-only downgrade wired in Task 6")]
+    pub(crate) fn bump_access_epoch(&self) -> u64 {
+        let new = self.access_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        if let Some(forwarder) = &self.input_forwarder {
+            forwarder.purge();
+        }
+        new
     }
 
     pub fn feed(&self, bytes: Vec<u8>) -> Result<(), FeedError> {
@@ -156,6 +212,11 @@ impl EngineHandle {
     }
 
     #[cfg(test)]
+    fn spawn_with_cmd_cap_for_test(cfg: EngineConfig, cmd_cap: usize) -> Self {
+        Self::spawn_with_cmd_cap(cfg, cmd_cap)
+    }
+
+    #[cfg(test)]
     fn frame_slot(&self) -> Arc<ArcSwapOption<Frame>> {
         Arc::clone(&self.frame_slot)
     }
@@ -170,14 +231,20 @@ impl EngineHandle {
     }
 
     fn shutdown_worker(&mut self) {
+        if let Some(mut forwarder) = self.input_forwarder.take() {
+            forwarder.sever_and_join();
+        }
         let _ = self.cmd_tx.send(EngineCommand::Stop);
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
     }
 
-    fn signal_stop(&mut self) {
-        let _ = self.cmd_tx.send(EngineCommand::Stop);
+    fn signal_stop_nonblocking(&mut self) {
+        if let Some(forwarder) = &self.input_forwarder {
+            forwarder.signal_stop_nonblocking();
+        }
+        let _ = self.cmd_tx.try_send(EngineCommand::Stop);
     }
 }
 
@@ -189,7 +256,8 @@ impl Drop for EngineHandle {
     /// [`EngineHandle::stop`] from a background task instead.
     fn drop(&mut self) {
         if self.join.is_some() {
-            self.signal_stop();
+            self.signal_stop_nonblocking();
+            let _ = self.input_forwarder.take();
             let _ = self.join.take();
         }
     }
@@ -203,6 +271,7 @@ mod tests {
 
     use super::*;
     use crate::engine::command::{KeyAction, KeyInput, KeyMods, LensKey};
+    use crate::engine::forwarder::InputForwarder;
     use crate::engine::inspect::InspectEventKind;
     use crate::engine::worker::EngineCommand;
 
@@ -225,6 +294,106 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
         }
         panic!("timeout waiting for frame");
+    }
+
+    #[test]
+    fn try_enqueue_never_blocks_when_engine_channel_full() {
+        let h = EngineHandle::spawn_with_cmd_cap_for_test(test_config(), 1);
+        h.cmd_sender()
+            .send(EngineCommand::BuildNow)
+            .expect("fill cmd channel");
+
+        let key = KeyInput {
+            action: KeyAction::Press,
+            key: LensKey::A,
+            mods: KeyMods::default(),
+            utf8: Some("a".into()),
+            composing: false,
+            access_epoch: 0,
+            ack: None,
+        };
+        let start = Instant::now();
+        for _ in 0..1000 {
+            h.enqueue_input(EngineCommand::Key(key.clone_without_ack()))
+                .expect("try_enqueue must not block");
+        }
+        assert!(
+            start.elapsed() < Duration::from_millis(50),
+            "1000 try_enqueues took {:?}",
+            start.elapsed()
+        );
+        h.stop();
+    }
+
+    #[test]
+    fn sever_unblocks_forwarder_after_blocked_barrier() {
+        let (cmd_tx, cmd_rx) = crossbeam_channel::bounded(1);
+        let _hold_rx = cmd_rx;
+        cmd_tx
+            .send(EngineCommand::BuildNow)
+            .expect("fill cmd channel");
+
+        let mut forwarder = InputForwarder::spawn(cmd_tx);
+        let key = KeyInput {
+            action: KeyAction::Press,
+            key: LensKey::A,
+            mods: KeyMods::default(),
+            utf8: Some("a".into()),
+            composing: false,
+            access_epoch: 0,
+            ack: None,
+        };
+        forwarder
+            .try_enqueue(EngineCommand::Key(key.clone_without_ack()))
+            .expect("enqueue key");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !forwarder.blocked_in_retry().load(Ordering::Acquire) {
+            if Instant::now() >= deadline {
+                panic!("timeout waiting for forwarder blocked-in-retry barrier");
+            }
+            thread::yield_now();
+        }
+
+        let done_rx = forwarder.take_sever_done_rx().expect("sever done rx");
+        forwarder.sever_and_join();
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("forwarder must exit after sever");
+    }
+
+    #[test]
+    fn drop_engine_handle_does_not_block_on_full_cmd_channel() {
+        let h = EngineHandle::spawn_with_cmd_cap_for_test(test_config(), 1);
+        h.cmd_sender()
+            .send(EngineCommand::BuildNow)
+            .expect("fill cmd channel");
+        let start = Instant::now();
+        drop(h);
+        assert!(
+            start.elapsed() < Duration::from_millis(50),
+            "Drop blocked for {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn forwarder_delivers_key_via_enqueue_input() {
+        let h = EngineHandle::spawn(test_config());
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+        h.enqueue_input(EngineCommand::Key(KeyInput {
+            action: KeyAction::Press,
+            key: LensKey::ArrowUp,
+            mods: KeyMods::default(),
+            utf8: None,
+            composing: false,
+            access_epoch: 0,
+            ack: Some(ack_tx),
+        }))
+        .unwrap();
+        let ack = ack_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(ack.accepted);
+        h.stop();
     }
 
     #[test]
