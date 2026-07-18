@@ -96,7 +96,12 @@ fn bridge_loop(
         let oper = sel.select();
 
         let exit = match oper.index() {
-            i if i == stop_idx => break,
+            // Complete the selected op before breaking: crossbeam's `SelectedOperation`
+            // panics on drop if not consumed via recv/send.
+            i if i == stop_idx => {
+                let _ = oper.recv(&stop_rx);
+                break;
+            }
             i if i == inbound_idx => match oper.recv(&inbound) {
                 Ok(msg) => handle_inbound(&engine, &policy_tx, msg),
                 Err(_) => {
