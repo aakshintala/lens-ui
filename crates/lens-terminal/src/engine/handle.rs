@@ -12,7 +12,7 @@ use super::forwarder::InputForwarder;
 use super::frame::Frame;
 use super::inspect::{EngineInspect, InspectShared};
 use super::vt::EngineConfig;
-use super::worker::{self, EngineCommand, WakerSlot};
+use super::worker::{self, EngineCommand, TestChunkBarrier, WakerSlot};
 
 /// Backpressure / lifecycle error when sending to a stopped or saturated engine.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -44,6 +44,8 @@ pub struct EngineHandle {
     /// — set via `test_inject_build_failures`, shared with this handle's worker.
     #[cfg(test)]
     test_build_failures: Arc<AtomicUsize>,
+    #[cfg(test)]
+    chunk_barrier: Arc<TestChunkBarrier>,
 }
 
 impl std::fmt::Debug for EngineHandle {
@@ -82,6 +84,7 @@ impl EngineHandle {
         let waker: WakerSlot = Arc::new(Mutex::new(None));
         let inspect = Arc::new(InspectShared::new(cfg.cols, cfg.rows, cfg.max_scrollback));
         let test_build_failures = Arc::new(AtomicUsize::new(0));
+        let chunk_barrier = Arc::new(TestChunkBarrier::new());
         let access_epoch = Arc::new(AtomicU64::new(0));
         #[cfg(any(test, feature = "test-util"))]
         let worker_stall_gate = Arc::new(AtomicBool::new(false));
@@ -101,6 +104,7 @@ impl EngineHandle {
             Arc::clone(&worker_stall_gate),
             #[cfg(not(any(test, feature = "test-util")))]
             Arc::new(AtomicBool::new(false)),
+            Arc::clone(&chunk_barrier),
         );
 
         Self {
@@ -117,6 +121,8 @@ impl EngineHandle {
             join: Some(join),
             #[cfg(test)]
             test_build_failures,
+            #[cfg(test)]
+            chunk_barrier,
         }
     }
 
@@ -227,6 +233,24 @@ impl EngineHandle {
     )]
     pub(crate) fn test_release_worker(&self) {
         self.worker_stall_gate.store(false, Ordering::Release);
+    }
+
+    /// Arm a barrier the worker waits on after chunk 0 of a multi-chunk Feed.
+    #[cfg(test)]
+    pub(crate) fn test_arm_chunk_barrier(&self) {
+        self.chunk_barrier.arm();
+    }
+
+    /// Block until the worker finishes feeding chunk 0 (requires [`Self::test_arm_chunk_barrier`]).
+    #[cfg(test)]
+    pub(crate) fn test_wait_after_first_chunk(&self) {
+        self.chunk_barrier.wait_after_first_chunk();
+    }
+
+    /// Release the worker from the post-chunk-0 barrier.
+    #[cfg(test)]
+    pub(crate) fn test_release_chunk_barrier(&self) {
+        self.chunk_barrier.release();
     }
 
     /// Bypass the publish throttle — intended for deterministic tests.
@@ -649,6 +673,95 @@ mod tests {
             .expect("ack timeout");
         assert_eq!(ack.encoded, b"\x1bOA");
         assert!(ack.accepted);
+        h.stop();
+    }
+
+    #[test]
+    fn feed_is_atomic_key_after_feed_sees_post_feed_modes() {
+        let h = EngineHandle::spawn(test_config());
+        h.feed(b"\x1b[?1h".to_vec()).unwrap();
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+        h.enqueue_input(EngineCommand::Key(KeyInput {
+            action: KeyAction::Press,
+            key: LensKey::ArrowUp,
+            mods: KeyMods::default(),
+            utf8: None,
+            composing: false,
+            access_epoch: 0,
+            ack: Some(ack_tx),
+        }))
+        .unwrap();
+        let ack = ack_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(ack.encoded, b"\x1bOA");
+        h.stop();
+    }
+
+    #[test]
+    fn key_before_feed_sees_pre_feed_modes() {
+        let h = EngineHandle::spawn(test_config());
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+        h.enqueue_input(EngineCommand::Key(KeyInput {
+            action: KeyAction::Press,
+            key: LensKey::ArrowUp,
+            mods: KeyMods::default(),
+            utf8: None,
+            composing: false,
+            access_epoch: 0,
+            ack: Some(ack_tx),
+        }))
+        .unwrap();
+        let mut mode_and_pad = Vec::with_capacity(64 * 1024);
+        mode_and_pad.extend_from_slice(b"\x1b[?1h");
+        mode_and_pad.resize(64 * 1024, b' ');
+        h.feed(mode_and_pad).unwrap();
+        let ack = ack_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(ack.encoded, b"\x1b[A");
+        h.stop();
+    }
+
+    #[test]
+    fn stop_preempts_feed_between_chunks_deterministically() {
+        use crate::engine::worker::MAX_FEED_CHUNK;
+
+        let h = EngineHandle::spawn(test_config());
+        h.set_inspect_enabled(true);
+        h.test_arm_chunk_barrier();
+        h.feed(vec![b'X'; 64 * 1024]).unwrap();
+        h.test_wait_after_first_chunk();
+        h.cmd_sender().send(EngineCommand::Stop).unwrap();
+        h.test_release_chunk_barrier();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while h.cmd_sender().try_send(EngineCommand::BuildNow).is_ok() {
+            assert!(Instant::now() < deadline, "worker did not exit after Stop");
+        }
+        let fed = h.inspect().bytes_fed;
+        h.stop();
+        assert!(fed >= MAX_FEED_CHUNK as u64);
+        assert!(fed < 64 * 1024);
+    }
+
+    #[test]
+    fn decset_straddling_feed_chunk_boundary_still_applies() {
+        use crate::engine::worker::MAX_FEED_CHUNK;
+
+        assert_eq!(MAX_FEED_CHUNK, 4096);
+        let h = EngineHandle::spawn(test_config());
+        let mut buf = vec![b' '; 4094];
+        buf.extend_from_slice(b"\x1b[?1h");
+        h.feed(buf).unwrap();
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+        h.enqueue_input(EngineCommand::Key(KeyInput {
+            action: KeyAction::Press,
+            key: LensKey::ArrowUp,
+            mods: KeyMods::default(),
+            utf8: None,
+            composing: false,
+            access_epoch: 0,
+            ack: Some(ack_tx),
+        }))
+        .unwrap();
+        let ack = ack_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(ack.encoded, b"\x1bOA");
         h.stop();
     }
 

@@ -1,5 +1,6 @@
 //! Engine worker run-loop — owns the non-`Send` [`VtEngine`] on a pinned OS thread.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -19,6 +20,78 @@ const CMD_CHANNEL_CAP: usize = 256;
 const EGRESS_CHANNEL_CAP: usize = 64;
 /// Default min interval between frame builds (~60 Hz).
 const DEFAULT_BUILD_INTERVAL: Duration = Duration::from_millis(16);
+
+pub(crate) const MAX_FEED_CHUNK: usize = 4096;
+const PENDING_PROBE_CAP: usize = 32;
+
+/// Deterministic sync for Stop-preempt-between-chunks test (`cfg(test)` only).
+pub(crate) struct TestChunkBarrier {
+    #[cfg(test)]
+    armed: AtomicBool,
+    #[cfg(test)]
+    after_chunk0_tx: Mutex<Option<Sender<()>>>,
+    #[cfg(test)]
+    after_chunk0_rx: Mutex<Option<crossbeam_channel::Receiver<()>>>,
+    #[cfg(test)]
+    release: AtomicBool,
+}
+
+impl TestChunkBarrier {
+    pub fn new() -> Self {
+        Self {
+            #[cfg(test)]
+            armed: AtomicBool::new(false),
+            #[cfg(test)]
+            after_chunk0_tx: Mutex::new(None),
+            #[cfg(test)]
+            after_chunk0_rx: Mutex::new(None),
+            #[cfg(test)]
+            release: AtomicBool::new(false),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn arm(&self) {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        *self.after_chunk0_tx.lock().expect("chunk barrier tx") = Some(tx);
+        *self.after_chunk0_rx.lock().expect("chunk barrier rx") = Some(rx);
+        self.release.store(false, Ordering::Release);
+        self.armed.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub fn wait_after_first_chunk(&self) {
+        let rx = self
+            .after_chunk0_rx
+            .lock()
+            .expect("chunk barrier rx")
+            .take()
+            .expect("chunk barrier not armed");
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("timeout waiting for worker after chunk 0");
+    }
+
+    #[cfg(test)]
+    pub fn release(&self) {
+        self.release.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn signal_and_wait_after_chunk0(&self) {
+        if let Some(tx) = self
+            .after_chunk0_tx
+            .lock()
+            .expect("chunk barrier tx")
+            .take()
+        {
+            let _ = tx.send(());
+        }
+        while !self.release.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+        self.armed.store(false, Ordering::Release);
+    }
+}
 
 /// User-input egress channel is full — never drop-oldest on this path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -86,6 +159,7 @@ pub(crate) fn spawn_worker(
     test_build_failures: Arc<AtomicUsize>,
     #[cfg_attr(not(any(test, feature = "test-util")), allow(unused_variables))]
     worker_stall_gate: Arc<AtomicBool>,
+    chunk_barrier: Arc<TestChunkBarrier>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut engine = match VtEngine::new(&cfg, |_| {}) {
@@ -100,6 +174,7 @@ pub(crate) fn spawn_worker(
         let mut visible = true;
         let mut force_build = false;
         let mut stopping = false;
+        let mut pending: VecDeque<EngineCommand> = VecDeque::new();
         let mut last_build = Instant::now()
             .checked_sub(DEFAULT_BUILD_INTERVAL)
             .unwrap_or_else(Instant::now);
@@ -130,15 +205,19 @@ pub(crate) fn spawn_worker(
                 if matches!(cmd, EngineCommand::Stop) {
                     stopping = true;
                 } else {
-                    handle_command(
+                    dispatch_command(
                         cmd,
                         &mut engine,
+                        &cmd_rx,
                         &egress_tx,
                         &egress_rx,
                         &inspect,
                         &mut dirty,
                         &mut visible,
                         &mut force_build,
+                        &mut pending,
+                        &mut stopping,
+                        &chunk_barrier,
                     );
                 }
             }
@@ -148,15 +227,19 @@ pub(crate) fn spawn_worker(
                     stopping = true;
                     break;
                 }
-                handle_command(
+                dispatch_command(
                     cmd,
                     &mut engine,
+                    &cmd_rx,
                     &egress_tx,
                     &egress_rx,
                     &inspect,
                     &mut dirty,
                     &mut visible,
                     &mut force_build,
+                    &mut pending,
+                    &mut stopping,
+                    &chunk_barrier,
                 );
             }
 
@@ -199,27 +282,214 @@ pub(crate) fn spawn_worker(
     clippy::too_many_arguments,
     reason = "command dispatch threads engine + I/O handles"
 )]
-fn handle_command(
+fn dispatch_command(
     cmd: EngineCommand,
     engine: &mut VtEngine,
+    cmd_rx: &Receiver<EngineCommand>,
     egress_tx: &Sender<Vec<u8>>,
     egress_rx: &Receiver<Vec<u8>>,
     inspect: &InspectShared,
     dirty: &mut bool,
     visible: &mut bool,
     force_build: &mut bool,
+    pending: &mut VecDeque<EngineCommand>,
+    stopping: &mut bool,
+    chunk_barrier: &TestChunkBarrier,
 ) {
     match cmd {
-        EngineCommand::Feed(bytes) => {
-            let n = bytes.len() as u64;
-            engine.feed(&bytes);
-            inspect.record_bytes_fed(n);
-            let replies = engine.take_replies();
-            if !replies.is_empty() {
-                inspect.record_egress(replies.len());
-                emit_reply_egress(egress_tx, egress_rx, replies);
+        EngineCommand::Feed(bytes) => handle_feed_chunked(
+            bytes,
+            engine,
+            cmd_rx,
+            egress_tx,
+            egress_rx,
+            inspect,
+            dirty,
+            visible,
+            force_build,
+            pending,
+            stopping,
+            chunk_barrier,
+        ),
+        EngineCommand::Stop => *stopping = true,
+        other => handle_command(
+            other,
+            engine,
+            egress_tx,
+            egress_rx,
+            inspect,
+            dirty,
+            visible,
+            force_build,
+        ),
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "feed chunk loop threads engine + channel handles"
+)]
+fn handle_feed_chunked(
+    bytes: Vec<u8>,
+    engine: &mut VtEngine,
+    cmd_rx: &Receiver<EngineCommand>,
+    egress_tx: &Sender<Vec<u8>>,
+    egress_rx: &Receiver<Vec<u8>>,
+    inspect: &InspectShared,
+    dirty: &mut bool,
+    visible: &mut bool,
+    force_build: &mut bool,
+    pending: &mut VecDeque<EngineCommand>,
+    stopping: &mut bool,
+    chunk_barrier: &TestChunkBarrier,
+) {
+    let total = bytes.len();
+    let mut offset = 0usize;
+    #[cfg(test)]
+    let chunk_count = total.div_ceil(MAX_FEED_CHUNK);
+    #[cfg(test)]
+    let mut chunk_idx = 0usize;
+
+    while offset < total {
+        if *stopping {
+            return;
+        }
+
+        let end = (offset + MAX_FEED_CHUNK).min(total);
+        feed_chunk(
+            &bytes[offset..end],
+            engine,
+            egress_tx,
+            egress_rx,
+            inspect,
+            dirty,
+        );
+        offset = end;
+
+        #[cfg(test)]
+        {
+            if chunk_barrier.armed.load(Ordering::Acquire) && chunk_count >= 2 && chunk_idx == 0 {
+                chunk_barrier.signal_and_wait_after_chunk0();
             }
-            *dirty = true;
+            chunk_idx += 1;
+        }
+
+        probe_pending_during_feed(cmd_rx, pending, stopping);
+        if *stopping {
+            return;
+        }
+    }
+
+    drain_pending_after_feed(
+        pending,
+        engine,
+        cmd_rx,
+        egress_tx,
+        egress_rx,
+        inspect,
+        dirty,
+        visible,
+        force_build,
+        stopping,
+        chunk_barrier,
+    );
+}
+
+fn feed_chunk(
+    chunk: &[u8],
+    engine: &mut VtEngine,
+    egress_tx: &Sender<Vec<u8>>,
+    egress_rx: &Receiver<Vec<u8>>,
+    inspect: &InspectShared,
+    dirty: &mut bool,
+) {
+    let n = chunk.len() as u64;
+    engine.feed(chunk);
+    inspect.record_bytes_fed(n);
+    let replies = engine.take_replies();
+    if !replies.is_empty() {
+        inspect.record_egress(replies.len());
+        emit_reply_egress(egress_tx, egress_rx, replies);
+    }
+    *dirty = true;
+}
+
+fn probe_pending_during_feed(
+    cmd_rx: &Receiver<EngineCommand>,
+    pending: &mut VecDeque<EngineCommand>,
+    stopping: &mut bool,
+) {
+    for _ in 0..PENDING_PROBE_CAP {
+        match cmd_rx.try_recv() {
+            Ok(EngineCommand::Stop) => {
+                *stopping = true;
+                return;
+            }
+            Ok(cmd) => pending.push_back(cmd),
+            Err(_) => break,
+        }
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "pending drain re-dispatches through the command path"
+)]
+fn drain_pending_after_feed(
+    pending: &mut VecDeque<EngineCommand>,
+    engine: &mut VtEngine,
+    cmd_rx: &Receiver<EngineCommand>,
+    egress_tx: &Sender<Vec<u8>>,
+    egress_rx: &Receiver<Vec<u8>>,
+    inspect: &InspectShared,
+    dirty: &mut bool,
+    visible: &mut bool,
+    force_build: &mut bool,
+    stopping: &mut bool,
+    chunk_barrier: &TestChunkBarrier,
+) {
+    while let Some(cmd) = pending.pop_front() {
+        if *stopping {
+            pending.push_front(cmd);
+            return;
+        }
+        dispatch_command(
+            cmd,
+            engine,
+            cmd_rx,
+            egress_tx,
+            egress_rx,
+            inspect,
+            dirty,
+            visible,
+            force_build,
+            pending,
+            stopping,
+            chunk_barrier,
+        );
+        if *stopping {
+            return;
+        }
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "command dispatch threads engine + I/O handles"
+)]
+fn handle_command(
+    cmd: EngineCommand,
+    engine: &mut VtEngine,
+    egress_tx: &Sender<Vec<u8>>,
+    _egress_rx: &Receiver<Vec<u8>>,
+    inspect: &InspectShared,
+    dirty: &mut bool,
+    visible: &mut bool,
+    force_build: &mut bool,
+) {
+    match cmd {
+        EngineCommand::Feed(_) => {
+            debug_assert!(false, "Feed must go through handle_feed_chunked");
         }
         EngineCommand::Key(mut input) => {
             let ack_tx = input.ack.take();
