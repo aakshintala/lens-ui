@@ -5,28 +5,39 @@ the current forward-looking state only. **Full dated session entries live in
 [`STATUS-ARCHIVE.md`](./STATUS-ARCHIVE.md)** — write each session's detail there
 and roll older "Recent" pointers off this page as they age.
 
-_Last curated 2026-07-17 (the pre-07-17 detail was rolled into the archive)._
+_Last curated 2026-07-18 (B-1 board data model shipped; board framing updated B6–B8 → B-1..B-6)._
 
 ---
 
 ## Next up
 
-- **▶ Board packing B6–B8** — the last structural piece of board-home (continues the wave build;
-  B1–B5 shipped). Scope per the `docs/design/renders/board-home.html` mockup is **three sub-features**,
-  not just a scrollbar: (B6) vertical scroll container + adaptive auto-fill grid; (B7) stable ordinal
-  ordering (today it's a placeholder `session_id` string sort in `board/mod.rs:187`); (B8) **grouped
-  lanes** — the mockup wraps cards in per-`workspace` lanes (`.gwrap`: colored border, header with
-  aggregate `$cost · Nd` + "N done" pill). The card model already carries `workspace` + `cumulative_cost`
-  for the group key/aggregation.
-  - **Acceptance gate (the one genuinely-remaining perf item):** full-scale >8-card off-screen
-    culling has never been exercised on-device — there's no scroll container yet. It rides *with* B6;
-    it is not a separate task.
-  - **Heads-up carried from the freeze fix:** B6's scroll container is a *different* off→on transition
-    than focus↔board. The current fix (`BoardView::recover_viewport_gates_on_reentry`) is edge-based on
-    the focus↔board mode switch — a card scrolling back into view has **no mode change**, so it won't
-    trigger the gate reset. B6 needs either its own scroll-driven gate reset or a revisit of the general
-    approach (paint-safe `on_next_frame` is clean on-device but a no-op in the test platform). Detail in
-    memory [[viewport-reentry-freeze]] and `docs/handoffs/2026-07-17-viewport-reentry-freeze.md`.
+- **▶ Board B-2..B-6 (board-home)** — §4 board is now decomposed into **six specs B-1..B-6**
+  (`docs/SPEC-GAPS.md` → "Board (§4) implementation specs"; supersedes the old B6/B7/B8 framing — B7
+  "stable ordinal ordering" dissolved into B-1's ordinal slots, no separate sort task).
+  **B-1 (data model & persistence) shipped 2026-07-18** (`8100cc8`; `lens-core` `BoardLayout` tree +
+  `SqliteBoardStore`, schema v3). Remaining, in dependency order:
+  - **B-2 — packing / scroll / culling** (NEXT): vertical scroll container + adaptive auto-fill grid over
+    B-1's tree. Consumes an ordered walk — the `board_tree(board_id)` read-API is **not yet exposed**
+    (B-1 has only `children(board_id, parent)`); add the visitor when B-2 needs it. The one remaining
+    perf item — full-scale >8-card off-screen culling, never exercised on-device — rides here (no scroll
+    container exists yet, so it's not a separate task).
+  - **B-3 — group render + cost/count/age aggregation** (the mockup's `.gwrap` lanes: colored border,
+    `$cost · Nd` header + "N done" pill). Cost is **derived at render** (sum members' `cumulative_cost`);
+    B-1 stores none. B-3 owns the palette/picker (B-1 just persists the chosen `color_token`).
+  - **B-4 — drag/move + context-menu grouping** — drives B-1's `move_item`/`ungroup`/`create_group`.
+  - **B-5 — multiple boards + rail switcher** — board CRUD (B-1 seeds only the default board), the
+    externally-discovered-session landing policy, and `FleetStore` connection-scoping.
+  - **B-6 — archive-as-board surface.**
+  - **Wiring gap:** B-1 is `lens-core` ONLY. The `lens-ui` `BoardView` still uses its placeholder
+    ordering and is **not yet wired** to read `BoardLayout` / call `BoardStore` ops (spec §6 replica) —
+    that consumer wiring rides with B-2/B-4.
+  - **Heads-up (carried from the freeze fix) → now B-2's:** the scroll container is a *different* off→on
+    transition than focus↔board. The current fix (`BoardView::recover_viewport_gates_on_reentry`) is
+    edge-based on the focus↔board mode switch — a card scrolling back into view has **no mode change**,
+    so it won't trigger the gate reset. B-2 needs its own scroll-driven gate reset or a revisit (paint-safe
+    `on_next_frame` is clean on-device but a no-op in the test platform). Memory [[viewport-reentry-freeze]]
+    + `docs/handoffs/2026-07-17-viewport-reentry-freeze.md`.
+  - Grounding: spec `docs/specs/2026-07-18-board-data-model-persistence-design.md`, memory [[board-b1-executed]].
 
 - **▶ `lens-ui` transcript fan-out** — the first real consumer of the Detailed feed + the disk
   `RowSource`/D23 render window (markdown + virtualization spikes both GO). Plugs into the slot API the
@@ -74,6 +85,15 @@ _Last curated 2026-07-17 (the pre-07-17 detail was rolled into the archive)._
 
 ## Recently shipped (all on `main` unless noted)
 
+- **Board B-1 — data model & persistence (2026-07-18):** `lens-core` `BoardLayout` recursive
+  Board→(Card|Group) tree + `SqliteBoardStore` (control-tier `lens.db`, schema **v2→v3** additive, lazy
+  placement no backfill), ordinal-slot placement, mutation ops (place/move/ungroup/group/archive/…),
+  bidirectional startup reconcile (lazy-place live, prune tombstoned). Adversarial review (grok-4.5 +
+  probe tests; grok's "HIGH id-collision" refuted empirically) → 5 hardening fixes (high-water-mark id
+  seed, tombstone place-guard, cycle seen-guard, deterministic reconcile order, +7 tests). 30 board
+  tests, full `xtask gate` green. Committed **`8100cc8` (UNPUSHED)**. Spec
+  `2026-07-18-board-data-model-persistence-design.md`; memory [[board-b1-executed]]; handoff
+  `docs/handoffs/2026-07-18-board-b1-executed.md`.
 - **Wave build B1–B5 + follow-ups (2026-07-17):** Lucide glyph tiles, context pbar, Slept/Wake/Retry
   seams, `loader-circle` spinner, canvas `paint_path` sweep, Scheduled countdown, viewport-gated
   20fps/1Hz anim driver, `demo` feature-gate; on-device visual pass; per-wave card-body wash; header
@@ -100,5 +120,7 @@ _Last curated 2026-07-17 (the pre-07-17 detail was rolled into the archive)._
 
 ## Housekeeping
 
-- **`main` pushed to `origin` (2026-07-17)** — the wave follow-ups + viewport freeze fix are on
-  `origin/main` (`b8727ab`). In sync.
+- **`main` is AHEAD of `origin` by 5 (unpushed, as of 2026-07-18):** `759eb3a` (status fix) ·
+  `c855ab6` (SPEC-GAPS §4 board → B-1..B-6) · `c21e669` (docs relocate → specs/plans) · `8100cc8`
+  (B-1 board data model) · this docs-status commit. `origin/main` is at `b8727ab`. Push decision
+  deferred to the user.
