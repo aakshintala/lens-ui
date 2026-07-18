@@ -134,7 +134,14 @@ mod tests {
         let (inbound_tx, inbound_rx) = crossbeam_channel::bounded::<WsInbound>(1);
         let (outbound_tx, _) = crossbeam_channel::bounded::<WsOutbound>(1);
         let (policy_tx, _) = async_channel::bounded(1);
-        let bridge = spawn_bridge(inbound_rx, outbound_tx, Arc::clone(&engine), policy_tx);
+        let egress_rx = engine.attach_test_egress();
+        let bridge = spawn_bridge(
+            inbound_rx,
+            outbound_tx,
+            Arc::clone(&engine),
+            policy_tx,
+            egress_rx,
+        );
         drop(inbound_tx);
         let rt = TerminalRuntime {
             bridge: Some(bridge),
@@ -154,7 +161,14 @@ mod tests {
         let (_t, inbound_rx) = crossbeam_channel::bounded::<WsInbound>(1);
         let (outbound_tx, _) = crossbeam_channel::bounded::<WsOutbound>(1);
         let (policy_tx, _) = async_channel::bounded(1);
-        let bridge = spawn_bridge(inbound_rx, outbound_tx, Arc::clone(&engine), policy_tx);
+        let egress_rx = engine.attach_test_egress();
+        let bridge = spawn_bridge(
+            inbound_rx,
+            outbound_tx,
+            Arc::clone(&engine),
+            policy_tx,
+            egress_rx,
+        );
         let rt = TerminalRuntime {
             bridge: Some(bridge),
             attach: None,

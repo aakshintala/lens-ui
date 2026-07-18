@@ -17,7 +17,7 @@ use super::vt::{EngineConfig, VtEngine};
 pub(crate) type WakerSlot = Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>;
 
 const CMD_CHANNEL_CAP: usize = 256;
-const EGRESS_CHANNEL_CAP: usize = 64;
+pub(crate) const EGRESS_CHANNEL_CAP: usize = 64;
 /// Default min interval between frame builds (~60 Hz).
 const DEFAULT_BUILD_INTERVAL: Duration = Duration::from_millis(16);
 
@@ -93,9 +93,23 @@ impl TestChunkBarrier {
     }
 }
 
-/// User-input egress channel is full — never drop-oldest on this path.
+/// One unit of engine→transport egress, routed to the bridge for the connection that
+/// is currently attached. Each connection owns its own channel (C2): residue from a
+/// prior connection lives in that connection's channel and is never delivered to a
+/// different one.
+pub struct EgressFrame {
+    pub kind: EgressKind,
+    pub bytes: Vec<u8>,
+}
+
+/// `Input` = encoded user keystrokes / committed text — a stale drop is user-visible
+/// data loss (surfaced). `Other` = focus reports and DA/DSR replies — protocol
+/// housekeeping, dropped silently.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct UserEgressFull;
+pub enum EgressKind {
+    Input,
+    Other,
+}
 
 pub(crate) enum EngineCommand {
     Feed(Vec<u8>),
@@ -110,25 +124,18 @@ pub(crate) enum EngineCommand {
     SetVisible(bool),
     /// Test/deterministic helper — bypass the time throttle for one publish pass.
     BuildNow,
+    SetEgress(Option<Sender<EgressFrame>>),
     Stop,
 }
 
 pub(crate) struct WorkerChannels {
     pub cmd_tx: Sender<EngineCommand>,
     pub cmd_rx: Receiver<EngineCommand>,
-    pub egress_tx: Sender<Vec<u8>>,
-    pub egress_rx: Receiver<Vec<u8>>,
 }
 
 pub(crate) fn worker_channels() -> WorkerChannels {
     let (cmd_tx, cmd_rx) = crossbeam_channel::bounded(CMD_CHANNEL_CAP);
-    let (egress_tx, egress_rx) = crossbeam_channel::bounded(EGRESS_CHANNEL_CAP);
-    WorkerChannels {
-        cmd_tx,
-        cmd_rx,
-        egress_tx,
-        egress_rx,
-    }
+    WorkerChannels { cmd_tx, cmd_rx }
 }
 
 #[expect(
@@ -138,8 +145,6 @@ pub(crate) fn worker_channels() -> WorkerChannels {
 pub(crate) fn spawn_worker(
     cfg: EngineConfig,
     cmd_rx: Receiver<EngineCommand>,
-    egress_tx: Sender<Vec<u8>>,
-    egress_rx: Receiver<Vec<u8>>,
     frame_slot: Arc<ArcSwapOption<Frame>>,
     frame_ready: Arc<AtomicBool>,
     waker: WakerSlot,
@@ -169,6 +174,7 @@ pub(crate) fn spawn_worker(
         let mut last_build = Instant::now()
             .checked_sub(DEFAULT_BUILD_INTERVAL)
             .unwrap_or_else(Instant::now);
+        let mut egress: Option<Sender<EgressFrame>> = None;
 
         loop {
             #[cfg(any(test, feature = "test-util"))]
@@ -201,8 +207,7 @@ pub(crate) fn spawn_worker(
                         cmd,
                         &mut engine,
                         &cmd_rx,
-                        &egress_tx,
-                        &egress_rx,
+                        &mut egress,
                         &inspect,
                         &mut dirty,
                         &mut visible,
@@ -224,8 +229,7 @@ pub(crate) fn spawn_worker(
                     cmd,
                     &mut engine,
                     &cmd_rx,
-                    &egress_tx,
-                    &egress_rx,
+                    &mut egress,
                     &inspect,
                     &mut dirty,
                     &mut visible,
@@ -280,8 +284,7 @@ fn dispatch_command(
     cmd: EngineCommand,
     engine: &mut VtEngine,
     cmd_rx: &Receiver<EngineCommand>,
-    egress_tx: &Sender<Vec<u8>>,
-    egress_rx: &Receiver<Vec<u8>>,
+    egress: &mut Option<Sender<EgressFrame>>,
     inspect: &InspectShared,
     dirty: &mut bool,
     visible: &mut bool,
@@ -296,8 +299,7 @@ fn dispatch_command(
             bytes,
             engine,
             cmd_rx,
-            egress_tx,
-            egress_rx,
+            egress,
             inspect,
             dirty,
             visible,
@@ -311,8 +313,7 @@ fn dispatch_command(
         other => handle_command(
             other,
             engine,
-            egress_tx,
-            egress_rx,
+            egress,
             inspect,
             dirty,
             visible,
@@ -330,8 +331,7 @@ fn handle_feed_chunked(
     bytes: Vec<u8>,
     engine: &mut VtEngine,
     cmd_rx: &Receiver<EngineCommand>,
-    egress_tx: &Sender<Vec<u8>>,
-    egress_rx: &Receiver<Vec<u8>>,
+    egress: &mut Option<Sender<EgressFrame>>,
     inspect: &InspectShared,
     dirty: &mut bool,
     visible: &mut bool,
@@ -355,7 +355,7 @@ fn handle_feed_chunked(
         }
 
         let end = (offset + MAX_FEED_CHUNK).min(total);
-        feed_chunk(&bytes[offset..end], engine, egress_tx, inspect, dirty);
+        feed_chunk(&bytes[offset..end], engine, egress.as_ref(), inspect, dirty);
         offset = end;
 
         #[cfg(test)]
@@ -377,8 +377,7 @@ fn handle_feed_chunked(
         pending,
         engine,
         cmd_rx,
-        egress_tx,
-        egress_rx,
+        egress,
         inspect,
         dirty,
         visible,
@@ -392,7 +391,7 @@ fn handle_feed_chunked(
 fn feed_chunk(
     chunk: &[u8],
     engine: &mut VtEngine,
-    egress_tx: &Sender<Vec<u8>>,
+    egress: Option<&Sender<EgressFrame>>,
     inspect: &InspectShared,
     dirty: &mut bool,
 ) {
@@ -403,7 +402,7 @@ fn feed_chunk(
     let replies = engine.take_replies();
     if !replies.is_empty() {
         inspect.record_egress(replies.len());
-        emit_reply_egress(egress_tx, replies);
+        emit_reply_egress(egress, replies);
     }
     *dirty = true;
 }
@@ -433,8 +432,7 @@ fn drain_pending_after_feed(
     pending: &mut VecDeque<EngineCommand>,
     engine: &mut VtEngine,
     cmd_rx: &Receiver<EngineCommand>,
-    egress_tx: &Sender<Vec<u8>>,
-    egress_rx: &Receiver<Vec<u8>>,
+    egress: &mut Option<Sender<EgressFrame>>,
     inspect: &InspectShared,
     dirty: &mut bool,
     visible: &mut bool,
@@ -452,8 +450,7 @@ fn drain_pending_after_feed(
             cmd,
             engine,
             cmd_rx,
-            egress_tx,
-            egress_rx,
+            egress,
             inspect,
             dirty,
             visible,
@@ -476,8 +473,7 @@ fn drain_pending_after_feed(
 fn handle_command(
     cmd: EngineCommand,
     engine: &mut VtEngine,
-    egress_tx: &Sender<Vec<u8>>,
-    _egress_rx: &Receiver<Vec<u8>>,
+    egress: &mut Option<Sender<EgressFrame>>,
     inspect: &InspectShared,
     dirty: &mut bool,
     visible: &mut bool,
@@ -489,6 +485,9 @@ fn handle_command(
     match cmd {
         EngineCommand::Feed(_) => {
             debug_assert!(false, "Feed must go through handle_feed_chunked");
+        }
+        EngineCommand::SetEgress(tx) => {
+            *egress = tx;
         }
         EngineCommand::Key(mut input) => {
             let cmd_epoch = input.access_epoch;
@@ -503,17 +502,14 @@ fn handle_command(
                             (Vec::new(), false)
                         } else {
                             inspect.record_keys_encoded();
-                            match try_emit_user_input(egress_tx, &bytes) {
-                                Ok(()) => {
-                                    inspect.record_user_egress_accepted();
-                                    (bytes, true)
-                                }
-                                Err(UserEgressFull) => {
-                                    inspect.record_user_egress_rejected();
-                                    // Never-drop: user input is atomically rejected (accepted:false), never drop-oldest (that policy is replies-only). Egress fills only when the bridge's forward_egress stalls on a full outbound; that path emits BridgeEvent::OutboundSaturated within 50ms (bridge.rs forward_egress) → reconnect. So saturation is surfaced to policy via the existing OutboundSaturated path (plan: "reuse OutboundSaturated with a clear comment") — no separate UserEgressSaturated event.
-                                    (bytes, false)
-                                }
+                            let delivered =
+                                try_emit_user_input(egress.as_ref(), EgressKind::Input, &bytes);
+                            if delivered {
+                                inspect.record_user_egress_accepted();
+                            } else {
+                                inspect.record_user_egress_rejected();
                             }
+                            (bytes, delivered)
                         }
                     }
                     Err(e) => {
@@ -540,13 +536,11 @@ fn handle_command(
                         return;
                     }
                     inspect.record_keys_encoded();
-                    match try_emit_user_input(egress_tx, &bytes) {
-                        Ok(()) => {
-                            inspect.record_user_egress_accepted();
-                        }
-                        Err(UserEgressFull) => {
-                            inspect.record_user_egress_rejected();
-                        }
+                    let delivered = try_emit_user_input(egress.as_ref(), EgressKind::Other, &bytes);
+                    if delivered {
+                        inspect.record_user_egress_accepted();
+                    } else {
+                        inspect.record_user_egress_rejected();
                     }
                 }
                 Ok(None) => {}
@@ -656,22 +650,25 @@ fn maybe_publish(
 }
 
 /// Non-blocking emit for DA/DSR replies; best-effort when egress is saturated.
-fn emit_reply_egress(tx: &Sender<Vec<u8>>, replies: Vec<u8>) {
-    match tx.try_send(replies) {
-        Ok(()) => {}
-        Err(TrySendError::Full(_)) => {
-            // Do NOT evict: the shared egress queue may hold never-drop user input.
-            // Drop this best-effort reply instead.
-        }
-        Err(TrySendError::Disconnected(_)) => {}
-    }
+fn emit_reply_egress(tx: Option<&Sender<EgressFrame>>, replies: Vec<u8>) {
+    let Some(tx) = tx else { return };
+    let _ = tx.try_send(EgressFrame {
+        kind: EgressKind::Other,
+        bytes: replies,
+    });
 }
 
-/// Never-drop user-input egress — on `Full`, return `Err` without evicting.
-fn try_emit_user_input(tx: &Sender<Vec<u8>>, bytes: &[u8]) -> Result<(), UserEgressFull> {
-    match tx.try_send(bytes.to_vec()) {
-        Ok(()) => Ok(()),
-        Err(TrySendError::Full(_)) => Err(UserEgressFull),
-        Err(TrySendError::Disconnected(_)) => Ok(()),
+/// Returns true iff `bytes` were handed to a live egress channel.
+fn try_emit_user_input(tx: Option<&Sender<EgressFrame>>, kind: EgressKind, bytes: &[u8]) -> bool {
+    let Some(tx) = tx else {
+        return false;
+    };
+    match tx.try_send(EgressFrame {
+        kind,
+        bytes: bytes.to_vec(),
+    }) {
+        Ok(()) => true,
+        Err(TrySendError::Full(_)) => false,
+        Err(TrySendError::Disconnected(_)) => false,
     }
 }

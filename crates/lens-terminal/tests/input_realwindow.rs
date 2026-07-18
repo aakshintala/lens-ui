@@ -18,7 +18,7 @@ use gpui::{
     Window, WindowBounds, WindowOptions, prelude::*, px, size,
 };
 use lens_terminal::render_test_api::ascii_frame;
-use lens_terminal::{CursorPos, EngineConfig, EngineHandle, TerminalTab};
+use lens_terminal::{CursorPos, EgressFrame, EngineConfig, EngineHandle, TerminalTab};
 
 const RECV_TIMEOUT: Duration = Duration::from_secs(2);
 const DOUBLE_EMIT_GUARD: Duration = Duration::from_millis(50);
@@ -96,7 +96,7 @@ type AwaitReceiver = async_channel::Receiver<Result<AwaitOutcome, String>>;
 struct HarnessView {
     phase: Rc<RefCell<Phase>>,
     await_rx: Rc<RefCell<Option<AwaitReceiver>>>,
-    engine: Arc<EngineHandle>,
+    egress: crossbeam_channel::Receiver<EgressFrame>,
     tab: gpui::Entity<TerminalTab>,
 }
 
@@ -110,6 +110,7 @@ impl HarnessView {
             cell_h_px: 16,
         };
         let engine = Arc::new(EngineHandle::spawn(cfg));
+        let egress = engine.attach_test_egress();
         let tab = TerminalTab::open_with_engine_for_test(Arc::clone(&engine), cx);
         let mut frame = ascii_frame(40, 10, ' ');
         frame.cursor = Some(CursorPos { col: 0, row: 0 });
@@ -119,21 +120,21 @@ impl HarnessView {
         Self {
             phase: Rc::new(RefCell::new(Phase::PrimePaint)),
             await_rx: Rc::new(RefCell::new(None)),
-            engine,
+            egress,
             tab,
         }
     }
 
     fn drain_egress(&self) {
-        while self.engine.egress_rx().try_recv().is_ok() {}
+        while self.egress.try_recv().is_ok() {}
     }
 
     fn spawn_await(&self, cx: &mut Context<Self>, step: Step) {
-        let engine = Arc::clone(&self.engine);
+        let egress = self.egress.clone();
         let (tx, rx) = async_channel::bounded(1);
         *self.await_rx.borrow_mut() = Some(rx);
         cx.spawn(async move |_weak, _cx| {
-            let result = await_single_egress(engine.as_ref(), step);
+            let result = await_single_egress(&egress, step);
             let _ = tx.send(result).await;
         })
         .detach();
@@ -196,7 +197,10 @@ fn fail(msg: &str) -> ! {
     std::process::exit(1);
 }
 
-fn await_single_egress(engine: &EngineHandle, step: Step) -> Result<AwaitOutcome, String> {
+fn await_single_egress(
+    egress: &crossbeam_channel::Receiver<EgressFrame>,
+    step: Step,
+) -> Result<AwaitOutcome, String> {
     let deadline = Instant::now() + RECV_TIMEOUT;
     let bytes = loop {
         if Instant::now() >= deadline {
@@ -209,8 +213,8 @@ fn await_single_egress(engine: &EngineHandle, step: Step) -> Result<AwaitOutcome
             }
             return Err(format!("timeout waiting for egress ({})", step.label()));
         }
-        if let Ok(bytes) = engine.egress_rx().try_recv() {
-            break bytes;
+        if let Ok(frame) = egress.try_recv() {
+            break frame.bytes;
         }
         std::thread::sleep(Duration::from_millis(1));
     };
@@ -224,8 +228,8 @@ fn await_single_egress(engine: &EngineHandle, step: Step) -> Result<AwaitOutcome
         ));
     }
 
-    match engine.egress_rx().recv_timeout(DOUBLE_EMIT_GUARD) {
-        Ok(extra) => Err(format!("{}: double-emit {extra:?}", step.label())),
+    match egress.recv_timeout(DOUBLE_EMIT_GUARD) {
+        Ok(extra) => Err(format!("{}: double-emit {:?}", step.label(), extra.bytes)),
         Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
             println!("input_realwindow: {} OK ({bytes:?})", step.label());
             Ok(AwaitOutcome { step })

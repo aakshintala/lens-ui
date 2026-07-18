@@ -9,6 +9,7 @@ use crossbeam_channel::{Receiver, Select, Sender, TrySendError};
 use lens_client::{CloseCause, WsInbound, WsOutbound};
 
 use crate::engine::handle::{EngineHandle, FeedError};
+use crate::engine::worker::EgressFrame;
 
 /// Policy events emitted by the bridge thread (off gpui foreground).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,11 +33,11 @@ pub(crate) fn spawn_bridge(
     outbound: Sender<WsOutbound>,
     engine: Arc<EngineHandle>,
     policy_tx: async_channel::Sender<BridgeEvent>,
+    egress_rx: Receiver<EgressFrame>,
 ) -> BridgeHandle {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = Arc::clone(&stop);
     let (stop_tx, stop_rx) = crossbeam_channel::bounded(1);
-    let egress_rx = engine.egress_rx().clone();
     let engine_thread = Arc::clone(&engine);
 
     let join = thread::spawn(move || {
@@ -79,7 +80,7 @@ fn bridge_loop(
     inbound: Receiver<WsInbound>,
     outbound: Sender<WsOutbound>,
     engine: Arc<EngineHandle>,
-    egress_rx: Receiver<Vec<u8>>,
+    egress_rx: Receiver<EgressFrame>,
     stop_rx: Receiver<()>,
     policy_tx: async_channel::Sender<BridgeEvent>,
     stop: &AtomicBool,
@@ -110,7 +111,7 @@ fn bridge_loop(
                 }
             },
             i if i == egress_idx => match oper.recv(&egress_rx) {
-                Ok(bytes) => forward_egress(&outbound, bytes, stop, &policy_tx),
+                Ok(frame) => forward_egress(&outbound, frame.bytes, stop, &policy_tx),
                 Err(_) => {
                     let _ = policy_tx.try_send(BridgeEvent::EngineStopped);
                     LoopExit::Stop
@@ -222,7 +223,14 @@ mod tests {
         let (outbound_tx, outbound_rx) = crossbeam_channel::bounded(8);
         let (policy_tx, _policy_rx) = async_channel::bounded(8);
         let before = engine.inspect().frames_built; // always-on counter
-        let bridge = spawn_bridge(inbound_rx, outbound_tx, Arc::clone(&engine), policy_tx);
+        let egress_rx = engine.attach_test_egress();
+        let bridge = spawn_bridge(
+            inbound_rx,
+            outbound_tx,
+            Arc::clone(&engine),
+            policy_tx,
+            egress_rx,
+        );
 
         inbound_tx.send(WsInbound::Vt(b"AB".to_vec())).unwrap();
         // Wait until feed is observed — NOT a blind sleep before build_now.
@@ -270,7 +278,14 @@ mod tests {
         let (outbound_tx, _outbound_rx) = crossbeam_channel::bounded(1);
         outbound_tx.send(WsOutbound::Input(vec![0])).unwrap();
         let (policy_tx, policy_rx) = async_channel::bounded(8);
-        let bridge = spawn_bridge(inbound_rx, outbound_tx, Arc::clone(&engine), policy_tx);
+        let egress_rx = engine.attach_test_egress();
+        let bridge = spawn_bridge(
+            inbound_rx,
+            outbound_tx,
+            Arc::clone(&engine),
+            policy_tx,
+            egress_rx,
+        );
 
         engine.feed(b"\x1b[c".to_vec()).unwrap();
         engine.build_now().ok();
@@ -294,7 +309,14 @@ mod tests {
         let (outbound_tx, outbound_rx) = crossbeam_channel::bounded(8);
         drop(outbound_rx);
         let (policy_tx, policy_rx) = async_channel::bounded(8);
-        let bridge = spawn_bridge(inbound_rx, outbound_tx, Arc::clone(&engine), policy_tx);
+        let egress_rx = engine.attach_test_egress();
+        let bridge = spawn_bridge(
+            inbound_rx,
+            outbound_tx,
+            Arc::clone(&engine),
+            policy_tx,
+            egress_rx,
+        );
 
         engine.feed(b"\x1b[c".to_vec()).unwrap();
         engine.build_now().ok();

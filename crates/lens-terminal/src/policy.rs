@@ -146,6 +146,11 @@ pub(crate) fn discover_and_attach(
 
     let cfg = engine_config_for(&resource, &options);
     let engine = Arc::new(EngineHandle::spawn(cfg));
+    let (egress_tx, egress_rx) =
+        crossbeam_channel::bounded(crate::engine::worker::EGRESS_CHANNEL_CAP);
+    engine
+        .attach_egress(egress_tx)
+        .map_err(|_| DetachedDetail::DiscoveryFailed)?;
 
     let (wake_tx, wake_rx) = async_channel::bounded(1);
     let (policy_tx, policy_rx) = async_channel::bounded(32);
@@ -154,6 +159,7 @@ pub(crate) fn discover_and_attach(
         attach_handle.outbound.clone(),
         Arc::clone(&engine),
         policy_tx.clone(),
+        egress_rx,
     );
 
     let runtime = TerminalRuntime {

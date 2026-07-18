@@ -14,3 +14,4 @@ pub use frame::CursorPos;
 pub use handle::{EngineHandle, FeedError};
 pub use inspect::EngineInspect;
 pub use vt::{EngineConfig, EngineError, VtEngine};
+pub use worker::{EgressFrame, EgressKind};

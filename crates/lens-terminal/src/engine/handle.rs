@@ -38,7 +38,6 @@ pub struct EngineHandle {
     frame_slot: Arc<ArcSwapOption<Frame>>,
     frame_ready: Arc<AtomicBool>,
     waker: WakerSlot,
-    egress_rx: Receiver<Vec<u8>>,
     inspect: Arc<InspectShared>,
     join: Option<JoinHandle<()>>,
     /// Per-handle build-failure injection counter (see `spawn_worker`). Test-only
@@ -57,28 +56,20 @@ impl std::fmt::Debug for EngineHandle {
 
 impl EngineHandle {
     pub fn spawn(cfg: EngineConfig) -> Self {
-        let worker::WorkerChannels {
-            cmd_tx,
-            cmd_rx,
-            egress_tx,
-            egress_rx,
-        } = worker::worker_channels();
-        Self::spawn_from_parts(cfg, cmd_tx, cmd_rx, egress_tx, egress_rx)
+        let worker::WorkerChannels { cmd_tx, cmd_rx } = worker::worker_channels();
+        Self::spawn_from_parts(cfg, cmd_tx, cmd_rx)
     }
 
     #[cfg(test)]
     fn spawn_with_cmd_cap(cfg: EngineConfig, cmd_cap: usize) -> Self {
         let (cmd_tx, cmd_rx) = crossbeam_channel::bounded(cmd_cap);
-        let (egress_tx, egress_rx) = crossbeam_channel::bounded(64);
-        Self::spawn_from_parts(cfg, cmd_tx, cmd_rx, egress_tx, egress_rx)
+        Self::spawn_from_parts(cfg, cmd_tx, cmd_rx)
     }
 
     fn spawn_from_parts(
         cfg: EngineConfig,
         cmd_tx: Sender<EngineCommand>,
         cmd_rx: Receiver<EngineCommand>,
-        egress_tx: Sender<Vec<u8>>,
-        egress_rx: Receiver<Vec<u8>>,
     ) -> Self {
         let frame_slot = Arc::new(ArcSwapOption::from(None));
         let frame_ready = Arc::new(AtomicBool::new(false));
@@ -94,8 +85,6 @@ impl EngineHandle {
         let join = worker::spawn_worker(
             cfg,
             cmd_rx,
-            egress_tx,
-            egress_rx.clone(),
             Arc::clone(&frame_slot),
             Arc::clone(&frame_ready),
             Arc::clone(&waker),
@@ -116,7 +105,6 @@ impl EngineHandle {
             frame_slot,
             frame_ready,
             waker,
-            egress_rx,
             inspect,
             join: Some(join),
             #[cfg(test)]
@@ -200,8 +188,28 @@ impl EngineHandle {
         }
     }
 
-    pub fn egress_rx(&self) -> &Receiver<Vec<u8>> {
-        &self.egress_rx
+    /// Point the worker's egress at `tx` via an in-order `SetEgress` command, so a query
+    /// fed on the prior connection has already emitted its reply to the prior channel
+    /// before this takes effect. Returns `Err` if the command could not be enqueued —
+    /// the caller MUST NOT then spawn a bridge on the paired receiver (see below).
+    pub(crate) fn attach_egress(
+        &self,
+        tx: crossbeam_channel::Sender<super::worker::EgressFrame>,
+    ) -> Result<(), FeedError> {
+        self.cmd_tx
+            .try_send(EngineCommand::SetEgress(Some(tx)))
+            .map_err(|e| match e {
+                TrySendError::Full(_) => FeedError::Full,
+                TrySendError::Disconnected(_) => FeedError::Stopped,
+            })
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn attach_test_egress(&self) -> crossbeam_channel::Receiver<super::worker::EgressFrame> {
+        let (tx, rx) = crossbeam_channel::bounded(worker::EGRESS_CHANNEL_CAP);
+        self.attach_egress(tx)
+            .expect("attach_test_egress: cmd_tx full");
+        rx
     }
 
     pub fn set_inspect_enabled(&self, enabled: bool) {
@@ -337,7 +345,7 @@ mod tests {
     use crate::engine::command::{KeyAction, KeyInput, KeyMods, LensKey};
     use crate::engine::forwarder::InputForwarder;
     use crate::engine::inspect::InspectEventKind;
-    use crate::engine::worker::EngineCommand;
+    use crate::engine::worker::{EgressFrame, EgressKind, EngineCommand};
 
     fn test_config() -> EngineConfig {
         EngineConfig {
@@ -358,6 +366,42 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
         }
         panic!("timeout waiting for frame");
+    }
+
+    fn recv_frame(rx: &crossbeam_channel::Receiver<EgressFrame>) -> EgressFrame {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok(f) = rx.try_recv() {
+                return f;
+            }
+            if Instant::now() >= deadline {
+                panic!("timeout waiting for egress frame");
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn egress_goes_to_the_currently_attached_channel() {
+        let h = EngineHandle::spawn(test_config());
+        let rx1 = h.attach_test_egress();
+        h.feed(b"\x1b[c".to_vec()).unwrap(); // Primary DA → reply (kind Other)
+        h.build_now().ok();
+        let f = recv_frame(&rx1);
+        assert_eq!(f.kind, EgressKind::Other);
+        assert!(!f.bytes.is_empty());
+
+        // Swap to a fresh channel; the old one receives nothing further.
+        let rx2 = h.attach_test_egress();
+        h.feed(b"\x1b[c".to_vec()).unwrap();
+        h.build_now().ok();
+        let f2 = recv_frame(&rx2);
+        assert_eq!(f2.kind, EgressKind::Other);
+        assert!(
+            rx1.try_recv().is_err(),
+            "old channel must not receive after swap"
+        );
+        h.stop();
     }
 
     #[test]
@@ -447,6 +491,7 @@ mod tests {
     #[test]
     fn forwarder_delivers_key_via_enqueue_input() {
         let h = EngineHandle::spawn(test_config());
+        let _egress = h.attach_test_egress();
         let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
         h.enqueue_input(EngineCommand::Key(KeyInput {
             action: KeyAction::Press,
@@ -515,19 +560,11 @@ mod tests {
     #[test]
     fn primary_da_query_emits_reply_on_egress_channel() {
         let h = EngineHandle::spawn(test_config());
+        let rx = h.attach_test_egress();
         h.feed(b"\x1b[c".to_vec()).expect("feed");
         h.build_now().expect("build_now");
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let reply = loop {
-            if let Ok(r) = h.egress_rx().try_recv() {
-                break r;
-            }
-            if Instant::now() >= deadline {
-                panic!("timeout waiting for DA/DSR reply");
-            }
-            thread::sleep(Duration::from_millis(1));
-        };
-        assert!(!reply.is_empty());
+        let reply = recv_frame(&rx);
+        assert!(!reply.bytes.is_empty());
         h.stop();
     }
 
@@ -660,6 +697,7 @@ mod tests {
     #[test]
     fn key_encodes_against_live_modes_via_ordered_feed_then_ack() {
         let h = EngineHandle::spawn(test_config());
+        let _egress = h.attach_test_egress();
         h.feed(b"\x1b[?1h".to_vec()).expect("feed");
 
         let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
@@ -763,6 +801,7 @@ mod tests {
         use crate::engine::worker::MAX_FEED_CHUNK;
 
         let h = EngineHandle::spawn(test_config());
+        let _egress = h.attach_test_egress();
         let mut feed = vec![b' '; MAX_FEED_CHUNK];
         feed.extend_from_slice(b"\x1b[?1h");
 
@@ -821,7 +860,8 @@ mod tests {
     #[test]
     fn focus_report_suppressed_when_report_false_with_ack_barrier() {
         let h = EngineHandle::spawn(test_config());
-        while h.egress_rx().try_recv().is_ok() {}
+        let rx = h.attach_test_egress();
+        while rx.try_recv().is_ok() {}
         h.feed(b"\x1b[?1004h".to_vec()).expect("feed");
         h.cmd_sender()
             .send(EngineCommand::Focus {
@@ -847,8 +887,8 @@ mod tests {
             .expect("barrier ack");
         assert!(ack.accepted);
         let mut egress = Vec::new();
-        while let Ok(b) = h.egress_rx().try_recv() {
-            egress.extend_from_slice(&b);
+        while let Ok(f) = rx.try_recv() {
+            egress.extend_from_slice(&f.bytes);
         }
         assert_eq!(egress, b"z");
         h.stop();
@@ -857,7 +897,8 @@ mod tests {
     #[test]
     fn focus_report_emits_csi_i_when_mode_on_and_report_true() {
         let h = EngineHandle::spawn(test_config());
-        while h.egress_rx().try_recv().is_ok() {}
+        let rx = h.attach_test_egress();
+        while rx.try_recv().is_ok() {}
         h.feed(b"\x1b[?1004h".to_vec()).expect("feed");
         h.cmd_sender()
             .send(EngineCommand::Focus {
@@ -866,18 +907,18 @@ mod tests {
                 access_epoch: 0,
             })
             .expect("focus");
-        let bytes = h
-            .egress_rx()
+        let frame = rx
             .recv_timeout(Duration::from_secs(2))
             .expect("focus egress");
-        assert_eq!(bytes, b"\x1b[I");
+        assert_eq!(frame.bytes, b"\x1b[I");
         h.stop();
     }
 
     #[test]
     fn focus_report_suppressed_when_mode_1004_off() {
         let h = EngineHandle::spawn(test_config());
-        while h.egress_rx().try_recv().is_ok() {}
+        let rx = h.attach_test_egress();
+        while rx.try_recv().is_ok() {}
         h.cmd_sender()
             .send(EngineCommand::Focus {
                 focused: true,
@@ -902,8 +943,8 @@ mod tests {
             .expect("barrier ack");
         assert!(ack.accepted);
         let mut egress = Vec::new();
-        while let Ok(b) = h.egress_rx().try_recv() {
-            egress.extend_from_slice(&b);
+        while let Ok(f) = rx.try_recv() {
+            egress.extend_from_slice(&f.bytes);
         }
         assert_eq!(egress, b"z");
         h.stop();
@@ -912,6 +953,7 @@ mod tests {
     #[test]
     fn downgrade_revokes_queued_key_before_egress() {
         let h = EngineHandle::spawn(test_config());
+        let rx = h.attach_test_egress();
         h.test_stall_worker();
         let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
         h.enqueue_input(EngineCommand::Key(KeyInput {
@@ -928,7 +970,7 @@ mod tests {
         h.test_release_worker();
         let ack = ack_rx.recv_timeout(Duration::from_secs(2)).expect("ack");
         assert!(!ack.accepted);
-        assert!(h.egress_rx().try_recv().is_err());
+        assert!(rx.try_recv().is_err());
         h.stop();
     }
 
@@ -967,13 +1009,15 @@ mod tests {
         let after = h.latest_frame().expect("frame after scroll");
         assert!(grid_text(&after).contains("L00"));
         assert!(!grid_text(&after).contains("L29"));
-        assert!(h.egress_rx().try_recv().is_err());
+        let rx = h.attach_test_egress();
+        assert!(rx.try_recv().is_err());
         h.stop();
     }
 
     #[test]
     fn user_input_egress_full_does_not_drop_or_false_ack() {
         let h = EngineHandle::spawn(test_config());
+        let rx = h.attach_test_egress();
         let first_key = KeyInput {
             action: KeyAction::Press,
             key: LensKey::Z,
@@ -1017,8 +1061,8 @@ mod tests {
         assert_eq!(ack.encoded, b"a");
 
         let mut drained = Vec::new();
-        while let Ok(b) = h.egress_rx().try_recv() {
-            drained.push(b);
+        while let Ok(f) = rx.try_recv() {
+            drained.push(f.bytes);
         }
         assert_eq!(
             drained.len(),
@@ -1037,6 +1081,7 @@ mod tests {
     #[test]
     fn reply_egress_full_does_not_evict_user_input() {
         let h = EngineHandle::spawn(test_config());
+        let rx = h.attach_test_egress();
 
         for i in 0..64u8 {
             let ch = char::from(b'A' + i);
@@ -1054,27 +1099,27 @@ mod tests {
         }
 
         let deadline = Instant::now() + Duration::from_secs(2);
-        while h.egress_rx().len() < 64 {
+        while rx.len() < 64 {
             if Instant::now() >= deadline {
                 panic!("timeout waiting for egress to fill with user input");
             }
             thread::sleep(Duration::from_millis(1));
         }
-        assert_eq!(h.egress_rx().len(), 64);
+        assert_eq!(rx.len(), 64);
 
         h.feed(b"\x1b[c".to_vec()).expect("feed DA query");
         h.build_now().expect("build_now");
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline {
-            if h.egress_rx().len() > 64 {
+            if rx.len() > 64 {
                 panic!("reply egress evicted user input from shared queue");
             }
             thread::sleep(Duration::from_millis(1));
         }
 
         let mut drained = Vec::new();
-        while let Ok(b) = h.egress_rx().try_recv() {
-            drained.push(b);
+        while let Ok(f) = rx.try_recv() {
+            drained.push(f.bytes);
         }
         assert_eq!(
             drained.len(),

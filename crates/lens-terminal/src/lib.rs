@@ -301,7 +301,8 @@ pub struct Progress {
 
 pub use engine::frame::{CellStyle, Frame, FrameCell, FrameRow, Rgb, UnderlineStyle};
 pub use engine::{
-    CursorPos, EngineConfig, EngineError, EngineHandle, EngineInspect, FeedError, VtEngine,
+    CursorPos, EgressFrame, EgressKind, EngineConfig, EngineError, EngineHandle, EngineInspect,
+    FeedError, VtEngine,
 };
 pub use inspect::TerminalInspect;
 pub use render::inspect::{RenderInspect, RenderInspectEvent, RenderInspectEventKind};
@@ -850,6 +851,13 @@ impl TerminalTab {
 
     fn teardown_transport_off_foreground(&mut self, cx: &mut Context<Self>) {
         if let Some(rt) = &mut self.runtime {
+            // Revoke any input still queued upstream (forwarder/cmd_tx): it belongs to the
+            // connection being torn down and must never be encoded onto the next one.
+            // Per-transport channels isolate already-emitted residue; this closes the
+            // un-encoded-residue path (C2). Covers Retry AND downgrade.
+            if let Some(engine) = rt.engine_ref() {
+                engine.bump_access_epoch();
+            }
             let (bridge, attach) = rt.take_transport();
             cx.spawn(async move |_weak, cx| {
                 cx.background_executor()
@@ -1104,11 +1112,25 @@ impl TerminalTab {
         let outbound = attach.outbound.clone();
         let engine = rt.engine_arc().expect("engine retained during reconnect");
         let snap = engine.inspect();
+        let (egress_tx, egress_rx) = crossbeam_channel::bounded(engine::worker::EGRESS_CHANNEL_CAP);
+        if engine.attach_egress(egress_tx).is_err() {
+            cx.spawn(async move |_w, cx| {
+                cx.background_executor()
+                    .spawn(async move {
+                        attach.close();
+                    })
+                    .await;
+            })
+            .detach();
+            self.schedule_reconnect(Duration::ZERO, cx);
+            return;
+        }
         let bridge = spawn_bridge(
             attach.inbound.clone(),
             attach.outbound.clone(),
             Arc::clone(&engine),
             self.policy_tx.clone().expect("policy_tx retained"),
+            egress_rx,
         );
         rt.install_transport(bridge, attach);
         if self.inspect_enabled {
@@ -1669,8 +1691,9 @@ mod tests {
         use gpui::Keystroke;
 
         let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let egress = engine.attach_test_egress();
         let tab = cx.new(|cx| TerminalTab::with_engine_for_test(Arc::clone(&engine), cx));
-        while engine.egress_rx().try_recv().is_ok() {}
+        while egress.try_recv().is_ok() {}
 
         let plain_a = Keystroke {
             key: "a".into(),
@@ -1684,18 +1707,17 @@ mod tests {
             );
         });
         assert!(
-            engine.egress_rx().try_recv().is_err(),
+            egress.try_recv().is_err(),
             "keydown must not emit egress for plain a"
         );
 
         tab.update(cx, |tab, _cx| tab.debug_input_handler_text_for_test("a"));
-        let bytes = engine
-            .egress_rx()
+        let frame = egress
             .recv_timeout(Duration::from_secs(2))
             .expect("committed text egress");
-        assert_eq!(bytes, b"a");
+        assert_eq!(frame.bytes, b"a");
         assert!(
-            engine.egress_rx().try_recv().is_err(),
+            egress.try_recv().is_err(),
             "exactly one egress for printable via InputHandler"
         );
     }
@@ -1703,6 +1725,7 @@ mod tests {
     #[gpui::test]
     async fn ime_commit_hook_returns_receiver_without_blocking(cx: &mut gpui::TestAppContext) {
         let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let _egress = engine.attach_test_egress();
         let tab = cx.new(|cx| TerminalTab::with_engine_for_test(Arc::clone(&engine), cx));
         let rx = tab.update(cx, |tab, _cx| {
             tab.debug_ime_commit_for_test("你好").expect("rx")
