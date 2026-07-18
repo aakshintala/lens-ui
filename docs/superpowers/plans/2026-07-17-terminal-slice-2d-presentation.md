@@ -88,7 +88,7 @@ Do **not** touch 2a-owned definitions. Do **not** plan input/keys/mouse-reportin
 **Step 0 (foundation — declare the presentation surface; do first):**
 - **Create `engine/presentation.rs`** with the types + constants (from the "Serial position" table): `EnginePresentationEvent { TitleChanged(String), HyperlinkOpen { url: String }, ClipboardWrite { location: ClipboardLocation, contents: Vec<ClipboardMimePart> } }`, `ClipboardLocation { Standard, Selection, Primary }`, `ClipboardMimePart { mime: String, data: String }`, `PRESENTATION_CHANNEL_CAP: usize = 64`, `MAX_REPORTED_TITLE_CHARS: usize = 512`, `MAX_HYPERLINK_URI_BYTES: usize = 8192`. Add `mod presentation;` + `pub use` to `engine/mod.rs`.
 - **Wire the channel:** `WorkerChannels` gains `presentation_tx/rx`; `worker_channels()` constructs it at `PRESENTATION_CHANNEL_CAP`; `spawn_worker` gains a `presentation_tx: Sender<EnginePresentationEvent>` param and threads it into `VtEngine::new`; `EngineHandle` gains `presentation_rx` + a `presentation_tx` clone, wired in `spawn()`.
-- **`VtEngine::new`:** add the `presentation_tx` param (2a left arity `(cfg, on_reply)`; 2d makes it `(cfg, on_reply, presentation_tx)`). Register a **bare** `on_title_changed` that `try_send`s `TitleChanged(raw)` (Task 2 wraps it with sanitize + latest-title slot). Update **every** `VtEngine::new` call site (production `spawn_worker`; test/fixture/bench sites 2a left) with a throwaway `presentation_tx`.
+- **`VtEngine::new`:** add the `presentation_tx` param (2a left arity `(cfg, on_reply)`; 2d makes it `(cfg, on_reply, presentation_tx)`). Register a **bare** `on_title_changed` that `try_send`s `TitleChanged(raw)` (Task 2 wraps it with sanitize + latest-title slot; **note in a comment that 2b re-threads `presentation_tx` for `on_clipboard_write`** and the title-clone may already consume one clone). The arity change breaks **every** `VtEngine::new` call site at once — this task MUST update **all of them** in the same commit or the crate won't compile under `--all-targets`: production `worker.rs:68` (via `spawn_worker`); tests `vt.rs:211,230`, `reconnect_seed.rs:150`, **`tests/replay_frame.rs:109,124`**; bench **`benches/engine.rs:32,41`**. Each gets a throwaway `let (tx,_rx)=crossbeam_channel::bounded(1);` → `VtEngine::new(&cfg, on_reply, tx)`.
 
 **Files:**
 - Create: `crates/lens-terminal/src/engine/presentation.rs`
@@ -97,7 +97,7 @@ Do **not** touch 2a-owned definitions. Do **not** plan input/keys/mouse-reportin
 - Modify: `crates/lens-terminal/src/engine/vt.rs` (`VtEngine::new` param + bare `on_title_changed`; latest-title slot Task 2 fills sanitize)
 - Modify: `crates/lens-terminal/src/engine/handle.rs` (presentation fields + `spawn()` wiring; `presentation_rx()`/`enqueue_presentation()` methods)
 - Modify: `crates/lens-terminal/src/lib.rs` (`drain_presentation_events` method + call it from `render`)
-- Modify: `VtEngine::new` call sites (fixtures/benches/reconnect_seed)
+- Modify: `VtEngine::new` call sites — `src/engine/reconnect_seed.rs`, `tests/replay_frame.rs`, `benches/engine.rs` (throwaway `presentation_tx`)
 - Test: `handle.rs` / `presentation.rs` / `lib.rs`
 
 **Interfaces:**
@@ -239,11 +239,17 @@ Expected: PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/lens-terminal/src/engine/handle.rs \
+git add crates/lens-terminal/src/engine/presentation.rs \
+  crates/lens-terminal/src/engine/mod.rs \
+  crates/lens-terminal/src/engine/worker.rs \
+  crates/lens-terminal/src/engine/handle.rs \
   crates/lens-terminal/src/engine/vt.rs \
-  crates/lens-terminal/src/lib.rs
+  crates/lens-terminal/src/engine/reconnect_seed.rs \
+  crates/lens-terminal/src/lib.rs \
+  crates/lens-terminal/tests/replay_frame.rs \
+  crates/lens-terminal/benches/engine.rs
 git commit -m "$(cat <<'EOF'
-feat(terminal-2d): presentation handle methods, drain arms, latest-title slot
+feat(terminal-2d): presentation channel foundation, handle methods, drain arms, latest-title slot
 
 EOF
 )"
@@ -430,8 +436,9 @@ EOF
 **Files:**
 - Modify: `crates/lens-terminal/src/engine/frame.rs` (**add** `FrameCell.hyperlink_uri: Option<Arc<str>>`)
 - Modify: `crates/lens-terminal/src/engine/vt.rs` (add the `hyperlink_uri:` line to every `FrameCell` literal in `build_frame` + fill extraction)
+- Modify: `crates/lens-terminal/src/render/fixtures.rs`, `crates/lens-terminal/src/render/paint.rs` (every `FrameCell { … }` literal gains `hyperlink_uri: None`)
 - Test: `vt.rs` OSC 8 integration tests
-- Note: every existing `FrameCell { … }` literal (fixtures, paint tests) gains `hyperlink_uri: None` (`None` fits `Option<Arc<str>>`)
+- Note: `None` fits `Option<Arc<str>>` — adding the field breaks every `FrameCell` literal in `vt.rs`/`frame.rs`/`render/fixtures.rs`/`render/paint.rs` until each gets `hyperlink_uri: None`
 
 **Interfaces:**
 - Consumes: `Cell::has_hyperlink`, `Terminal::grid_ref`, `GridRef::hyperlink_uri`.
@@ -557,7 +564,9 @@ Expected: PASS. If OSC 8 needs BEL instead of ST on this pin, try `\x07` and rec
 
 ```bash
 git add crates/lens-terminal/src/engine/frame.rs \
-  crates/lens-terminal/src/engine/vt.rs
+  crates/lens-terminal/src/engine/vt.rs \
+  crates/lens-terminal/src/render/fixtures.rs \
+  crates/lens-terminal/src/render/paint.rs
 git commit -m "$(cat <<'EOF'
 feat(terminal-2d): extract interned OSC 8 hyperlink URIs into Frame cells
 

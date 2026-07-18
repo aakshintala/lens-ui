@@ -290,7 +290,7 @@ EOF
 ### Task 2: Foundation decls (egress rename, key fields, `Frame.cursor`) + live-mode `encode_key` + never-drop user egress + viewport-safe cursor
 
 **Step 0 (foundation declarations — do first, keep mechanical):**
-- Rename `DA_DSR_CHANNEL_CAP`→`EGRESS_CHANNEL_CAP` (keep `64`); `WorkerChannels.da_dsr_tx/rx`→`egress_tx/rx`; `emit_da_dsr`→`emit_egress`; all `da_dsr` locals→`egress`; `handle.rs` field/accessor `da_dsr_rx`→`egress_rx`; `inspect.rs` `record_da_dsr`→`record_egress` (+ any snapshot field + its tests, same commit). Purely mechanical; no counter-semantics change. **`VtEngine::new` keeps its current arity** (no `presentation_tx` — that's 2d).
+- Rename `DA_DSR_CHANNEL_CAP`→`EGRESS_CHANNEL_CAP` (keep `64`); `WorkerChannels.da_dsr_tx/rx`→`egress_tx/rx`; `emit_da_dsr`→`emit_egress`; all `da_dsr` locals→`egress`; `handle.rs` field/accessor `da_dsr_rx`→`egress_rx`; `inspect.rs` `record_da_dsr`→`record_egress` + snapshot field `da_dsr_emitted`→`egress_emitted`. **The rename fans out to `bridge.rs`** (`engine.da_dsr_rx()`→`egress_rx()`, `da_dsr_rx` local/field, `forward_da_dsr`→`forward_egress`, `inspect().da_dsr_emitted`→`egress_emitted` **including the bridge tests at ~242/256**) and a stale comment in `runtime.rs` — **all in the same commit** or the crate won't compile. Purely mechanical; no counter-semantics change. **`VtEngine::new` keeps its current arity** (no `presentation_tx` — that's 2d).
 - Add `key_encoder: libghostty_vt::key::Encoder<'static>` + `key_event: libghostty_vt::key::Event<'static>` to `VtEngine`, constructed in `VtEngine::new` (`Encoder::new()?` / `Event::new()?`). Task 2 uses them immediately, so no `#[expect(dead_code)]` needed.
 - Add `CursorPos { col: u16, row: u16 }` + `Frame.cursor: Option<CursorPos>` to `frame.rs`; re-export `CursorPos` from `engine/mod.rs`. Every existing `Frame { … }` literal (fixtures, paint tests, reconnect_seed) gains `cursor: None` — the viewport fill below replaces the `build_frame` one.
 
@@ -301,8 +301,9 @@ EOF
 - Modify: `crates/lens-terminal/src/engine/handle.rs` (`egress_rx` rename)
 - Modify: `crates/lens-terminal/src/engine/inspect.rs` (egress rename; user-egress accept/reject counters)
 - Modify: `crates/lens-terminal/src/engine/mod.rs` (re-export `CursorPos`)
-- Modify: fixtures/call-sites — every `Frame { … }` literal gains `cursor: None` (`render/fixtures.rs`, `render/paint.rs`, `reconnect_seed.rs`, `lib.rs` tests)
-- Modify: `crates/lens-terminal/src/bridge.rs` only if a saturation event must be surfaced for user-egress-full
+- Modify: `crates/lens-terminal/src/bridge.rs` (**mandatory** egress rename: `egress_rx()` accessor call, `da_dsr_rx` local, `forward_da_dsr`→`forward_egress`, `da_dsr_emitted`→`egress_emitted` + bridge tests; **plus** any user-egress-full saturation event if surfaced)
+- Modify: `crates/lens-terminal/src/runtime.rs` (stale `da_dsr` comment)
+- Modify: fixtures/`Frame` literals gain `cursor: None` — only `render/fixtures.rs` has non-`build_frame` `Frame { … }` literals (grep-confirmed: no `Frame` literals in tests/benches/`reconnect_seed`)
 
 **Interfaces:**
 - Consumes: `self.key_encoder` / `self.key_event` (declared in Step 0) / `egress_tx/rx` / `emit_egress`.
@@ -371,8 +372,9 @@ git add crates/lens-terminal/src/engine/frame.rs \
         crates/lens-terminal/src/engine/handle.rs \
         crates/lens-terminal/src/engine/inspect.rs \
         crates/lens-terminal/src/engine/mod.rs \
-        crates/lens-terminal/src/render/ \
-        crates/lens-terminal/src/bridge.rs
+        crates/lens-terminal/src/render/fixtures.rs \
+        crates/lens-terminal/src/bridge.rs \
+        crates/lens-terminal/src/runtime.rs
 git commit -m "$(cat <<'EOF'
 feat(lens-terminal): egress rename, key-encoder fields, Frame.cursor, live encode_key, never-drop user egress (2a)
 
