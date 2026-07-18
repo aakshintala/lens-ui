@@ -131,7 +131,9 @@ brainstorm→spec→plan→build cycle. **This supersedes the old "B6/B7/B8" fra
 in STATUS — B7 "stable ordinal ordering" dissolves into B-1's ordinal slots (no
 separate sort task). Order below is dependency order.
 
-- **B-1 — Board data model & persistence (`BoardLayout`)** — *keystone; lens-core.*
+- **B-1 — Board data model & persistence (`BoardLayout`)** — ✅ **SPEC WRITTEN
+  2026-07-18** ([`docs/specs/2026-07-18-board-data-model-persistence-design.md`](specs/2026-07-18-board-data-model-persistence-design.md),
+  user-approved). *keystone; lens-core.*
   The concrete recursive **Board→(Card | Group)** tree; **ordinal-slot**
   representation (§4.1, index-within-parent, never pixels); Lens-local **SQLite
   schema + migration** (§4.2 — persisted in the state-model store, not a server

@@ -2,7 +2,7 @@
 //! a STABLE, DENORMALIZED read contract (§6.1) — Bridge reads these tables.
 
 /// Bumped only on a breaking schema change; gates per-file migration (§6.3).
-pub const SCHEMA_VERSION: u32 = 2; // provisional + call_id columns (D30)
+pub const SCHEMA_VERSION: u32 = 3; // boards + board_items (B-1)
 
 /// `lens.db` — control plane (one file). `meta` is created by `db::open_db`.
 /// P2 additions vs §6.2 sketch: `cost_json` (D-P2-2), `terminal_pending` (D-P2-3).
@@ -63,6 +63,38 @@ CREATE TABLE IF NOT EXISTS cost_samples (
   total_cost_usd REAL NOT NULL,
   PRIMARY KEY (connection_id, session_id, sampled_at)
 );
+
+CREATE TABLE IF NOT EXISTS boards (
+  id         TEXT PRIMARY KEY,
+  name       TEXT NOT NULL,
+  ordinal    INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS board_items (
+  item_id        TEXT PRIMARY KEY,
+  board_id       TEXT NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
+  parent_item_id TEXT REFERENCES board_items(item_id) ON DELETE CASCADE,
+  ordinal        INTEGER NOT NULL,
+  kind           TEXT NOT NULL,
+
+  session_conn_id TEXT,
+  session_id      TEXT,
+
+  group_name   TEXT,
+  color_token  TEXT,
+  collapsed    INTEGER NOT NULL DEFAULT 0,
+  archived     INTEGER NOT NULL DEFAULT 0,
+  group_config TEXT,
+
+  created_at   INTEGER NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS board_items_session
+  ON board_items(session_conn_id, session_id) WHERE kind = 'card';
+
+CREATE INDEX IF NOT EXISTS board_items_parent ON board_items(board_id, parent_item_id, ordinal);
 "#;
 
 /// Per-session transcript file. `meta` (created by `db::open_db`) additionally
