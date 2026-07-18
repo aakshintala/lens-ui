@@ -32,7 +32,9 @@ pub struct EngineInspect {
     pub frames_built: u64,
     pub last_build_micros: u64,
     pub bytes_fed: u64,
-    pub da_dsr_emitted: u64,
+    pub egress_emitted: u64,
+    pub user_egress_accepted: u64,
+    pub user_egress_rejected: u64,
     pub recent: Vec<InspectEvent>,
 }
 
@@ -47,7 +49,9 @@ pub(crate) struct InspectShared {
     frames_built: AtomicU64,
     last_build_micros: AtomicU64,
     bytes_fed: AtomicU64,
-    da_dsr_emitted: AtomicU64,
+    egress_emitted: AtomicU64,
+    user_egress_accepted: AtomicU64,
+    user_egress_rejected: AtomicU64,
     ring: Mutex<VecDeque<InspectEvent>>,
 }
 
@@ -62,7 +66,9 @@ impl InspectShared {
             frames_built: AtomicU64::new(0),
             last_build_micros: AtomicU64::new(0),
             bytes_fed: AtomicU64::new(0),
-            da_dsr_emitted: AtomicU64::new(0),
+            egress_emitted: AtomicU64::new(0),
+            user_egress_accepted: AtomicU64::new(0),
+            user_egress_rejected: AtomicU64::new(0),
             ring: Mutex::new(VecDeque::with_capacity(RING_CAP)),
         }
     }
@@ -97,11 +103,19 @@ impl InspectShared {
         });
     }
 
-    pub fn record_da_dsr(&self, len: usize) {
-        self.da_dsr_emitted.fetch_add(1, Ordering::Relaxed);
+    pub fn record_egress(&self, len: usize) {
+        self.egress_emitted.fetch_add(1, Ordering::Relaxed);
         self.record_event(InspectEvent {
             kind: InspectEventKind::DaDsr { len },
         });
+    }
+
+    pub fn record_user_egress_accepted(&self) {
+        self.user_egress_accepted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_user_egress_rejected(&self) {
+        self.user_egress_rejected.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn set_visible(&self, visible: bool) {
@@ -138,7 +152,9 @@ impl InspectShared {
             frames_built: self.frames_built.load(Ordering::Relaxed),
             last_build_micros: self.last_build_micros.load(Ordering::Relaxed),
             bytes_fed: self.bytes_fed.load(Ordering::Relaxed),
-            da_dsr_emitted: self.da_dsr_emitted.load(Ordering::Relaxed),
+            egress_emitted: self.egress_emitted.load(Ordering::Relaxed),
+            user_egress_accepted: self.user_egress_accepted.load(Ordering::Relaxed),
+            user_egress_rejected: self.user_egress_rejected.load(Ordering::Relaxed),
             recent,
         }
     }

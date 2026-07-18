@@ -49,6 +49,7 @@ pub fn ascii_frame(cols: u16, rows: u16, fill: char) -> Frame {
         default_fg: FG,
         default_bg: BG,
         grid,
+        cursor: None,
     }
 }
 
@@ -94,6 +95,7 @@ pub fn sgr_frame() -> Frame {
         default_fg: FG,
         default_bg: BG,
         grid: vec![FrameRow { cells }],
+        cursor: None,
     }
 }
 
@@ -165,6 +167,7 @@ pub fn dense_wide_emoji_frame(cols: u16, rows: u16) -> Frame {
         default_fg: FG,
         default_bg: BG,
         grid,
+        cursor: None,
     }
 }
 
@@ -201,6 +204,7 @@ pub fn pathological_wide_emoji_frame(cols: u16, rows: u16) -> Frame {
         default_fg: FG,
         default_bg: BG,
         grid,
+        cursor: None,
     }
 }
 
@@ -225,5 +229,6 @@ pub fn mixed_ascii_wide_frame(cols: u16, rows: u16) -> Frame {
         default_fg: FG,
         default_bg: BG,
         grid,
+        cursor: None,
     }
 }

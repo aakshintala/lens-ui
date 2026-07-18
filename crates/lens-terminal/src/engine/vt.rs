@@ -7,10 +7,15 @@ use std::rc::Rc;
 use libghostty_vt::render::{CellIterator, RenderState, RowIterator};
 use libghostty_vt::screen::CellWide;
 use libghostty_vt::style::{RgbColor, Style, StyleColor, Underline};
+#[cfg(test)]
+use libghostty_vt::terminal::ScrollViewport;
+use libghostty_vt::terminal::{Point, PointCoordinate, PointSpace};
 use libghostty_vt::{Terminal, TerminalOptions};
 use thiserror::Error;
 
-use super::frame::{CellStyle, Frame, FrameCell, FrameRow, Rgb, UnderlineStyle};
+use super::command::KeyInput;
+use super::frame::{CellStyle, CursorPos, Frame, FrameCell, FrameRow, Rgb, UnderlineStyle};
+use super::key_map::encode_key_pure;
 
 type OnReplyFn = Box<dyn FnMut(&[u8]) + 'static>;
 
@@ -36,6 +41,8 @@ pub struct VtEngine {
     render_state: RenderState<'static>,
     rows: RowIterator<'static>,
     cells: CellIterator<'static>,
+    key_encoder: libghostty_vt::key::Encoder<'static>,
+    key_event: libghostty_vt::key::Event<'static>,
     cell_w_px: u32,
     cell_h_px: u32,
     reply_buffer: Rc<RefCell<Vec<u8>>>,
@@ -65,11 +72,26 @@ impl VtEngine {
             render_state: RenderState::new()?,
             rows: RowIterator::new()?,
             cells: CellIterator::new()?,
+            key_encoder: libghostty_vt::key::Encoder::new()?,
+            key_event: libghostty_vt::key::Event::new()?,
             cell_w_px: cfg.cell_w_px,
             cell_h_px: cfg.cell_h_px,
             reply_buffer,
             on_reply: Box::new(on_reply) as OnReplyFn,
         })
+    }
+
+    /// Encode a key event against the terminal's live modes.
+    pub(crate) fn encode_key(&mut self, input: &KeyInput) -> Result<Vec<u8>, EngineError> {
+        self.key_encoder.set_options_from_terminal(&self.terminal);
+        // `set_options_from_terminal` resets macOS option-as-alt to False; Lens
+        // treats Option as Alt for PTY encoding (ESC-prefix on printable keys).
+        #[cfg(target_os = "macos")]
+        self.key_encoder
+            .set_macos_option_as_alt(libghostty_vt::key::OptionAsAlt::True);
+        let mut buf = Vec::new();
+        encode_key_pure(&mut self.key_encoder, &mut self.key_event, input, &mut buf)?;
+        Ok(buf)
     }
 
     /// Feed server VT bytes into the terminal.
@@ -143,8 +165,32 @@ impl VtEngine {
             default_fg,
             default_bg,
             grid,
+            cursor: viewport_cursor_pos(&self.terminal, cols, rows),
         })
     }
+}
+
+fn viewport_cursor_pos(term: &Terminal<'_, '_>, cols: u16, rows: u16) -> Option<CursorPos> {
+    // cursor_x/y are ACTIVE-AREA coords — NEVER unwrap_or(0).
+    if !term.is_cursor_visible().ok()? {
+        return None;
+    }
+    let ax = term.cursor_x().ok()?;
+    let ay = term.cursor_y().ok()?;
+    let grid_ref = term
+        .grid_ref(Point::Active(PointCoordinate {
+            x: ax,
+            y: u32::from(ay),
+        }))
+        .ok()?;
+    let vp = term
+        .point_from_grid_ref(&grid_ref, PointSpace::Viewport)
+        .ok()??;
+    if vp.x >= cols || vp.y >= u32::from(rows) {
+        return None;
+    }
+    let row = u16::try_from(vp.y).ok()?;
+    Some(CursorPos { col: vp.x, row })
 }
 
 fn rgb_from_ghostty(c: RgbColor) -> Rgb {
@@ -189,6 +235,10 @@ fn underline_from_ghostty(u: Underline) -> UnderlineStyle {
 impl VtEngine {
     pub fn scrollback_rows_for_test(&self) -> usize {
         self.terminal.scrollback_rows().unwrap_or(0)
+    }
+
+    fn scroll_viewport_for_test(&mut self, scroll: ScrollViewport) {
+        self.terminal.scroll_viewport(scroll);
     }
 }
 
@@ -248,5 +298,20 @@ mod tests {
 
         let cols: Vec<u16> = row.iter().map(|c| c.col).collect();
         assert!(cols.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn build_frame_cursor_none_when_scrolled_out_of_viewport() {
+        let mut e = VtEngine::new(&test_config(), |_| {}).unwrap();
+        for i in 0..20 {
+            e.feed(format!("line{i}\r\n").as_bytes());
+        }
+        e.scroll_viewport_for_test(ScrollViewport::Top);
+        let f = e.build_frame().unwrap();
+        assert!(
+            f.cursor.is_none(),
+            "cursor must be None when scrolled out of viewport, got {:?}",
+            f.cursor
+        );
     }
 }

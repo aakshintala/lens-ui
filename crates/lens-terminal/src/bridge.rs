@@ -36,7 +36,7 @@ pub(crate) fn spawn_bridge(
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = Arc::clone(&stop);
     let (stop_tx, stop_rx) = crossbeam_channel::bounded(1);
-    let da_dsr_rx = engine.da_dsr_rx().clone();
+    let egress_rx = engine.egress_rx().clone();
     let engine_thread = Arc::clone(&engine);
 
     let join = thread::spawn(move || {
@@ -44,7 +44,7 @@ pub(crate) fn spawn_bridge(
             inbound,
             outbound,
             engine_thread,
-            da_dsr_rx,
+            egress_rx,
             stop_rx,
             policy_tx,
             &stop_thread,
@@ -79,7 +79,7 @@ fn bridge_loop(
     inbound: Receiver<WsInbound>,
     outbound: Sender<WsOutbound>,
     engine: Arc<EngineHandle>,
-    da_dsr_rx: Receiver<Vec<u8>>,
+    egress_rx: Receiver<Vec<u8>>,
     stop_rx: Receiver<()>,
     policy_tx: async_channel::Sender<BridgeEvent>,
     stop: &AtomicBool,
@@ -91,7 +91,7 @@ fn bridge_loop(
 
         let mut sel = Select::new();
         let inbound_idx = sel.recv(&inbound);
-        let da_idx = sel.recv(&da_dsr_rx);
+        let egress_idx = sel.recv(&egress_rx);
         let stop_idx = sel.recv(&stop_rx);
         let oper = sel.select();
 
@@ -104,8 +104,8 @@ fn bridge_loop(
                     LoopExit::Stop
                 }
             },
-            i if i == da_idx => match oper.recv(&da_dsr_rx) {
-                Ok(bytes) => forward_da_dsr(&outbound, bytes, stop, &policy_tx),
+            i if i == egress_idx => match oper.recv(&egress_rx) {
+                Ok(bytes) => forward_egress(&outbound, bytes, stop, &policy_tx),
                 Err(_) => {
                     let _ = policy_tx.try_send(BridgeEvent::EngineStopped);
                     LoopExit::Stop
@@ -145,7 +145,7 @@ fn handle_inbound(
     }
 }
 
-fn forward_da_dsr(
+fn forward_egress(
     outbound: &Sender<WsOutbound>,
     bytes: Vec<u8>,
     stop: &AtomicBool,
@@ -239,7 +239,7 @@ mod tests {
         );
 
         // DA/DSR forward
-        let before_da = engine.inspect().da_dsr_emitted;
+        let before_egress = engine.inspect().egress_emitted;
         engine.feed(b"\x1b[c".to_vec()).unwrap();
         engine.build_now().ok();
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -253,7 +253,7 @@ mod tests {
             }
         };
         assert!(!reply.is_empty());
-        assert!(engine.inspect().da_dsr_emitted > before_da);
+        assert!(engine.inspect().egress_emitted > before_egress);
         bridge.join();
     }
 

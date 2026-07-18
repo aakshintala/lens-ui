@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwapOption;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError};
 
-use super::command::{KeyInput, ScrollDelta};
+use super::command::{InputAck, KeyInput};
 use super::frame::Frame;
 use super::inspect::InspectShared;
 use super::vt::{EngineConfig, VtEngine};
@@ -16,13 +16,20 @@ use super::vt::{EngineConfig, VtEngine};
 pub(crate) type WakerSlot = Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>;
 
 const CMD_CHANNEL_CAP: usize = 256;
-const DA_DSR_CHANNEL_CAP: usize = 64;
+const EGRESS_CHANNEL_CAP: usize = 64;
 /// Default min interval between frame builds (~60 Hz).
 const DEFAULT_BUILD_INTERVAL: Duration = Duration::from_millis(16);
 
+/// User-input egress channel is full — never drop-oldest on this path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct UserEgressFull;
+
 pub(crate) enum EngineCommand {
     Feed(Vec<u8>),
-    #[expect(dead_code, reason = "Slice 2a Task 1 — Key arm wired in Task 2")]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "constructed via enqueue_input in Task 3+")
+    )]
     Key(KeyInput),
     #[expect(dead_code, reason = "Slice 2a Task 1 — Focus arm wired in Task 5")]
     Focus {
@@ -34,7 +41,7 @@ pub(crate) enum EngineCommand {
         dead_code,
         reason = "Slice 2a Task 1 — LocalScroll arm wired in Task 2"
     )]
-    LocalScroll(ScrollDelta),
+    LocalScroll(super::command::ScrollDelta),
     Resize(u16, u16),
     SetVisible(bool),
     /// Test/deterministic helper — bypass the time throttle for one publish pass.
@@ -45,18 +52,18 @@ pub(crate) enum EngineCommand {
 pub(crate) struct WorkerChannels {
     pub cmd_tx: Sender<EngineCommand>,
     pub cmd_rx: Receiver<EngineCommand>,
-    pub da_dsr_tx: Sender<Vec<u8>>,
-    pub da_dsr_rx: Receiver<Vec<u8>>,
+    pub egress_tx: Sender<Vec<u8>>,
+    pub egress_rx: Receiver<Vec<u8>>,
 }
 
 pub(crate) fn worker_channels() -> WorkerChannels {
     let (cmd_tx, cmd_rx) = crossbeam_channel::bounded(CMD_CHANNEL_CAP);
-    let (da_dsr_tx, da_dsr_rx) = crossbeam_channel::bounded(DA_DSR_CHANNEL_CAP);
+    let (egress_tx, egress_rx) = crossbeam_channel::bounded(EGRESS_CHANNEL_CAP);
     WorkerChannels {
         cmd_tx,
         cmd_rx,
-        da_dsr_tx,
-        da_dsr_rx,
+        egress_tx,
+        egress_rx,
     }
 }
 
@@ -67,8 +74,8 @@ pub(crate) fn worker_channels() -> WorkerChannels {
 pub(crate) fn spawn_worker(
     cfg: EngineConfig,
     cmd_rx: Receiver<EngineCommand>,
-    da_dsr_tx: Sender<Vec<u8>>,
-    da_dsr_rx: Receiver<Vec<u8>>,
+    egress_tx: Sender<Vec<u8>>,
+    egress_rx: Receiver<Vec<u8>>,
     frame_slot: Arc<ArcSwapOption<Frame>>,
     frame_ready: Arc<AtomicBool>,
     waker: WakerSlot,
@@ -120,8 +127,8 @@ pub(crate) fn spawn_worker(
                     handle_command(
                         cmd,
                         &mut engine,
-                        &da_dsr_tx,
-                        &da_dsr_rx,
+                        &egress_tx,
+                        &egress_rx,
                         &inspect,
                         &mut dirty,
                         &mut visible,
@@ -138,8 +145,8 @@ pub(crate) fn spawn_worker(
                 handle_command(
                     cmd,
                     &mut engine,
-                    &da_dsr_tx,
-                    &da_dsr_rx,
+                    &egress_tx,
+                    &egress_rx,
                     &inspect,
                     &mut dirty,
                     &mut visible,
@@ -189,8 +196,8 @@ pub(crate) fn spawn_worker(
 fn handle_command(
     cmd: EngineCommand,
     engine: &mut VtEngine,
-    da_dsr_tx: &Sender<Vec<u8>>,
-    da_dsr_rx: &Receiver<Vec<u8>>,
+    egress_tx: &Sender<Vec<u8>>,
+    egress_rx: &Receiver<Vec<u8>>,
     inspect: &InspectShared,
     dirty: &mut bool,
     visible: &mut bool,
@@ -203,10 +210,37 @@ fn handle_command(
             inspect.record_bytes_fed(n);
             let replies = engine.take_replies();
             if !replies.is_empty() {
-                inspect.record_da_dsr(replies.len());
-                emit_da_dsr(da_dsr_tx, da_dsr_rx, replies);
+                inspect.record_egress(replies.len());
+                emit_reply_egress(egress_tx, egress_rx, replies);
             }
             *dirty = true;
+        }
+        EngineCommand::Key(mut input) => {
+            let ack_tx = input.ack.take();
+            let encoded = match engine.encode_key(&input) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    eprintln!("lens-terminal engine: encode_key failed: {e}");
+                    Vec::new()
+                }
+            };
+            let accepted = if encoded.is_empty() {
+                true
+            } else {
+                match try_emit_user_input(egress_tx, &encoded) {
+                    Ok(()) => {
+                        inspect.record_user_egress_accepted();
+                        true
+                    }
+                    Err(UserEgressFull) => {
+                        inspect.record_user_egress_rejected();
+                        false
+                    }
+                }
+            };
+            if let Some(tx) = ack_tx {
+                let _ = tx.try_send(InputAck { encoded, accepted });
+            }
         }
         EngineCommand::Resize(cols, rows) => {
             if let Err(e) = engine.resize(cols, rows) {
@@ -228,7 +262,7 @@ fn handle_command(
         EngineCommand::BuildNow => {
             *force_build = true;
         }
-        EngineCommand::Key(_) | EngineCommand::Focus { .. } | EngineCommand::LocalScroll(_) => {}
+        EngineCommand::Focus { .. } | EngineCommand::LocalScroll(_) => {}
         EngineCommand::Stop => {}
     }
 }
@@ -304,8 +338,8 @@ fn maybe_publish(
     }
 }
 
-/// Non-blocking emit; if the channel is full, drop the oldest reply and retry once.
-fn emit_da_dsr(tx: &Sender<Vec<u8>>, rx: &Receiver<Vec<u8>>, replies: Vec<u8>) {
+/// Non-blocking emit for DA/DSR replies; if full, drop the oldest and retry once.
+fn emit_reply_egress(tx: &Sender<Vec<u8>>, rx: &Receiver<Vec<u8>>, replies: Vec<u8>) {
     match tx.try_send(replies) {
         Ok(()) => {}
         Err(TrySendError::Full(replies)) => {
@@ -313,5 +347,14 @@ fn emit_da_dsr(tx: &Sender<Vec<u8>>, rx: &Receiver<Vec<u8>>, replies: Vec<u8>) {
             let _ = tx.try_send(replies);
         }
         Err(TrySendError::Disconnected(_)) => {}
+    }
+}
+
+/// Never-drop user-input egress — on `Full`, return `Err` without evicting.
+fn try_emit_user_input(tx: &Sender<Vec<u8>>, bytes: &[u8]) -> Result<(), UserEgressFull> {
+    match tx.try_send(bytes.to_vec()) {
+        Ok(()) => Ok(()),
+        Err(TrySendError::Full(_)) => Err(UserEgressFull),
+        Err(TrySendError::Disconnected(_)) => Ok(()),
     }
 }

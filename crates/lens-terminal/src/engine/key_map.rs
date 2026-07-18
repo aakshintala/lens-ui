@@ -140,10 +140,6 @@ pub(crate) fn apply_key_input_to_event(ev: &mut Event<'_>, input: &KeyInput) -> 
 ///
 /// Does not set macOS option-as-alt policy — the caller/terminal owns that via
 /// [`Encoder::set_macos_option_as_alt`] (Task 2 `encode_key` / `set_options_from_terminal`).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Slice 2a Task 1 surface — wired in Task 2")
-)]
 pub(crate) fn encode_key_pure(
     enc: &mut Encoder<'_>,
     ev: &mut Event<'_>,

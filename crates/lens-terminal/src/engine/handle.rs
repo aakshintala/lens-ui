@@ -28,7 +28,7 @@ pub struct EngineHandle {
     frame_slot: Arc<ArcSwapOption<Frame>>,
     frame_ready: Arc<AtomicBool>,
     waker: WakerSlot,
-    da_dsr_rx: Receiver<Vec<u8>>,
+    egress_rx: Receiver<Vec<u8>>,
     inspect: Arc<InspectShared>,
     join: Option<JoinHandle<()>>,
     /// Per-handle build-failure injection counter (see `spawn_worker`). Test-only
@@ -48,8 +48,8 @@ impl EngineHandle {
         let worker::WorkerChannels {
             cmd_tx,
             cmd_rx,
-            da_dsr_tx,
-            da_dsr_rx,
+            egress_tx,
+            egress_rx,
         } = worker::worker_channels();
         let frame_slot = Arc::new(ArcSwapOption::from(None));
         let frame_ready = Arc::new(AtomicBool::new(false));
@@ -60,8 +60,8 @@ impl EngineHandle {
         let join = worker::spawn_worker(
             cfg,
             cmd_rx,
-            da_dsr_tx,
-            da_dsr_rx.clone(),
+            egress_tx,
+            egress_rx.clone(),
             Arc::clone(&frame_slot),
             Arc::clone(&frame_ready),
             Arc::clone(&waker),
@@ -74,7 +74,7 @@ impl EngineHandle {
             frame_slot,
             frame_ready,
             waker,
-            da_dsr_rx,
+            egress_rx,
             inspect,
             join: Some(join),
             #[cfg(test)]
@@ -120,8 +120,8 @@ impl EngineHandle {
         }
     }
 
-    pub fn da_dsr_rx(&self) -> &Receiver<Vec<u8>> {
-        &self.da_dsr_rx
+    pub fn egress_rx(&self) -> &Receiver<Vec<u8>> {
+        &self.egress_rx
     }
 
     pub fn set_inspect_enabled(&self, enabled: bool) {
@@ -202,7 +202,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+    use crate::engine::command::{KeyAction, KeyInput, KeyMods, LensKey};
     use crate::engine::inspect::InspectEventKind;
+    use crate::engine::worker::EngineCommand;
 
     fn test_config() -> EngineConfig {
         EngineConfig {
@@ -275,13 +277,13 @@ mod tests {
     }
 
     #[test]
-    fn primary_da_query_emits_reply_on_da_dsr_channel() {
+    fn primary_da_query_emits_reply_on_egress_channel() {
         let h = EngineHandle::spawn(test_config());
         h.feed(b"\x1b[c".to_vec()).expect("feed");
         h.build_now().expect("build_now");
         let deadline = Instant::now() + Duration::from_secs(2);
         let reply = loop {
-            if let Ok(r) = h.da_dsr_rx().try_recv() {
+            if let Ok(r) = h.egress_rx().try_recv() {
                 break r;
             }
             if Instant::now() >= deadline {
@@ -417,5 +419,77 @@ mod tests {
             tx.try_send(EngineCommand::Feed(vec![])),
             Err(TrySendError::Disconnected(_))
         ));
+    }
+
+    #[test]
+    fn key_encodes_against_live_modes_via_ordered_feed_then_ack() {
+        let h = EngineHandle::spawn(test_config());
+        h.feed(b"\x1b[?1h".to_vec()).expect("feed");
+
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+        h.cmd_sender()
+            .send(EngineCommand::Key(KeyInput {
+                action: KeyAction::Press,
+                key: LensKey::ArrowUp,
+                mods: KeyMods::default(),
+                utf8: None,
+                composing: false,
+                access_epoch: 0,
+                ack: Some(ack_tx),
+            }))
+            .expect("send key");
+
+        let ack = ack_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("ack timeout");
+        assert_eq!(ack.encoded, b"\x1bOA");
+        assert!(ack.accepted);
+        h.stop();
+    }
+
+    #[test]
+    fn user_input_egress_full_does_not_drop_or_false_ack() {
+        let h = EngineHandle::spawn(test_config());
+        let key = KeyInput {
+            action: KeyAction::Press,
+            key: LensKey::A,
+            mods: KeyMods::default(),
+            utf8: Some("a".into()),
+            composing: false,
+            access_epoch: 0,
+            ack: None,
+        };
+        for _ in 0..64 {
+            h.cmd_sender()
+                .send(EngineCommand::Key(key.clone_without_ack()))
+                .expect("send key");
+        }
+
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+        h.cmd_sender()
+            .send(EngineCommand::Key(KeyInput {
+                ack: Some(ack_tx),
+                ..key.clone_without_ack()
+            }))
+            .expect("send key with ack");
+
+        let ack = ack_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("ack timeout");
+        assert!(!ack.accepted, "must not ACK accepted when egress is full");
+        assert_eq!(ack.encoded, b"a");
+
+        let mut drained = Vec::new();
+        while let Ok(b) = h.egress_rx().try_recv() {
+            drained.push(b);
+        }
+        assert_eq!(
+            drained.len(),
+            64,
+            "prior egress must not be drop-oldest evicted"
+        );
+        assert!(drained.iter().all(|b| b == b"a"));
+        assert_eq!(h.inspect().user_egress_rejected, 1);
+        h.stop();
     }
 }

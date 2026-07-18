@@ -52,6 +52,13 @@ pub struct FrameRow {
     pub cells: Vec<FrameCell>,
 }
 
+/// Cursor position in viewport coordinates (for IME preedit overlay).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CursorPos {
+    pub col: u16,
+    pub row: u16,
+}
+
 /// Immutable owned snapshot of the visible grid — the Send boundary.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Frame {
@@ -60,4 +67,6 @@ pub struct Frame {
     pub default_fg: Rgb,
     pub default_bg: Rgb,
     pub grid: Vec<FrameRow>,
+    /// `None` when the cursor is hidden or scrolled out of the visible viewport.
+    pub cursor: Option<CursorPos>,
 }

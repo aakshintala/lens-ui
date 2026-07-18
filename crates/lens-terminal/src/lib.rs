@@ -248,7 +248,9 @@ pub struct Progress {
 // ---------------------------------------------------------------------------
 
 pub use engine::frame::{CellStyle, Frame, FrameCell, FrameRow, Rgb, UnderlineStyle};
-pub use engine::{EngineConfig, EngineError, EngineHandle, EngineInspect, FeedError, VtEngine};
+pub use engine::{
+    CursorPos, EngineConfig, EngineError, EngineHandle, EngineInspect, FeedError, VtEngine,
+};
 pub use inspect::TerminalInspect;
 pub use render::inspect::{RenderInspect, RenderInspectEvent, RenderInspectEventKind};
 

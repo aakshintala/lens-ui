@@ -60,7 +60,7 @@ impl TerminalRuntime {
     }
 
     pub(crate) fn teardown_blocking(mut self) {
-        // 1. signal+join bridge (stops feeding / da_dsr forward)
+        // 1. signal+join bridge (stops feeding / egress forward)
         if let Some(b) = self.bridge.take() {
             b.join();
         }
