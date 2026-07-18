@@ -1122,7 +1122,11 @@ impl TerminalTab {
                     .await;
             })
             .detach();
-            self.schedule_reconnect(Duration::ZERO, cx);
+            // Near-unreachable cmd_tx-full defensive path; consumes retry budget.
+            match self.policy.retry.next_delay(Instant::now()) {
+                Some(delay) => self.schedule_reconnect(delay, cx),
+                None => self.on_detach(DetachedDetail::RetriesExhausted, cx),
+            }
             return;
         }
         let bridge = spawn_bridge(
