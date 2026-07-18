@@ -943,6 +943,7 @@ impl TerminalTab {
                 detail,
                 reattach_available,
             } => {
+                self.clear_input_composition_state();
                 if reattach_available {
                     self.teardown_transport_off_foreground(cx);
                 } else {
@@ -973,6 +974,7 @@ impl TerminalTab {
                 self.schedule_reconnect(Duration::ZERO, cx);
             }
             PolicyAction::Retry { delay } => {
+                self.clear_input_composition_state();
                 self.lifecycle = Lifecycle::Reconnecting;
                 self.presentation.lifecycle = Lifecycle::Reconnecting;
                 self.input_enabled = false;
@@ -1277,13 +1279,10 @@ impl EntityInputHandler for TerminalTab {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        let frame = self.render.latest_frame.as_ref()?;
-        let cursor = frame.cursor?;
+        // `element_bounds` is already the cursor cell (see `default_ime_bounds` registration).
         let metrics = self.render.cell_metrics.as_ref()?;
-        let x = element_bounds.origin.x + metrics.cell_w * f32::from(cursor.col);
-        let y = element_bounds.origin.y + metrics.cell_h * f32::from(cursor.row);
         Some(Bounds::new(
-            gpui::point(x, y),
+            element_bounds.origin,
             gpui::size(metrics.cell_w, metrics.cell_h),
         ))
     }

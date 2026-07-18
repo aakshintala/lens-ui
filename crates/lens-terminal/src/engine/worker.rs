@@ -148,8 +148,7 @@ pub(crate) fn spawn_worker(
     // Per-handle (not a process-global) so parallel tests can't consume each
     // other's injected failures. Zero-cost in production (never read).
     test_build_failures: Arc<AtomicUsize>,
-    #[cfg_attr(not(any(test, feature = "test-util")), allow(unused_variables))]
-    worker_stall_gate: Arc<AtomicBool>,
+    #[cfg(any(test, feature = "test-util"))] worker_stall_gate: Arc<AtomicBool>,
     chunk_barrier: Arc<TestChunkBarrier>,
     access_epoch: Arc<AtomicU64>,
 ) -> JoinHandle<()> {
@@ -172,6 +171,7 @@ pub(crate) fn spawn_worker(
             .unwrap_or_else(Instant::now);
 
         loop {
+            #[cfg(any(test, feature = "test-util"))]
             while worker_stall_gate.load(Ordering::Acquire) {
                 thread::yield_now();
             }
@@ -355,14 +355,7 @@ fn handle_feed_chunked(
         }
 
         let end = (offset + MAX_FEED_CHUNK).min(total);
-        feed_chunk(
-            &bytes[offset..end],
-            engine,
-            egress_tx,
-            egress_rx,
-            inspect,
-            dirty,
-        );
+        feed_chunk(&bytes[offset..end], engine, egress_tx, inspect, dirty);
         offset = end;
 
         #[cfg(test)]
@@ -400,7 +393,6 @@ fn feed_chunk(
     chunk: &[u8],
     engine: &mut VtEngine,
     egress_tx: &Sender<Vec<u8>>,
-    egress_rx: &Receiver<Vec<u8>>,
     inspect: &InspectShared,
     dirty: &mut bool,
 ) {
@@ -411,7 +403,7 @@ fn feed_chunk(
     let replies = engine.take_replies();
     if !replies.is_empty() {
         inspect.record_egress(replies.len());
-        emit_reply_egress(egress_tx, egress_rx, replies);
+        emit_reply_egress(egress_tx, replies);
     }
     *dirty = true;
 }
@@ -663,13 +655,13 @@ fn maybe_publish(
     }
 }
 
-/// Non-blocking emit for DA/DSR replies; if full, drop the oldest and retry once.
-fn emit_reply_egress(tx: &Sender<Vec<u8>>, rx: &Receiver<Vec<u8>>, replies: Vec<u8>) {
+/// Non-blocking emit for DA/DSR replies; best-effort when egress is saturated.
+fn emit_reply_egress(tx: &Sender<Vec<u8>>, replies: Vec<u8>) {
     match tx.try_send(replies) {
         Ok(()) => {}
-        Err(TrySendError::Full(replies)) => {
-            let _ = rx.try_recv();
-            let _ = tx.try_send(replies);
+        Err(TrySendError::Full(_)) => {
+            // Do NOT evict: the shared egress queue may hold never-drop user input.
+            // Drop this best-effort reply instead.
         }
         Err(TrySendError::Disconnected(_)) => {}
     }

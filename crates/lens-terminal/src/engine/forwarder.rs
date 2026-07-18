@@ -13,10 +13,6 @@ use super::worker::EngineCommand;
 const CMD_SEND_TIMEOUT: Duration = Duration::from_millis(50);
 
 enum ForwarderMsg {
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "enqueued via try_enqueue from handle in Task 5+")
-    )]
     Cmd(EngineCommand),
     /// Unblock `recv` during non-blocking stop / sever.
     Wake,
@@ -72,10 +68,6 @@ impl InputForwarder {
     }
 
     /// Never blocks the caller — pushes into the unbounded local queue.
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "called from handle::enqueue_input in Task 5+")
-    )]
     pub(crate) fn try_enqueue(&self, cmd: EngineCommand) -> Result<(), ()> {
         if self.stop.load(Ordering::Acquire) {
             return Err(());

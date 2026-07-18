@@ -1,7 +1,5 @@
 //! Engine input command types for the Slice 2a input path.
 
-#![expect(dead_code, reason = "Slice 2a Task 1 surface — wired in Tasks 2–6")]
-
 use crossbeam_channel::Sender;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -20,6 +18,7 @@ pub(crate) struct KeyMods {
 }
 
 /// Full physical key set mirrored from Ghostty's [`libghostty_vt::key::Key`].
+#[allow(dead_code, reason = "variants exercised as the key map grows")]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[non_exhaustive]
 pub(crate) enum LensKey {
@@ -213,6 +212,10 @@ pub(crate) struct KeyInput {
 }
 
 impl KeyInput {
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "test helper for ack-barrier tests")
+    )]
     pub(crate) fn clone_without_ack(&self) -> Self {
         Self {
             action: self.action,
@@ -232,6 +235,10 @@ pub struct InputAck {
     pub accepted: bool,
 }
 
+#[allow(
+    dead_code,
+    reason = "Top/Bottom for programmatic scroll; UI wheel maps to Lines"
+)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ScrollDelta {
     Lines(i32),

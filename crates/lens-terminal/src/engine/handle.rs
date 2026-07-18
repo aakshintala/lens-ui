@@ -103,8 +103,6 @@ impl EngineHandle {
             Arc::clone(&test_build_failures),
             #[cfg(any(test, feature = "test-util"))]
             Arc::clone(&worker_stall_gate),
-            #[cfg(not(any(test, feature = "test-util")))]
-            Arc::new(AtomicBool::new(false)),
             Arc::clone(&chunk_barrier),
             Arc::clone(&access_epoch),
         );
@@ -132,10 +130,6 @@ impl EngineHandle {
     ///
     /// Stamps the current [`access_epoch`](Self::bump_access_epoch) onto `Key` / `Focus` at
     /// enqueue time.
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "TerminalTab input path wired in Task 5+")
-    )]
     pub(crate) fn enqueue_input(&self, mut cmd: EngineCommand) -> Result<(), FeedError> {
         let epoch = self.access_epoch.load(Ordering::Acquire);
         match &mut cmd {
@@ -154,7 +148,6 @@ impl EngineHandle {
     /// queued in the forwarder are dropped at forward time via epoch comparison; the
     /// worker's final-egress epoch recheck (Slice 2a Task 6) is the second layer for
     /// commands already mid-retry on `cmd_tx`.
-    #[allow(dead_code, reason = "read-only downgrade wired in Task 6")]
     pub(crate) fn bump_access_epoch(&self) -> u64 {
         self.access_epoch.fetch_add(1, Ordering::AcqRel) + 1
     }
@@ -1038,6 +1031,60 @@ mod tests {
         );
         assert!(drained[1..].iter().all(|b| b == b"a"));
         assert_eq!(h.inspect().user_egress_rejected, 1);
+        h.stop();
+    }
+
+    #[test]
+    fn reply_egress_full_does_not_evict_user_input() {
+        let h = EngineHandle::spawn(test_config());
+
+        for i in 0..64u8 {
+            let ch = char::from(b'A' + i);
+            h.cmd_sender()
+                .send(EngineCommand::Key(KeyInput {
+                    action: KeyAction::Press,
+                    key: LensKey::Unidentified,
+                    mods: KeyMods::default(),
+                    utf8: Some(ch.to_string()),
+                    composing: false,
+                    access_epoch: 0,
+                    ack: None,
+                }))
+                .expect("send key");
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while h.egress_rx().len() < 64 {
+            if Instant::now() >= deadline {
+                panic!("timeout waiting for egress to fill with user input");
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(h.egress_rx().len(), 64);
+
+        h.feed(b"\x1b[c".to_vec()).expect("feed DA query");
+        h.build_now().expect("build_now");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if h.egress_rx().len() > 64 {
+                panic!("reply egress evicted user input from shared queue");
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        let mut drained = Vec::new();
+        while let Ok(b) = h.egress_rx().try_recv() {
+            drained.push(b);
+        }
+        assert_eq!(
+            drained.len(),
+            64,
+            "reply must be dropped, not evict never-drop user egress"
+        );
+        for (i, bytes) in drained.iter().enumerate() {
+            let expected = char::from(b'A' + i as u8).to_string();
+            assert_eq!(bytes.as_slice(), expected.as_bytes(), "egress order at {i}");
+        }
         h.stop();
     }
 }
