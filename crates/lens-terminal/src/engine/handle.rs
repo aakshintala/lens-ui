@@ -882,9 +882,16 @@ mod tests {
     }
 
     #[test]
-    fn downgrade_revokes_queued_key_before_egress() {
+    fn focus_report_suppressed_when_mode_1004_off() {
         let h = EngineHandle::spawn(test_config());
-        h.test_stall_worker();
+        while h.egress_rx().try_recv().is_ok() {}
+        h.cmd_sender()
+            .send(EngineCommand::Focus {
+                focused: true,
+                report: true,
+                access_epoch: 0,
+            })
+            .expect("focus");
         let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
         h.cmd_sender()
             .send(EngineCommand::Key(KeyInput {
@@ -896,7 +903,34 @@ mod tests {
                 access_epoch: 0,
                 ack: Some(ack_tx),
             }))
-            .expect("queue key");
+            .expect("barrier key");
+        let ack = ack_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("barrier ack");
+        assert!(ack.accepted);
+        let mut egress = Vec::new();
+        while let Ok(b) = h.egress_rx().try_recv() {
+            egress.extend_from_slice(&b);
+        }
+        assert_eq!(egress, b"z");
+        h.stop();
+    }
+
+    #[test]
+    fn downgrade_revokes_queued_key_before_egress() {
+        let h = EngineHandle::spawn(test_config());
+        h.test_stall_worker();
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+        h.enqueue_input(EngineCommand::Key(KeyInput {
+            action: KeyAction::Press,
+            key: LensKey::Z,
+            mods: KeyMods::default(),
+            utf8: Some("z".into()),
+            composing: false,
+            access_epoch: 0,
+            ack: Some(ack_tx),
+        }))
+        .expect("enqueue key");
         h.bump_access_epoch();
         h.test_release_worker();
         let ack = ack_rx.recv_timeout(Duration::from_secs(2)).expect("ack");
@@ -929,25 +963,17 @@ mod tests {
         );
 
         h.enqueue_local_scroll(ScrollDelta::Top).expect("scroll");
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        h.set_waker(Box::new(move || {
+            let _ = done_tx.try_send(());
+        }));
         h.build_now().expect("build_now");
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let after = loop {
-            if let Some(f) = h.latest_frame() {
-                let text = grid_text(&f);
-                if text.contains("L00") && !text.contains("L29") {
-                    break f;
-                }
-            }
-            if Instant::now() >= deadline {
-                panic!(
-                    "timeout waiting for scroll top; last={:?}",
-                    h.latest_frame().map(|f| grid_text(&f))
-                );
-            }
-            h.build_now().ok();
-            thread::sleep(Duration::from_millis(1));
-        };
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("scroll frame wake");
+        let after = h.latest_frame().expect("frame after scroll");
         assert!(grid_text(&after).contains("L00"));
+        assert!(!grid_text(&after).contains("L29"));
         assert!(h.egress_rx().try_recv().is_err());
         h.stop();
     }

@@ -128,14 +128,23 @@ impl InspectShared {
     }
 
     pub fn record_keys_encoded(&self) {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return;
+        }
         self.keys_encoded.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_feed_chunk(&self) {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return;
+        }
         self.feed_chunks.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_stop_preempt(&self) {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return;
+        }
         self.stop_preempts.fetch_add(1, Ordering::Relaxed);
     }
 

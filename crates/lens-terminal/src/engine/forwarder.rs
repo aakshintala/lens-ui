@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use crossbeam_channel::{Receiver, SendTimeoutError, Sender};
 
+use super::command::InputAck;
 use super::worker::EngineCommand;
 
 const CMD_SEND_TIMEOUT: Duration = Duration::from_millis(50);
@@ -108,6 +109,18 @@ impl InputForwarder {
     }
 }
 
+/// Honest revoke ack for stale Key commands — never leave the caller hanging.
+fn send_stale_revoke_ack(cmd: EngineCommand) {
+    if let EngineCommand::Key(mut input) = cmd
+        && let Some(tx) = input.ack.take()
+    {
+        let _ = tx.try_send(InputAck {
+            encoded: Vec::new(),
+            accepted: false,
+        });
+    }
+}
+
 /// True when a stamped command belongs to a prior access epoch and must not be forwarded.
 fn is_stale(cmd: &EngineCommand, current_epoch: u64) -> bool {
     match cmd {
@@ -134,6 +147,7 @@ fn forward_loop(
             ForwarderMsg::Wake => {}
             ForwarderMsg::Cmd(cmd) => {
                 if is_stale(&cmd, access_epoch.load(Ordering::Acquire)) {
+                    send_stale_revoke_ack(cmd);
                     continue;
                 }
                 let mut pending = cmd;
@@ -158,6 +172,8 @@ fn forward_loop(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::engine::command::{KeyAction, KeyInput, KeyMods, LensKey, ScrollDelta};
 
@@ -189,5 +205,24 @@ mod tests {
             &EngineCommand::LocalScroll(ScrollDelta::Lines(1)),
             u64::MAX
         ));
+    }
+
+    #[test]
+    fn stale_key_with_ack_gets_revoke_ack_before_drop() {
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+        send_stale_revoke_ack(EngineCommand::Key(KeyInput {
+            action: KeyAction::Press,
+            key: LensKey::Z,
+            mods: KeyMods::default(),
+            utf8: Some("z".into()),
+            composing: false,
+            access_epoch: 0,
+            ack: Some(ack_tx),
+        }));
+        let ack = ack_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("stale ack");
+        assert!(!ack.accepted);
+        assert!(ack.encoded.is_empty());
     }
 }

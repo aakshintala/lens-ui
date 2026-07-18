@@ -507,16 +507,20 @@ fn handle_command(
                 match engine.encode_key(&input) {
                     Ok(bytes) if bytes.is_empty() => (bytes, true),
                     Ok(bytes) => {
-                        inspect.record_keys_encoded();
-                        match try_emit_user_input(egress_tx, &bytes) {
-                            Ok(()) => {
-                                inspect.record_user_egress_accepted();
-                                (bytes, true)
-                            }
-                            Err(UserEgressFull) => {
-                                inspect.record_user_egress_rejected();
-                                // Never-drop: user input is atomically rejected (accepted:false), never drop-oldest (that policy is replies-only). Egress fills only when the bridge's forward_egress stalls on a full outbound; that path emits BridgeEvent::OutboundSaturated within 50ms (bridge.rs forward_egress) → reconnect. So saturation is surfaced to policy via the existing OutboundSaturated path (plan: "reuse OutboundSaturated with a clear comment") — no separate UserEgressSaturated event.
-                                (bytes, false)
+                        if cmd_epoch != access_epoch.load(Ordering::Acquire) {
+                            (Vec::new(), false)
+                        } else {
+                            inspect.record_keys_encoded();
+                            match try_emit_user_input(egress_tx, &bytes) {
+                                Ok(()) => {
+                                    inspect.record_user_egress_accepted();
+                                    (bytes, true)
+                                }
+                                Err(UserEgressFull) => {
+                                    inspect.record_user_egress_rejected();
+                                    // Never-drop: user input is atomically rejected (accepted:false), never drop-oldest (that policy is replies-only). Egress fills only when the bridge's forward_egress stalls on a full outbound; that path emits BridgeEvent::OutboundSaturated within 50ms (bridge.rs forward_egress) → reconnect. So saturation is surfaced to policy via the existing OutboundSaturated path (plan: "reuse OutboundSaturated with a clear comment") — no separate UserEgressSaturated event.
+                                    (bytes, false)
+                                }
                             }
                         }
                     }
@@ -540,6 +544,9 @@ fn handle_command(
             }
             match engine.encode_focus_report(focused) {
                 Ok(Some(bytes)) => {
+                    if cmd_epoch != access_epoch.load(Ordering::Acquire) {
+                        return;
+                    }
                     inspect.record_keys_encoded();
                     match try_emit_user_input(egress_tx, &bytes) {
                         Ok(()) => {

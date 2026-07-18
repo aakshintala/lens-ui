@@ -70,7 +70,7 @@ pub mod render_bench_api {
 /// Engine input-path helpers for Criterion benches (`bench` feature).
 #[cfg(feature = "bench")]
 pub mod engine_bench_api {
-    use std::time::Duration;
+    use crossbeam_channel::bounded;
 
     use crate::engine::command::{KeyAction, KeyInput, KeyMods, LensKey};
     use crate::engine::worker::EngineCommand;
@@ -88,8 +88,9 @@ pub mod engine_bench_api {
         })
     }
 
-    pub fn feed_app_cursor_mode_then_arrow_up(handle: &EngineHandle) -> Result<u64, FeedError> {
+    pub fn feed_app_cursor_mode_then_arrow_up(handle: &EngineHandle) -> Result<(), FeedError> {
         handle.feed(b"\x1b[?1h".to_vec())?;
+        let (ack_tx, ack_rx) = bounded(1);
         handle.enqueue_input(EngineCommand::Key(KeyInput {
             action: KeyAction::Press,
             key: LensKey::ArrowUp,
@@ -97,10 +98,10 @@ pub mod engine_bench_api {
             utf8: None,
             composing: false,
             access_epoch: 0,
-            ack: None,
+            ack: Some(ack_tx),
         }))?;
-        std::thread::sleep(Duration::from_millis(1));
-        Ok(handle.inspect().keys_encoded)
+        ack_rx.recv().map_err(|_| FeedError::Stopped)?;
+        Ok(())
     }
 }
 
@@ -952,14 +953,17 @@ impl TerminalTab {
                 cx.notify();
             }
             PolicyAction::DowngradeReadOnly => {
-                if let Some(rt) = &self.runtime
-                    && let Some(engine) = &rt.engine
-                {
-                    engine.bump_access_epoch();
+                let was_write = matches!(self.presentation.access, AccessMode::Write);
+                if was_write {
+                    if let Some(rt) = &self.runtime
+                        && let Some(engine) = &rt.engine
+                    {
+                        engine.bump_access_epoch();
+                    }
+                    self.clear_input_composition_state();
                 }
                 self.presentation.access = AccessMode::ReadOnly;
                 self.input_enabled = false;
-                self.clear_input_composition_state();
                 self.teardown_transport_off_foreground(cx);
                 self.policy.retry.reset();
                 self.lifecycle = Lifecycle::Reconnecting;
