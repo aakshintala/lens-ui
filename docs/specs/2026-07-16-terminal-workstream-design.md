@@ -521,7 +521,8 @@ Every requirement maps to a slice; deferral is explicit, never forgotten.
 | Retained-engine reconnect-seed semantics (scrollback dup / gap-marker) | 1d (acceptance test) |
 | Live vertical proof vs real omnigent | 1d |
 | Identity/replacement: `Existing`/`OpenOrCreate`, generation guard | 1d (basic guard), 3 (full) |
-| Interaction: keyboard/IME/paste/selection/copy/mouse; OSC 52 write-cap + **read-denial**; OSC progress + background notifications; titles; hyperlink gestures | 2 |
+| Interaction: keyboard/IME/paste/selection/copy/mouse; OSC 52 write-cap + **read-denial**; titles; hyperlink gestures | 2 |
+| OSC progress + background notification **payloads** | deferred → Slice-2 follow-up (libghostty-vt binding gap — see Open contract gaps; un-defer via upstream Ghostty selector **or** a hand-rolled Lens OSC tap) |
 | Lifecycle full: `ReplacementWaiting`/`Sleeping`/`Ended`, Sleep/wake (confirmed-exit teardown), supersession | 3 |
 | Fleet memory-pressure trim/disconnect + **byte-accounting FFI extension** | 3 |
 | Inspect + diagnostic rings (disabled-path proof) | per-slice (1a/1b/1c/1d **+ 2/3 extensions**), integrated 4 |
@@ -544,3 +545,16 @@ Every requirement maps to a slice; deferral is explicit, never forgotten.
   `StreamUpdate::Superseded { target_conversation_id, reason }`) is Slice 3 /
   terminal-integration work, not the lens-ui skeleton (cross-spec risk recorded in
   SPEC-GAPS).
+- **No OSC progress / desktop-notification payload accessor in `libghostty-vt`.**
+  The pinned Ghostty C ABI (`ghostty_osc_command_data`) defines exactly one real
+  `OscCommandData` selector — `CHANGE_WINDOW_TITLE_STR`; there is **no** getter for
+  `CONEMU_PROGRESS_REPORT` (OSC 9;4) or `SHOW_DESKTOP_NOTIFICATION` (OSC 9 / OSC 777)
+  payloads, and no matching `on_*` terminal callback (spike 2026-07-17, verified
+  against the vendored `bindings.rs`). The parser recognizes the command *type* but
+  exposes no payload. **Progress + notifications are deferred to a Slice-2 follow-up**
+  (matrix updated); titles / hyperlinks / OSC 52 are unaffected and ship in 2d.
+  Un-defer via (a) upstreaming the two `OscCommandData` selectors to Ghostty + re-vendor,
+  **or** (b) a hand-rolled incremental Lens OSC tap over the raw `Feed` bytes (must
+  handle OSC split across `Feed`-chunk boundaries + ST/BEL terminators + the
+  ConEmu 9;4 / OSC 777 grammar). `TerminalTab::presentation()` keeps its `progress`
+  field in the public surface; it is simply unpopulated until un-defer.
