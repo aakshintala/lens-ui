@@ -1,7 +1,7 @@
 //! Foreground-local input queue + off-fg forwarder onto the bounded `cmd_tx`.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -17,14 +17,16 @@ enum ForwarderMsg {
         allow(dead_code, reason = "enqueued via try_enqueue from handle in Task 5+")
     )]
     Cmd(EngineCommand),
-    /// Drop all pending local commands (access downgrade).
-    #[allow(dead_code, reason = "bump_access_epoch purge in Task 6")]
-    Purge,
     /// Unblock `recv` during non-blocking stop / sever.
     Wake,
 }
 
 /// Off-foreground forwarder: unbounded FG-local queue → bounded `cmd_tx` with retry.
+///
+/// Access downgrade revoke is epoch-gated at forward time: each `Cmd` is dropped if its
+/// stamped epoch is strictly less than the shared [`access_epoch`](AtomicU64). The worker's
+/// final-egress epoch recheck (Slice 2a Task 6) is the authoritative second layer for
+/// commands already mid-retry on `cmd_tx`.
 pub(crate) struct InputForwarder {
     local_tx: Sender<ForwarderMsg>,
     stop: Arc<AtomicBool>,
@@ -39,7 +41,7 @@ pub(crate) struct InputForwarder {
 }
 
 impl InputForwarder {
-    pub(crate) fn spawn(cmd_tx: Sender<EngineCommand>) -> Self {
+    pub(crate) fn spawn(cmd_tx: Sender<EngineCommand>, access_epoch: Arc<AtomicU64>) -> Self {
         let (local_tx, local_rx) = crossbeam_channel::unbounded();
         let stop = Arc::new(AtomicBool::new(false));
         let blocked_in_retry = Arc::new(AtomicBool::new(false));
@@ -48,10 +50,11 @@ impl InputForwarder {
 
         let stop_t = Arc::clone(&stop);
         let blocked_t = Arc::clone(&blocked_in_retry);
+        let epoch_t = Arc::clone(&access_epoch);
         let join = thread::Builder::new()
             .name("lens-terminal-input-forwarder".into())
             .spawn(move || {
-                forward_loop(local_rx, cmd_tx, stop_t, blocked_t);
+                forward_loop(local_rx, cmd_tx, stop_t, blocked_t, epoch_t);
                 #[cfg(test)]
                 let _ = sever_done_tx.send(());
             })
@@ -77,15 +80,6 @@ impl InputForwarder {
             return Err(());
         }
         self.local_tx.send(ForwarderMsg::Cmd(cmd)).map_err(|_| ())
-    }
-
-    /// Drop all commands still waiting in the local queue.
-    #[allow(dead_code, reason = "bump_access_epoch in Task 6")]
-    pub(crate) fn purge(&self) {
-        if self.stop.load(Ordering::Acquire) {
-            return;
-        }
-        let _ = self.local_tx.send(ForwarderMsg::Purge);
     }
 
     /// Set `stop`, wake the thread, and block until it exits.
@@ -114,11 +108,21 @@ impl InputForwarder {
     }
 }
 
+/// True when a stamped command belongs to a prior access epoch and must not be forwarded.
+fn is_stale(cmd: &EngineCommand, current_epoch: u64) -> bool {
+    match cmd {
+        EngineCommand::Key(k) => k.access_epoch < current_epoch,
+        EngineCommand::Focus { access_epoch, .. } => *access_epoch < current_epoch,
+        _ => false,
+    }
+}
+
 fn forward_loop(
     local_rx: Receiver<ForwarderMsg>,
     cmd_tx: Sender<EngineCommand>,
     stop: Arc<AtomicBool>,
     #[cfg_attr(not(test), allow(unused_variables))] blocked_in_retry: Arc<AtomicBool>,
+    access_epoch: Arc<AtomicU64>,
 ) {
     while !stop.load(Ordering::Acquire) {
         let msg = match local_rx.recv() {
@@ -127,9 +131,11 @@ fn forward_loop(
         };
 
         match msg {
-            ForwarderMsg::Purge => while local_rx.try_recv().is_ok() {},
             ForwarderMsg::Wake => {}
             ForwarderMsg::Cmd(cmd) => {
+                if is_stale(&cmd, access_epoch.load(Ordering::Acquire)) {
+                    continue;
+                }
                 let mut pending = cmd;
                 loop {
                     if stop.load(Ordering::Acquire) {
@@ -147,5 +153,41 @@ fn forward_loop(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::command::{KeyAction, KeyInput, KeyMods, LensKey, ScrollDelta};
+
+    fn key_with_epoch(epoch: u64) -> EngineCommand {
+        EngineCommand::Key(KeyInput {
+            action: KeyAction::Press,
+            key: LensKey::A,
+            mods: KeyMods::default(),
+            utf8: Some("a".into()),
+            composing: false,
+            access_epoch: epoch,
+            ack: None,
+        })
+    }
+
+    #[test]
+    fn is_stale_drops_prior_epoch_key_and_focus_not_scroll() {
+        assert!(is_stale(&key_with_epoch(0), 1));
+        assert!(!is_stale(&key_with_epoch(1), 1));
+        assert!(is_stale(
+            &EngineCommand::Focus {
+                focused: true,
+                report: false,
+                access_epoch: 0,
+            },
+            2
+        ));
+        assert!(!is_stale(
+            &EngineCommand::LocalScroll(ScrollDelta::Lines(1)),
+            u64::MAX
+        ));
     }
 }

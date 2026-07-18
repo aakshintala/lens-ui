@@ -28,6 +28,12 @@ pub struct EngineHandle {
     cmd_tx: Sender<EngineCommand>,
     input_forwarder: Option<InputForwarder>,
     access_epoch: Arc<AtomicU64>,
+    #[cfg(any(test, feature = "test-util"))]
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "used from #[cfg(test)] handle tests")
+    )]
+    worker_stall_gate: Arc<AtomicBool>,
     frame_slot: Arc<ArcSwapOption<Frame>>,
     frame_ready: Arc<AtomicBool>,
     waker: WakerSlot,
@@ -77,7 +83,9 @@ impl EngineHandle {
         let inspect = Arc::new(InspectShared::new(cfg.cols, cfg.rows, cfg.max_scrollback));
         let test_build_failures = Arc::new(AtomicUsize::new(0));
         let access_epoch = Arc::new(AtomicU64::new(0));
-        let input_forwarder = InputForwarder::spawn(cmd_tx.clone());
+        #[cfg(any(test, feature = "test-util"))]
+        let worker_stall_gate = Arc::new(AtomicBool::new(false));
+        let input_forwarder = InputForwarder::spawn(cmd_tx.clone(), Arc::clone(&access_epoch));
 
         let join = worker::spawn_worker(
             cfg,
@@ -89,12 +97,18 @@ impl EngineHandle {
             Arc::clone(&waker),
             Arc::clone(&inspect),
             Arc::clone(&test_build_failures),
+            #[cfg(any(test, feature = "test-util"))]
+            Arc::clone(&worker_stall_gate),
+            #[cfg(not(any(test, feature = "test-util")))]
+            Arc::new(AtomicBool::new(false)),
         );
 
         Self {
             cmd_tx,
             input_forwarder: Some(input_forwarder),
             access_epoch,
+            #[cfg(any(test, feature = "test-util"))]
+            worker_stall_gate,
             frame_slot,
             frame_ready,
             waker,
@@ -128,14 +142,13 @@ impl EngineHandle {
         forwarder.try_enqueue(cmd).map_err(|()| FeedError::Stopped)
     }
 
-    /// Bump the access epoch and purge pending local input (read-only downgrade).
+    /// Bump the access epoch (read-only downgrade). Stale `Key`/`Focus` commands still
+    /// queued in the forwarder are dropped at forward time via epoch comparison; the
+    /// worker's final-egress epoch recheck (Slice 2a Task 6) is the second layer for
+    /// commands already mid-retry on `cmd_tx`.
     #[allow(dead_code, reason = "read-only downgrade wired in Task 6")]
     pub(crate) fn bump_access_epoch(&self) -> u64 {
-        let new = self.access_epoch.fetch_add(1, Ordering::AcqRel) + 1;
-        if let Some(forwarder) = &self.input_forwarder {
-            forwarder.purge();
-        }
-        new
+        self.access_epoch.fetch_add(1, Ordering::AcqRel) + 1
     }
 
     pub fn feed(&self, bytes: Vec<u8>) -> Result<(), FeedError> {
@@ -194,6 +207,26 @@ impl EngineHandle {
     #[cfg(test)]
     pub(crate) fn test_inject_build_failures(&self, count: usize) {
         self.test_build_failures.store(count, Ordering::SeqCst);
+    }
+
+    /// Hold the worker before it drains `cmd_rx` so bounded-channel fullness tests are deterministic.
+    #[cfg(any(test, feature = "test-util"))]
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "used from #[cfg(test)] handle tests")
+    )]
+    pub(crate) fn test_stall_worker(&self) {
+        self.worker_stall_gate.store(true, Ordering::Release);
+    }
+
+    /// Release a worker held by [`Self::test_stall_worker`].
+    #[cfg(any(test, feature = "test-util"))]
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "used from #[cfg(test)] handle tests")
+    )]
+    pub(crate) fn test_release_worker(&self) {
+        self.worker_stall_gate.store(false, Ordering::Release);
     }
 
     /// Bypass the publish throttle — intended for deterministic tests.
@@ -299,6 +332,7 @@ mod tests {
     #[test]
     fn try_enqueue_never_blocks_when_engine_channel_full() {
         let h = EngineHandle::spawn_with_cmd_cap_for_test(test_config(), 1);
+        h.test_stall_worker();
         h.cmd_sender()
             .send(EngineCommand::BuildNow)
             .expect("fill cmd channel");
@@ -322,6 +356,7 @@ mod tests {
             "1000 try_enqueues took {:?}",
             start.elapsed()
         );
+        h.test_release_worker();
         h.stop();
     }
 
@@ -333,7 +368,7 @@ mod tests {
             .send(EngineCommand::BuildNow)
             .expect("fill cmd channel");
 
-        let mut forwarder = InputForwarder::spawn(cmd_tx);
+        let mut forwarder = InputForwarder::spawn(cmd_tx, Arc::new(AtomicU64::new(0)));
         let key = KeyInput {
             action: KeyAction::Press,
             key: LensKey::A,
@@ -356,7 +391,7 @@ mod tests {
         }
 
         let done_rx = forwarder.take_sever_done_rx().expect("sever done rx");
-        forwarder.sever_and_join();
+        thread::spawn(move || forwarder.sever_and_join());
         done_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("forwarder must exit after sever");
@@ -365,6 +400,7 @@ mod tests {
     #[test]
     fn drop_engine_handle_does_not_block_on_full_cmd_channel() {
         let h = EngineHandle::spawn_with_cmd_cap_for_test(test_config(), 1);
+        h.test_stall_worker();
         h.cmd_sender()
             .send(EngineCommand::BuildNow)
             .expect("fill cmd channel");

@@ -84,6 +84,8 @@ pub(crate) fn spawn_worker(
     // Per-handle (not a process-global) so parallel tests can't consume each
     // other's injected failures. Zero-cost in production (never read).
     test_build_failures: Arc<AtomicUsize>,
+    #[cfg_attr(not(any(test, feature = "test-util")), allow(unused_variables))]
+    worker_stall_gate: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut engine = match VtEngine::new(&cfg, |_| {}) {
@@ -103,6 +105,10 @@ pub(crate) fn spawn_worker(
             .unwrap_or_else(Instant::now);
 
         loop {
+            while worker_stall_gate.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+
             let throttle_remaining = DEFAULT_BUILD_INTERVAL.saturating_sub(last_build.elapsed());
             let wait_for_throttle =
                 dirty && visible && !force_build && throttle_remaining > Duration::ZERO;
