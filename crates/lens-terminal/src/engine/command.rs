@@ -227,7 +227,7 @@ impl KeyInput {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct InputAck {
+pub struct InputAck {
     pub encoded: Vec<u8>,
     pub accepted: bool,
 }

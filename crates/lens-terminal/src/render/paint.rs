@@ -21,7 +21,7 @@ use gpui::{
 use gpui::{fill, point, px, size};
 
 use super::metrics::CellMetrics;
-use crate::{Frame, FrameCell, FrameRow, Rgb};
+use crate::{CursorPos, Frame, FrameCell, FrameRow, Rgb};
 
 /// Selection background (matches the spike's highlight).
 const SELECTION_BG: Rgb = Rgb {
@@ -464,6 +464,48 @@ fn paint_per_cell_row(
         }
     }
     (shapes, errors)
+}
+
+/// Foreground IME preedit overlay at the viewport cursor (Slice 2a). Only called
+/// when `frame.cursor` is `Some`; paints above the grid at `cursor` cell origin.
+pub fn paint_preedit_overlay(
+    preedit: &str,
+    cursor: CursorPos,
+    origin: Point<Pixels>,
+    metrics: &CellMetrics,
+    window: &mut Window,
+    cx: &mut App,
+) -> bool {
+    if preedit.is_empty() {
+        return false;
+    }
+    let x = origin.x + metrics.cell_w * f32::from(cursor.col);
+    let y = origin.y + metrics.cell_h * f32::from(cursor.row);
+    let fg = rgb_to_hsla(Rgb {
+        r: 255,
+        g: 255,
+        b: 180,
+    });
+    let bg = rgb_to_hsla(Rgb {
+        r: 60,
+        g: 60,
+        b: 90,
+    });
+    let text = SharedString::from(preedit.to_owned());
+    let run = TextRun {
+        len: text.len(),
+        font: metrics.font.clone(),
+        color: fg,
+        background_color: Some(bg),
+        underline: None,
+        strikethrough: None,
+    };
+    let shaped = window
+        .text_system()
+        .shape_line(text, metrics.font_size, &[run], None);
+    shaped
+        .paint(point(x, y), metrics.cell_h, window, cx)
+        .is_ok()
 }
 
 /// Paint a full `Frame` snapshot at `origin`. Emits the default-bg fill, per

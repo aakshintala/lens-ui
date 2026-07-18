@@ -99,12 +99,8 @@ pub(crate) struct UserEgressFull;
 
 pub(crate) enum EngineCommand {
     Feed(Vec<u8>),
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "constructed via enqueue_input in Task 3+")
-    )]
     Key(KeyInput),
-    #[expect(dead_code, reason = "Slice 2a Task 1 — Focus arm wired in Task 5")]
+    #[expect(dead_code, reason = "Slice 2a Task 1 — Focus arm wired in Task 6")]
     Focus {
         focused: bool,
         report: bool,

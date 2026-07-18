@@ -296,3 +296,15 @@ fn spawn_driver(tab: Entity<TerminalTab>, marker: String, cx: &mut App) {
     })
     .detach();
 }
+
+// ---------------------------------------------------------------------------
+// Manual IME checklist (Slice 2a Task 5 — not automatable in CI)
+// ---------------------------------------------------------------------------
+//
+// With a CJK input source active on macOS:
+// 1. Focus the live terminal tab; confirm IME candidate window tracks the cursor.
+// 2. Compose preedit (e.g. pinyin "nihao") — preedit overlay appears at cursor;
+//    no PTY bytes until commit.
+// 3. Commit (space/enter) — exactly one UTF-8 commit hits the remote shell.
+// 4. Cancel composition (escape) — preedit overlay clears; no egress.
+// 5. Switch input source back to ABC; plain typing still single-emits via InputHandler.

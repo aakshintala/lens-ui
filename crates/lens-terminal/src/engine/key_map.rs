@@ -5,11 +5,71 @@ use libghostty_vt::key::{Action, Encoder, Event, Key, Mods};
 
 use super::command::{KeyAction, KeyInput, KeyMods, LensKey};
 
+/// Whether a gpui keydown should enqueue via the special-key path (not plain printable text).
+///
+/// Unmodified printable keys are owned by [`gpui::EntityInputHandler::replace_text_in_range`]
+/// so gpui does not double-emit `key_char` and keydown.
+pub(crate) fn keydown_should_enqueue(key: &str, mods: &gpui::Modifiers) -> bool {
+    if mods.control || mods.alt || mods.platform || mods.function {
+        return true;
+    }
+    if mods.shift {
+        return true;
+    }
+    matches!(
+        key,
+        "up" | "down"
+            | "left"
+            | "right"
+            | "pageup"
+            | "pagedown"
+            | "home"
+            | "end"
+            | "insert"
+            | "enter"
+            | "tab"
+            | "escape"
+            | "backspace"
+            | "delete"
+            | "f1"
+            | "f2"
+            | "f3"
+            | "f4"
+            | "f5"
+            | "f6"
+            | "f7"
+            | "f8"
+            | "f9"
+            | "f10"
+            | "f11"
+            | "f12"
+            | "f13"
+            | "f14"
+            | "f15"
+            | "f16"
+            | "f17"
+            | "f18"
+            | "f19"
+            | "f20"
+            | "f21"
+            | "f22"
+            | "f23"
+            | "f24"
+            | "f25"
+    )
+}
+
+/// Map gpui modifier state to engine [`KeyMods`].
+pub(crate) fn gpui_mods_to_key_mods(mods: &gpui::Modifiers) -> KeyMods {
+    KeyMods {
+        shift: mods.shift,
+        alt: mods.alt,
+        ctrl: mods.control,
+        super_key: mods.platform,
+    }
+}
+
 /// Map a gpui [`Keystroke`](gpui::Keystroke) physical `key` string to [`LensKey`].
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Slice 2a Task 1 surface — wired in Task 2")
-)]
 pub(crate) fn keystroke_to_lens(key: &str) -> LensKey {
     match key {
         "a" => LensKey::A,
@@ -485,6 +545,30 @@ mod tests {
         assert_eq!(press, b"\x1b[1;1:1A");
         assert_eq!(release, b"\x1b[1;1:3A");
         assert_eq!(repeat, b"\x1b[1;1:2A");
+    }
+
+    #[test]
+    fn keydown_should_enqueue_special_and_modified_only() {
+        use gpui::Modifiers;
+
+        assert!(keydown_should_enqueue("up", &Modifiers::default()));
+        assert!(keydown_should_enqueue("enter", &Modifiers::default()));
+        assert!(!keydown_should_enqueue("a", &Modifiers::default()));
+        assert!(!keydown_should_enqueue("z", &Modifiers::default()));
+        assert!(keydown_should_enqueue(
+            "c",
+            &Modifiers {
+                control: true,
+                ..Modifiers::default()
+            }
+        ));
+        assert!(keydown_should_enqueue(
+            "a",
+            &Modifiers {
+                shift: true,
+                ..Modifiers::default()
+            }
+        ));
     }
 
     #[test]

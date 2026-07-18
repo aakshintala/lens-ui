@@ -159,7 +159,7 @@ impl Render for HarnessView {
                     *self.phase.borrow_mut() = Phase::PaintWideRouting;
                 }
                 self.state
-                    .render_element(&self.focus, "harness", "PaintAscii", window, cx)
+                    .render_element(&self.focus, "harness", "PaintAscii", None, window, cx)
                     .into_any_element()
             }
             Phase::PaintWideRouting => {
@@ -175,7 +175,7 @@ impl Render for HarnessView {
                     *self.phase.borrow_mut() = Phase::PaintSgr;
                 }
                 self.state
-                    .render_element(&self.focus, "harness", "PaintWideRouting", window, cx)
+                    .render_element(&self.focus, "harness", "PaintWideRouting", None, window, cx)
                     .into_any_element()
             }
             Phase::PaintSgr => {
@@ -187,7 +187,7 @@ impl Render for HarnessView {
                     *self.phase.borrow_mut() = Phase::PerfAscii200x50;
                 }
                 self.state
-                    .render_element(&self.focus, "harness", "PaintSgr", window, cx)
+                    .render_element(&self.focus, "harness", "PaintSgr", None, window, cx)
                     .into_any_element()
             }
             Phase::PerfAscii200x50 => self

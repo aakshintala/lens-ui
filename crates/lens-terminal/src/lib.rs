@@ -25,6 +25,7 @@
 //!   callback) and [`TerminalTab::presentation`] (latest atomic
 //!   title/lifecycle/access/progress).
 
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -63,13 +64,19 @@ pub mod render_bench_api {
 }
 
 use gpui::prelude::*;
-use gpui::{App, Context, Entity, EventEmitter, FocusHandle, IntoElement, Render, Window};
+use gpui::{
+    App, Bounds, Context, Entity, EntityInputHandler, EventEmitter, FocusHandle, IntoElement,
+    KeyDownEvent, KeyUpEvent, Pixels, Render, UTF16Selection, Window,
+};
 use lens_client::Client;
 use lens_client::ids::{SessionId, TerminalId};
 use lens_client::{AttachOptions, TerminalResource, attach};
 use serde::{Deserialize, Serialize};
 
 use bridge::{BridgeEvent, spawn_bridge};
+use engine::command::{InputAck, KeyAction, KeyInput, LensKey};
+use engine::key_map::{gpui_mods_to_key_mods, keydown_should_enqueue, keystroke_to_lens};
+use engine::worker::EngineCommand;
 use policy::{
     AttachedParts, PolicyAction, PolicyState, discover_and_attach, identity_title_from_resource,
     preflight_reconnect,
@@ -318,6 +325,8 @@ pub struct TerminalTab {
     input_enabled: bool,
     /// Desired attach + engine inspect enablement; restored on reconnect.
     inspect_enabled: bool,
+    /// IME composition preedit overlay (foreground-only; not in the PTY buffer).
+    ime_preedit: Option<String>,
 }
 
 impl TerminalTab {
@@ -344,10 +353,11 @@ impl TerminalTab {
             current_tid: None,
             input_enabled: false,
             inspect_enabled: false,
+            ime_preedit: None,
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     fn with_engine_for_test(engine: Arc<EngineHandle>, cx: &mut Context<Self>) -> Self {
         let target = TerminalTarget::OpenOrCreate {
             session_id: SessionId::new("test_sess"),
@@ -383,9 +393,19 @@ impl TerminalTab {
             policy_tx: None,
             current_session: None,
             current_tid: None,
-            input_enabled: false,
+            input_enabled: true,
             inspect_enabled: false,
+            ime_preedit: None,
         }
+    }
+
+    /// Construct a writable [`TerminalTab`] backed by a test engine (harness only).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn open_with_engine_for_test(
+        engine: Arc<EngineHandle>,
+        cx: &mut App,
+    ) -> Entity<TerminalTab> {
+        cx.new(|cx| TerminalTab::with_engine_for_test(engine, cx))
     }
 
     /// Host-driven focus. Direct accessor, not a callback.
@@ -491,6 +511,142 @@ impl TerminalTab {
     pub fn set_frame_for_test(&mut self, frame: Arc<Frame>, cx: &mut Context<Self>) {
         self.render.set_frame(frame);
         cx.notify();
+    }
+
+    fn write_input_allowed(&self) -> bool {
+        self.input_enabled && matches!(self.presentation.access, AccessMode::Write)
+    }
+
+    /// Special/modified keys only — plain printable text is owned by [`EntityInputHandler`].
+    pub(crate) fn handle_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        let ks = &event.keystroke;
+        if !keydown_should_enqueue(&ks.key, &ks.modifiers) {
+            return;
+        }
+        let action = if event.is_held {
+            KeyAction::Repeat
+        } else {
+            KeyAction::Press
+        };
+        self.enqueue_key(KeyInput {
+            action,
+            key: keystroke_to_lens(&ks.key),
+            mods: gpui_mods_to_key_mods(&ks.modifiers),
+            utf8: ks.key_char.clone(),
+            composing: false,
+            access_epoch: 0,
+            ack: None,
+        });
+    }
+
+    pub(crate) fn handle_key_up(
+        &mut self,
+        event: &KeyUpEvent,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        let ks = &event.keystroke;
+        if !keydown_should_enqueue(&ks.key, &ks.modifiers) {
+            return;
+        }
+        self.enqueue_key(KeyInput {
+            action: KeyAction::Release,
+            key: keystroke_to_lens(&ks.key),
+            mods: gpui_mods_to_key_mods(&ks.modifiers),
+            utf8: ks.key_char.clone(),
+            composing: false,
+            access_epoch: 0,
+            ack: None,
+        });
+    }
+
+    fn enqueue_key(&mut self, input: KeyInput) {
+        if !self.write_input_allowed() {
+            return;
+        }
+        let Some(rt) = &self.runtime else {
+            return;
+        };
+        let Some(engine) = &rt.engine else {
+            return;
+        };
+        let _ = engine.enqueue_input(EngineCommand::Key(input));
+    }
+
+    fn enqueue_committed_text(
+        &mut self,
+        text: &str,
+    ) -> Option<crossbeam_channel::Receiver<InputAck>> {
+        if text.is_empty() || !self.write_input_allowed() {
+            return None;
+        }
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+        let input = KeyInput {
+            action: KeyAction::Press,
+            key: LensKey::Unidentified,
+            mods: engine::command::KeyMods::default(),
+            utf8: Some(text.to_owned()),
+            composing: false,
+            access_epoch: 0,
+            ack: Some(ack_tx),
+        };
+        let rt = self.runtime.as_ref()?;
+        let engine = rt.engine.as_ref()?;
+        engine
+            .enqueue_input(EngineCommand::Key(input))
+            .ok()
+            .map(|()| ack_rx)
+    }
+
+    /// Simulate keydown for harness tests; returns whether a key command was enqueued.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn debug_key_down_for_test(&mut self, keystroke: gpui::Keystroke, is_held: bool) -> bool {
+        if !keydown_should_enqueue(&keystroke.key, &keystroke.modifiers) {
+            return false;
+        }
+        if !self.write_input_allowed() {
+            return false;
+        }
+        let action = if is_held {
+            KeyAction::Repeat
+        } else {
+            KeyAction::Press
+        };
+        self.enqueue_key(KeyInput {
+            action,
+            key: keystroke_to_lens(&keystroke.key),
+            mods: gpui_mods_to_key_mods(&keystroke.modifiers),
+            utf8: keystroke.key_char.clone(),
+            composing: false,
+            access_epoch: 0,
+            ack: None,
+        });
+        true
+    }
+
+    /// Mirror [`EntityInputHandler::replace_text_in_range`] commit path (harness only).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn debug_input_handler_text_for_test(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        self.ime_preedit = None;
+        let _ = self.enqueue_committed_text(text);
+    }
+
+    /// Enqueue committed IME/text bytes and return the ACK receiver (never blocks inside).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn debug_ime_commit_for_test(
+        &mut self,
+        text: &str,
+    ) -> Option<crossbeam_channel::Receiver<InputAck>> {
+        self.ime_preedit = None;
+        self.enqueue_committed_text(text)
     }
 
     fn on_attached(&mut self, parts: AttachedParts, cx: &mut Context<Self>) {
@@ -886,6 +1042,103 @@ fn spawn_foreground_sampler(
 
 impl EventEmitter<TerminalEvent> for TerminalTab {}
 
+fn utf16_len(text: &str) -> usize {
+    text.encode_utf16().count()
+}
+
+impl EntityInputHandler for TerminalTab {
+    fn text_for_range(
+        &mut self,
+        _range: Range<usize>,
+        _adjusted_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        None
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        None
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        self.ime_preedit.as_ref().map(|text| 0..utf16_len(text))
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.ime_preedit.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        _range: Option<Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+        self.ime_preedit = None;
+        let _ = self.enqueue_committed_text(text);
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _range: Option<Range<usize>>,
+        new_text: &str,
+        _new_selected_range: Option<Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.ime_preedit = if new_text.is_empty() {
+            None
+        } else {
+            Some(new_text.to_owned())
+        };
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range_utf16: Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        let frame = self.render.latest_frame.as_ref()?;
+        let cursor = frame.cursor?;
+        let metrics = self.render.cell_metrics.as_ref()?;
+        let x = element_bounds.origin.x + metrics.cell_w * f32::from(cursor.col);
+        let y = element_bounds.origin.y + metrics.cell_h * f32::from(cursor.row);
+        Some(Bounds::new(
+            gpui::point(x, y),
+            gpui::size(metrics.cell_w, metrics.cell_h),
+        ))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: gpui::Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
+    }
+}
+
 impl Render for TerminalTab {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sample_latest_frame_from_engine();
@@ -894,8 +1147,15 @@ impl Render for TerminalTab {
         // Never panics.
         let title = self.presentation.identity_title.clone();
         let life = format!("{:?}", self.lifecycle);
-        self.render
-            .render_element(&self.focus_handle, &title, &life, window, cx)
+        let tab = cx.entity().clone();
+        self.render.render_element(
+            &self.focus_handle,
+            &title,
+            &life,
+            Some((self.ime_preedit.as_deref(), tab)),
+            window,
+            cx,
+        )
     }
 }
 
@@ -1127,7 +1387,7 @@ mod tests {
             assert_eq!(snap.lifecycle, Lifecycle::Live);
             assert!(!snap.output_gap);
             assert!(!snap.bridge_alive);
-            assert!(!snap.input_enabled);
+            assert!(snap.input_enabled);
             assert!(snap.attach.is_none());
             assert!(snap.engine.is_some());
             let engine_snap = snap.engine.unwrap();
@@ -1220,5 +1480,55 @@ mod tests {
         assert!(!p.output_gap);
         assert!(p.detached_detail.is_none());
         assert!(!p.reattach_available);
+    }
+
+    #[gpui::test]
+    async fn printable_key_emits_exactly_once_via_input_handler_not_keydown(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::Keystroke;
+
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let tab = cx.new(|cx| TerminalTab::with_engine_for_test(Arc::clone(&engine), cx));
+        while engine.egress_rx().try_recv().is_ok() {}
+
+        let plain_a = Keystroke {
+            key: "a".into(),
+            modifiers: Default::default(),
+            key_char: Some("a".into()),
+        };
+        tab.update(cx, |tab, _cx| {
+            assert!(
+                !tab.debug_key_down_for_test(plain_a, false),
+                "unmodified printable must not enqueue from keydown"
+            );
+        });
+        assert!(
+            engine.egress_rx().try_recv().is_err(),
+            "keydown must not emit egress for plain a"
+        );
+
+        tab.update(cx, |tab, _cx| tab.debug_input_handler_text_for_test("a"));
+        let bytes = engine
+            .egress_rx()
+            .recv_timeout(Duration::from_secs(2))
+            .expect("committed text egress");
+        assert_eq!(bytes, b"a");
+        assert!(
+            engine.egress_rx().try_recv().is_err(),
+            "exactly one egress for printable via InputHandler"
+        );
+    }
+
+    #[gpui::test]
+    async fn ime_commit_hook_returns_receiver_without_blocking(cx: &mut gpui::TestAppContext) {
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let tab = cx.new(|cx| TerminalTab::with_engine_for_test(Arc::clone(&engine), cx));
+        let rx = tab.update(cx, |tab, _cx| {
+            tab.debug_ime_commit_for_test("你好").expect("rx")
+        });
+        let ack = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(ack.encoded, "你好".as_bytes());
+        assert!(ack.accepted);
     }
 }
