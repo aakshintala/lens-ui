@@ -306,6 +306,12 @@ mod tests {
         for i in 0..20 {
             e.feed(format!("line{i}\r\n").as_bytes());
         }
+        let f = e.build_frame().unwrap();
+        assert_eq!(
+            f.cursor,
+            Some(CursorPos { col: 0, row: 2 }),
+            "cursor must be visible in viewport before scroll"
+        );
         e.scroll_viewport_for_test(ScrollViewport::Top);
         let f = e.build_frame().unwrap();
         assert!(

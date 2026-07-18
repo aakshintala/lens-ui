@@ -217,25 +217,22 @@ fn handle_command(
         }
         EngineCommand::Key(mut input) => {
             let ack_tx = input.ack.take();
-            let encoded = match engine.encode_key(&input) {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    eprintln!("lens-terminal engine: encode_key failed: {e}");
-                    Vec::new()
-                }
-            };
-            let accepted = if encoded.is_empty() {
-                true
-            } else {
-                match try_emit_user_input(egress_tx, &encoded) {
+            let (encoded, accepted) = match engine.encode_key(&input) {
+                Ok(bytes) if bytes.is_empty() => (bytes, true),
+                Ok(bytes) => match try_emit_user_input(egress_tx, &bytes) {
                     Ok(()) => {
                         inspect.record_user_egress_accepted();
-                        true
+                        (bytes, true)
                     }
                     Err(UserEgressFull) => {
                         inspect.record_user_egress_rejected();
-                        false
+                        // Never-drop: user input is atomically rejected (accepted:false), never drop-oldest (that policy is replies-only). Egress fills only when the bridge's forward_egress stalls on a full outbound; that path emits BridgeEvent::OutboundSaturated within 50ms (bridge.rs forward_egress) → reconnect. So saturation is surfaced to policy via the existing OutboundSaturated path (plan: "reuse OutboundSaturated with a clear comment") — no separate UserEgressSaturated event.
+                        (bytes, false)
                     }
+                },
+                Err(e) => {
+                    eprintln!("lens-terminal engine: encode_key failed: {e}");
+                    (Vec::new(), false)
                 }
             };
             if let Some(tx) = ack_tx {

@@ -450,7 +450,20 @@ mod tests {
     #[test]
     fn user_input_egress_full_does_not_drop_or_false_ack() {
         let h = EngineHandle::spawn(test_config());
-        let key = KeyInput {
+        let first_key = KeyInput {
+            action: KeyAction::Press,
+            key: LensKey::Z,
+            mods: KeyMods::default(),
+            utf8: Some("z".into()),
+            composing: false,
+            access_epoch: 0,
+            ack: None,
+        };
+        h.cmd_sender()
+            .send(EngineCommand::Key(first_key.clone_without_ack()))
+            .expect("send first key");
+
+        let fill_key = KeyInput {
             action: KeyAction::Press,
             key: LensKey::A,
             mods: KeyMods::default(),
@@ -459,17 +472,17 @@ mod tests {
             access_epoch: 0,
             ack: None,
         };
-        for _ in 0..64 {
+        for _ in 0..63 {
             h.cmd_sender()
-                .send(EngineCommand::Key(key.clone_without_ack()))
-                .expect("send key");
+                .send(EngineCommand::Key(fill_key.clone_without_ack()))
+                .expect("send fill key");
         }
 
         let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
         h.cmd_sender()
             .send(EngineCommand::Key(KeyInput {
                 ack: Some(ack_tx),
-                ..key.clone_without_ack()
+                ..fill_key.clone_without_ack()
             }))
             .expect("send key with ack");
 
@@ -488,7 +501,11 @@ mod tests {
             64,
             "prior egress must not be drop-oldest evicted"
         );
-        assert!(drained.iter().all(|b| b == b"a"));
+        assert_eq!(
+            drained[0], b"z",
+            "oldest egress must remain at front (no drop-oldest)"
+        );
+        assert!(drained[1..].iter().all(|b| b == b"a"));
         assert_eq!(h.inspect().user_egress_rejected, 1);
         h.stop();
     }
