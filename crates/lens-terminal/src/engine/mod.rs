@@ -1,6 +1,8 @@
+pub mod command;
 pub mod frame;
 pub mod handle;
 pub mod inspect;
+pub mod key_map;
 pub mod vt;
 pub mod worker;
 

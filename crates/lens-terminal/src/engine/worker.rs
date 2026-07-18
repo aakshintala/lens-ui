@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwapOption;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError};
 
+use super::command::{KeyInput, ScrollDelta};
 use super::frame::Frame;
 use super::inspect::InspectShared;
 use super::vt::{EngineConfig, VtEngine};
@@ -21,6 +22,19 @@ const DEFAULT_BUILD_INTERVAL: Duration = Duration::from_millis(16);
 
 pub(crate) enum EngineCommand {
     Feed(Vec<u8>),
+    #[expect(dead_code, reason = "Slice 2a Task 1 — Key arm wired in Task 2")]
+    Key(KeyInput),
+    #[expect(dead_code, reason = "Slice 2a Task 1 — Focus arm wired in Task 5")]
+    Focus {
+        focused: bool,
+        report: bool,
+        access_epoch: u64,
+    },
+    #[expect(
+        dead_code,
+        reason = "Slice 2a Task 1 — LocalScroll arm wired in Task 2"
+    )]
+    LocalScroll(ScrollDelta),
     Resize(u16, u16),
     SetVisible(bool),
     /// Test/deterministic helper — bypass the time throttle for one publish pass.
@@ -214,6 +228,7 @@ fn handle_command(
         EngineCommand::BuildNow => {
             *force_build = true;
         }
+        EngineCommand::Key(_) | EngineCommand::Focus { .. } | EngineCommand::LocalScroll(_) => {}
         EngineCommand::Stop => {}
     }
 }
