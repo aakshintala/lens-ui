@@ -282,6 +282,10 @@ pub struct Presentation {
     pub progress: Option<Progress>,
     /// Set after a reconnect gap (Slice 1d policy); false at open.
     pub output_gap: bool,
+    /// Set when a reconnect/downgrade dropped user input that had not been sent (C2).
+    /// One-shot notice — cleared on the next accepted user keystroke. Cosmetic; never
+    /// identity/authorization.
+    pub input_discarded: bool, // rendered by presentation slice (2d+)
     /// Populated when lifecycle is [`Lifecycle::Detached`].
     pub detached_detail: Option<DetachedDetail>,
     /// Whether the host may offer an explicit reattach action.
@@ -432,6 +436,7 @@ impl TerminalTab {
                 reported_title: None,
                 progress: None,
                 output_gap: false,
+                input_discarded: false,
                 detached_detail: None,
                 reattach_available: false,
             },
@@ -557,6 +562,7 @@ impl TerminalTab {
         TerminalInspect {
             lifecycle: self.lifecycle,
             output_gap: self.presentation.output_gap,
+            input_discarded: self.presentation.input_discarded,
             bridge_alive,
             input_enabled: self.input_enabled,
             attach,
@@ -657,6 +663,7 @@ impl TerminalTab {
             if matches!(action, KeyAction::Press) {
                 self.pressed_keys.insert(lens_key);
             }
+            self.clear_input_discarded(cx);
             cx.stop_propagation();
         }
     }
@@ -716,6 +723,14 @@ impl TerminalTab {
             access_epoch: 0,
             ack: None,
         })
+    }
+
+    fn clear_input_discarded(&mut self, cx: &mut Context<Self>) {
+        if self.presentation.input_discarded {
+            self.presentation.input_discarded = false;
+            cx.emit(TerminalEvent::PresentationChanged);
+            cx.notify();
+        }
     }
 
     /// Simulate keydown for harness tests; returns whether a key command was enqueued.
@@ -945,7 +960,9 @@ impl TerminalTab {
                 self.policy.on_close(CloseCause::Network, Instant::now())
             }
             BridgeEvent::StaleInputDiscarded => {
-                // Task 3 wires presentation.
+                self.presentation.input_discarded = true;
+                cx.emit(TerminalEvent::PresentationChanged);
+                cx.notify();
                 return;
             }
         };
@@ -1282,6 +1299,7 @@ impl EntityInputHandler for TerminalTab {
         }
         self.ime_preedit = None;
         if self.enqueue_committed_text(text) {
+            self.clear_input_discarded(cx);
             cx.notify();
         }
     }
@@ -1390,6 +1408,7 @@ fn starting_presentation(target: &TerminalTarget, options: &TerminalOpenOptions)
         reported_title: None,
         progress: None,
         output_gap: false,
+        input_discarded: false,
         detached_detail: None,
         reattach_available: false,
     }
@@ -1605,6 +1624,7 @@ mod tests {
             let snap = tab.inspect();
             assert_eq!(snap.lifecycle, Lifecycle::Live);
             assert!(!snap.output_gap);
+            assert!(!snap.input_discarded);
             assert!(!snap.bridge_alive);
             assert!(snap.input_enabled);
             assert!(snap.attach.is_none());
@@ -1697,8 +1717,64 @@ mod tests {
         };
         let p = starting_presentation(&target, &TerminalOpenOptions::default());
         assert!(!p.output_gap);
+        assert!(!p.input_discarded);
         assert!(p.detached_detail.is_none());
         assert!(!p.reattach_available);
+    }
+
+    #[gpui::test]
+    async fn stale_input_discarded_sets_and_clears_on_accepted_keydown(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::{KeyDownEvent, KeyUpEvent, Keystroke};
+
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let tab = cx.new(|cx| TerminalTab::with_engine_for_test(Arc::clone(&engine), cx));
+
+        tab.update(cx, |tab, cx| {
+            tab.apply_bridge_event(crate::bridge::BridgeEvent::StaleInputDiscarded, cx);
+            assert!(tab.presentation().input_discarded);
+            assert!(tab.inspect().input_discarded);
+        });
+
+        tab.update(cx, |tab, cx| {
+            tab.on_focus_changed(true, cx);
+            assert!(
+                tab.presentation().input_discarded,
+                "focus report must not clear input_discarded"
+            );
+        });
+
+        let (_win, vcx) = cx.add_window_view(|_, _| gpui::Empty);
+        vcx.update(|window, cx| {
+            let up = Keystroke::parse("up").expect("parse up");
+            tab.update(cx, |tab, cx| {
+                tab.debug_handle_key_up_for_test(&KeyUpEvent { keystroke: up }, window, cx);
+                assert!(
+                    tab.presentation().input_discarded,
+                    "key-up without prior press must not clear input_discarded"
+                );
+            });
+        });
+
+        vcx.update(|window, cx| {
+            let enter = Keystroke::parse("enter").expect("parse enter");
+            tab.update(cx, |tab, cx| {
+                tab.debug_handle_key_down_for_test(
+                    &KeyDownEvent {
+                        keystroke: enter,
+                        is_held: false,
+                    },
+                    window,
+                    cx,
+                );
+                assert!(
+                    !tab.presentation().input_discarded,
+                    "accepted keydown must clear input_discarded"
+                );
+                assert!(!tab.inspect().input_discarded);
+            });
+        });
     }
 
     #[gpui::test]

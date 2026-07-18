@@ -10,6 +10,7 @@ use crate::Lifecycle;
 pub struct TerminalInspect {
     pub lifecycle: Lifecycle,
     pub output_gap: bool,
+    pub input_discarded: bool,
     pub bridge_alive: bool,
     pub input_enabled: bool,
     pub attach: Option<AttachInspect>,
