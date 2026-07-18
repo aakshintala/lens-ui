@@ -116,9 +116,9 @@ use lens_client::{AttachOptions, TerminalResource, attach};
 use serde::{Deserialize, Serialize};
 
 use bridge::{BridgeEvent, spawn_bridge};
-use engine::command::{KeyAction, KeyInput, LensKey, ScrollDelta};
 #[cfg(any(test, feature = "test-util"))]
 use engine::command::InputAck;
+use engine::command::{KeyAction, KeyInput, LensKey, ScrollDelta};
 use engine::key_map::{gpui_mods_to_key_mods, keydown_should_enqueue, keystroke_to_lens};
 use engine::worker::EngineCommand;
 use policy::{
