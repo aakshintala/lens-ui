@@ -25,6 +25,7 @@
 //!   callback) and [`TerminalTab::presentation`] (latest atomic
 //!   title/lifecycle/access/progress).
 
+use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -327,6 +328,8 @@ pub struct TerminalTab {
     inspect_enabled: bool,
     /// IME composition preedit overlay (foreground-only; not in the PTY buffer).
     ime_preedit: Option<String>,
+    /// Keys whose Press was enqueued — gates Release so suppressed presses never orphan.
+    pressed_keys: HashSet<LensKey>,
 }
 
 impl TerminalTab {
@@ -354,6 +357,7 @@ impl TerminalTab {
             input_enabled: false,
             inspect_enabled: false,
             ime_preedit: None,
+            pressed_keys: HashSet::new(),
         }
     }
 
@@ -396,6 +400,7 @@ impl TerminalTab {
             input_enabled: true,
             inspect_enabled: false,
             ime_preedit: None,
+            pressed_keys: HashSet::new(),
         }
     }
 
@@ -517,90 +522,100 @@ impl TerminalTab {
         self.input_enabled && matches!(self.presentation.access, AccessMode::Write)
     }
 
+    fn clear_input_composition_state(&mut self) {
+        self.ime_preedit = None;
+        self.pressed_keys.clear();
+    }
+
     /// Special/modified keys only — plain printable text is owned by [`EntityInputHandler`].
     pub(crate) fn handle_key_down(
         &mut self,
         event: &KeyDownEvent,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
         let ks = &event.keystroke;
         if !keydown_should_enqueue(&ks.key, &ks.modifiers) {
             return;
         }
+        let lens_key = keystroke_to_lens(&ks.key);
         let action = if event.is_held {
             KeyAction::Repeat
         } else {
             KeyAction::Press
         };
-        self.enqueue_key(KeyInput {
+        let enqueued = self.try_enqueue_key(KeyInput {
             action,
-            key: keystroke_to_lens(&ks.key),
+            key: lens_key,
             mods: gpui_mods_to_key_mods(&ks.modifiers),
             utf8: ks.key_char.clone(),
             composing: false,
             access_epoch: 0,
             ack: None,
         });
+        if enqueued {
+            if matches!(action, KeyAction::Press) {
+                self.pressed_keys.insert(lens_key);
+            }
+            cx.stop_propagation();
+        }
     }
 
     pub(crate) fn handle_key_up(
         &mut self,
         event: &KeyUpEvent,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
         let ks = &event.keystroke;
         if !keydown_should_enqueue(&ks.key, &ks.modifiers) {
             return;
         }
-        self.enqueue_key(KeyInput {
+        let lens_key = keystroke_to_lens(&ks.key);
+        if !self.pressed_keys.contains(&lens_key) {
+            return;
+        }
+        let enqueued = self.try_enqueue_key(KeyInput {
             action: KeyAction::Release,
-            key: keystroke_to_lens(&ks.key),
+            key: lens_key,
             mods: gpui_mods_to_key_mods(&ks.modifiers),
             utf8: ks.key_char.clone(),
             composing: false,
             access_epoch: 0,
             ack: None,
         });
+        if enqueued {
+            self.pressed_keys.remove(&lens_key);
+            cx.stop_propagation();
+        }
     }
 
-    fn enqueue_key(&mut self, input: KeyInput) {
+    fn try_enqueue_key(&mut self, input: KeyInput) -> bool {
         if !self.write_input_allowed() {
-            return;
+            return false;
         }
         let Some(rt) = &self.runtime else {
-            return;
+            return false;
         };
         let Some(engine) = &rt.engine else {
-            return;
+            return false;
         };
-        let _ = engine.enqueue_input(EngineCommand::Key(input));
+        engine.enqueue_input(EngineCommand::Key(input)).is_ok()
     }
 
-    fn enqueue_committed_text(
-        &mut self,
-        text: &str,
-    ) -> Option<crossbeam_channel::Receiver<InputAck>> {
+    fn enqueue_committed_text(&mut self, text: &str) -> bool {
         if text.is_empty() || !self.write_input_allowed() {
-            return None;
+            return false;
         }
-        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
-        let input = KeyInput {
+        self.try_enqueue_key(KeyInput {
             action: KeyAction::Press,
             key: LensKey::Unidentified,
             mods: engine::command::KeyMods::default(),
             utf8: Some(text.to_owned()),
             composing: false,
             access_epoch: 0,
-            ack: Some(ack_tx),
-        };
-        let rt = self.runtime.as_ref()?;
-        let engine = rt.engine.as_ref()?;
-        engine
-            .enqueue_input(EngineCommand::Key(input))
-            .ok()
-            .map(|()| ack_rx)
+            ack: None,
+        })
     }
 
     /// Simulate keydown for harness tests; returns whether a key command was enqueued.
@@ -617,7 +632,7 @@ impl TerminalTab {
         } else {
             KeyAction::Press
         };
-        self.enqueue_key(KeyInput {
+        self.try_enqueue_key(KeyInput {
             action,
             key: keystroke_to_lens(&keystroke.key),
             mods: gpui_mods_to_key_mods(&keystroke.modifiers),
@@ -625,8 +640,29 @@ impl TerminalTab {
             composing: false,
             access_epoch: 0,
             ack: None,
-        });
-        true
+        })
+    }
+
+    /// Invoke the production keydown handler (real-window harness).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn debug_handle_key_down_for_test(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.handle_key_down(event, window, cx);
+    }
+
+    /// Invoke the production keyup handler (real-window harness).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn debug_handle_key_up_for_test(
+        &mut self,
+        event: &KeyUpEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.handle_key_up(event, window, cx);
     }
 
     /// Mirror [`EntityInputHandler::replace_text_in_range`] commit path (harness only).
@@ -646,7 +682,20 @@ impl TerminalTab {
         text: &str,
     ) -> Option<crossbeam_channel::Receiver<InputAck>> {
         self.ime_preedit = None;
-        self.enqueue_committed_text(text)
+        if text.is_empty() || !self.write_input_allowed() {
+            return None;
+        }
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+        let enqueued = self.try_enqueue_key(KeyInput {
+            action: KeyAction::Press,
+            key: LensKey::Unidentified,
+            mods: engine::command::KeyMods::default(),
+            utf8: Some(text.to_owned()),
+            composing: false,
+            access_epoch: 0,
+            ack: Some(ack_tx),
+        });
+        enqueued.then_some(ack_rx)
     }
 
     fn on_attached(&mut self, parts: AttachedParts, cx: &mut Context<Self>) {
@@ -742,6 +791,7 @@ impl TerminalTab {
 
     fn on_detach(&mut self, detail: DetachedDetail, cx: &mut Context<Self>) {
         let reattach_available = matches!(detail, DetachedDetail::ClientDetached);
+        self.clear_input_composition_state();
         self.teardown_runtime_full(cx);
         self.set_detached_presentation(detail, reattach_available);
         cx.emit(TerminalEvent::PresentationChanged);
@@ -806,6 +856,7 @@ impl TerminalTab {
             PolicyAction::DowngradeReadOnly => {
                 self.presentation.access = AccessMode::ReadOnly;
                 self.input_enabled = false;
+                self.clear_input_composition_state();
                 self.teardown_transport_off_foreground(cx);
                 self.policy.retry.reset();
                 self.lifecycle = Lifecycle::Reconnecting;
@@ -1091,8 +1142,9 @@ impl EntityInputHandler for TerminalTab {
             return;
         }
         self.ime_preedit = None;
-        let _ = self.enqueue_committed_text(text);
-        cx.notify();
+        if self.enqueue_committed_text(text) {
+            cx.notify();
+        }
     }
 
     fn replace_and_mark_text_in_range(

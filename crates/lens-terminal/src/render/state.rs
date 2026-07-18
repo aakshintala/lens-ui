@@ -10,7 +10,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    App, Div, ElementInputHandler, Entity, FocusHandle, Window, canvas, div, point, prelude::*,
+    App, Bounds, Div, ElementInputHandler, Entity, FocusHandle, Pixels, Window, canvas, div, point,
+    prelude::*, size,
 };
 
 use super::inspect::RenderInspectShared;
@@ -99,7 +100,24 @@ impl TabRenderState {
                 });
         }
         match frame {
-            None => el.child(placeholder),
+            None => {
+                if let Some(tab) = input_tab {
+                    let focus = focus_for_input.clone();
+                    let metrics = metrics.clone();
+                    el = el.child(canvas(
+                        |_, _, _| {},
+                        move |bounds, _, window, cx| {
+                            let ime_bounds = default_ime_bounds(bounds, None, metrics.as_ref());
+                            window.handle_input(
+                                &focus,
+                                ElementInputHandler::new(ime_bounds, tab),
+                                cx,
+                            );
+                        },
+                    ));
+                }
+                el.child(placeholder)
+            }
             Some(frame) => {
                 let input_tab_paint = input_tab.clone();
                 el.child(canvas(
@@ -128,9 +146,11 @@ impl TabRenderState {
                             );
                         }
                         if let Some(tab) = input_tab_paint {
+                            let ime_bounds =
+                                default_ime_bounds(bounds, Some(&frame), Some(metrics));
                             window.handle_input(
                                 &focus_for_input,
-                                ElementInputHandler::new(bounds, tab),
+                                ElementInputHandler::new(ime_bounds, tab),
                                 cx,
                             );
                         }
@@ -140,6 +160,26 @@ impl TabRenderState {
                 ))
             }
         }
+    }
+}
+
+/// IME anchor when no cursor is available yet (pre-first-frame).
+fn default_ime_bounds(
+    element_bounds: Bounds<Pixels>,
+    frame: Option<&Frame>,
+    metrics: Option<&CellMetrics>,
+) -> Bounds<Pixels> {
+    if let (Some(frame), Some(metrics)) = (frame, metrics)
+        && let Some(cursor) = frame.cursor
+    {
+        let x = element_bounds.origin.x + metrics.cell_w * f32::from(cursor.col);
+        let y = element_bounds.origin.y + metrics.cell_h * f32::from(cursor.row);
+        return Bounds::new(point(x, y), size(metrics.cell_w, metrics.cell_h));
+    }
+    if let Some(metrics) = metrics {
+        Bounds::new(element_bounds.origin, size(metrics.cell_w, metrics.cell_h))
+    } else {
+        element_bounds
     }
 }
 

@@ -20,7 +20,7 @@ pub(crate) struct KeyMods {
 }
 
 /// Full physical key set mirrored from Ghostty's [`libghostty_vt::key::Key`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[non_exhaustive]
 pub(crate) enum LensKey {
     Unidentified,

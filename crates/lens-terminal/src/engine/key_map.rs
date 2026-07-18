@@ -13,9 +13,6 @@ pub(crate) fn keydown_should_enqueue(key: &str, mods: &gpui::Modifiers) -> bool 
     if mods.control || mods.alt || mods.platform || mods.function {
         return true;
     }
-    if mods.shift {
-        return true;
-    }
     matches!(
         key,
         "up" | "down"
@@ -562,8 +559,15 @@ mod tests {
                 ..Modifiers::default()
             }
         ));
-        assert!(keydown_should_enqueue(
+        assert!(!keydown_should_enqueue(
             "a",
+            &Modifiers {
+                shift: true,
+                ..Modifiers::default()
+            }
+        ));
+        assert!(keydown_should_enqueue(
+            "tab",
             &Modifiers {
                 shift: true,
                 ..Modifiers::default()
