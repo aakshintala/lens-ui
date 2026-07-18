@@ -1,7 +1,7 @@
 # Handoff — Wave Build B1–B5 follow-ups
 
 **Written:** 2026-07-17 · **Branch:** `feat/lens-app-multi-session` · **HEAD:** `86a74aa` (branch-only, NOT merged/pushed)
-**Plan executed:** `docs/superpowers/plans/2026-07-17-wave-build-b1-b5.md` (all 11 tasks DONE)
+**Plan executed:** `docs/plans/2026-07-17-wave-build-b1-b5.md` (all 11 tasks DONE)
 **SDD ledger (per-task detail, decisions, adjudications):** `.superpowers/sdd/progress.md` → the `PLAN 4 — Wave Build B1-B5` section (git-ignored scratch; if `git clean -fdx` nuked it, reconstruct from `git log 52c31eb..HEAD`)
 **Perf write-up:** `docs/spikes/2026-07-17-wave-build-perf.md`
 
@@ -84,7 +84,7 @@ Solo-project convention (memory `integration-workflow` / `commit-when-finished`)
 ## Design SSOTs / references (for any visual work)
 - Motion params: `docs/design/renders/wave-states-motion.html` (sweep/skew/alpha; pbar-in-dim-group at :111)
 - Card structure: `docs/design/renders/board-home.html` (pbar track = rgba(255,255,255,.06))
-- Spec: `docs/superpowers/specs/2026-07-17-wave-behaviors-design.md`
+- Spec: `docs/specs/2026-07-17-wave-behaviors-design.md`
 
 ## By-design / not-bugs (don't "fix" these)
 - **B5 Wake/Retry → no-op `FleetStore` seams** (`wake_session`/`retry_session` in `fleet/store.rs`) — real behavior lands with state-model wake=respawn plumbing. The buttons are real affordances wired to the seam.

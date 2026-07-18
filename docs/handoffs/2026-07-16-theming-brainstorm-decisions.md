@@ -91,7 +91,7 @@ when authoring starts to hurt. **File as TWO up-next items:** "wave build (B1–
 
 ## Resume checklist (next session)
 1. Re-enter `superpowers:brainstorming` at step 6 (design already approved through fork+scope+seq).
-2. **Write the design doc** → `docs/superpowers/specs/2026-07-1X-theming-substrate-design.md`. Fully
+2. **Write the design doc** → `docs/specs/2026-07-1X-theming-substrate-design.md`. Fully
    specify: the `LensTheme` struct + all 4 token-group schemas (base/status/terminal/diff, even the
    deferred groups' *shape*), the embedded-dark-JSON format, the bridge fn, the `cx.lens_theme()`
    accessor. Commit.

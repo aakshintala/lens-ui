@@ -2,7 +2,7 @@
 
 **Written:** 2026-07-17 · **Branch:** merged to `main` · **HEAD:** `7396afc` (== `origin/main`, pushed)
 **Prior handoff:** `docs/handoffs/2026-07-17-wave-build-b1-b5-followups.md` (the pre-visual-pass state)
-**Spec SSOT:** `docs/superpowers/specs/2026-07-17-wave-behaviors-design.md` (see **§11** — as-built amendments)
+**Spec SSOT:** `docs/specs/2026-07-17-wave-behaviors-design.md` (see **§11** — as-built amendments)
 
 ## TL;DR
 

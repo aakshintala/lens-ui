@@ -21,7 +21,7 @@ Every task's requirements implicitly include these. Copy exact values.
 - **Colors are PLACEHOLDERS.** Never hardcode raw hex at a call site — read `t.status.*` / `t.base.*` tokens and derive tints with `gpui_component::Colorize::opacity`/`.mix` (already imported patterns: `chrome.rs:123` `t.base.overlay.opacity(0.55)`). Final color/light tuning is one end-of-build pass via the reload loop (`⌘⇧T`, `LENS_THEME_DIR=crates/lens-ui/src/theme`).
 - **Visual verification is on-device, not pixel-asserted.** Under `#[gpui::test]`/`TestAppContext` the text/SVG system is a `NoopTextSystem` — font/shape/paint asserts are false-green (memory `gpui-test-noop-text-system`). Testable units = the **pure functions** (phase, fraction, format, icon-path). Visuals are checked by running `cargo run -p lens-app --release --features demo -- --demo` and looking, plus the compile/clippy gate.
 - **Gate (must pass at every commit):** `cargo xtask gate` (fmt --check + clippy -D warnings + tests for the production crates). Never pipe it through `tail` (masks the exit code — memory `xtask-gate-scope`).
-- **Reference SSOTs (use these for every visual value):** motion params `docs/design/renders/wave-states-motion.html`; card structure `docs/design/renders/board-home.html`; the design spec `docs/superpowers/specs/2026-07-17-wave-behaviors-design.md`.
+- **Reference SSOTs (use these for every visual value):** motion params `docs/design/renders/wave-states-motion.html`; card structure `docs/design/renders/board-home.html`; the design spec `docs/specs/2026-07-17-wave-behaviors-design.md`.
 
 ---
 

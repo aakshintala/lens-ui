@@ -87,7 +87,7 @@ Ordering below is by "blocks shipping Lens to a second human" (roughly).
     is focused. Small, self-contained; no omnigent dependency.
 
 11. **Lens-owned MCP producer layer** — *surfaced 2026-07-16 designing the two new
-    wave states (`docs/superpowers/specs/2026-07-16-wave-states-scheduled-awaitingreview-design.md`).*
+    wave states (`docs/specs/2026-07-16-wave-states-scheduled-awaitingreview-design.md`).*
     Lens exposes its own MCP server to agents: `await_review` (ask a human to review
     a Canvas artifact), `schedule_wake` (park-until-T) + the wake-firing **scheduler**
     (Lens sends a message at T; also drives the `Ready`-style repaint timer in the

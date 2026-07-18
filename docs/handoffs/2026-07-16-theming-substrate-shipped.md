@@ -15,8 +15,8 @@ Supersedes the "write the design doc → implement substrate" next-step in
 ## What shipped this session
 
 **§18 theming substrate + A2 migration + reload loop + global shortcuts.** Design →
-`docs/superpowers/specs/2026-07-16-theming-substrate-design.md`; plan →
-`docs/superpowers/plans/2026-07-16-theming-substrate.md`. Executed subagent-driven (composer-2.5
+`docs/specs/2026-07-16-theming-substrate-design.md`; plan →
+`docs/plans/2026-07-16-theming-substrate.md`. Executed subagent-driven (composer-2.5
 impl per task, codex + Opus review). All 7 plan tasks + follow-ons done.
 
 **New: `crates/lens-ui/src/theme/`**

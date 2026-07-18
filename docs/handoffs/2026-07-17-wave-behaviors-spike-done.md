@@ -13,7 +13,7 @@ then execute subagent-driven.
 
 ## What this session produced
 
-1. **Visual design LOCKED** — `docs/superpowers/specs/2026-07-17-wave-behaviors-design.md`
+1. **Visual design LOCKED** — `docs/specs/2026-07-17-wave-behaviors-design.md`
    (the SSOT for the build). Live tunable mockup: `docs/design/renders/wave-states-motion.html`.
 2. **Animation spike EXECUTED → GO** — `docs/spikes/2026-07-17-wave-animation.md` (verdict +
    cost + gotchas). Spec §8 now holds the LOCKED architecture.

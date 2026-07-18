@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust, gpui 0.2.2, gpui-component 0.5.1 (`Theme`, `ThemeConfig`, `ThemeConfigColors`, `ThemeMode`, `Colorize`), serde + serde_json + anyhow.
 
-**Source spec:** `docs/superpowers/specs/2026-07-16-theming-substrate-design.md` (cross-family reviewed). This plan folds three corrections discovered by verifying the spec against the real crate + repo:
+**Source spec:** `docs/specs/2026-07-16-theming-substrate-design.md` (cross-family reviewed). This plan folds three corrections discovered by verifying the spec against the real crate + repo:
 
 1. **Deps are NOT already present.** Spec §8 claims "serde, serde_json, anyhow are already in lens-ui" — they are not (`crates/lens-ui/Cargo.toml` has only async-channel, crossbeam-channel, futures, gpui, gpui-component, lens-client, lens-core, smallvec). Task 1 adds them.
 2. **Reload needs a non-fallback loader.** Spec §3.4's single `load()` falls back to the *embedded* default when an external file is bad (correct for startup). But §3.4's reload prose requires "keep the current active theme — do not reset to embedded" on a bad edit. Those conflict in one function. Resolution: two named loaders — `load(mode, dir) -> Result<LensTheme>` reads the external file *only* and returns `Err` on failure (no fallback; the reload handler calls it → bad edit → `Err` → keep current); `load_or_embedded(mode, dir) -> Result<LensTheme>` wraps `load` with the embedded fallback (startup). See Task 3 / Task 5.

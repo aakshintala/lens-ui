@@ -192,7 +192,7 @@ re-imports (clippy-clean); `MockReopen` redundant `open_stream_always_503` branc
       watcher/registry). Defer file-load/registry/hot-reload/light/importers/picker.
   - **✅ THEMING SUBSTRATE SHIPPED + LIVE-VERIFIED (2026-07-16, branch `feat/lens-app-multi-session`
     @ `fdcaef8`, branch-only — not merged/pushed).** Handoff:
-    `docs/handoffs/2026-07-16-theming-substrate-shipped.md`. Design/plan under `docs/superpowers/`.
+    `docs/handoffs/2026-07-16-theming-substrate-shipped.md`. Design under `docs/specs/`, plan under `docs/plans/`.
     Landed: `crates/lens-ui/src/theme/` — `LensTheme` global (base+status tokens, hex↔Hsla serde,
     **dark+light** JSON), `cx.lens_theme()` accessor, gpui-component bridge via public
     `Theme::apply_config`, external-file load + **global `cmd-shift-t` reload** (off-thread); **A2**
@@ -205,7 +205,7 @@ re-imports (clippy-clean); `MockReopen` redundant `open_stream_always_503` branc
     reload loop makes it cheap).
   - **✅ WAVE STATES `Scheduled` + `AwaitingReview` SHIPPED (2026-07-16, branch `feat/lens-app-multi-session`
     @ `f1f0d6e`, branch-only).** Handoff `docs/handoffs/2026-07-16-wave-states-shipped.md`; spec
-    `docs/superpowers/specs/2026-07-16-wave-states-scheduled-awaitingreview-design.md`. **Structural
+    `docs/specs/2026-07-16-wave-states-scheduled-awaitingreview-design.md`. **Structural
     contract only:** `Wave` 6→8, two Lens-owned card fields (`awaiting_review`, source-agnostic
     `scheduled_wake_at`), 8-step ladder (`NeedsInput>Failed>Working>AwaitingReview>Scheduled>Ready>
     Slept>Neutral`), 2 placeholder colors (both themes), 2 `--demo` cards, 9 tests. composer author +
@@ -215,7 +215,7 @@ re-imports (clippy-clean); `MockReopen` redundant `open_stream_always_503` branc
     as the load-bearing open risk.
   - **✅ WAVE BEHAVIORS DESIGN LOCKED + ANIMATION SPIKE DONE (2026-07-17, branch `feat/lens-app-multi-session`
     @ `114e242`, branch-only).** Handoff `docs/handoffs/2026-07-17-wave-behaviors-spike-done.md`; design
-    SSOT `docs/superpowers/specs/2026-07-17-wave-behaviors-design.md` (+ tunable mockup
+    SSOT `docs/specs/2026-07-17-wave-behaviors-design.md` (+ tunable mockup
     `docs/design/renders/wave-states-motion.html`); spike verdict `docs/spikes/2026-07-17-wave-animation.md`.
     **Strategy B — motion *character* encodes class:** sweep=attention (NeedsInput/Failed +ring / Awaiting/
     Ready), spinner=Working, depleting countdown-ring=Scheduled, still=Slept(dim+Wake)/Idle. Glyphs final.

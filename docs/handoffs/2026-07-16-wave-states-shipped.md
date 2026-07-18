@@ -17,7 +17,7 @@ fold into B1–B5). The B1–B8 deviation ledger remains
 Design → build for **two new card wave states**, brainstormed then composer-built.
 
 **Design (`b7c747a` + `ff9ac7c`):**
-`docs/superpowers/specs/2026-07-16-wave-states-scheduled-awaitingreview-design.md`.
+`docs/specs/2026-07-16-wave-states-scheduled-awaitingreview-design.md`.
 Wave-side contract only. Producers filed as **`SPEC-GAPS.md` #11**.
 
 **Implementation (`f1f0d6e`)** — composer-2.5 author, codex/gpt-5.6-sol review (ran

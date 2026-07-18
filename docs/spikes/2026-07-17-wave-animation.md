@@ -1,7 +1,7 @@
 # Spike — wave animation feasibility + cost (B3)
 
 **Date:** 2026-07-17 · **Branch:** `feat/lens-app-multi-session` · **Verdict: GO**
-Design: `docs/superpowers/specs/2026-07-16-wave-behaviors-design.md` §8.
+Design: `docs/specs/2026-07-17-wave-behaviors-design.md` §8.
 
 ## Question
 
