@@ -1,53 +1,65 @@
-# Handoff — Terminal Slice 2: EXECUTION (2026-07-17)
+# Handoff — Terminal Slice 2: EXECUTION (2026-07-17, SERIAL re-cut)
 
 **Self-contained driver for a fresh session** whose job is to **execute** Slice 2. Planning is
-DONE and gpt-5.6-reviewed; do NOT re-plan or re-review the plans — execute them.
+DONE and gpt-5.6-reviewed; do NOT re-plan or re-review the plan bodies — execute them.
+
+**2026-07-17 update — Task 0 dissolved; execution is now SERIAL.** The earlier parallel-worktree
+structure (Task 0 foundation + 2a∥2d in isolated worktrees + merge) was **replaced** with a straight
+serial sequence on `terminal-ws`. Task 0 existed *only* to make parallel worktrees merge-safe; in
+serial there is no merge, so each slice declares and fills its own surface against the prior slice's
+committed code. The Task 0 plan file was deleted and its declarations folded into 2a and 2d.
 
 ## State
 
-- **Three plans, execution-ready**, in `docs/superpowers/plans/`:
-  - `2026-07-17-terminal-slice-2-task0-foundation.md` — shared skeleton (lands FIRST).
-  - `2026-07-17-terminal-slice-2a-input.md` — input/IME/focus/read-only.
-  - `2026-07-17-terminal-slice-2d-presentation.md` — titles/hyperlinks/presentation egress.
+- **Two plans, execution-ready**, in `docs/superpowers/plans/`:
+  - `2026-07-17-terminal-slice-2a-input.md` — input/IME/focus/read-only. **Self-contained, lands FIRST.**
+  - `2026-07-17-terminal-slice-2d-presentation.md` — titles/hyperlinks/presentation egress. **Lands
+    AFTER 2a**, on 2a's committed code.
+  - (`…-task0-foundation.md` was **deleted** — dissolved into 2a/2d.)
 - **Design spec (ground truth):** `docs/specs/2026-07-17-terminal-slice-2-interaction-design.md`;
   parent `docs/specs/2026-07-16-terminal-workstream-design.md` (matrix + Open-contract-gaps
   amended for the progress/notification defer).
 - **Branch:** `terminal-ws` (pushed to `origin/terminal-ws`; **not** merged to `main` — user holds
-  the whole terminal workstream on-branch). All Slice-2 planning artifacts are **uncommitted** on
-  `terminal-ws` (the three plan docs + the parent-spec matrix amendment + CLAUDE.md gpt-5.6 edit).
-  **Commit those planning docs first** (or fold into Task 0's first commit).
+  the whole terminal workstream on-branch). Slice-2 **planning** (the design + both plan docs) is
+  **already committed** (673d8bb). The serial re-cut (this handoff + plan edits + Task-0 deletion)
+  is uncommitted at handoff time — **commit it first**, then execute.
 - **Durable context:** memories [[terminal-slice-2-design-ghostty-precedent]] (design + spike
-  resolution), [[terminal-parallel-worktree-task0-foundation]] (why Task 0 + the single-writer rule),
-  [[terminal-slice-1d-executed]], [[gpui-test-noop-text-system]], [[parallel-worktree-composer-delegation]].
+  resolution), [[terminal-parallel-worktree-task0-foundation]] (**superseded** — records why Task 0
+  was needed for the PARALLEL structure; serial dropped it), [[terminal-slice-1d-executed]],
+  [[gpui-test-noop-text-system]], [[plan-detail-vs-delegation-calibration]],
+  [[composer-delegation-profile]], [[premature-layer-boundary-binding]].
 
-## Execution order (STRICT)
+## Execution order (STRICT, serial on `terminal-ws` — no worktrees, no merge)
 
-1. **Task 0 (shared foundation) — FIRST, on `terminal-ws` directly (no worktree).**
-   Mechanical, inert (egress rename + presentation channel + `Frame.cursor`/`FrameCell.hyperlink_uri`
-   + `VtEngine` key fields + `TerminalTab` interaction fields + render hook-points, all no-op
-   placeholders). **composer-2.5 executes** (it's a deterministic transcription — see
-   [[plan-detail-vs-delegation-calibration]]); Opus reviews + runs the gate; commit. Acceptance =
-   **compiles + existing suite green unchanged + clippy clean + every placeholder inert.**
-2. **2a ∥ 2d — isolated git worktrees off the post-Task-0 `terminal-ws`** (the 1a∥1b pattern,
-   [[parallel-worktree-composer-delegation]]). **subagent-driven-development** per each plan's header
-   (composer-2.5 per task + per-task review). **Each worktree cross-family reviewed by a DIFFERENT
-   family** (reviews now default to **gpt-5.6** — [[review-spend-policy]]; codex/gpt-5.5 = free fallback).
-3. **Merge 2a + 2d → `terminal-ws`.** After Task 0 the merge is **additive** (each plan is a single
-   writer to every shared definition; they touch disjoint lines of `build_frame`/`render`). Run the
-   **full gate on the merged tree** regardless.
-4. **Then 2b** (clipboard/OSC-52 policy — needs 2a + 2d's presentation egress; **owns** the
+1. **2a (input) — FIRST.** Self-contained: declares AND fills egress rename, `key_encoder`/`key_event`
+   fields, `Frame.cursor`/`CursorPos`, `EngineCommand::{Key,Focus,LocalScroll}`, `input_forwarder`,
+   `ime_preedit`, `on_key_down`/`on_key_up` render hooks, `input_gate.rs`. **`VtEngine::new` keeps its
+   current arity** (no `presentation_tx`). Execute via **subagent-driven-development** per the plan
+   header — composer-2.5 per task + per-task review; cross-family review by a non-author family
+   (gpt-5.6 default — [[review-spend-policy]]; codex/gpt-5.5 = free fallback). Gate after each task.
+2. **2d (presentation) — SECOND**, on 2a's committed code. Self-contained: T1 declares the presentation
+   surface (create `engine/presentation.rs`, wire the presentation channel through
+   `WorkerChannels`/`worker_channels`/`spawn_worker`/`EngineHandle`, **add `presentation_tx` to
+   `VtEngine::new`** + update every call site, register bare `on_title_changed`, add the
+   `drain_presentation_events` render hook + presentation methods); T2 sanitize; T3 adds
+   `FrameCell.hyperlink_uri: Option<Arc<str>>` + OSC-8 extraction; T4 adds `next_host_request_id` +
+   `on_mouse_down` + URL validation/gesture. Same execution flow + cross-family review (different
+   family than 2a's reviewer for diversity).
+3. **Then 2b** (clipboard/OSC-52 policy — needs 2d's presentation egress; **owns** the
    `on_clipboard_write` registration + the cap-before-clone that 2d deliberately deferred), **then 2c**
    (mouse — opens with the **XTSHIFTESCAPE `mouse_shift_capture` safe-FFI spike**, still unresolved).
    Neither is planned yet.
 
-## Why Task 0 (do not skip)
+## Why serial (and why Task 0 is gone)
 
-The gpt-5.6 review proved 2a and 2d are **not** independent: both edit `VtEngine::new`,
-`WorkerChannels`/`spawn_worker`, `EngineHandle::spawn`, `build_frame`, and `TerminalTab::render`, and
-each plan's struct literals omit the other's new fields (an **invisible** merge hazard — compiles in
-isolation, drops a field on merge). Task 0 pre-declares every shared field/param/literal/hook-point as
-inert placeholders so each plan is a **single writer** to disjoint bodies/lines. The plans are already
-rebased onto this (each has a "Builds on Task 0" table + a handoff table of what it fills).
+The gpt-5.6 review found 2a and 2d both edit `VtEngine::new`, `WorkerChannels`/`spawn_worker`,
+`EngineHandle::spawn`, `build_frame`, and `TerminalTab::render`. In **parallel** worktrees each plan's
+struct literals omit the other's fields — an invisible merge hazard (compiles in isolation, drops a
+field on merge). Task 0 was invented to pre-declare every shared field as an inert placeholder so each
+worktree was a single writer. **Serial removes the hazard at the root:** 2d edits 2a's *real* committed
+code, so it sees 2a's actual struct/fn shapes and adds its own fields directly — no placeholders, no
+merge, no dead-code carried through 2a. Cost: 2a and 2d run sequentially (no wall-clock parallelism),
+judged not worth the Task-0 ceremony for a solo/agent-delegated build.
 
 ## Non-negotiables baked into the plans (don't regress during execution)
 
@@ -77,5 +89,6 @@ These were folded from the gpt-5.6 review — the plans contain the tests; keep 
 
 ## First action
 
-Commit the uncommitted Slice-2 planning docs, then execute **Task 0** (composer-2.5 → Opus review →
-gate → commit on `terminal-ws`). Then set up the 2a ∥ 2d worktrees.
+Commit the serial re-cut (this handoff + the two edited plan docs + the Task-0 deletion), then execute
+**2a** task-by-task (composer-2.5 → per-task cross-family review → gate → commit on `terminal-ws`).
+When 2a is done + green, execute **2d** on top of it.

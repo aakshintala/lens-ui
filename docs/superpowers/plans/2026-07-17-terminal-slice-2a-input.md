@@ -4,22 +4,26 @@
 
 **Goal:** Ship the first production input path in `lens-terminal`: owner-side VT key encoding (live modes, full physical-key map), IME commit + foreground preedit overlay, focus wiring with mode-1004 report suppression, read-only gating with access-epoch revoke, `LocalScroll`, the ordered ingress/input command stream with worker-side Feed-chunk `Stop` preemption, and off-foreground never-drop / never-block-fg backpressure into `WsOutbound::Input`.
 
-**Architecture:** Extend the existing single `EngineCommand` channel (`CMD_CHANNEL_CAP=256`) with `Key` / `Focus` / `LocalScroll` — **do not** add a second input channel. A `Feed` is an **atomic ordering unit**: the worker chunks it only for `Stop` preemption + a bounded work quantum — **never** to interleave later-arriving input mid-Feed (a Key that arrived after a Feed must see post-Feed modes). Encode keys on the engine thread via Task 0's `key_encoder`/`key_event` with `set_options_from_terminal` per encode. User-input bytes and DA/DSR replies share Task 0's `egress_*` channel as **distinct producers** with different full-channel policies (never-drop for keys; drop-oldest only for replies). Foreground `try_enqueue`s into a local queue; an off-fg forwarder does bounded blocking onto `cmd_tx` and is `Stop`-severable without blocking GPUI (preserves C3 `runtime.take()`).
+**Architecture:** Extend the existing single `EngineCommand` channel (`CMD_CHANNEL_CAP=256`) with `Key` / `Focus` / `LocalScroll` — **do not** add a second input channel. A `Feed` is an **atomic ordering unit**: the worker chunks it only for `Stop` preemption + a bounded work quantum — **never** to interleave later-arriving input mid-Feed (a Key that arrived after a Feed must see post-Feed modes). Encode keys on the engine thread via the `key_encoder`/`key_event` fields **this plan declares on `VtEngine`** with `set_options_from_terminal` per encode. User-input bytes and DA/DSR replies share the **`egress_*` channel** (this plan renames `da_dsr_*`→`egress_*`) as **distinct producers** with different full-channel policies (never-drop for keys; drop-oldest only for replies). Foreground `try_enqueue`s into a local queue; an off-fg forwarder does bounded blocking onto `cmd_tx` and is `Stop`-severable without blocking GPUI (preserves C3 `runtime.take()`).
 
 **Tech Stack:** `crossbeam-channel`, `gpui` (`EntityInputHandler` / `ElementInputHandler` / `Window::handle_input`, `KeyDownEvent`/`KeyUpEvent`/`is_held`), `libghostty-vt` (`key::{Encoder,Event,Action,Key,Mods}`, `focus::Event`, `Terminal::scroll_viewport` / `Mode::FOCUS_EVENT` / cursor + `PointSpace`), `arc-swap`.
 
-## Builds on Task 0
+## Serial position (2a is FIRST — self-contained; no Task 0)
 
-Land / assume `docs/superpowers/plans/2026-07-17-terminal-slice-2-task0-foundation.md` is already on `terminal-ws`. **Do not re-declare** these — **fill bodies / use them**:
+Slice 2 executes **serially on `terminal-ws`** (no worktrees, no merge): `2a → 2d → 2b → 2c`. **2a lands first**, so it **declares AND fills its own surface** — there is no shared foundation to build on. 2d lands *after* 2a and adds its own presentation surface against 2a's committed code; 2a therefore **never touches** presentation/hyperlink/mouse/host-request code.
 
-| Task 0 already landed | 2a fills / uses |
+**2a declares (new) and fills:**
+
+| Surface 2a declares here | What 2a fills |
 | --- | --- |
-| `egress_*` rename, `emit_egress`, inspect `record_egress` | Use as-is; split **user-input** vs **reply** emit policy in worker |
-| `VtEngine.key_encoder` / `key_event` + `VtEngine::new(cfg, on_reply, presentation_tx)` | Add `encode_key` / `encode_focus_report` / `local_scroll` that **use** existing fields |
-| `Frame.cursor: Option<CursorPos>` (always `None`) | Replace the `cursor:` line with viewport-safe computation (I5) |
-| `TerminalTab.ime_preedit` + render `on_key_down` stub | Fill `on_key_down` body + IME overlay + focus subs |
-| `EngineHandle` without `input_forwarder` | **Sole writer:** add `input_forwarder`, `enqueue_input`, accessors as needed |
-| `EngineCommand` untouched | **Sole writer:** add `Key` / `Focus` / `LocalScroll` + arms |
+| Rename `da_dsr_*`→`egress_*` (channel, `emit_egress`, inspect `record_egress`) | Split **user-input** (never-drop) vs **reply** (drop-oldest) emit policy in worker |
+| `VtEngine.key_encoder` / `key_event` fields (**`VtEngine::new` keeps its current arity** — 2d adds `presentation_tx` later) | `encode_key` / `encode_focus_report` / `local_scroll` using those fields |
+| `Frame.cursor: Option<CursorPos>` + `CursorPos` in `frame.rs` | Viewport-safe cursor computation (I5) on the `cursor:` line of `build_frame` |
+| `TerminalTab.ime_preedit` field (both literal sites) + `on_key_down`/`on_key_up` on the render div | `on_key_down` body + IME overlay + focus subs |
+| `input_forwarder` on `EngineHandle`, `enqueue_input`, accessors | Forwarder wiring, non-blocking Drop, access-epoch |
+| `EngineCommand::{Key,Focus,LocalScroll}` + arms | Full input command handling |
+
+**2a does NOT touch** (2d owns, lands later): `presentation.rs`, the presentation channel, `VtEngine::new` arity, `on_title_changed`, `FrameCell.hyperlink_uri`, `next_host_request_id`, `on_mouse_down`, `drain_presentation_events`.
 
 ## Global Constraints
 
@@ -31,11 +35,11 @@ Land / assume `docs/superpowers/plans/2026-07-17-terminal-slice-2-task0-foundati
 - **Never block the GPUI foreground** on engine I/O; off-fg forwarder may block; `Stop`-severable; `EngineHandle::Drop` must use a **non-blocking** stop signal.
 - **No sleeps / frame-polling for input ACK sync** — `recv_timeout` / barriers only. (`cargo test` takes **one** positional filter — split multi-name runs into separate invocations.)
 - **`#[gpui::test]` / `NoopTextSystem` false-greens** — real IME/`InputHandler` claims go in `tests/input_realwindow.rs` (`harness = false`, `test-util`).
-- Ground truth: Slice-2 interaction design (2a + DP1/2/5/6); Task 0 foundation; real APIs in `worker.rs` / `handle.rs` / `vt.rs` / `bridge.rs` / `runtime.rs` / `key.rs` / `focus.rs` / gpui 0.2.2.
+- Ground truth: Slice-2 interaction design (2a + DP1/2/5/6); real APIs in `worker.rs` / `handle.rs` / `vt.rs` / `bridge.rs` / `runtime.rs` / `key.rs` / `focus.rs` / gpui 0.2.2.
 
-## Parallel-worktree note (2a ∥ 2d)
+## Serial-seam note (2a → 2d)
 
-After Task 0, 2a and 2d are **single writers to disjoint definitions/lines**. 2a owns: `EngineCommand` variants/arms, Feed chunk loop, `input_forwarder` on `EngineHandle`, `encode_key*`, `build_frame` **`cursor:`** line, `on_key_down` body, `ime_preedit` overlay. 2d owns: presentation sanitize, `hyperlink_uri:` lines, `on_mouse_down`, presentation drain arms. Do **not** redesign 2d.
+2a and 2d edit **disjoint lines** of the shared functions, but serially, not in parallel. 2a owns: `EngineCommand` variants/arms, Feed chunk loop, `input_forwarder` on `EngineHandle`, `encode_key*`, the `egress` rename, `frame.rs` `cursor`/`CursorPos`, `build_frame` **`cursor:`** line, the `on_key_down` render hook + body, `ime_preedit`. Leave `build_frame` and `render` **clean and complete** for 2a's scope — 2d will add its `hyperlink_uri:` line, `on_mouse_down`, and `drain_presentation_events` call **on top of 2a's committed code**. Do **not** stub presentation hooks for 2d; 2d adds them itself.
 
 ## File Structure
 
@@ -43,14 +47,15 @@ After Task 0, 2a and 2d are **single writers to disjoint definitions/lines**. 2a
 | --- | --- |
 | `crates/lens-terminal/src/engine/command.rs` | **Create.** `KeyInput` (incl. `access_epoch`), `KeyAction`, `LensKey` (**full** physical set), `KeyMods`, `ScrollDelta`, `InputAck`. |
 | `crates/lens-terminal/src/engine/key_map.rs` | **Create.** GPUI/`LensKey` → Ghostty `Key` map + pure-encoder goldens. |
-| `crates/lens-terminal/src/engine/worker.rs` | **Modify.** `EngineCommand` variants; Feed chunking + bounded pending drain; Key/Focus/LocalScroll arms; split reply vs user-input egress emit. |
-| `crates/lens-terminal/src/engine/handle.rs` | **Modify.** Add `input_forwarder`; `enqueue_input`; access-epoch; non-blocking Drop; test barriers; **use** Task 0 `egress_rx` (do not rename). |
-| `crates/lens-terminal/src/engine/vt.rs` | **Modify.** Add `encode_key` / `encode_focus_report` / `local_scroll`; **fill** `cursor:` in `build_frame` (viewport-safe). |
+| `crates/lens-terminal/src/engine/worker.rs` | **Modify.** Rename `da_dsr_*`→`egress_*` (const/channels/`emit_egress`); `EngineCommand` variants; Feed chunking + bounded pending drain; Key/Focus/LocalScroll arms; split reply vs user-input egress emit. |
+| `crates/lens-terminal/src/engine/handle.rs` | **Modify.** Rename `da_dsr_rx`→`egress_rx` (field + accessor); add `input_forwarder`; `enqueue_input`; access-epoch; non-blocking Drop; test barriers. |
+| `crates/lens-terminal/src/engine/frame.rs` | **Modify.** Add `CursorPos` + `Frame.cursor: Option<CursorPos>` (fixtures/`Frame` literals get `cursor: None`). |
+| `crates/lens-terminal/src/engine/vt.rs` | **Modify.** Add `key_encoder`/`key_event` fields on `VtEngine` (**keep `VtEngine::new` arity**); add `encode_key` / `encode_focus_report` / `local_scroll`; set + fill `cursor:` in `build_frame` (viewport-safe). |
 | `crates/lens-terminal/src/engine/forwarder.rs` | **Create.** FG-local queue + off-fg forwarder; Stop-sever; purge-on-epoch; blocked-in-retry barrier for tests. |
 | `crates/lens-terminal/src/engine/mod.rs` | **Modify.** `mod` + `pub use` for new modules. |
-| `crates/lens-terminal/src/engine/inspect.rs` | **Modify.** Input-path counters (keys encoded, user-egress accepts/rejects, feed chunks, stops preempted). |
+| `crates/lens-terminal/src/engine/inspect.rs` | **Modify.** Rename `record_da_dsr`→`record_egress`; input-path counters (keys encoded, user-egress accepts/rejects, feed chunks, stops preempted). |
 | `crates/lens-terminal/src/input_gate.rs` | **Create.** `write_input_allowed` + unit tests. |
-| `crates/lens-terminal/src/lib.rs` | **Modify.** Fill `on_key_down` / `on_key_up`; `EntityInputHandler`; focus subs; epoch bump on downgrade; gate; preedit overlay; **do not redeclare** `ime_preedit`. |
+| `crates/lens-terminal/src/lib.rs` | **Modify.** Add `ime_preedit` field to `TerminalTab` (+ both literal sites); register `on_key_down`/`on_key_up` on the render div + fill; `EntityInputHandler`; focus subs; epoch bump on downgrade; gate; preedit overlay. |
 | `crates/lens-terminal/src/render/state.rs` | **Modify.** `window.handle_input` during paint; preedit at `Frame.cursor` (hide if `None`). |
 | `crates/lens-terminal/src/render/paint.rs` | **Modify.** Preedit overlay helper. |
 | `crates/lens-terminal/benches/engine.rs` | **Modify.** Ordered-stream / key-encode micro-benches. |
@@ -282,22 +287,31 @@ EOF
 
 ---
 
-### Task 2: Live-mode `encode_key` + never-drop user egress + viewport-safe cursor
+### Task 2: Foundation decls (egress rename, key fields, `Frame.cursor`) + live-mode `encode_key` + never-drop user egress + viewport-safe cursor
+
+**Step 0 (foundation declarations — do first, keep mechanical):**
+- Rename `DA_DSR_CHANNEL_CAP`→`EGRESS_CHANNEL_CAP` (keep `64`); `WorkerChannels.da_dsr_tx/rx`→`egress_tx/rx`; `emit_da_dsr`→`emit_egress`; all `da_dsr` locals→`egress`; `handle.rs` field/accessor `da_dsr_rx`→`egress_rx`; `inspect.rs` `record_da_dsr`→`record_egress` (+ any snapshot field + its tests, same commit). Purely mechanical; no counter-semantics change. **`VtEngine::new` keeps its current arity** (no `presentation_tx` — that's 2d).
+- Add `key_encoder: libghostty_vt::key::Encoder<'static>` + `key_event: libghostty_vt::key::Event<'static>` to `VtEngine`, constructed in `VtEngine::new` (`Encoder::new()?` / `Event::new()?`). Task 2 uses them immediately, so no `#[expect(dead_code)]` needed.
+- Add `CursorPos { col: u16, row: u16 }` + `Frame.cursor: Option<CursorPos>` to `frame.rs`; re-export `CursorPos` from `engine/mod.rs`. Every existing `Frame { … }` literal (fixtures, paint tests, reconnect_seed) gains `cursor: None` — the viewport fill below replaces the `build_frame` one.
 
 **Files:**
-- Modify: `crates/lens-terminal/src/engine/vt.rs` (`encode_key`; **fill** `cursor:` only — fields already exist from Task 0)
-- Modify: `crates/lens-terminal/src/engine/worker.rs` (Key arm; split egress emit)
-- Modify: `crates/lens-terminal/src/engine/inspect.rs` (user-egress accept/reject counters)
+- Modify: `crates/lens-terminal/src/engine/frame.rs` (add `CursorPos` + `Frame.cursor`)
+- Modify: `crates/lens-terminal/src/engine/vt.rs` (add `key_encoder`/`key_event` fields; `encode_key`; set + fill `cursor:` in `build_frame`)
+- Modify: `crates/lens-terminal/src/engine/worker.rs` (egress rename; Key arm; split egress emit)
+- Modify: `crates/lens-terminal/src/engine/handle.rs` (`egress_rx` rename)
+- Modify: `crates/lens-terminal/src/engine/inspect.rs` (egress rename; user-egress accept/reject counters)
+- Modify: `crates/lens-terminal/src/engine/mod.rs` (re-export `CursorPos`)
+- Modify: fixtures/call-sites — every `Frame { … }` literal gains `cursor: None` (`render/fixtures.rs`, `render/paint.rs`, `reconnect_seed.rs`, `lib.rs` tests)
 - Modify: `crates/lens-terminal/src/bridge.rs` only if a saturation event must be surfaced for user-egress-full
 
 **Interfaces:**
-- Consumes: Task 0 `self.key_encoder` / `self.key_event` / `egress_tx/rx` / existing `emit_egress`.
+- Consumes: `self.key_encoder` / `self.key_event` (declared in Step 0) / `egress_tx/rx` / `emit_egress`.
 - Produces:
   - `VtEngine::encode_key(&mut self, input: &KeyInput) -> Result<Vec<u8>, EngineError>` — `set_options_from_terminal(&self.terminal)` then `encode_key_pure`; composing → empty.
   - `emit_reply_egress(...)` — keep **drop-oldest** behavior; **only** for DA/DSR / `take_replies`.
   - `try_emit_user_input(egress_tx, bytes) -> Result<(), UserEgressFull>` — **`try_send` only**; on `Full` return `Err` (**never** drop-oldest). On `Err`: do **not** ACK as accepted; bump inspect `user_egress_rejected`; surface saturation toward reconnect policy (`UserEgressSaturated` **or** reuse `OutboundSaturated` with a clear comment).
   - Key arm: encode → `try_emit_user_input` → ACK `{ encoded, accepted }` reflecting **actual** acceptance (empty encode → `accepted: true`, no send).
-  - `build_frame` **`cursor:`** line (I5) — replace Task 0's `cursor: None`:
+  - `build_frame` **`cursor:`** line (I5) — the viewport fill (fixtures/other `Frame` literals keep `cursor: None`):
 
 ```rust
 cursor: viewport_cursor_pos(&self.terminal, cols, rows),
@@ -344,19 +358,23 @@ cargo test -p lens-terminal --lib user_input_egress_full -- --nocapture
 cargo test -p lens-terminal --lib build_frame_cursor_none -- --nocapture
 ```
 
-- [ ] **Step 3: Implement** `encode_key`, split emit paths, viewport-safe cursor fill. **Do not** re-add `key_encoder` fields, change `VtEngine::new` arity, or rename egress.
+- [ ] **Step 3: Implement** Step-0 decls (egress rename, `key_encoder`/`key_event` fields, `Frame.cursor`/`CursorPos`), then `encode_key`, split emit paths, viewport-safe cursor fill. **Do not** add `presentation_tx` to `VtEngine::new` (2d owns presentation).
 
 - [ ] **Step 4: Run — expect PASS** (same three commands).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/lens-terminal/src/engine/vt.rs \
+git add crates/lens-terminal/src/engine/frame.rs \
+        crates/lens-terminal/src/engine/vt.rs \
         crates/lens-terminal/src/engine/worker.rs \
+        crates/lens-terminal/src/engine/handle.rs \
         crates/lens-terminal/src/engine/inspect.rs \
+        crates/lens-terminal/src/engine/mod.rs \
+        crates/lens-terminal/src/render/ \
         crates/lens-terminal/src/bridge.rs
 git commit -m "$(cat <<'EOF'
-feat(lens-terminal): live-mode encode_key, never-drop user egress, viewport cursor (2a)
+feat(lens-terminal): egress rename, key-encoder fields, Frame.cursor, live encode_key, never-drop user egress (2a)
 
 EOF
 )"
@@ -568,7 +586,7 @@ EOF
 ### Task 5: GPUI InputHandler + special-only keydown + real-window keystroke
 
 **Files:**
-- Modify: `crates/lens-terminal/src/lib.rs` (fill Task 0 `on_key_down`; add `on_key_up`; `EntityInputHandler`; `cfg(any(test, feature = "test-util"))` hooks)
+- Modify: `crates/lens-terminal/src/lib.rs` (add `ime_preedit` field to `TerminalTab` + both literal sites `starting()`/`with_engine_for_test()`; register `on_key_down` + `on_key_up` on the render div + fill; `EntityInputHandler`; `cfg(any(test, feature = "test-util"))` hooks)
 - Modify: `crates/lens-terminal/src/render/state.rs` (`handle_input` + preedit at `cursor`)
 - Modify: `crates/lens-terminal/src/render/paint.rs`
 - Modify: `crates/lens-terminal/Cargo.toml`
@@ -578,7 +596,7 @@ EOF
 **Interfaces / critical split (no double-emit):**
 - **`on_key_down` / `on_key_up`:** encode **ONLY** non-text / special / modified keys (nav, F-keys, Enter/Tab/Esc/Backspace/Delete, Ctrl/Alt/Super combos including Ctrl-C). Map `KeyDownEvent::is_held` → `Repeat`; `KeyUpEvent` → `Release`. **Do not** enqueue plain printable unmodified text from keydown — gpui auto-forwards `key_char` to `InputHandler::replace_text_in_range` (`window.rs:3553-3557`).
 - **`replace_text_in_range`:** sole owner of committed text / IME commit → `KeyInput { key: Unidentified, utf8: Some(text), composing: false, access_epoch }`.
-- **`replace_and_mark_text_in_range`:** set `ime_preedit` (Task 0 field); no engine enqueue.
+- **`replace_and_mark_text_in_range`:** set `ime_preedit` (this plan's `TerminalTab` field); no engine enqueue.
 - Preedit overlay only when `frame.cursor.is_some()`; else hide.
 - Hooks under `cfg(any(test, feature = "test-util"))`:
   - `debug_ime_commit_for_test(&mut self, text: &str) -> Option<Receiver<InputAck>>` — **enqueues and returns receiver**; **never** `recv_timeout` inside the entity method.
@@ -605,7 +623,7 @@ fn ime_commit_hook_returns_receiver_without_blocking() {
 
 - [ ] **Step 2: Run — expect FAIL.**
 
-- [ ] **Step 3: Implement** handler split + overlay + `window.handle_input` during paint. Register `on_key_up` on the render div alongside Task 0's `on_key_down` hook-point.
+- [ ] **Step 3: Implement** `ime_preedit` field + both literal sites; register `on_key_down` + `on_key_up` on the render div; handler split + overlay + `window.handle_input` during paint.
 
 - [ ] **Step 4: Real-window harness** — dispatch a **real** gpui keystroke into the painted focused window (not only debug hooks). Assert special-key path (ArrowUp) and printable-via-InputHandler. Manual IME checklist in `terminal_live.rs`.
 
@@ -763,9 +781,9 @@ EOF
 
 ## Self-Review
 
-### Task 0 rebase
-- Removed: egress rename steps; `key_encoder` field / `VtEngine::new` arity changes; `Frame.cursor` field-add; `ime_preedit` / `on_key_down` hook **declarations**.
-- Retained as sole-writer: `EngineCommand` Key/Focus/LocalScroll; `input_forwarder`; Feed chunking; `input_gate.rs`; body fills for `cursor:` / `encode_*` / `on_key_down`.
+### Serial structure (no Task 0)
+- **2a is self-contained and lands first on `terminal-ws`.** It declares **and** fills its own surface: egress rename (T2 Step 0), `key_encoder`/`key_event` fields (T2), `Frame.cursor`/`CursorPos` (T2), `EngineCommand::{Key,Focus,LocalScroll}` (T1), `input_forwarder` (T3), `ime_preedit` + `on_key_down`/`on_key_up` render hooks (T5), `input_gate.rs` (T6).
+- **`VtEngine::new` keeps its current arity** — 2a adds no `presentation_tx`. 2d (lands after 2a) adds the presentation channel, `on_title_changed`, `FrameCell.hyperlink_uri`, `on_mouse_down`, and `drain_presentation_events` against 2a's committed code. 2a must **not** stub any of those.
 
 ### Completion matrix (2a) + folded findings
 
@@ -790,4 +808,4 @@ EOF
 | **#11 benches/inspect** | T6 |
 | **#12 cargo test filter** | All tasks use one filter per invocation |
 
-**Placeholder scan:** no TBD; Focus/`access_epoch` shape stable from T1; Task 0 dependencies explicit; API signatures cited earlier remain unchanged.
+**Placeholder scan:** no TBD; Focus/`access_epoch` shape stable from T1; no Task 0 — all declarations folded into T1/T2/T5; API signatures cited earlier remain unchanged.

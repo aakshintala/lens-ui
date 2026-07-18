@@ -2,25 +2,25 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Ship terminal→host presentation effects for titles (full) and hyperlinks (click → typed host request), filling the Task-0 presentation skeleton so Slice 2b can later register OSC 52 without redesigning the channel.
+**Goal:** Ship terminal→host presentation effects for titles (full) and hyperlinks (click → typed host request), building the presentation skeleton (types, channel, `on_title_changed`, `FrameCell.hyperlink_uri`, render hooks) so Slice 2b can later register OSC 52 without redesigning the channel.
 
-**Architecture:** Task 0 already declared the presentation types, channel, bare `on_title_changed`, `FrameCell.hyperlink_uri: None`, and inert `on_mouse_down` / `drain_presentation_events` stubs. This plan **fills bodies only**: sanitize/bound inside the existing title closure (with latest-title semantics), real OSC 8 extraction (interned URIs), click-only URL validation + gesture → `OpenUrlRequest`, and presentation-path inspect/benches. **Do not** register `on_clipboard_write` here — 2b owns that (pre-clone cap + policy). Demo host DENYs/no-ops any clipboard request; never auto-allows.
+**Architecture:** 2d lands **serially, after 2a**, on `terminal-ws` — it edits 2a's committed code (no worktree, no merge). This plan **declares and wires** the entire presentation surface AND fills its bodies: create `engine/presentation.rs` (types + constants), add the presentation channel to `WorkerChannels`/`worker_channels()`/`spawn_worker`/`EngineHandle`, add the `presentation_tx` param to `VtEngine::new` (+ call-site fan-out), register `on_title_changed` (sanitize/bound inside, latest-title semantics), add `FrameCell.hyperlink_uri` + real OSC 8 extraction (interned URIs), add `TerminalTab.next_host_request_id` + the `on_mouse_down`/`drain_presentation_events` render hooks, click-only URL validation + gesture → `OpenUrlRequest`, and presentation-path inspect/benches. **Do not** register `on_clipboard_write` here — 2b owns that (pre-clone cap + policy). Demo host DENYs/no-ops any clipboard request; never auto-allows.
 
 **Tech Stack:** gpui `EventEmitter`, `libghostty-vt` (`Terminal::title`, `on_title_changed`, `GridRef::hyperlink_uri`), `crossbeam-channel`, `url` (`url::Url` — already in `crates/lens-terminal/Cargo.toml` as `url = "2"`; reuse it).
 
-## Builds on Task 0
+## Serial position (2d is SECOND — lands after 2a; declares + fills its own surface)
 
-Prerequisite: `docs/superpowers/plans/2026-07-17-terminal-slice-2-task0-foundation.md` lands on `terminal-ws` **before** this plan. After Task 0:
+Prerequisite: **2a is committed on `terminal-ws`.** 2d edits 2a's real code directly (no worktree, no merge, no Task 0). 2d **declares AND fills** the entire presentation surface — nothing is pre-declared for it. `VtEngine::new` currently has 2a's arity `(cfg, on_reply)`; **2d adds the `presentation_tx` param** and updates every call site (production + fixtures 2a left).
 
-| Already declared / wired (do **not** re-do) | 2d fills |
+| Surface 2d declares here | What 2d fills |
 | --- | --- |
-| `EnginePresentationEvent` / `ClipboardLocation` / `ClipboardMimePart` + `PRESENTATION_CHANNEL_CAP` / `MAX_REPORTED_TITLE_CHARS` / `MAX_HYPERLINK_URI_BYTES` | Use them; add helpers (`sanitize_*`, `validate_*`) only |
-| `WorkerChannels` / `worker_channels()` / `spawn_worker` / `EngineHandle` presentation fields + `VtEngine::new(cfg, on_reply, presentation_tx)` | `enqueue_presentation()` method; ensure `presentation_rx()`; fill drain arms |
-| Bare `on_title_changed` (raw title enqueue) | Sanitize/bound **inside** that closure; latest-title slot |
-| `FrameCell.hyperlink_uri` (always `None`) + fixtures | Real extraction on the `hyperlink_uri:` line via `GridRef::hyperlink_uri` |
-| `render` `on_mouse_down` hook + stub + `TerminalTab.next_host_request_id` | Fill `on_mouse_down` body; mint request ids |
+| `engine/presentation.rs` (**Create**): `EnginePresentationEvent` / `ClipboardLocation` / `ClipboardMimePart` + `PRESENTATION_CHANNEL_CAP=64` / `MAX_REPORTED_TITLE_CHARS=512` / `MAX_HYPERLINK_URI_BYTES=8192` | `sanitize_reported_title`, `validate_open_url`, plain-URL scan helpers |
+| Presentation channel in `WorkerChannels` / `worker_channels()` / `spawn_worker` / `EngineHandle` + `presentation_tx` param on `VtEngine::new` | `enqueue_presentation()` / `presentation_rx()` methods; latest-title slot |
+| `on_title_changed` registration in `VtEngine::new` | Sanitize/bound **inside** the closure; latest-title slot |
+| `FrameCell.hyperlink_uri: Option<Arc<str>>` (declare directly as `Arc<str>`; fixtures get `None`) | Real extraction on the `hyperlink_uri:` line via `GridRef::hyperlink_uri` |
+| `TerminalTab.next_host_request_id: u64` + both literal sites; `on_mouse_down` + `drain_presentation_events` on the render div | `on_mouse_down` body + drain arms; mint request ids |
 
-Single-writer rule: 2d edits only the title-closure body, each `hyperlink_uri:` line in `build_frame`, the `on_mouse_down` body, drain arms, and presentation **methods** — never re-declare shared fields/params that Task 0 owns.
+**2d must not touch** 2a-owned surface: `EngineCommand` input variants, the egress rename, `Frame.cursor`, `key_encoder`/`key_event`, `ime_preedit`, `on_key_down`. Edit `build_frame` / `render` only to **add** 2d's lines next to 2a's.
 
 ## Global Constraints
 
@@ -39,7 +39,7 @@ Single-writer rule: 2d edits only the title-closure body, each `hyperlink_uri:` 
 - **`TerminalTab::presentation()` returns an owned `Presentation`** (`lib.rs:394-397`), not a reference — clone/own wording accordingly.
 - **No Ghostty type escapes the engine boundary** — Lens-owned presentation types / `FrameCell` fields only.
 - **`#[gpui::test]` / `NoopTextSystem` false-greens hit-testing** — click claims go in `tests/presentation_realwindow.rs` (`harness = false`, `test-util`), not `#[gpui::test]`.
-- Ground truth: `docs/specs/2026-07-17-terminal-slice-2-interaction-design.md` (2d + command seam + render-path constraint); Task 0 foundation plan; real APIs in `lib.rs`, `policy.rs`, `frame.rs`, `vt.rs`, `worker.rs`, `vendor/.../terminal.rs`, `vendor/.../screen.rs`.
+- Ground truth: `docs/specs/2026-07-17-terminal-slice-2-interaction-design.md` (2d + command seam + render-path constraint); **2a's committed code** on `terminal-ws`; real APIs in `lib.rs`, `policy.rs`, `frame.rs`, `vt.rs`, `worker.rs`, `vendor/.../terminal.rs`, `vendor/.../screen.rs`.
 
 ## Deferred (out of this plan)
 
@@ -50,25 +50,28 @@ OSC progress reports (`CONEMU_PROGRESS_REPORT`, OSC 9;4) and desktop notificatio
 - **Hover** hyperlink affordance (cursor / highlight) — Slice-2 follow-up; 2d is click-only.
 - **`on_clipboard_write` registration**, pre-clone decoded-byte cap, allow/deny policy, copy notice, cap±1 tests — **Slice 2b** (see Task 5 note).
 
-## Parallel-worktree note (2a ∥ 2d, after Task 0)
+## Serial-seam note (2a → 2d)
 
-Task 0 dissolved the shared-definition merge seam. 2a and 2d fill **disjoint bodies/lines**:
+2d lands on 2a's committed code and edits **disjoint lines** of the shared functions:
 
 | Region | Owner |
 | --- | --- |
-| `EngineCommand` variants + `handle_command` arms; Feed fairness; `Stop`; egress input forwarder; `build_frame` `cursor:` line; `on_key_down` body; `ime_preedit` | **2a** |
-| Title-closure sanitize/bound + latest-title; `build_frame` `hyperlink_uri:` line; `on_mouse_down` body; drain arms; `enqueue_presentation()`; host-request id minting | **2d** |
+| `EngineCommand` variants + `handle_command` arms; Feed fairness; `Stop`; egress input forwarder; egress rename; `Frame.cursor`; `build_frame` `cursor:` line; `on_key_down`; `ime_preedit` | **2a (already landed)** |
+| `presentation.rs`; presentation channel wiring; `VtEngine::new` `presentation_tx` param; title-closure sanitize/bound + latest-title; `FrameCell.hyperlink_uri` + `build_frame` `hyperlink_uri:` line; `on_mouse_down` body; `drain_presentation_events`; `enqueue_presentation()`; `next_host_request_id` | **2d (this plan)** |
 
-Do **not** re-edit Task-0-owned definitions (channel wiring, field lists, `VtEngine::new` arity, fixture `None` literals for new fields). Do **not** plan input/keys/mouse-reporting/selection/paste/copy (2a/2b/2c).
+Do **not** touch 2a-owned definitions. Do **not** plan input/keys/mouse-reporting/selection/paste/copy (2a/2b/2c).
 
 ## File Structure
 
 | File | Responsibility |
 | --- | --- |
-| `crates/lens-terminal/src/engine/presentation.rs` | **Modify** (Task 0 created types). Add `sanitize_reported_title`, `validate_open_url`, plain-URL cell-index scan helpers + unit tests. |
-| `crates/lens-terminal/src/engine/vt.rs` | **Modify.** Fill sanitize inside existing `on_title_changed`; fill `hyperlink_uri:` extraction (intern + safe grow); latest-title slot wiring. |
-| `crates/lens-terminal/src/engine/frame.rs` | **Modify.** Upgrade `FrameCell.hyperlink_uri` from `Option<String>` → `Option<Arc<str>>` (interning; fixtures stay `None`). |
-| `crates/lens-terminal/src/engine/handle.rs` | **Modify.** Add `enqueue_presentation()`; ensure `presentation_rx()`; latest-title slot accessors if held on the handle. |
+| `crates/lens-terminal/src/engine/presentation.rs` | **Create.** Types (`EnginePresentationEvent`, `ClipboardLocation`, `ClipboardMimePart`) + constants (`PRESENTATION_CHANNEL_CAP`, `MAX_REPORTED_TITLE_CHARS`, `MAX_HYPERLINK_URI_BYTES`) + `sanitize_reported_title`, `validate_open_url`, plain-URL cell-index scan helpers + unit tests. |
+| `crates/lens-terminal/src/engine/mod.rs` | **Modify.** `mod presentation;` + `pub use` presentation types. |
+| `crates/lens-terminal/src/engine/worker.rs` | **Modify.** Add presentation channel to `WorkerChannels`/`worker_channels()`; thread `presentation_tx` into `spawn_worker` → `VtEngine::new`. |
+| `crates/lens-terminal/src/engine/vt.rs` | **Modify.** Add `presentation_tx` param to `VtEngine::new`; register + sanitize `on_title_changed`; add + fill `hyperlink_uri:` extraction (intern + safe grow); latest-title slot wiring. |
+| `crates/lens-terminal/src/engine/frame.rs` | **Modify.** Add `FrameCell.hyperlink_uri: Option<Arc<str>>` (fixtures get `None`). |
+| `crates/lens-terminal/src/engine/handle.rs` | **Modify.** Add presentation `_rx`/`_tx` fields + `spawn()` wiring; `enqueue_presentation()`; `presentation_rx()`; latest-title slot accessors if held on the handle. |
+| `VtEngine::new` call-site fan-out | **Modify.** Every `VtEngine::new(&cfg, on_reply)` (vt.rs tests, `reconnect_seed.rs`, benches) gains a throwaway `presentation_tx`: `let (tx,_rx)=crossbeam_channel::bounded(1); VtEngine::new(&cfg, on_reply, tx)`. |
 | `crates/lens-terminal/src/engine/inspect.rs` | **Modify.** Presentation-path counters (titles applied, hyperlink opens, drops / slot overwrites). |
 | `crates/lens-terminal/src/lib.rs` | **Modify.** Fill `drain_presentation_events` arms; fill `on_mouse_down`; `TerminalEvent` / `TerminalHostEvent` for OpenUrl; mint `next_host_request_id`. |
 | `crates/lens-terminal/src/hit_test.rs` | **Create.** Pure `pixel_to_cell` + `uri_for_gesture` (OSC 8 field or plain-URL scan). |
@@ -80,18 +83,27 @@ Do **not** re-edit Task-0-owned definitions (channel wiring, field lists, `VtEng
 
 ---
 
-### Task 1: `EngineHandle` presentation methods + drain arms + latest-title slot
+### Task 1: presentation channel foundation + `EngineHandle` methods + drain arms + latest-title slot
+
+**Step 0 (foundation — declare the presentation surface; do first):**
+- **Create `engine/presentation.rs`** with the types + constants (from the "Serial position" table): `EnginePresentationEvent { TitleChanged(String), HyperlinkOpen { url: String }, ClipboardWrite { location: ClipboardLocation, contents: Vec<ClipboardMimePart> } }`, `ClipboardLocation { Standard, Selection, Primary }`, `ClipboardMimePart { mime: String, data: String }`, `PRESENTATION_CHANNEL_CAP: usize = 64`, `MAX_REPORTED_TITLE_CHARS: usize = 512`, `MAX_HYPERLINK_URI_BYTES: usize = 8192`. Add `mod presentation;` + `pub use` to `engine/mod.rs`.
+- **Wire the channel:** `WorkerChannels` gains `presentation_tx/rx`; `worker_channels()` constructs it at `PRESENTATION_CHANNEL_CAP`; `spawn_worker` gains a `presentation_tx: Sender<EnginePresentationEvent>` param and threads it into `VtEngine::new`; `EngineHandle` gains `presentation_rx` + a `presentation_tx` clone, wired in `spawn()`.
+- **`VtEngine::new`:** add the `presentation_tx` param (2a left arity `(cfg, on_reply)`; 2d makes it `(cfg, on_reply, presentation_tx)`). Register a **bare** `on_title_changed` that `try_send`s `TitleChanged(raw)` (Task 2 wraps it with sanitize + latest-title slot). Update **every** `VtEngine::new` call site (production `spawn_worker`; test/fixture/bench sites 2a left) with a throwaway `presentation_tx`.
 
 **Files:**
-- Modify: `crates/lens-terminal/src/engine/handle.rs` (methods on existing fields)
-- Modify: `crates/lens-terminal/src/engine/vt.rs` (latest-title slot shared with title callback — Task 2 fills sanitize; Task 1 can wire the slot for raw titles)
-- Modify: `crates/lens-terminal/src/lib.rs` (`drain_presentation_events` arms; sample/wake drain call sites if not already from Task 0)
+- Create: `crates/lens-terminal/src/engine/presentation.rs`
+- Modify: `crates/lens-terminal/src/engine/mod.rs` (`mod` + `pub use`)
+- Modify: `crates/lens-terminal/src/engine/worker.rs` (channel + `spawn_worker` param)
+- Modify: `crates/lens-terminal/src/engine/vt.rs` (`VtEngine::new` param + bare `on_title_changed`; latest-title slot Task 2 fills sanitize)
+- Modify: `crates/lens-terminal/src/engine/handle.rs` (presentation fields + `spawn()` wiring; `presentation_rx()`/`enqueue_presentation()` methods)
+- Modify: `crates/lens-terminal/src/lib.rs` (`drain_presentation_events` method + call it from `render`)
+- Modify: `VtEngine::new` call sites (fixtures/benches/reconnect_seed)
 - Test: `handle.rs` / `presentation.rs` / `lib.rs`
 
 **Interfaces:**
-- Consumes: Task-0 `presentation_rx` / `presentation_tx` fields; bare title events.
+- Consumes: the presentation `_rx`/`_tx` fields declared in Step 0; bare title events.
 - Produces:
-  - `EngineHandle::presentation_rx(&self) -> &Receiver<EnginePresentationEvent>` (ensure present; Task 0 may already have a minimal accessor)
+  - `EngineHandle::presentation_rx(&self) -> &Receiver<EnginePresentationEvent>` (add it; Step 0 declared the field)
   - `EngineHandle::enqueue_presentation(&self, ev: EnginePresentationEvent) -> Result<(), FeedError>` (`try_send`)
   - Latest-title slot: always overwrite with the newest title string; non-blocking wake so FG drain sees it even when the channel is full / tab was hidden
   - Drain maps `TitleChanged` / slot → `presentation.reported_title` + `cx.emit(TerminalEvent::PresentationChanged)`; stubs for `HyperlinkOpen` (Task 4) and `ClipboardWrite` (no-op / Task 5 note)
@@ -135,7 +147,7 @@ fn latest_title_wins_when_channel_full() {
     // the FINAL title — not a stale earlier one.
     let (tx, rx) = crossbeam_channel::bounded(1);
     // Construct VtEngine with presentation_tx + assert final title via slot.
-    // Exact setup mirrors Task-0 VtEngine::new arity.
+    // Exact setup mirrors the new VtEngine::new arity (cfg, on_reply, presentation_tx).
     let _ = (tx, rx);
     // Implement against the real latest-title API chosen in Step 3.
 }
@@ -178,7 +190,7 @@ Latest-title design (pin one; do not invent a second):
 // and wake the FG sampler. If try_send is Full, the slot still holds the truth.
 ```
 
-Fill drain arms (Task 0 left inert discard):
+Add the `drain_presentation_events` method + arms (and call it from `render`):
 
 ```rust
 fn drain_presentation_events(&mut self, cx: &mut Context<Self>) {
@@ -209,7 +221,7 @@ fn drain_presentation_events(&mut self, cx: &mut Context<Self>) {
 }
 ```
 
-Call drain from Task-0's existing render hook and from the `wake_rx` / sample path as needed so hidden→visible still applies the freshest title.
+Add the drain call to `render` (alongside 2a's `sample_latest_frame_from_engine()`) and to the `wake_rx` / sample path as needed so hidden→visible still applies the freshest title.
 
 - [ ] **Step 4: Run tests — expect PASS**
 
@@ -243,7 +255,7 @@ EOF
 
 **Files:**
 - Modify: `crates/lens-terminal/src/engine/presentation.rs` (add `sanitize_reported_title`)
-- Modify: `crates/lens-terminal/src/engine/vt.rs` (**inside** Task-0's existing `on_title_changed` body — do not re-register)
+- Modify: `crates/lens-terminal/src/engine/vt.rs` (**inside** the `on_title_changed` body registered in Task 1 — do not re-register)
 - Modify: `crates/lens-terminal/src/lib.rs` (`apply_title_to_presentation`; never writes `identity_title`)
 - Test: `presentation.rs` unit tests + OSC integration
 
@@ -339,7 +351,7 @@ pub fn sanitize_reported_title(raw: &str) -> Option<String> {
 }
 ```
 
-Inside the **existing** Task-0 closure (do not call `on_title_changed` again):
+Inside the **existing** Task-1 closure (do not call `on_title_changed` again):
 
 ```rust
 // was: try_send(TitleChanged(title.to_owned()))
@@ -416,10 +428,10 @@ EOF
 ### Task 3: Fill `hyperlink_uri` extraction (intern + safe grow) + OSC 8
 
 **Files:**
-- Modify: `crates/lens-terminal/src/engine/frame.rs` (`Option<String>` → `Option<Arc<str>>`)
-- Modify: `crates/lens-terminal/src/engine/vt.rs` (`hyperlink_uri:` line in `build_frame` only — field already exists)
+- Modify: `crates/lens-terminal/src/engine/frame.rs` (**add** `FrameCell.hyperlink_uri: Option<Arc<str>>`)
+- Modify: `crates/lens-terminal/src/engine/vt.rs` (add the `hyperlink_uri:` line to every `FrameCell` literal in `build_frame` + fill extraction)
 - Test: `vt.rs` OSC 8 integration tests
-- Note: fixtures already have `hyperlink_uri: None` from Task 0 — update type only if the compiler requires (`None` is fine for `Option<Arc<str>>`)
+- Note: every existing `FrameCell { … }` literal (fixtures, paint tests) gains `hyperlink_uri: None` (`None` fits `Option<Arc<str>>`)
 
 **Interfaces:**
 - Consumes: `Cell::has_hyperlink`, `Terminal::grid_ref`, `GridRef::hyperlink_uri`.
@@ -469,7 +481,7 @@ cargo test -p lens-terminal --features test-util osc8_hyperlink_populates_frame_
 ```bash
 cargo test -p lens-terminal --features test-util osc8_closer_clears_subsequent_cells -- --nocapture
 ```
-Expected: FAIL — still `None` (Task 0 placeholder).
+Expected: FAIL — field/extraction not present yet.
 
 - [ ] **Step 3: Fill extraction on the `hyperlink_uri:` line**
 
@@ -529,7 +541,7 @@ let hyperlink_uri = if raw.has_hyperlink().unwrap_or(false) {
 };
 ```
 
-Upgrade `FrameCell.hyperlink_uri` to `Option<Arc<str>>`.
+Add `FrameCell.hyperlink_uri: Option<Arc<str>>` to `frame.rs`.
 
 - [ ] **Step 4: Run — expect PASS**
 
@@ -560,7 +572,7 @@ EOF
 **Files:**
 - Modify: `crates/lens-terminal/src/engine/presentation.rs` (`validate_open_url`, `plain_url_covering_cell`)
 - Create: `crates/lens-terminal/src/hit_test.rs`
-- Modify: `crates/lens-terminal/src/lib.rs` (events, fill Task-0 `on_mouse_down`, drain `HyperlinkOpen`, mint ids)
+- Modify: `crates/lens-terminal/src/lib.rs` (add `next_host_request_id: u64` field to `TerminalTab` + both literal sites; register + fill `on_mouse_down` on the render div; events; drain `HyperlinkOpen`; mint ids)
 - Modify: `crates/lens-terminal/Cargo.toml` (`presentation_realwindow` test; confirm `url = "2"`)
 - Create: `crates/lens-terminal/tests/presentation_realwindow.rs`
 - Modify: `crates/lens-terminal-demo/src/main.rs`
@@ -590,7 +602,7 @@ EOF
   - `pub fn validate_open_url(raw: &str) -> Option<String>` — see Step 3 contract
   - `pub fn plain_url_covering_cell(...)` — **cell/char index**, never byte offsets from `str::find` alone
   - `pixel_to_cell` / `uri_for_gesture`
-  - **Click-only:** primary `on_mouse_down` (Task-0 hook) → validate → enqueue `HyperlinkOpen` → drain → `OpenUrlRequest`. Hover deferred.
+  - **Click-only:** primary `on_mouse_down` (this plan's render hook) → validate → enqueue `HyperlinkOpen` → drain → `OpenUrlRequest`. Hover deferred.
   - Read-only tabs may still open URLs (local gesture, no PTY bytes). Do not auto-fire on OSC 8 alone.
 
 - [ ] **Step 1: Write failing validation + hit-test + adversarial URL tests**
@@ -708,7 +720,7 @@ pub fn plain_url_covering_cell(row_text: &str, col: usize) -> Option<String> {
 
 `hit_test.rs`: `pixel_to_cell` + `uri_for_gesture` (prefer OSC 8 `Arc<str>`, else plain-URL on a dense cell row built from `FrameCell.col` → grapheme).
 
-Fill Task-0's **`on_mouse_down`** body (not mouse-up; not hover):
+Register `.on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))` on the render div (next to 2a's `on_key_down`), and fill the **`on_mouse_down`** body (not mouse-up; not hover):
 
 ```rust
 fn on_mouse_down(
@@ -839,11 +851,11 @@ EOF
 
 **Do not implement `on_clipboard_write` registration or payload cloning in 2d.**
 
-Task 0 already declared `EnginePresentationEvent::ClipboardWrite { location, contents }`. Emitting it by registering the Ghostty callback and cloning every MIME part here would defeat Slice 2b's required **cap BEFORE cloning** (`interaction-design.md` OSC-52 policy) and would tempt demo auto-Allow.
+2d's Task 1 declares `EnginePresentationEvent::ClipboardWrite { location, contents }`. Emitting it by registering the Ghostty callback and cloning every MIME part here would defeat Slice 2b's required **cap BEFORE cloning** (`interaction-design.md` OSC-52 policy) and would tempt demo auto-Allow.
 
 **2b owns:**
 
-1. Re-thread `presentation_tx` into `on_clipboard_write` registration at `VtEngine` construction (Task 0 left a note that 2b re-threads; title clone may already consume one clone).
+1. Re-thread `presentation_tx` into `on_clipboard_write` registration at `VtEngine` construction (2d's Task 1 left a note that 2b re-threads; the title clone may already consume one clone).
 2. Pre-clone decoded-byte cap; drop/deny over-cap **before** allocating owned MIME copies.
 3. Allow/deny / allow-once/session policy + copy notice + cap−1/cap/cap+1 tests.
 4. Mapping drain → `TerminalEvent::ClipboardWriteRequest` (if not already a no-op stub).
@@ -875,7 +887,7 @@ EOF
 **Files:**
 - Modify: `crates/lens-terminal/src/engine/inspect.rs` (presentation counters + ring events)
 - Modify: `crates/lens-terminal/src/engine/vt.rs` / `handle.rs` / `lib.rs` (record on title apply / hyperlink open / slot overwrite)
-- Modify: `crates/lens-terminal/benches/engine.rs` (new benches; update `VtEngine::new` arity with throwaway `presentation_tx` if Task 0 already did)
+- Modify: `crates/lens-terminal/benches/engine.rs` (new benches; `VtEngine::new` call sites use a throwaway `presentation_tx` — Task 1 added the arity)
 
 **Interfaces:**
 - Produces (names illustrative — match existing inspect style):
@@ -949,16 +961,16 @@ EOF
 | --- | --- |
 | Titles: sanitize/bound inside existing `on_title_changed`, stable `identity_title`, latest-title semantics | T1 (slot + drain) + T2 (sanitize/bound + reported-only) |
 | Hyperlink: fill `FrameCell` URI + OSC 8 + plain-URL validation → **click** host request | T3 (extraction + intern) + T4 (validate + click gesture + `OpenUrlRequest` + demo) |
-| `EnginePresentationEvent` backbone for 2b | Task 0 declared; T1 methods/drain; **T5 defers clipboard registration to 2b** |
+| `EnginePresentationEvent` backbone for 2b | T1 declares + methods/drain; **T5 defers clipboard registration to 2b** |
 | Inspect + benches (matrix-mandated) | T6 |
 | Progress + notifications | Deferred paragraph only — no tasks |
 | Hover affordance | Explicitly deferred (T4 click-only) |
 
-**Task-0 rebase (what was removed / narrowed):**
+**Serial structure (no Task 0):**
 
-- Deleted type-definition, channel-wiring, `VtEngine::new` arity, field-add, fixture-init, callback-registration, and `on_mouse_down` declaration steps — Task 0 owns those.
-- Tasks now **fill bodies**: title-closure sanitize, `hyperlink_uri:` extraction, `on_mouse_down` body, drain arms, presentation **methods**.
-- Parallel-worktree note rewritten around the single-writer body rule.
+- 2d lands **after 2a** and is self-contained: T1 **declares** the presentation surface (types, channel wiring, `VtEngine::new` `presentation_tx` param, bare `on_title_changed`, presentation methods, `drain_presentation_events` + render call) and fills the methods/drain; T2 sanitize; T3 adds `FrameCell.hyperlink_uri` + extraction; T4 adds `next_host_request_id` + `on_mouse_down` register/body + validation/gesture.
+- **`VtEngine::new` arity change is 2d's** (2a kept `(cfg, on_reply)`); T1 updates every call site.
+- Serial-seam note frames 2d as adding disjoint lines on top of 2a's committed `build_frame`/`render`.
 
 **gpt-5.6 findings folded:**
 
@@ -979,8 +991,8 @@ EOF
 - Hyperlink URI on `Frame` (render-path constraint), interned, not a side channel.
 - OSC 52 **not registered** in 2d — 2b owns pre-clone cap + policy.
 - Real-window vs `#[gpui::test]` false-green called out for click hit-testing.
-- Concrete constants reused from Task 0: `MAX_REPORTED_TITLE_CHARS = 512`, `PRESENTATION_CHANNEL_CAP = 64`, `MAX_HYPERLINK_URI_BYTES = 8192`.
+- Concrete constants declared in T1: `MAX_REPORTED_TITLE_CHARS = 512`, `PRESENTATION_CHANNEL_CAP = 64`, `MAX_HYPERLINK_URI_BYTES = 8192`.
 
 **Placeholder scan:** no TBD / "add error handling" / "similar to Task N" steps — each code step shows concrete Rust (or an explicit 2b boundary note for T5).
 
-**Type consistency:** Task-0 `EnginePresentationEvent::{TitleChanged, HyperlinkOpen, ClipboardWrite}` → drain → `TerminalEvent::{PresentationChanged, OpenUrlRequest}` (clipboard emit deferred); `FrameCell.hyperlink_uri: Option<Arc<str>>`; `HostRequestId` for open-URL (and later clipboard in 2b); demo Deny for clipboard.
+**Type consistency:** T1 `EnginePresentationEvent::{TitleChanged, HyperlinkOpen, ClipboardWrite}` → drain → `TerminalEvent::{PresentationChanged, OpenUrlRequest}` (clipboard emit deferred); `FrameCell.hyperlink_uri: Option<Arc<str>>`; `HostRequestId` for open-URL (and later clipboard in 2b); demo Deny for clipboard.
