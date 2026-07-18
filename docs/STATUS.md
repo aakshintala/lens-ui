@@ -11,14 +11,22 @@ _Last curated 2026-07-17 (the pre-07-17 detail was rolled into the archive)._
 
 ## Next up
 
-- **▶ Board packing B6–B8 (scroll container + grid packing)** — the continuation of the
-  wave build (B1–B5 shipped). **Heads-up carried from the freeze fix:** B6's scroll container is a
-  *different* off→on transition than focus↔board. The current fix
-  (`BoardView::recover_viewport_gates_on_reentry`) is edge-based on the focus↔board mode switch — a
-  card scrolling back into view has **no mode change**, so it won't trigger the gate reset. B6 needs
-  either its own scroll-driven gate reset or a revisit of the general approach (paint-safe
-  `on_next_frame` is clean on-device but a no-op in the test platform). Detail in memory
-  [[viewport-reentry-freeze]] and `docs/handoffs/2026-07-17-viewport-reentry-freeze.md`.
+- **▶ Board packing B6–B8** — the last structural piece of board-home (continues the wave build;
+  B1–B5 shipped). Scope per the `docs/design/renders/board-home.html` mockup is **three sub-features**,
+  not just a scrollbar: (B6) vertical scroll container + adaptive auto-fill grid; (B7) stable ordinal
+  ordering (today it's a placeholder `session_id` string sort in `board/mod.rs:187`); (B8) **grouped
+  lanes** — the mockup wraps cards in per-`workspace` lanes (`.gwrap`: colored border, header with
+  aggregate `$cost · Nd` + "N done" pill). The card model already carries `workspace` + `cumulative_cost`
+  for the group key/aggregation.
+  - **Acceptance gate (the one genuinely-remaining perf item):** full-scale >8-card off-screen
+    culling has never been exercised on-device — there's no scroll container yet. It rides *with* B6;
+    it is not a separate task.
+  - **Heads-up carried from the freeze fix:** B6's scroll container is a *different* off→on transition
+    than focus↔board. The current fix (`BoardView::recover_viewport_gates_on_reentry`) is edge-based on
+    the focus↔board mode switch — a card scrolling back into view has **no mode change**, so it won't
+    trigger the gate reset. B6 needs either its own scroll-driven gate reset or a revisit of the general
+    approach (paint-safe `on_next_frame` is clean on-device but a no-op in the test platform). Detail in
+    memory [[viewport-reentry-freeze]] and `docs/handoffs/2026-07-17-viewport-reentry-freeze.md`.
 
 - **▶ `lens-ui` transcript fan-out** — the first real consumer of the Detailed feed + the disk
   `RowSource`/D23 render window (markdown + virtualization spikes both GO). Plugs into the slot API the
@@ -59,7 +67,10 @@ _Last curated 2026-07-17 (the pre-07-17 detail was rolled into the archive)._
   (10 MB), transcript truncation tiers, `cost_samples` cadence.
 - **Undecided UX:** terminal-`transfer` UX, managed-provider selection, policy/skill in-app authoring,
   multi-depth breadcrumb, exact-vs-range version pin.
-- **Build artifact:** render/status/harness icons are still unicode placeholders — ship a real icon set.
+- **Build artifact:** all status/harness/render glyphs are real Lucide SVGs (bell, triangle-alert,
+  loader-circle, alarm-clock, check, moon, coffee, circle-dot, folder, git-branch). Only chrome
+  furniture is still unicode — the kebab `⋮` and close `✕` (trivially swappable to `ellipsis-vertical`/
+  `x` if/when a fully-bespoke set is wanted).
 
 ## Recently shipped (all on `main` unless noted)
 
@@ -73,8 +84,10 @@ _Last curated 2026-07-17 (the pre-07-17 detail was rolled into the archive)._
     review addressed. Memory [[viewport-reentry-freeze]]. **Unpushed on `main`** (see below).
 - **§18 Theming substrate (2026-07-16):** `crates/lens-ui/src/theme/` — `LensTheme` global (base+status
   tokens, hex↔Hsla serde, dark+light JSON), `cx.lens_theme()`, gpui-component bridge, external-file load
-  + `cmd-shift-t` reload, `shortcuts.rs`. **On `main`, load-bearing for the cards.** Color values are
-  placeholders → one end-of-build tuning pass (reload loop makes it cheap). Memory [[lens-ui-theming-fork]].
+  + `cmd-shift-t` reload, `shortcuts.rs`. **On `main`, load-bearing for the cards.** Palettes tuned
+   during the 2026-07-17 §11 on-device visual pass (bg ramp, wave status colors, context-bar thresholds,
+   per-wave wash intensities) — no longer placeholders; residual fine-tuning is cheap via the reload
+   loop. Memory [[lens-ui-theming-fork]].
 - **`lens-ui` shell skeleton Plan 2 + card/board audit (2026-07-15/16):** §4–§7 skeleton merged; wave
   colors un-swapped, Needs-input=orange, icon-tile readout. Gate now covers lens-ui/lens-app.
 - **lens-core §3 ActorFeed gate (2026-07-15):** unified `ActorFeed` FIFO, scheduler dual-mode,
@@ -87,5 +100,5 @@ _Last curated 2026-07-17 (the pre-07-17 detail was rolled into the archive)._
 
 ## Housekeeping
 
-- **`main` is ahead of `origin` (unpushed)** — the wave follow-ups + viewport freeze fix. Push is a
-  deliberate call; not done automatically.
+- **`main` pushed to `origin` (2026-07-17)** — the wave follow-ups + viewport freeze fix are on
+  `origin/main` (`b8727ab`). In sync.
