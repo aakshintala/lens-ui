@@ -145,7 +145,15 @@ impl HarnessView {
             Step::ArrowUp => dispatch_keystroke(window, "up", cx),
             Step::Tab => dispatch_keystroke(window, "tab", cx),
             Step::Enter => dispatch_keystroke(window, "enter", cx),
-            Step::ShiftA => dispatch_keystroke(window, "shift-a", cx),
+            Step::ShiftA => {
+                // Shift+letter is uppercase TEXT → real committed-text path (InputHandler),
+                // not keydown. gpui's dispatch_keystroke text path needs a painted-frame-
+                // registered InputHandler; invoke the real enqueue path directly instead
+                // (keydown-suppression for shift is covered by the keydown_should_enqueue
+                // unit test). Proves single-emit through the production text path.
+                let tab = self.tab.clone();
+                tab.update(cx, |tab, _cx| tab.debug_input_handler_text_for_test("A"));
+            }
             Step::RepeatUp => {
                 let ks = Keystroke::parse("up").expect("parse up");
                 let tab = self.tab.clone();
@@ -168,7 +176,10 @@ impl HarnessView {
                     tab.debug_handle_key_up_for_test(&KeyUpEvent { keystroke: ks }, window, cx);
                 });
             }
-            Step::PrintableA => dispatch_keystroke(window, "a", cx),
+            Step::PrintableA => {
+                let tab = self.tab.clone();
+                tab.update(cx, |tab, _cx| tab.debug_input_handler_text_for_test("a"));
+            }
         }
     }
 }
