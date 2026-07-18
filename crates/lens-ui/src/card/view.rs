@@ -62,6 +62,20 @@ impl SessionCardView {
         }
     }
 
+    /// Clear the paint-time viewport gate so the next render re-evaluates visibility as
+    /// first-frame (`visible = true`) and respawns the anim driver if the wave animates.
+    ///
+    /// The gate reads `last_bounds`, which is written at *paint* time (after render, with
+    /// no notify). When a card is re-shown after being off-screen — e.g. returning to the
+    /// board from focused mode, where it sat off-screen in the shrunk rail — its stale
+    /// off-screen `last_bounds` makes the single re-entry render read `visible = false` and
+    /// never respawn the dropped timer → frozen spinner/pulse. The board resets the gate on
+    /// the focus→board edge (see `board::mod`) so recovery is immediate and needs no
+    /// paint-time notify (which would break gpui's render/paint separation).
+    pub fn invalidate_viewport_gate(&self) {
+        self.last_bounds.set(None);
+    }
+
     fn send_command(&self, cmd: SessionCommand, cx: &mut Context<Self>) {
         let fleet = self.fleet.clone();
         let sid = self.session_id.clone();

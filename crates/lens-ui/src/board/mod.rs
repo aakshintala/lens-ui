@@ -34,6 +34,11 @@ pub struct BoardView {
     cached_tiles: HashMap<SessionId, AnyView>,
     working_tab: TabHandle,
     pty_probe: Option<PtyProbe>,
+    /// Mode at the last `render` (the actually-displayed layout, not merely the last
+    /// observed fleet state) — drives the focus→board viewport-gate reset. Tracked in
+    /// render so it is correct even when the board first mounts already focused (no fleet
+    /// notification would establish it otherwise → the re-entry freeze would recur).
+    last_mode: Option<ShellMode>,
 }
 
 impl BoardView {
@@ -62,6 +67,7 @@ impl BoardView {
         let fleet_for_observe = fleet.clone();
         cx.observe(&fleet_for_observe, |board: &mut BoardView, _, cx| {
             board.sync_card_views(cx);
+            board.recover_viewport_gates_on_reentry(cx);
             cx.notify();
         })
         .detach();
@@ -71,6 +77,7 @@ impl BoardView {
             cached_tiles,
             working_tab,
             pty_probe,
+            last_mode: None,
         }
     }
 
@@ -93,6 +100,34 @@ impl BoardView {
         self.cached_tiles
             .insert(id.clone(), mount_cached_card(view.clone()));
         self.card_views.insert(id, view);
+    }
+
+    /// Viewport-gate recovery on the focus→board edge (runs in the fleet-observe effect,
+    /// never in render). A card that sat off-screen in the focus rail carries stale
+    /// off-screen `last_bounds` and a dropped anim driver; the single board re-entry render
+    /// would read it as hidden and never respawn the driver → frozen spinner/pulse. On the
+    /// transition back to the board, clear each card's gate (so the next render re-evaluates
+    /// visibility as first-frame and respawns if animating) and `notify()` the view so the
+    /// re-render lands in `dirty_views` — the same path a card-entity notify takes, which is
+    /// why the still-focused-from card (which gets a Demote notify) never froze. Doing this
+    /// in an effect (not render) keeps entity access out of `detect_accessed_entities`, which
+    /// would otherwise perturb the cached views' dirty-tracking and swallow their ticks.
+    fn recover_viewport_gates_on_reentry(&mut self, cx: &mut Context<Self>) {
+        // Compare the fleet's current mode against the last *rendered* mode (updated in
+        // `render`). The imminent board re-render advances `last_mode` to Board afterwards.
+        let mode = ShellMode::from_fleet(self.fleet.read(cx));
+        let returned_to_board =
+            mode == ShellMode::Board && matches!(self.last_mode, Some(ShellMode::Focused { .. }));
+        if !returned_to_board {
+            return;
+        }
+        let views: Vec<_> = self.card_views.values().cloned().collect();
+        for view in views {
+            view.update(cx, |v, cx| {
+                v.invalidate_viewport_gate();
+                cx.notify();
+            });
+        }
     }
 
     fn sync_card_views(&mut self, cx: &mut Context<Self>) {
@@ -216,6 +251,10 @@ impl Render for BoardView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_card_views(cx);
         let mode = ShellMode::from_fleet(self.fleet.read(cx));
+        // Record the actually-displayed mode so the fleet-observe recovery can detect the
+        // focus→board edge even on the very first frame (mount-while-focused). Pure scalar
+        // write — no entity access, so it does not perturb cached-view dirty tracking.
+        self.last_mode = Some(mode.clone());
         let body = match mode {
             ShellMode::Board => div()
                 .id("shell-board")

@@ -1,5 +1,18 @@
 # Handoff — Viewport re-entry animation freeze (focus↔board)
 
+> **✅ RESOLVED 2026-07-17** (same day, dedicated session). Fixed on `main` in `lens-ui`
+> (`board/mod.rs`, `card/view.rs`) with 3 regression tests in `tests/acceptance_shell.rs`; gate green;
+> codex cross-family review addressed (Findings 1+2 fixed, 3 deferred). **Fix ≠ candidate #1 verbatim:**
+> resetting `last_bounds` from `BoardView::render` SUPPRESSED the cards' re-renders (reading sibling
+> entities inside `detect_accessed_entities` perturbs `.cached()` dirty-tracking); the working fix does
+> it in the **fleet-observe EFFECT** via `view.update(|v,cx| { v.invalidate_viewport_gate(); cx.notify() })`.
+> **Also: the handoff was wrong that `#[gpui::test]` can't assert this** — canvas paint bounds ARE real
+> under `add_window_view` (only glyph shaping is faked), so the regression tests are ordinary
+> `#[gpui::test]`s, no `harness = false` binary needed. Full write-up: memory `viewport-reentry-freeze`.
+> Remaining optional step: on-device visual confirmation of the demo repro (automated real-window test
+> already drives board→focus→board and asserts render resumes). The rest of this doc is the original
+> (pre-fix) analysis, kept for provenance.
+
 **Written:** 2026-07-17 · **Branch:** `main` · **HEAD:** `ad7a6d5` (unpushed) · **For:** a dedicated next session
 **Use `superpowers:diagnosing-bugs` (perf/UI regression loop).** This is a real bug with a known mechanism.
 

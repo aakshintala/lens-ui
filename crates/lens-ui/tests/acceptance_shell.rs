@@ -46,6 +46,216 @@ fn summary(
     }
 }
 
+/// Viewport re-entry freeze repro (handoff 2026-07-17): a Working card that lands
+/// OFF-SCREEN in the focus-mode shrunk rail must resume animating after returning to
+/// the board. The paint-time `last_bounds` gate (view.rs) drops the anim timer while
+/// off-screen and, on a single board re-render reading stale off-screen bounds, never
+/// respawns it → frozen spinner/pulse. RED before fix, GREEN after.
+#[gpui::test]
+async fn card_offscreen_in_focus_rail_resumes_animating_on_return(cx: &mut gpui::TestAppContext) {
+    use gpui::{Size, px};
+
+    const N: usize = 8;
+    let clock = Arc::new(ManualUiClock::new(10_000));
+    let ids: Vec<SessionId> = (0..N).map(|i| SessionId::new(format!("s{i}"))).collect();
+
+    let fleet = cx.update(|cx| {
+        gpui_component::init(cx);
+        lens_ui::theme::install_at_startup(cx);
+        let fleet = FleetStore::new(Arc::clone(&clock) as Arc<dyn UiClock>, cx);
+        fleet.update(cx, |f, cx| {
+            for id in &ids {
+                f.spawn_fake_session(id.clone(), cx);
+            }
+        });
+        // All cards Working (Running → Wave::Working → animating tick).
+        for id in &ids {
+            let card = fleet.read(cx).card(id).unwrap();
+            card.update(cx, |c, _| c.status = SessionStatusValue::Running);
+        }
+        fleet
+    });
+
+    let fleet_for_window = fleet.clone();
+    let (board_handle, vcx) = cx.add_window_view(|_, cx| {
+        let working_tab = placeholder_tab(cx);
+        BoardView::mount(fleet_for_window, working_tab, None, cx)
+    });
+
+    // Wide + short: board grid (horizontal wrap) keeps ALL cards on-screen; the focus
+    // rail (280px vertical column, ~152px/card) overflows so bottom cards go off-screen.
+    vcx.simulate_resize(Size {
+        width: px(3000.0),
+        height: px(700.0),
+    });
+    for id in &ids {
+        vcx.update(|_, cx| {
+            let card = fleet.read(cx).card(id).unwrap();
+            card.update(cx, |_, cx| cx.notify());
+        });
+    }
+    vcx.run_until_parked();
+
+    let top = ids[1].clone(); // on-screen in the rail (healthy control)
+    let bottom = ids[N - 1].clone(); // off-screen in the rail (freeze suspect)
+
+    // Capture the per-card render_count handles once (no borrow of cx afterwards).
+    let (rc_top, rc_bottom) = vcx.read(|cx| {
+        let views = board_handle.read(cx).card_views_for_test();
+        (
+            views[&top].read(cx).render_count.clone(),
+            views[&bottom].read(cx).render_count.clone(),
+        )
+    });
+    let bottom_for_bounds = bottom.clone();
+    let top_for_bounds = top.clone();
+    let bounds = |vcx: &mut gpui::VisualTestContext, id: SessionId| {
+        vcx.read(|cx| board_handle.read(cx).card_bounds_for_test(&id, cx))
+    };
+
+    // Sanity: on the board every Working card animates.
+    let board_base_top = rc_top.get();
+    let board_base_bottom = rc_bottom.get();
+    for _ in 0..5 {
+        vcx.executor().advance_clock(Duration::from_millis(50));
+        vcx.run_until_parked();
+    }
+    assert!(
+        rc_top.get() > board_base_top && rc_bottom.get() > board_base_bottom,
+        "sanity: all Working cards animate on the board"
+    );
+
+    // Enter focus mode; let the off-screen card's timer fire and self-drop.
+    vcx.update(|_, cx| fleet.update(cx, |f, cx| f.focus_session(ids[0].clone(), cx)));
+    vcx.run_until_parked();
+    for _ in 0..5 {
+        vcx.executor().advance_clock(Duration::from_millis(50));
+        vcx.run_until_parked();
+    }
+    // Precondition: the suspect really did land off-screen in the rail (else the repro is
+    // vacuous — it would pass without exercising the freeze path).
+    let bottom_rail = bounds(vcx, bottom_for_bounds.clone()).expect("bottom card painted in rail");
+    let vp = vcx.update(|window, _| window.viewport_size());
+    assert!(
+        bottom_rail.origin.y >= vp.height,
+        "repro precondition: suspect must be off-screen in the focus rail \
+         (y={:?}, viewport height={:?})",
+        bottom_rail.origin.y,
+        vp.height
+    );
+    // The viewport gate must actually CULL the off-screen card (driver dropped → no more
+    // re-renders). Without this, a fix that simply deleted the gate would pass the recovery
+    // assertion while silently reintroducing the off-screen-CPU regression.
+    let bottom_settled = rc_bottom.get();
+    for _ in 0..5 {
+        vcx.executor().advance_clock(Duration::from_millis(50));
+        vcx.run_until_parked();
+    }
+    assert_eq!(
+        rc_bottom.get(),
+        bottom_settled,
+        "gate must cull the off-screen rail card (render_count frozen while hidden)"
+    );
+
+    // Return to the board.
+    vcx.update(|_, cx| fleet.update(cx, |f, cx| f.blur_to_board(cx)));
+    vcx.run_until_parked();
+
+    let top_after_blur = rc_top.get();
+    let bottom_after_blur = rc_bottom.get();
+
+    // Advance the animation clock; a Working card that is animating keeps re-rendering.
+    for _ in 0..6 {
+        vcx.executor().advance_clock(Duration::from_millis(50));
+        vcx.run_until_parked();
+    }
+    let top_delta = rc_top.get() - top_after_blur;
+    let bottom_delta = rc_bottom.get() - bottom_after_blur;
+    let _ = top_for_bounds;
+
+    assert!(
+        top_delta > 0,
+        "control: on-screen card must keep animating on the board (delta={top_delta})"
+    );
+    assert!(
+        bottom_delta > 0,
+        "FREEZE BUG: card that was off-screen in the focus rail is frozen after return \
+         (delta={bottom_delta}) — anim driver never respawned"
+    );
+}
+
+/// Same freeze, but the board *mounts already focused* (deep-link / session-restore shape).
+/// The recovery must not depend on a fleet notification having established the focused mode
+/// before the first blur — it tracks the last *rendered* mode, so the first render (focused)
+/// records it and the blur recovers. Guards against the observer-only regression.
+#[gpui::test]
+async fn card_offscreen_resumes_when_board_mounts_focused(cx: &mut gpui::TestAppContext) {
+    use gpui::{Size, px};
+
+    const N: usize = 8;
+    let clock = Arc::new(ManualUiClock::new(10_000));
+    let ids: Vec<SessionId> = (0..N).map(|i| SessionId::new(format!("s{i}"))).collect();
+
+    let fleet = cx.update(|cx| {
+        gpui_component::init(cx);
+        lens_ui::theme::install_at_startup(cx);
+        let fleet = FleetStore::new(Arc::clone(&clock) as Arc<dyn UiClock>, cx);
+        fleet.update(cx, |f, cx| {
+            for id in &ids {
+                f.spawn_fake_session(id.clone(), cx);
+            }
+        });
+        for id in &ids {
+            let card = fleet.read(cx).card(id).unwrap();
+            card.update(cx, |c, _| c.status = SessionStatusValue::Running);
+        }
+        // Focus BEFORE the board window exists — the board will mount already in focus mode,
+        // and this notify predates the board's fleet observer (so it never sees the edge).
+        fleet.update(cx, |f, cx| f.focus_session(ids[0].clone(), cx));
+        fleet
+    });
+
+    let fleet_for_window = fleet.clone();
+    let (board_handle, vcx) = cx.add_window_view(|_, cx| {
+        let working_tab = placeholder_tab(cx);
+        BoardView::mount(fleet_for_window, working_tab, None, cx)
+    });
+    vcx.simulate_resize(Size {
+        width: px(3000.0),
+        height: px(700.0),
+    });
+    vcx.run_until_parked();
+
+    let bottom = ids[N - 1].clone();
+    let rc_bottom = vcx.read(|cx| {
+        board_handle.read(cx).card_views_for_test()[&bottom]
+            .read(cx)
+            .render_count
+            .clone()
+    });
+
+    // Settle in focus mode so the off-screen bottom card drops its driver.
+    for _ in 0..5 {
+        vcx.executor().advance_clock(Duration::from_millis(50));
+        vcx.run_until_parked();
+    }
+
+    // Return to the board and confirm the previously-off-screen card resumes animating.
+    vcx.update(|_, cx| fleet.update(cx, |f, cx| f.blur_to_board(cx)));
+    vcx.run_until_parked();
+    let after_blur = rc_bottom.get();
+    for _ in 0..6 {
+        vcx.executor().advance_clock(Duration::from_millis(50));
+        vcx.run_until_parked();
+    }
+    assert!(
+        rc_bottom.get() > after_blur,
+        "mount-focused → blur must recover the off-screen card's animation \
+         (delta={})",
+        rc_bottom.get() - after_blur
+    );
+}
+
 #[gpui::test]
 async fn shell_skeleton_acceptance(cx: &mut gpui::TestAppContext) {
     let clock = Arc::new(ManualUiClock::new(10_000));

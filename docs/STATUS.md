@@ -39,13 +39,18 @@ and roll older "Recent" pointers off this page as they age.
     +mono, Scheduled=colored mono countdown, waiting/idle states **blank** (activity_summary is empty
     in real data). All on-device dark-mode verified via screenshots. Spec §11 + render
     `docs/design/renders/wave-card-activity-line.html`.
-  - **🐞 OPEN BUG — viewport re-entry animation freeze (was "B6 carry-forward", NOW LIVE):** entering
-    focused mode then returning to board leaves Working spinner + activity pulse **frozen**. Same
-    mechanism as handoff Follow-up 3 (stale `last_bounds` in `view.rs` render gate; paint closure
-    updates bounds without notifying → re-entry sees off-screen → driver never respawns) — but the
-    handoff **wrongly assumed it was unreachable** in the non-scrolling build; the focus↔board toggle
-    reaches it. **Next session** (dedicated). Handoff: `docs/handoffs/2026-07-17-viewport-reentry-freeze.md`.
-    Constraint: do NOT fix by notifying from the paint closure (breaks gpui render/paint separation).
+  - **✅ RESOLVED (2026-07-17) — viewport re-entry animation freeze:** focus→board left the Working
+    spinner + activity pulse **frozen** (stale paint-time `last_bounds` dropped the anim driver, never
+    respawned). Fixed in `lens-ui` (`board/mod.rs`, `card/view.rs`) + 3 regression tests in
+    `tests/acceptance_shell.rs`; gate green; codex cross-family review addressed (Findings 1+2 fixed, 3
+    deferred). **Fix shape ≠ the handoff's candidate #1 verbatim:** resetting the gate from
+    `BoardView::render` SUPPRESSED the cards' re-renders (sibling-entity access inside
+    `detect_accessed_entities` perturbs `.cached()` dirty-tracking), so the reset lives in the
+    **fleet-observe EFFECT** (`view.update(|v,cx|{ v.invalidate_viewport_gate(); cx.notify() })`).
+    Two beliefs corrected: `#[gpui::test]` CAN assert paint bounds (only glyph shaping is faked → tests
+    are plain `#[gpui::test]`s), and `.cached()` re-renders only on `dirty_views` OR bounds-change.
+    Handoff marked resolved; memory `viewport-reentry-freeze`. Optional follow-up: on-device visual
+    confirmation of the demo repro.
 
 - **✅ DONE (2026-07-16): `lens-ui` card/board audit vs shell spec §4–§5 + cheap fixes** (branch
   `feat/lens-app-multi-session`, commit `b367dbf`, branch-only). Audited `lens-app`/`lens-ui` against
