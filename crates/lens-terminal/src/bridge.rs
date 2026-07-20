@@ -65,10 +65,23 @@ pub(crate) fn spawn_bridge(
 }
 
 impl BridgeHandle {
-    /// Signal stop and **join** the bridge thread. Drops this handle's engine Arc.
-    pub fn join(mut self) {
+    /// Synchronously ask the bridge loop to stop, WITHOUT joining. Idempotent.
+    ///
+    /// C2 invariant: the foreground calls this at the top of teardown, before any
+    /// egress swap can drop this bridge's sender. Once `stop` is set, a bridge that
+    /// then observes its egress channel `Disconnected` recognises the teardown and
+    /// exits quietly instead of emitting a false [`BridgeEvent::EngineStopped`]
+    /// (see the egress-`Disconnected` arm in `bridge_loop`). It also guarantees the
+    /// old bridge has ceased feeding the engine before the next connection's egress
+    /// is attached, so a post-teardown reply can never land on the new channel.
+    pub fn signal_stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
         let _ = self.stop_tx.try_send(());
+    }
+
+    /// Signal stop and **join** the bridge thread. Drops this handle's engine Arc.
+    pub fn join(mut self) {
+        self.signal_stop();
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
@@ -117,7 +130,16 @@ fn bridge_loop(
             i if i == egress_idx => match oper.recv(&egress_rx) {
                 Ok(frame) => forward_egress(&outbound, frame.bytes, stop, &policy_tx),
                 Err(_) => {
-                    let _ = policy_tx.try_send(BridgeEvent::EngineStopped);
+                    // The egress sender dropped. If `stop` is already set, this is an
+                    // intentional teardown (the foreground called `signal_stop` before
+                    // swapping/clearing egress) — exit quietly. Only a sender drop that
+                    // is NOT part of a teardown (stop still false) is a genuine engine
+                    // death worth surfacing. Suppressing here prevents a false
+                    // `EngineStopped` from tearing down the freshly reconnected
+                    // transport (C2 hardening).
+                    if !stop.load(Ordering::Relaxed) {
+                        let _ = policy_tx.try_send(BridgeEvent::EngineStopped);
+                    }
                     LoopExit::Stop
                 }
             },
@@ -435,5 +457,86 @@ mod tests {
             m,
             WsOutbound::Input(b) if b == b"\x1b[0n"
         )));
+    }
+
+    // C2 hardening: a bridge whose egress sender is dropped as part of an intentional
+    // teardown (stop already set) must exit QUIETLY — no false `EngineStopped`, which
+    // would otherwise tear down the freshly reconnected transport. Driven at the
+    // `bridge_loop` level so we own the raw `stop` flag and can set it WITHOUT sending
+    // `stop_rx`, forcing the wake to come through the egress-`Disconnected` arm alone.
+    #[test]
+    fn dropped_egress_after_stop_flag_suppresses_engine_stopped() {
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let (_inbound_tx, inbound_rx) = crossbeam_channel::bounded::<WsInbound>(1);
+        let (outbound_tx, _outbound_rx) = crossbeam_channel::bounded::<WsOutbound>(1);
+        let (egress_tx, egress_rx) = crossbeam_channel::bounded::<EgressFrame>(EGRESS_CHANNEL_CAP);
+        let (_stop_tx, stop_rx) = crossbeam_channel::bounded::<()>(1);
+        let (policy_tx, policy_rx) = async_channel::bounded(8);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = Arc::clone(&stop);
+        let engine_thread = Arc::clone(&engine);
+        let handle = std::thread::spawn(move || {
+            bridge_loop(
+                inbound_rx,
+                outbound_tx,
+                engine_thread,
+                egress_rx,
+                stop_rx,
+                policy_tx,
+                &stop_thread,
+            );
+        });
+
+        // Let the loop park in `select` (nothing else is ready), then set stop and drop
+        // the sole egress sender: the wake arrives on the egress arm with stop already
+        // true — the suppression path. Removing the `if !stop.load()` guard makes this
+        // emit `EngineStopped` and the assertion below fail.
+        std::thread::sleep(Duration::from_millis(50));
+        stop.store(true, Ordering::Relaxed);
+        drop(egress_tx);
+        handle.join().unwrap();
+
+        let mut saw_engine_stopped = false;
+        while let Ok(ev) = policy_rx.try_recv() {
+            if matches!(ev, BridgeEvent::EngineStopped) {
+                saw_engine_stopped = true;
+            }
+        }
+        assert!(
+            !saw_engine_stopped,
+            "teardown egress-drop with stop set must not emit EngineStopped"
+        );
+    }
+
+    // Converse of the above: with stop NOT set, dropping the egress sender is a genuine
+    // engine death and MUST surface `EngineStopped`. Proves the suppression is guarding a
+    // live path, not silencing a dead one.
+    #[test]
+    fn dropped_egress_without_stop_emits_engine_stopped() {
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let (_inbound_tx, inbound_rx) = crossbeam_channel::bounded::<WsInbound>(1);
+        let (outbound_tx, _outbound_rx) = crossbeam_channel::bounded::<WsOutbound>(8);
+        let (egress_tx, egress_rx) = crossbeam_channel::bounded::<EgressFrame>(EGRESS_CHANNEL_CAP);
+        let (policy_tx, policy_rx) = async_channel::bounded(8);
+        let bridge = spawn_bridge(
+            inbound_rx,
+            outbound_tx,
+            Arc::clone(&engine),
+            policy_tx,
+            egress_rx,
+        );
+
+        drop(egress_tx);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let saw = loop {
+            if let Ok(BridgeEvent::EngineStopped) = policy_rx.try_recv() {
+                break true;
+            }
+            assert!(Instant::now() < deadline, "expected EngineStopped");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(saw);
+        bridge.join();
     }
 }

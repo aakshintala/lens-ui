@@ -874,6 +874,15 @@ impl TerminalTab {
                 engine.bump_access_epoch();
             }
             let (bridge, attach) = rt.take_transport();
+            // Signal the outgoing bridge to stop SYNCHRONOUSLY, before the (detached,
+            // possibly-delayed) join and before the next connection can attach its
+            // egress. This sets the bridge's `stop` flag so a subsequent egress-sender
+            // drop is recognised as teardown (suppressed, not a false EngineStopped),
+            // and ensures the old bridge stops feeding the engine before the new
+            // channel is live — a post-teardown reply can never reach it (C2).
+            if let Some(b) = &bridge {
+                b.signal_stop();
+            }
             cx.spawn(async move |_weak, cx| {
                 cx.background_executor()
                     .spawn(async move {
