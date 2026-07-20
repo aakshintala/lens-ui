@@ -1,5 +1,15 @@
 # Handoff — Terminal Slice 2: EXECUTION (2026-07-17, SERIAL re-cut)
 
+> **UPDATE 2026-07-20 — 2a DONE + C2 CLOSED. NEXT = 2d.** Slice 2a (input) executed + DONE
+> (2026-07-17). The deferred Critical **C2 (egress-replay across reconnect/downgrade) is now CLOSED**
+> via per-transport egress channels + T4 hardening — full slice `fd79d54..2921da8`, plan
+> `docs/superpowers/plans/2026-07-18-terminal-c2-per-transport-egress.md`. C1 (false EngineStopped)
+> robust by-construction; C2 (reply-source) narrowed + **join-before-attach documented residual** (only
+> needed if a live-bridge teardown path is ever added — see the C2 invariant comment in
+> `TerminalTab::teardown_transport_off_foreground`). **A fresh session resumes at Slice 2d**
+> (presentation), then 2b → 2c. gate-green, `terminal-ws` unpushed since C2 (merge = user's call).
+> Cross-family reviews: gpt-5.6 endpoints stalled all session → grok-4.5 was used (user-approved).
+
 **Self-contained driver for a fresh session** whose job is to **execute** Slice 2. Planning is
 DONE and gpt-5.6-reviewed; do NOT re-plan or re-review the plan bodies — execute them.
 

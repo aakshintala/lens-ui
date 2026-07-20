@@ -9,7 +9,7 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Open threads & next up
 
-- **▶ ACTIVE: shared terminal workstream — Slices 0/1a/1b merged; 1c DONE; 1d COMPLETE (live-proven); Slice 2 RE-CUT TO SERIAL + ▶▶ 2a (input) EXECUTED + DONE (2026-07-17): all 6 tasks, gate-green, real-window keystroke-validated on display. `terminal-ws` PUSHED to `origin/terminal-ws` (backup; no `main` merge — user's call). ⚠ ONE deferred Critical (C2 egress-replay across reconnect/downgrade). NEXT SESSION: fix C2, then 2d (presentation) → 2b (clipboard) → 2c (mouse). Driver: `docs/handoffs/2026-07-17-terminal-slice-2-execution.md`.**
+- **▶ ACTIVE: shared terminal workstream — Slices 0/1a/1b merged; 1c DONE; 1d COMPLETE (live-proven); Slice 2 RE-CUT TO SERIAL + ▶▶ 2a (input) EXECUTED + DONE (2026-07-17): all 6 tasks, gate-green, real-window keystroke-validated. `terminal-ws` PUSHED to `origin/terminal-ws` (backup; no `main` merge — user's call). ✅ C2 egress-replay Critical CLOSED (2026-07-20): per-transport egress channels `fd79d54..2921da8` + T4 hardening (C1 by-construction, C2 narrowed + join-before-attach documented residual). NEXT: 2d (presentation) → 2b (clipboard) → 2c (mouse). Driver: `docs/handoffs/2026-07-17-terminal-slice-2-execution.md`.**
   - **▶ SLICE 2 (interaction) — RE-CUT TO SERIAL; 2a EXECUTED + DONE (2026-07-17).** Design spec
     [`docs/specs/2026-07-17-terminal-slice-2-interaction-design.md`](./specs/2026-07-17-terminal-slice-2-interaction-design.md).
     **Task 0 DELETED — dissolved into 2a/2d** (serial removes the parallel merge hazard at the root; 2d edits 2a's
@@ -18,11 +18,17 @@ and roll older "Recent" pointers off this page as they age.
     **2a DONE**: all 6 tasks via composer-2.5 + per-task gpt-5.6 review + fix waves + broad-slice review; gate-green
     (both clippy configs, 77 lens-terminal + 162 lens-client tests, real-window keystroke validated). Reviews caught
     real bugs each task (macOS option-as-alt clobber, reversed epoch-revoke, Tab/Enter/Shift double-emit, worker
-    epoch TOCTOU, reply-evicts-user-egress). **⚠ DEFERRED Critical C2** (next session, #1): retained-engine egress
-    survives reconnect + is epoch-unrevocable → stale input replays across reconnect + a Write→ReadOnly downgrade
-    can't revoke already-queued write bytes (security). Root = untyped shared egress `Vec<u8>`; candidate fix =
-    drain egress on retained-engine bridge respawn, but needs a Reconnecting-input-semantics decision. Details in
-    the ledger `.superpowers/sdd/progress.md` + handoff.
+    epoch TOCTOU, reply-evicts-user-egress). **✅ Critical C2 CLOSED (2026-07-20)** via **per-transport egress
+    channels** (`fd79d54..2921da8`; plan `docs/superpowers/plans/2026-07-18-terminal-c2-per-transport-egress.md`):
+    the shared untyped `Vec<u8>` egress became a swappable typed `Sender<EgressFrame>` owned by the worker
+    (in-order `SetEgress`), each bridge owning its own receiver → emitted residue stays on the OLD channel
+    (drain-dropped on stop); + `access_epoch` bump on every teardown revokes un-encoded upstream input.
+    **T4 hardening (option A):** grok/Opus reviews diverged → source-verified adjudication (Opus GO correct;
+    grok's Criticals need a live old bridge, unreachable today since every teardown = bridge self-stop). C1
+    (false EngineStopped) closed BY-CONSTRUCTION (`signal_stop` synchronous-before-swap + Disconnected-arm
+    suppression); C2 (reply-source) NARROWED (inbound-arm re-checks `stop` before feeding) + **join-before-attach
+    documented residual** (only needed if a live-bridge teardown path is ever added, e.g. `on_host_event` →
+    server downgrade). Reconnecting-input-semantics decision resolved in 1d. Ledger `.superpowers/sdd/progress.md`.
     Architecture = Option A (single-owner engine + ONE ordered command stream). **Progress+notifications spike-resolved
     bucket-C (absent from pinned C ABI) → DEFERRED + parent matrix amended.** Plans: grok authored → Opus review →
     consolidated **gpt-5.6-sol-high** review ($1.67; 8 Critical + 11 Important) → folded + verified. **Merge-seam
