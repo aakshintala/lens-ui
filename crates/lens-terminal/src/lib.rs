@@ -601,6 +601,14 @@ impl TerminalTab {
         cx.notify();
     }
 
+    /// Currently-sampled frame (test/harness only). Reflects what
+    /// `on_mouse_down` would hit-test — i.e. the engine-sampled frame, so a
+    /// harness can poll until an engine-fed OSC-8 frame has propagated.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn latest_frame_for_test(&self) -> Option<Arc<Frame>> {
+        self.render.latest_frame()
+    }
+
     /// Last canvas paint origin (test/harness only).
     #[cfg(any(test, feature = "test-util"))]
     pub fn last_paint_origin_for_test(&self) -> Option<gpui::Point<Pixels>> {

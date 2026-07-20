@@ -1,10 +1,15 @@
 //! Real-window presentation harness (Slice 2d Task 4).
 //!
 //! NOT under `#[gpui::test]`: gpui's `NoopTextSystem` false-greens hit-testing.
-//! This `harness = false` binary opens a real GPUI window, paints a focused
-//! [`TerminalTab`] with a multi-cell OSC-8 frame, clicks a plain cell (negative)
-//! then the link cell (positive), and asserts `TerminalEvent::OpenUrlRequest`
-//! only on the correct cell (click only — hover deferred).
+//! This `harness = false` binary opens a real GPUI window and drives the FULL
+//! production hyperlink path: it feeds an OSC-8 sequence to a real engine so the
+//! engine-built frame carries `hyperlink_uri` on one specific cell (the same
+//! frame `on_mouse_down` hit-tests via the render sampler — injecting a frame
+//! with `set_frame_for_test` does not work here because the render loop's
+//! `sample_latest_frame_from_engine` overwrites it every paint). It then clicks
+//! a plain cell (negative) and the link cell (positive), asserting
+//! `TerminalEvent::OpenUrlRequest` fires only for the correct cell (click only —
+//! hover deferred).
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -15,10 +20,7 @@ use gpui::{
     WindowOptions, point, prelude::*, px, size,
 };
 use lens_terminal::render_test_api::CellMetrics;
-use lens_terminal::{
-    CellStyle, EngineConfig, EngineHandle, Frame, FrameCell, FrameRow, HostRequestId, Rgb,
-    TerminalEvent, TerminalTab,
-};
+use lens_terminal::{EngineConfig, EngineHandle, HostRequestId, TerminalEvent, TerminalTab};
 
 const FRAME_COLS: u16 = 4;
 const FRAME_ROWS: u16 = 2;
@@ -27,19 +29,31 @@ const LINK_ROW: u16 = 1;
 const LINK_URL: &str = "https://osc.example/click";
 const PLAIN_COL: u16 = 0;
 const PLAIN_ROW: u16 = 0;
+/// Bounded wait for the engine to publish the OSC-8 frame (async worker) — well
+/// above the handful of paints it actually needs, low enough to fail fast.
+const MAX_PRIME_POLLS: u32 = 600;
+/// `cx.emit` delivers to subscribers on the effect cycle AFTER the render that
+/// dispatched the click, so the link result must be polled across renders, not
+/// read synchronously in the click's own render pass.
+const MAX_RESULT_POLLS: u32 = 120;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
     PrimePaint,
     ClickPlainCell,
     ClickLinkCell,
+    CheckLinkResult,
     Done,
 }
 
 struct HarnessView {
     phase: Rc<RefCell<Phase>>,
+    prime_polls: Rc<RefCell<u32>>,
+    result_polls: Rc<RefCell<u32>>,
     tab: gpui::Entity<TerminalTab>,
     captured: Rc<RefCell<Option<(HostRequestId, String)>>>,
+    // Must be held: dropping the Subscription cancels the callback.
+    _sub: gpui::Subscription,
 }
 
 fn fail(msg: &str) -> ! {
@@ -47,54 +61,18 @@ fn fail(msg: &str) -> ! {
     std::process::exit(1);
 }
 
-fn default_fg() -> Rgb {
-    Rgb {
-        r: 200,
-        g: 200,
-        b: 200,
-    }
-}
-
-fn frame_cell(col: u16, grapheme: char, hyperlink_uri: Option<Arc<str>>) -> FrameCell {
-    FrameCell {
-        col,
-        grapheme: grapheme.to_string(),
-        fg: default_fg(),
-        bg: None,
-        wide: false,
-        selected: false,
-        style: CellStyle::default(),
-        hyperlink_uri,
-    }
-}
-
-fn osc8_frame() -> Frame {
-    let link_uri = Arc::<str>::from(LINK_URL);
-    let mut grid = Vec::with_capacity(usize::from(FRAME_ROWS));
-    for row in 0..FRAME_ROWS {
-        let mut cells = Vec::with_capacity(usize::from(FRAME_COLS));
-        for col in 0..FRAME_COLS {
-            let is_link = row == LINK_ROW && col == LINK_COL;
-            cells.push(frame_cell(
-                col,
-                if is_link { 'X' } else { '.' },
-                if is_link {
-                    Some(Arc::clone(&link_uri))
-                } else {
-                    None
-                },
-            ));
-        }
-        grid.push(FrameRow { cells });
-    }
-    Frame {
-        cols: FRAME_COLS,
-        rows: FRAME_ROWS,
-        default_fg: default_fg(),
-        default_bg: Rgb { r: 0, g: 0, b: 0 },
-        grid,
-        cursor: None,
-    }
+/// OSC-8 feed placing the hyperlink on cell (LINK_COL, LINK_ROW):
+/// `\r\n` → row 1 col 0; `..` → fill cols 0,1, cursor at col 2; then the OSC-8
+/// open/close wrapping a single `X` glyph at col 2. Row 0 stays blank (plain).
+fn osc8_feed() -> Vec<u8> {
+    let mut feed = Vec::new();
+    feed.extend_from_slice(b"\r\n..");
+    feed.extend_from_slice(b"\x1b]8;;");
+    feed.extend_from_slice(LINK_URL.as_bytes());
+    feed.extend_from_slice(b"\x1b\\"); // ST
+    feed.extend_from_slice(b"X");
+    feed.extend_from_slice(b"\x1b]8;;\x1b\\"); // OSC-8 close
+    feed
 }
 
 fn cell_center(origin: Point<Pixels>, metrics: &CellMetrics, col: u16, row: u16) -> Point<Pixels> {
@@ -114,14 +92,16 @@ impl HarnessView {
             cell_h_px: 16,
         };
         let engine = Arc::new(EngineHandle::spawn(cfg));
+        // Ensure the engine publishes frames, then feed the OSC-8 so the
+        // engine-built frame (the one the render sampler hands to on_mouse_down)
+        // carries the hyperlink.
+        let _ = engine.set_visible(true);
+        let _ = engine.feed(osc8_feed());
         let tab = TerminalTab::open_with_engine_for_test(Arc::clone(&engine), cx);
-        tab.update(cx, |tab, cx| {
-            tab.set_frame_for_test(Arc::new(osc8_frame()), cx);
-        });
 
         let captured = Rc::new(RefCell::new(None));
         let captured_sub = Rc::clone(&captured);
-        let _ = cx.subscribe(&tab, move |_this, _tab, event, _cx| {
+        let sub = cx.subscribe(&tab, move |_this, _tab, event, _cx| {
             if let TerminalEvent::OpenUrlRequest { id, url } = event {
                 *captured_sub.borrow_mut() = Some((*id, url.clone()));
             }
@@ -129,14 +109,32 @@ impl HarnessView {
 
         Self {
             phase: Rc::new(RefCell::new(Phase::PrimePaint)),
+            prime_polls: Rc::new(RefCell::new(0)),
+            result_polls: Rc::new(RefCell::new(0)),
             tab,
             captured,
+            _sub: sub,
         }
     }
 
     fn paint_ready(&self, cx: &Context<Self>) -> bool {
         self.tab.read(cx).last_paint_origin_for_test().is_some()
             && self.tab.read(cx).cell_metrics_for_test().is_some()
+    }
+
+    /// True once the render loop has sampled an engine frame that carries the
+    /// OSC-8 hyperlink on the link cell — i.e. the same frame `on_mouse_down`
+    /// will hit-test.
+    fn link_frame_ready(&self, cx: &Context<Self>) -> bool {
+        let Some(frame) = self.tab.read(cx).latest_frame_for_test() else {
+            return false;
+        };
+        let Some(row) = frame.grid.get(LINK_ROW as usize) else {
+            return false;
+        };
+        row.cells
+            .iter()
+            .any(|c| c.col == LINK_COL && c.hyperlink_uri.as_deref() == Some(LINK_URL))
     }
 
     fn dispatch_click(&self, col: u16, row: u16, window: &mut Window, cx: &mut Context<Self>) {
@@ -165,11 +163,20 @@ impl Render for HarnessView {
 
         match phase {
             Phase::PrimePaint => {
-                if self.paint_ready(cx) {
+                if self.paint_ready(cx) && self.link_frame_ready(cx) {
                     *self.phase.borrow_mut() = Phase::ClickPlainCell;
+                } else {
+                    let mut polls = self.prime_polls.borrow_mut();
+                    *polls += 1;
+                    if *polls > MAX_PRIME_POLLS {
+                        fail("engine never published a frame carrying the OSC-8 link at (2,1)");
+                    }
                 }
             }
             Phase::ClickPlainCell => {
+                // The plain-cell path returns early in `on_mouse_down` (no URI),
+                // so it never schedules an emit — a synchronous None check is
+                // sound here.
                 self.dispatch_click(PLAIN_COL, PLAIN_ROW, window, cx);
                 if self.captured.borrow().is_some() {
                     fail("plain-cell click must not emit OpenUrlRequest");
@@ -178,20 +185,29 @@ impl Render for HarnessView {
                 *self.phase.borrow_mut() = Phase::ClickLinkCell;
             }
             Phase::ClickLinkCell => {
+                // Dispatch the link click; its `cx.emit` is delivered on a later
+                // effect cycle, so read the result in CheckLinkResult, not here.
                 self.dispatch_click(LINK_COL, LINK_ROW, window, cx);
-                match self.captured.borrow().clone() {
-                    Some((id, url)) if url == LINK_URL => {
-                        println!(
-                            "presentation_realwindow: link-cell OpenUrlRequest OK id={id:?} url={url}"
-                        );
-                        *self.phase.borrow_mut() = Phase::Done;
-                    }
-                    Some((id, url)) => {
-                        fail(&format!("unexpected OpenUrlRequest id={id:?} url={url}"));
-                    }
-                    None => fail("link-cell click did not emit OpenUrlRequest"),
-                }
+                *self.phase.borrow_mut() = Phase::CheckLinkResult;
             }
+            Phase::CheckLinkResult => match self.captured.borrow().clone() {
+                Some((id, url)) if url == LINK_URL => {
+                    println!(
+                        "presentation_realwindow: link-cell OpenUrlRequest OK id={id:?} url={url}"
+                    );
+                    *self.phase.borrow_mut() = Phase::Done;
+                }
+                Some((id, url)) => {
+                    fail(&format!("unexpected OpenUrlRequest id={id:?} url={url}"));
+                }
+                None => {
+                    let mut polls = self.result_polls.borrow_mut();
+                    *polls += 1;
+                    if *polls > MAX_RESULT_POLLS {
+                        fail("link-cell click did not emit OpenUrlRequest");
+                    }
+                }
+            },
             Phase::Done => {
                 println!("presentation_realwindow: all phases OK");
                 std::process::exit(0);
