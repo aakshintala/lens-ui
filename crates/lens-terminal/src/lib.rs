@@ -950,15 +950,12 @@ impl TerminalTab {
         let Some(engine) = self.runtime.as_ref().and_then(|r| r.engine.as_ref()) else {
             return;
         };
-        if let Some(title) = engine.take_latest_title() {
-            apply_title_to_presentation(&mut self.presentation, title);
-            cx.emit(TerminalEvent::PresentationChanged);
-        }
+        let slot_title = engine.take_latest_title();
+        let mut channel_titles = Vec::new();
         while let Ok(ev) = engine.presentation_rx().try_recv() {
             match ev {
                 engine::presentation::EnginePresentationEvent::TitleChanged(title) => {
-                    apply_title_to_presentation(&mut self.presentation, title);
-                    cx.emit(TerminalEvent::PresentationChanged);
+                    channel_titles.push(title);
                 }
                 engine::presentation::EnginePresentationEvent::HyperlinkOpen { .. } => {
                     // Task 4 fills.
@@ -967,6 +964,11 @@ impl TerminalTab {
                     // 2b owns policy/registration. 2d: no-op (do not emit Allow).
                 }
             }
+        }
+        if let Some(title) = engine::presentation::resolve_drain_title(slot_title, &channel_titles)
+        {
+            apply_title_to_presentation(&mut self.presentation, title);
+            cx.emit(TerminalEvent::PresentationChanged);
         }
     }
 

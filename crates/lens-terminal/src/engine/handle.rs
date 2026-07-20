@@ -1188,7 +1188,7 @@ mod tests {
 
     #[test]
     fn latest_title_wins_when_channel_full() {
-        use crate::engine::presentation::EnginePresentationEvent;
+        use crate::engine::presentation::{EnginePresentationEvent, resolve_drain_title};
         use crate::engine::vt::VtEngine;
 
         let (tx, rx) = crossbeam_channel::bounded(1);
@@ -1201,17 +1201,24 @@ mod tests {
             "channel must be full"
         );
         engine.feed(b"\x1b]2;FinalTitle\x1b\\");
+        let slot = engine.take_latest_title();
         assert_eq!(
-            engine.take_latest_title().as_deref(),
+            slot.as_deref(),
             Some("FinalTitle"),
             "latest-title slot must hold the final OSC title when channel is saturated"
         );
         let first = rx.try_recv().unwrap();
-        assert!(
-            matches!(first, EnginePresentationEvent::TitleChanged(t) if t == "Stale"),
-            "channel retains the first enqueued event"
-        );
+        let stale = match first {
+            EnginePresentationEvent::TitleChanged(t) => t,
+            _ => panic!("expected TitleChanged"),
+        };
+        assert_eq!(stale, "Stale");
         assert!(rx.try_recv().is_err());
+        assert_eq!(
+            resolve_drain_title(slot, &[stale]).as_deref(),
+            Some("FinalTitle"),
+            "drain apply must not let a stale channel title overwrite the slot"
+        );
     }
 
     #[test]
