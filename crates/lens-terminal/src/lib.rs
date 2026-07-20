@@ -1050,6 +1050,7 @@ impl TerminalTab {
                     if let Some(url) = engine::presentation::validate_open_url(&url) {
                         let id = HostRequestId(self.next_host_request_id);
                         self.next_host_request_id = self.next_host_request_id.wrapping_add(1);
+                        engine.record_presentation_hyperlink_open();
                         cx.emit(TerminalEvent::OpenUrlRequest { id, url });
                     }
                 }
@@ -1061,6 +1062,7 @@ impl TerminalTab {
         if let Some(title) = engine::presentation::resolve_drain_title(slot_title, &channel_titles)
         {
             apply_title_to_presentation(&mut self.presentation, title);
+            engine.record_presentation_title_applied();
             cx.emit(TerminalEvent::PresentationChanged);
         }
     }

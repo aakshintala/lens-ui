@@ -266,6 +266,14 @@ impl EngineHandle {
             .map(|title| (*title).clone())
     }
 
+    pub(crate) fn record_presentation_title_applied(&self) {
+        self.inspect.record_title_applied();
+    }
+
+    pub(crate) fn record_presentation_hyperlink_open(&self) {
+        self.inspect.record_hyperlink_open();
+    }
+
     /// Test hook: the next `count` `build_frame` attempts on **this handle's**
     /// worker fail synthetically. Per-handle (not a process-global) so parallel
     /// tests cannot consume each other's injected failures.
@@ -1219,6 +1227,108 @@ mod tests {
             Some("FinalTitle"),
             "drain apply must not let a stale channel title overwrite the slot"
         );
+    }
+
+    #[test]
+    fn presentation_inspect_title_slot_overwrite_when_enabled() {
+        use std::time::Duration;
+
+        use crate::engine::presentation::EnginePresentationEvent;
+
+        let h = EngineHandle::spawn(test_config());
+        h.set_inspect_enabled(true);
+        h.feed(b"\x1b]2;First\x1b\\".to_vec()).unwrap();
+        let first = h
+            .presentation_rx()
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first title event");
+        assert_eq!(first, EnginePresentationEvent::TitleChanged("First".into()));
+        h.feed(b"\x1b]2;Second\x1b\\".to_vec()).unwrap();
+        let second = h
+            .presentation_rx()
+            .recv_timeout(Duration::from_secs(2))
+            .expect("second title event");
+        assert_eq!(
+            second,
+            EnginePresentationEvent::TitleChanged("Second".into())
+        );
+        assert_eq!(h.inspect().title_slot_overwrites, 1);
+        h.stop();
+    }
+
+    #[test]
+    fn presentation_inspect_channel_full_drop_when_enabled() {
+        use std::thread;
+        use std::time::Duration;
+
+        use crate::engine::presentation::{EnginePresentationEvent, PRESENTATION_CHANNEL_CAP};
+
+        let h = EngineHandle::spawn(test_config());
+        h.set_inspect_enabled(true);
+        while h.presentation_rx().try_recv().is_ok() {}
+        for i in 0..PRESENTATION_CHANNEL_CAP {
+            h.enqueue_presentation(EnginePresentationEvent::TitleChanged(format!("fill{i}")))
+                .unwrap();
+        }
+        h.feed(b"\x1b]2;Overflow\x1b\\".to_vec()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while h.inspect().presentation_channel_full_drops == 0 {
+            if Instant::now() >= deadline {
+                panic!("timeout waiting for presentation_channel_full_drops");
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(h.inspect().presentation_channel_full_drops, 1);
+        h.stop();
+    }
+
+    #[test]
+    fn presentation_inspect_counters_zero_when_disabled() {
+        use std::time::Duration;
+
+        let h = EngineHandle::spawn(test_config());
+        h.feed(b"\x1b]2;First\x1b\\".to_vec()).unwrap();
+        let _ = h
+            .presentation_rx()
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first title");
+        h.feed(b"\x1b]2;Second\x1b\\".to_vec()).unwrap();
+        let _ = h
+            .presentation_rx()
+            .recv_timeout(Duration::from_secs(2))
+            .expect("second title");
+        let snap = h.inspect();
+        assert_eq!(snap.titles_applied, 0);
+        assert_eq!(snap.title_slot_overwrites, 0);
+        assert_eq!(snap.hyperlink_opens, 0);
+        assert_eq!(snap.presentation_channel_full_drops, 0);
+        h.stop();
+    }
+
+    #[test]
+    fn presentation_inspect_title_applied_when_enabled() {
+        use std::time::Duration;
+
+        use crate::engine::presentation::EnginePresentationEvent;
+
+        let h = EngineHandle::spawn(test_config());
+        h.set_inspect_enabled(true);
+        h.feed(b"\x1b]2;Applied\x1b\\".to_vec()).unwrap();
+        let ev = h
+            .presentation_rx()
+            .recv_timeout(Duration::from_secs(2))
+            .expect("title event");
+        assert_eq!(ev, EnginePresentationEvent::TitleChanged("Applied".into()));
+        assert!(h.take_latest_title().is_some());
+        h.record_presentation_title_applied();
+        assert_eq!(h.inspect().titles_applied, 1);
+        assert!(
+            h.inspect()
+                .recent
+                .iter()
+                .any(|e| e.kind == InspectEventKind::TitleApplied)
+        );
+        h.stop();
     }
 
     #[test]

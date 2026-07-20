@@ -118,6 +118,59 @@ fn bench_ordered_stream_feed_then_key_throughput(c: &mut Criterion) {
     });
 }
 
+const TITLE_FEED_ROUNDS: usize = 64;
+const PRESENTATION_CHANNEL_CAP: usize = 64;
+
+fn bench_presentation_title_callback_throughput(c: &mut Criterion) {
+    let title_bytes = b"\x1b]2;BenchTitle\x1b\\";
+    c.bench_function("presentation_title_callback_throughput", |b| {
+        b.iter_batched(
+            || {
+                let (tx, _rx) = crossbeam_channel::bounded(PRESENTATION_CHANNEL_CAP);
+                VtEngine::new(&bench_config(), |_| {}, tx).expect("engine")
+            },
+            |mut engine| {
+                for _ in 0..TITLE_FEED_ROUNDS {
+                    engine.feed(black_box(title_bytes));
+                }
+                black_box(engine.take_latest_title());
+                engine
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
+fn dense_hyperlink_seed_bytes(cols: u16, rows: u16) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(usize::from(cols) * usize::from(rows) + 48);
+    bytes.extend_from_slice(b"\x1b[2J\x1b[H\x1b]8;;https://example.com/bench\x1b\\");
+    for _ in 0..rows {
+        for _ in 0..cols {
+            bytes.push(b'X');
+        }
+        bytes.extend_from_slice(b"\r\n");
+    }
+    bytes.extend_from_slice(b"\x1b]8;;\x1b\\");
+    bytes
+}
+
+fn seeded_dense_hyperlink_engine() -> VtEngine {
+    let (tx, _rx) = crossbeam_channel::bounded(1);
+    let mut engine = VtEngine::new(&bench_config(), |_| {}, tx).expect("engine");
+    engine.feed(&dense_hyperlink_seed_bytes(BENCH_COLS, BENCH_ROWS));
+    engine
+}
+
+fn bench_dense_hyperlink_frame_build(c: &mut Criterion) {
+    c.bench_function("engine_frame_build_dense_hyperlink_200x50", |b| {
+        b.iter_batched(
+            seeded_dense_hyperlink_engine,
+            |mut engine| black_box(engine.build_frame().expect("frame")),
+            BatchSize::SmallInput,
+        );
+    });
+}
+
 criterion_group!(
     engine,
     bench_vt_parse,
@@ -125,6 +178,8 @@ criterion_group!(
     bench_scroll,
     bench_reflow,
     bench_key_encode_arrow_up,
-    bench_ordered_stream_feed_then_key_throughput
+    bench_ordered_stream_feed_then_key_throughput,
+    bench_presentation_title_callback_throughput,
+    bench_dense_hyperlink_frame_build
 );
 criterion_main!(engine);

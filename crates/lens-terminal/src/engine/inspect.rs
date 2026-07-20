@@ -20,6 +20,10 @@ pub enum InspectEventKind {
     BytesFed { count: u64 },
     Resize { cols: u16, rows: u16 },
     DaDsr { len: usize },
+    TitleApplied,
+    TitleSlotOverwrite,
+    HyperlinkOpen,
+    PresentationChannelFullDrop,
 }
 
 /// Point-in-time engine snapshot for introspection tooling.
@@ -38,6 +42,10 @@ pub struct EngineInspect {
     pub keys_encoded: u64,
     pub feed_chunks: u64,
     pub stop_preempts: u64,
+    pub titles_applied: u64,
+    pub title_slot_overwrites: u64,
+    pub hyperlink_opens: u64,
+    pub presentation_channel_full_drops: u64,
     pub recent: Vec<InspectEvent>,
 }
 
@@ -58,6 +66,10 @@ pub(crate) struct InspectShared {
     keys_encoded: AtomicU64,
     feed_chunks: AtomicU64,
     stop_preempts: AtomicU64,
+    titles_applied: AtomicU64,
+    title_slot_overwrites: AtomicU64,
+    hyperlink_opens: AtomicU64,
+    presentation_channel_full_drops: AtomicU64,
     ring: Mutex<VecDeque<InspectEvent>>,
 }
 
@@ -78,6 +90,10 @@ impl InspectShared {
             keys_encoded: AtomicU64::new(0),
             feed_chunks: AtomicU64::new(0),
             stop_preempts: AtomicU64::new(0),
+            titles_applied: AtomicU64::new(0),
+            title_slot_overwrites: AtomicU64::new(0),
+            hyperlink_opens: AtomicU64::new(0),
+            presentation_channel_full_drops: AtomicU64::new(0),
             ring: Mutex::new(VecDeque::with_capacity(RING_CAP)),
         }
     }
@@ -148,6 +164,47 @@ impl InspectShared {
         self.stop_preempts.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_title_applied(&self) {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        self.titles_applied.fetch_add(1, Ordering::Relaxed);
+        self.record_event(InspectEvent {
+            kind: InspectEventKind::TitleApplied,
+        });
+    }
+
+    pub fn record_title_slot_overwrite(&self) {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        self.title_slot_overwrites.fetch_add(1, Ordering::Relaxed);
+        self.record_event(InspectEvent {
+            kind: InspectEventKind::TitleSlotOverwrite,
+        });
+    }
+
+    pub fn record_hyperlink_open(&self) {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        self.hyperlink_opens.fetch_add(1, Ordering::Relaxed);
+        self.record_event(InspectEvent {
+            kind: InspectEventKind::HyperlinkOpen,
+        });
+    }
+
+    pub fn record_presentation_channel_full_drop(&self) {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        self.presentation_channel_full_drops
+            .fetch_add(1, Ordering::Relaxed);
+        self.record_event(InspectEvent {
+            kind: InspectEventKind::PresentationChannelFullDrop,
+        });
+    }
+
     pub fn set_visible(&self, visible: bool) {
         self.visible.store(visible, Ordering::Relaxed);
     }
@@ -188,6 +245,12 @@ impl InspectShared {
             keys_encoded: self.keys_encoded.load(Ordering::Relaxed),
             feed_chunks: self.feed_chunks.load(Ordering::Relaxed),
             stop_preempts: self.stop_preempts.load(Ordering::Relaxed),
+            titles_applied: self.titles_applied.load(Ordering::Relaxed),
+            title_slot_overwrites: self.title_slot_overwrites.load(Ordering::Relaxed),
+            hyperlink_opens: self.hyperlink_opens.load(Ordering::Relaxed),
+            presentation_channel_full_drops: self
+                .presentation_channel_full_drops
+                .load(Ordering::Relaxed),
             recent,
         }
     }

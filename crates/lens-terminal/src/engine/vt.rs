@@ -24,6 +24,7 @@ use super::presentation::{
     EnginePresentationEvent, MAX_HYPERLINK_URI_BYTES, sanitize_reported_title,
 };
 use super::worker::WakerSlot;
+use crate::engine::inspect::InspectShared;
 
 type OnReplyFn = Box<dyn FnMut(&[u8]) + 'static>;
 
@@ -72,6 +73,7 @@ impl VtEngine {
             presentation_tx,
             Arc::new(ArcSwapOption::from(None)),
             None,
+            None,
         )
     }
 
@@ -81,6 +83,7 @@ impl VtEngine {
         presentation_tx: Sender<EnginePresentationEvent>,
         latest_title_slot: Arc<ArcSwapOption<String>>,
         waker: Option<WakerSlot>,
+        inspect: Option<Arc<InspectShared>>,
     ) -> Result<Self, EngineError> {
         let reply_buffer = Rc::new(RefCell::new(Vec::new()));
         let buf = Rc::clone(&reply_buffer);
@@ -99,6 +102,7 @@ impl VtEngine {
         let title_slot = Arc::clone(&latest_title_slot);
         let title_tx = presentation_tx;
         let waker_for_title = waker.clone();
+        let inspect_for_title = inspect.clone();
         terminal.on_title_changed(move |term| {
             let Ok(title) = term.title() else {
                 return;
@@ -113,13 +117,35 @@ impl VtEngine {
             };
             match sanitize_reported_title(title) {
                 Some(clean) => {
+                    if title_slot.load().is_some()
+                        && let Some(insp) = inspect_for_title.as_ref()
+                    {
+                        insp.record_title_slot_overwrite();
+                    }
                     title_slot.store(Some(Arc::new(clean.clone())));
-                    let _ = title_tx.try_send(EnginePresentationEvent::TitleChanged(clean));
+                    if title_tx
+                        .try_send(EnginePresentationEvent::TitleChanged(clean))
+                        .is_err()
+                        && let Some(insp) = inspect_for_title.as_ref()
+                    {
+                        insp.record_presentation_channel_full_drop();
+                    }
                     wake();
                 }
                 None => {
+                    if title_slot.load().is_some()
+                        && let Some(insp) = inspect_for_title.as_ref()
+                    {
+                        insp.record_title_slot_overwrite();
+                    }
                     title_slot.store(None);
-                    let _ = title_tx.try_send(EnginePresentationEvent::TitleChanged(String::new()));
+                    if title_tx
+                        .try_send(EnginePresentationEvent::TitleChanged(String::new()))
+                        .is_err()
+                        && let Some(insp) = inspect_for_title.as_ref()
+                    {
+                        insp.record_presentation_channel_full_drop();
+                    }
                     wake();
                 }
             }

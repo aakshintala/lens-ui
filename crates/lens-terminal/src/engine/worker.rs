@@ -175,6 +175,7 @@ pub(crate) fn spawn_worker(
             presentation_tx,
             latest_title_slot,
             Some(Arc::clone(&waker)),
+            Some(Arc::clone(&inspect)),
         ) {
             Ok(e) => e,
             Err(e) => {
