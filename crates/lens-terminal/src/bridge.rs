@@ -125,6 +125,13 @@ fn bridge_loop(
                 break;
             }
             i if i == inbound_idx => match oper.recv(&inbound) {
+                // Once stop is requested (teardown in progress), do NOT feed the
+                // outgoing connection's VT into the engine: a query reply it produces
+                // could encode onto the next connection's egress. This narrows the C2
+                // reply-source window — the bridge stops feeding as soon as it observes
+                // the flag. Full closure still requires join-before-attach (see
+                // `TerminalTab::teardown_transport_off_foreground`).
+                Ok(_) if stop.load(Ordering::Relaxed) => LoopExit::Stop,
                 Ok(msg) => handle_inbound(&engine, &policy_tx, msg),
                 Err(_) => {
                     let _ = policy_tx.try_send(BridgeEvent::AttachDisconnected);
@@ -542,5 +549,55 @@ mod tests {
         };
         assert!(saw);
         bridge.join();
+    }
+
+    // C2 narrowing (inbound-arm stop re-check): once stop is requested, the bridge must
+    // NOT feed the outgoing connection's VT into the engine — a reply it produced could
+    // encode onto the next connection's egress. Driven at `bridge_loop` level so we own
+    // the raw `stop` flag: set it WITHOUT signalling `stop_rx`, then deliver inbound, so
+    // the wake comes through the inbound arm alone, which must drop the VT unfed.
+    // Removing the `stop.load()` guard makes `bytes_fed` advance and this assertion fail.
+    #[test]
+    fn stopped_bridge_does_not_feed_inbound_vt() {
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let (inbound_tx, inbound_rx) = crossbeam_channel::bounded::<WsInbound>(1);
+        let (outbound_tx, _outbound_rx) = crossbeam_channel::bounded::<WsOutbound>(1);
+        // Held (not dropped) so the egress arm never wakes the select ahead of inbound.
+        let (_egress_tx, egress_rx) = crossbeam_channel::bounded::<EgressFrame>(EGRESS_CHANNEL_CAP);
+        let (_stop_tx, stop_rx) = crossbeam_channel::bounded::<()>(1);
+        let (policy_tx, _policy_rx) = async_channel::bounded(8);
+
+        let baseline = engine.inspect().bytes_fed;
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = Arc::clone(&stop);
+        let engine_thread = Arc::clone(&engine);
+        let handle = std::thread::spawn(move || {
+            bridge_loop(
+                inbound_rx,
+                outbound_tx,
+                engine_thread,
+                egress_rx,
+                stop_rx,
+                policy_tx,
+                &stop_thread,
+            );
+        });
+
+        // Park in select, then request stop and deliver a VT that WOULD change the engine
+        // if fed. The inbound arm observes stop and drops it unfed.
+        std::thread::sleep(Duration::from_millis(50));
+        stop.store(true, Ordering::Relaxed);
+        inbound_tx.send(WsInbound::Vt(b"Z".to_vec())).unwrap();
+        handle.join().unwrap();
+
+        // The bridge thread is gone; drain any (should-be-zero) pending feed cmd.
+        for _ in 0..3 {
+            engine.build_now().ok();
+        }
+        assert_eq!(
+            engine.inspect().bytes_fed,
+            baseline,
+            "stopped bridge must not feed inbound VT to the engine"
+        );
     }
 }
