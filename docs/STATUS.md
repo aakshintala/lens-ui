@@ -5,7 +5,7 @@ the current forward-looking state only. **Full dated session entries live in
 [`STATUS-ARCHIVE.md`](./STATUS-ARCHIVE.md)** — write each session's detail there
 and roll older "Recent" pointers off this page as they age.
 
-_Last curated 2026-07-18 (B-1 board data model shipped; board framing updated B6–B8 → B-1..B-6)._
+_Last curated 2026-07-20 (transcript fan-out decomposed into build-slices T-1..T-6)._
 
 ---
 
@@ -42,7 +42,46 @@ _Last curated 2026-07-18 (B-1 board data model shipped; board framing updated B6
 - **▶ `lens-ui` transcript fan-out** — the first real consumer of the Detailed feed + the disk
   `RowSource`/D23 render window (markdown + virtualization spikes both GO). Plugs into the slot API the
   shell skeleton publishes; sibling parallel surfaces (terminal via `lens-terminal::open`, workspace,
-  permissions) can fan out against `ContentTab`/`TabHandle`.
+  permissions) can fan out against `ContentTab`/`TabHandle`. Product design is **complete**
+  (`docs/design/conversation-transcript.md`, §1–§21); this workstream is **implementation decomposition +
+  gpui/lens-ui specifics**, not product design.
+  - **Decomposed 2026-07-20 (brainstorm) into six build-slices T-1..T-6**, each its own
+    brainstorm→spec→plan→build cycle, dependency order below. Slices are *internal build increments* (like
+    Board B-1..B-6) — the **surface** is not declared done until its closer lands. Two real surfaces fall
+    out: **History view** (read-only transcript, no composer — §18, used for archived/sleeping sessions) is
+    complete after **T-5**; **Chat column (full)** is complete after **T-6**. No functionality is deferred
+    *out* of the workstream — the earlier "composer/interrupt/permissions belong elsewhere" framing was the
+    error and is corrected: they are **T-6**, in-scope.
+  - **T-1 — ViewBlock projection pipeline (pure).** §3/§4. Pure transforms over `&[Item]` + `StreamScratch`
+    → `Vec<ViewBlock>` (`pair_tool_spans`, `group_work_section`, `merge_optimistic_user`,
+    `flatten_sub_agents`, `hide_reasoning`, `with_agent_changed_markers`); exhaustive `ItemKind` match;
+    no gpui, fully unit-testable. The spine. *(Open for its brainstorm: `lens-core` vs `lens-ui` home.)*
+    **← brainstorm this first.**
+  - **T-2 — Focused view scaffold + virtualized disk-sourced surface.** §16/§17. Mount focused `ContentTab`
+    in `#chat-slot`; lift `RowSource` (id-keyed retained store) from spike to production; native
+    `list()`/`ListState`/`ListAlignment::Bottom`; D23 disk-paint (finalized from `TranscriptStore`, live
+    tail from actor scratch, id-keyed upsert, no below-watermark invalidation); wake/reconnect reconcile;
+    scroll contracts (anchoring/windowing/jump-to-bottom) + "N new" pill. **Bucket-C dep** (`GET /items`
+    tail pagination) is flagged here — small/medium sessions work without it.
+  - **T-3 — Message & reasoning content.** §5/§6/§7. Vendor+patch gpui-component markdown (3 spots:
+    debounce reset, `clear_selection` on reparse, `list_state.reset` scroll-jump); markdown-vs-verbatim
+    channels + user backtick-gating; sanitization pre-pass; streaming safe-prefix / stable identity;
+    reasoning + capped scroll region.
+  - **T-4 — Tool spans, sub-agent spans, native tools, resource markers.** §8/§9/§12. Tool-span render
+    (archetypes, truncation tiers, inline edit diff); §8.6 in-transcript sub-agent span (peek,
+    navigate-to-child, output-in-transcript); native tools; §12 inline resource markers. **Bucket-B stubs
+    live here** — "show full → editor/Review", "dock to Canvas", "open terminal" render **inert/disabled**;
+    **no invented inline fallbacks** (they'd be ripped out by the real surfaces).
+  - **T-5 — Turn lifecycle, compaction, agent-changed, todos, minor items.** §4/§10/§11/§13/§14.
+    Work-section collapse lifecycle, compaction marker, AgentChanged marker, inline todos (forms 1–3),
+    minor items, reconnect break. **← History view complete here.**
+  - **T-6 — Composer & complete live turn (the chat closer).** §15/§18. Always-sends composer; optimistic
+    user bubble (`⋯ sending` → settle on `session.input.consumed` → `⚠ failed·retry`); **Esc-interrupt**
+    (+ new lens-core `Interrupt` command + lens-client call — server already echoes `session.interrupted`/
+    `response.incomplete`); **permission/elicitation dock + widget integration** (reuse the GO elicitation
+    spike; round-trip binary/form/url/plan/codex; emit `approval{action,content}` — **this workstream owns
+    the integration**); **send-recovery** (never drop send text) + **input history** (up/down).
+    **← Chat column (full) complete here.**
   - **Carry-forward arch notes:** a Summary-mode card consumer MUST tolerate occasional
     `Detailed(TranscriptAdvanced)` watermarks (catch-up/deferred-commit emit them regardless of mode).
     §3.5 Ready *policy* (seen_turn detector / `last_completed_at` stamp / per-card decay one-shot /
