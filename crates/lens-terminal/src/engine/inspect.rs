@@ -105,6 +105,10 @@ impl InspectShared {
         }
     }
 
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
     pub fn record_bytes_fed(&self, count: u64) {
         self.bytes_fed.fetch_add(count, Ordering::Relaxed);
         self.record_event(InspectEvent {

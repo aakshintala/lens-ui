@@ -7,7 +7,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Sender, TrySendError};
 use libghostty_vt::render::{CellIterator, RenderState, RowIterator};
 use libghostty_vt::screen::CellWide;
 use libghostty_vt::style::{RgbColor, Style, StyleColor, Underline};
@@ -117,15 +117,15 @@ impl VtEngine {
             };
             match sanitize_reported_title(title) {
                 Some(clean) => {
-                    if title_slot.load().is_some()
-                        && let Some(insp) = inspect_for_title.as_ref()
+                    if let Some(insp) = inspect_for_title.as_ref()
+                        && insp.is_enabled()
+                        && title_slot.load().is_some()
                     {
                         insp.record_title_slot_overwrite();
                     }
                     title_slot.store(Some(Arc::new(clean.clone())));
-                    if title_tx
-                        .try_send(EnginePresentationEvent::TitleChanged(clean))
-                        .is_err()
+                    if let Err(TrySendError::Full(_)) =
+                        title_tx.try_send(EnginePresentationEvent::TitleChanged(clean))
                         && let Some(insp) = inspect_for_title.as_ref()
                     {
                         insp.record_presentation_channel_full_drop();
@@ -133,15 +133,15 @@ impl VtEngine {
                     wake();
                 }
                 None => {
-                    if title_slot.load().is_some()
-                        && let Some(insp) = inspect_for_title.as_ref()
+                    if let Some(insp) = inspect_for_title.as_ref()
+                        && insp.is_enabled()
+                        && title_slot.load().is_some()
                     {
                         insp.record_title_slot_overwrite();
                     }
                     title_slot.store(None);
-                    if title_tx
-                        .try_send(EnginePresentationEvent::TitleChanged(String::new()))
-                        .is_err()
+                    if let Err(TrySendError::Full(_)) =
+                        title_tx.try_send(EnginePresentationEvent::TitleChanged(String::new()))
                         && let Some(insp) = inspect_for_title.as_ref()
                     {
                         insp.record_presentation_channel_full_drop();

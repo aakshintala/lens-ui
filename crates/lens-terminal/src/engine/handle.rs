@@ -266,12 +266,11 @@ impl EngineHandle {
             .map(|title| (*title).clone())
     }
 
-    pub(crate) fn record_presentation_title_applied(&self) {
-        self.inspect.record_title_applied();
-    }
-
-    pub(crate) fn record_presentation_hyperlink_open(&self) {
-        self.inspect.record_hyperlink_open();
+    pub(crate) fn record_presentation_drain_inspect(
+        &self,
+        result: &super::presentation::PresentationDrainResult,
+    ) {
+        super::presentation::record_presentation_drain_inspect(&self.inspect, result);
     }
 
     /// Test hook: the next `count` `build_frame` attempts on **this handle's**
@@ -1302,32 +1301,6 @@ mod tests {
         assert_eq!(snap.title_slot_overwrites, 0);
         assert_eq!(snap.hyperlink_opens, 0);
         assert_eq!(snap.presentation_channel_full_drops, 0);
-        h.stop();
-    }
-
-    #[test]
-    fn presentation_inspect_title_applied_when_enabled() {
-        use std::time::Duration;
-
-        use crate::engine::presentation::EnginePresentationEvent;
-
-        let h = EngineHandle::spawn(test_config());
-        h.set_inspect_enabled(true);
-        h.feed(b"\x1b]2;Applied\x1b\\".to_vec()).unwrap();
-        let ev = h
-            .presentation_rx()
-            .recv_timeout(Duration::from_secs(2))
-            .expect("title event");
-        assert_eq!(ev, EnginePresentationEvent::TitleChanged("Applied".into()));
-        assert!(h.take_latest_title().is_some());
-        h.record_presentation_title_applied();
-        assert_eq!(h.inspect().titles_applied, 1);
-        assert!(
-            h.inspect()
-                .recent
-                .iter()
-                .any(|e| e.kind == InspectEventKind::TitleApplied)
-        );
         h.stop();
     }
 

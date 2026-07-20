@@ -45,6 +45,50 @@ pub(crate) fn resolve_drain_title(
     }
 }
 
+/// Outcome of draining presentation channel events + the latest-title slot.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub(crate) struct PresentationDrainResult {
+    pub applied_title: Option<String>,
+    pub validated_hyperlink_urls: Vec<String>,
+}
+
+/// Collect presentation drain effects from the slot + channel batch.
+pub(crate) fn collect_presentation_drain(
+    slot_title: Option<String>,
+    channel_events: impl IntoIterator<Item = EnginePresentationEvent>,
+) -> PresentationDrainResult {
+    let mut channel_titles = Vec::new();
+    let mut validated_hyperlink_urls = Vec::new();
+    for ev in channel_events {
+        match ev {
+            EnginePresentationEvent::TitleChanged(title) => channel_titles.push(title),
+            EnginePresentationEvent::HyperlinkOpen { url } => {
+                if let Some(url) = validate_open_url(&url) {
+                    validated_hyperlink_urls.push(url);
+                }
+            }
+            EnginePresentationEvent::ClipboardWrite { .. } => {}
+        }
+    }
+    PresentationDrainResult {
+        applied_title: resolve_drain_title(slot_title, &channel_titles),
+        validated_hyperlink_urls,
+    }
+}
+
+/// The sole inspect-counter site for foreground presentation drain.
+pub(crate) fn record_presentation_drain_inspect(
+    inspect: &super::inspect::InspectShared,
+    result: &PresentationDrainResult,
+) {
+    for _ in &result.validated_hyperlink_urls {
+        inspect.record_hyperlink_open();
+    }
+    if result.applied_title.is_some() {
+        inspect.record_title_applied();
+    }
+}
+
 /// Sanitize and bound an OSC-reported title for `reported_title` only.
 pub fn sanitize_reported_title(raw: &str) -> Option<String> {
     let mut out = String::with_capacity(raw.len());
@@ -132,9 +176,11 @@ pub fn plain_url_covering_cell(row_text: &str, col: usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_REPORTED_TITLE_CHARS, plain_url_covering_cell, resolve_drain_title,
-        sanitize_reported_title, validate_open_url,
+        EnginePresentationEvent, MAX_REPORTED_TITLE_CHARS, PresentationDrainResult,
+        collect_presentation_drain, plain_url_covering_cell, record_presentation_drain_inspect,
+        resolve_drain_title, sanitize_reported_title, validate_open_url,
     };
+    use crate::engine::inspect::{InspectEventKind, InspectShared};
 
     #[test]
     fn sanitize_strips_controls_and_bounds_length() {
@@ -205,5 +251,58 @@ mod tests {
             Some("https://example.com/x")
         );
         assert_eq!(plain_url_covering_cell(row, 0), None);
+    }
+
+    #[test]
+    fn presentation_inspect_drain_records_title_applied_when_enabled() {
+        let inspect = InspectShared::new(40, 8, 32);
+        inspect.set_enabled(true);
+        let result = collect_presentation_drain(
+            Some("Applied".into()),
+            std::iter::empty::<EnginePresentationEvent>(),
+        );
+        record_presentation_drain_inspect(&inspect, &result);
+        assert_eq!(inspect.snapshot().titles_applied, 1);
+        assert!(
+            inspect
+                .snapshot()
+                .recent
+                .iter()
+                .any(|e| e.kind == InspectEventKind::TitleApplied)
+        );
+    }
+
+    #[test]
+    fn presentation_inspect_drain_records_hyperlink_open_when_enabled() {
+        let inspect = InspectShared::new(40, 8, 32);
+        inspect.set_enabled(true);
+        let result = collect_presentation_drain(
+            None,
+            [EnginePresentationEvent::HyperlinkOpen {
+                url: "https://example.com/x".into(),
+            }],
+        );
+        record_presentation_drain_inspect(&inspect, &result);
+        assert_eq!(inspect.snapshot().hyperlink_opens, 1);
+        assert!(
+            inspect
+                .snapshot()
+                .recent
+                .iter()
+                .any(|e| e.kind == InspectEventKind::HyperlinkOpen)
+        );
+    }
+
+    #[test]
+    fn presentation_inspect_drain_counters_zero_when_disabled() {
+        let inspect = InspectShared::new(40, 8, 32);
+        let result = PresentationDrainResult {
+            applied_title: Some("Applied".into()),
+            validated_hyperlink_urls: vec!["https://example.com/x".into()],
+        };
+        record_presentation_drain_inspect(&inspect, &result);
+        let snap = inspect.snapshot();
+        assert_eq!(snap.titles_applied, 0);
+        assert_eq!(snap.hyperlink_opens, 0);
     }
 }

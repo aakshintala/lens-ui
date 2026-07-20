@@ -1040,31 +1040,24 @@ impl TerminalTab {
             return;
         };
         let slot_title = engine.take_latest_title();
-        let mut channel_titles = Vec::new();
+        let mut channel_events = Vec::new();
         while let Ok(ev) = engine.presentation_rx().try_recv() {
-            match ev {
-                engine::presentation::EnginePresentationEvent::TitleChanged(title) => {
-                    channel_titles.push(title);
-                }
-                engine::presentation::EnginePresentationEvent::HyperlinkOpen { url } => {
-                    if let Some(url) = engine::presentation::validate_open_url(&url) {
-                        let id = HostRequestId(self.next_host_request_id);
-                        self.next_host_request_id = self.next_host_request_id.wrapping_add(1);
-                        engine.record_presentation_hyperlink_open();
-                        cx.emit(TerminalEvent::OpenUrlRequest { id, url });
-                    }
-                }
-                engine::presentation::EnginePresentationEvent::ClipboardWrite { .. } => {
-                    // 2b owns policy/registration. 2d: no-op (do not emit Allow).
-                }
-            }
+            channel_events.push(ev);
         }
-        if let Some(title) = engine::presentation::resolve_drain_title(slot_title, &channel_titles)
-        {
+        let result = engine::presentation::collect_presentation_drain(slot_title, channel_events);
+        for url in &result.validated_hyperlink_urls {
+            let id = HostRequestId(self.next_host_request_id);
+            self.next_host_request_id = self.next_host_request_id.wrapping_add(1);
+            cx.emit(TerminalEvent::OpenUrlRequest {
+                id,
+                url: url.clone(),
+            });
+        }
+        if let Some(title) = result.applied_title.clone() {
             apply_title_to_presentation(&mut self.presentation, title);
-            engine.record_presentation_title_applied();
             cx.emit(TerminalEvent::PresentationChanged);
         }
+        engine.record_presentation_drain_inspect(&result);
     }
 
     /// Forward visibility to the engine worker; repaint when shown.
