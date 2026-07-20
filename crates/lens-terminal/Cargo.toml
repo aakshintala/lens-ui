@@ -19,6 +19,7 @@ libghostty-vt = { path = "../../vendor/libghostty-rs/libghostty-vt" }
 arc-swap = "1"
 crossbeam-channel = "0.5"
 futures = "0.3"
+url = "2"
 
 [features]
 bench = []
@@ -58,6 +59,12 @@ required-features = ["test-util"]
 [[test]]
 name = "input_realwindow"
 path = "tests/input_realwindow.rs"
+harness = false
+required-features = ["test-util"]
+
+[[test]]
+name = "presentation_realwindow"
+path = "tests/presentation_realwindow.rs"
 harness = false
 required-features = ["test-util"]
 

@@ -10,8 +10,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    App, Bounds, Div, ElementInputHandler, Entity, FocusHandle, Pixels, Window, canvas, div, point,
-    prelude::*, size,
+    App, Bounds, Div, ElementInputHandler, Entity, FocusHandle, MouseButton, Pixels, Point, Window,
+    canvas, div, point, prelude::*, size,
 };
 
 use super::inspect::RenderInspectShared;
@@ -24,6 +24,7 @@ pub struct TabRenderState {
     pub latest_frame: Option<Arc<Frame>>,
     pub cell_metrics: Option<CellMetrics>,
     pub inspect: RenderInspectShared,
+    last_paint_origin: Rc<RefCell<Option<Point<Pixels>>>>,
     /// Written every paint; read only via `last_stats` (the test/harness stats
     /// surface). In the normal 1c build there is no reader yet, so suppress
     /// dead-code there — the production stats surface is the Inspect ring.
@@ -37,8 +38,17 @@ impl TabRenderState {
             latest_frame: None,
             cell_metrics: None,
             inspect: RenderInspectShared::new(),
+            last_paint_origin: Rc::new(RefCell::new(None)),
             stats_slot: Rc::new(RefCell::new(None)),
         }
+    }
+
+    pub fn latest_frame(&self) -> Option<Arc<Frame>> {
+        self.latest_frame.clone()
+    }
+
+    pub fn last_paint_origin(&self) -> Option<Point<Pixels>> {
+        *self.last_paint_origin.borrow()
     }
 
     /// Replace the frame to paint on the next render. Slice 1d's engine wake
@@ -82,6 +92,7 @@ impl TabRenderState {
         let frame = self.latest_frame.clone();
         let inspect = self.inspect.clone();
         let stats_slot = Rc::clone(&self.stats_slot);
+        let paint_origin_slot = Rc::clone(&self.last_paint_origin);
         let placeholder = format!("{placeholder_title} — {lifecycle_dbg}");
         let preedit_owned = input.as_ref().and_then(|(p, _)| (*p).map(str::to_owned));
         let focus_for_input = focus.clone();
@@ -91,7 +102,8 @@ impl TabRenderState {
         if let Some(tab) = input_tab.clone() {
             let tab_down = tab.clone();
             let tab_up = tab.clone();
-            let tab_scroll = tab;
+            let tab_scroll = tab.clone();
+            let tab_mouse = tab;
             el = el
                 .on_key_down(move |event, window, cx| {
                     tab_down.update(cx, |tab, cx| tab.handle_key_down(event, window, cx));
@@ -101,6 +113,9 @@ impl TabRenderState {
                 })
                 .on_scroll_wheel(move |event, _window, cx| {
                     tab_scroll.update(cx, |tab, cx| tab.handle_scroll_wheel(event, cx));
+                })
+                .on_mouse_down(MouseButton::Left, move |event, window, cx| {
+                    tab_mouse.update(cx, |tab, cx| tab.on_mouse_down(event, window, cx));
                 });
         }
         match frame {
@@ -124,9 +139,12 @@ impl TabRenderState {
             }
             Some(frame) => {
                 let input_tab_paint = input_tab.clone();
+                let paint_origin_slot = Rc::clone(&paint_origin_slot);
                 el.child(canvas(
                     |_, _, _| {},
                     move |bounds, _, window, cx| {
+                        *paint_origin_slot.borrow_mut() =
+                            Some(point(bounds.origin.x, bounds.origin.y));
                         let Some(metrics) = metrics.as_ref() else {
                             return;
                         };

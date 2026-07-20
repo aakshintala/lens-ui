@@ -39,7 +39,10 @@ use gpui::{App, AppContext, Application, WindowOptions};
 use gpui_component::Root;
 use lens_client::ids::{ConnectionId, SessionId, TerminalId};
 use lens_client::{Auth, Client, Connection};
-use lens_terminal::{TerminalKey, TerminalOpenOptions, TerminalTarget, open};
+use lens_terminal::{
+    HostRequestDecision, TerminalEvent, TerminalHostEvent, TerminalKey, TerminalOpenOptions,
+    TerminalTarget, open,
+};
 
 struct DemoConfig {
     base_url: url::Url,
@@ -75,6 +78,36 @@ fn main() {
 
         match cx.open_window(WindowOptions::default(), move |window, cx| {
             let tab = open(target, client, options, cx);
+            let tab_for_events = tab.clone();
+            let _ = cx.subscribe(&tab_for_events, move |this, event, cx| {
+                match event {
+                    TerminalEvent::OpenUrlRequest { id, url } => {
+                        eprintln!("demo: OpenUrlRequest id={id:?} url={url}");
+                        let id = *id;
+                        this.update(cx, |tab, cx| {
+                            tab.on_host_event(
+                                TerminalHostEvent::HostRequestResponse {
+                                    id,
+                                    decision: HostRequestDecision::Allow,
+                                },
+                                cx,
+                            );
+                        });
+                    }
+                    TerminalEvent::PresentationChanged => {
+                        let p = this.read(cx).presentation();
+                        eprintln!(
+                            "demo: presentation identity={} reported={:?}",
+                            p.identity_title, p.reported_title
+                        );
+                    }
+                    _ => {
+                        // Forward-compat: never auto-allow unknown host requests
+                        // (Slice 2b clipboard). `#[non_exhaustive]` — catch-all required.
+                        eprintln!("demo: unhandled TerminalEvent — Deny by policy (2d no-op)");
+                    }
+                }
+            });
             let any: gpui::AnyView = tab.into();
             cx.new(|cx| Root::new(any, window, cx))
         }) {

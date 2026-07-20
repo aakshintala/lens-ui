@@ -35,6 +35,7 @@ use lens_client::WsOutbound;
 
 mod bridge;
 mod engine;
+mod hit_test;
 mod input_gate;
 mod inspect;
 mod policy;
@@ -108,8 +109,8 @@ pub mod engine_bench_api {
 use gpui::prelude::*;
 use gpui::{
     App, Bounds, Context, Entity, EntityInputHandler, EventEmitter, FocusHandle, IntoElement,
-    KeyDownEvent, KeyUpEvent, Pixels, Render, ScrollWheelEvent, Subscription, UTF16Selection,
-    Window,
+    KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, Pixels, Render, ScrollWheelEvent,
+    Subscription, UTF16Selection, Window,
 };
 use lens_client::Client;
 use lens_client::ids::{SessionId, TerminalId};
@@ -315,6 +316,17 @@ pub use render::inspect::{RenderInspect, RenderInspectEvent, RenderInspectEventK
 // Typed event seams (opaque; grow across slices — hence `#[non_exhaustive]`).
 // ---------------------------------------------------------------------------
 
+/// Opaque id for a host permission request (URL open, clipboard write, …).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct HostRequestId(pub u64);
+
+/// Host decision on a [`HostRequestId`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HostRequestDecision {
+    Allow,
+    Deny,
+}
+
 /// The single typed **inbound** seam: host → tab. Delivered via
 /// [`TerminalTab::on_host_event`].
 ///
@@ -328,6 +340,11 @@ pub enum TerminalHostEvent {
     Sleep,
     /// Wake from Sleep: reattach if the same resource generation survived.
     Wake,
+    /// Host response to a typed permission request emitted on [`TerminalEvent`].
+    HostRequestResponse {
+        id: HostRequestId,
+        decision: HostRequestDecision,
+    },
 }
 
 /// The single typed **outbound** stream: tab → host, via gpui's
@@ -342,6 +359,8 @@ pub enum TerminalEvent {
     /// The tab's [`Presentation`] changed; host should re-read via
     /// [`TerminalTab::presentation`].
     PresentationChanged,
+    /// User clicked a validated hyperlink; host may open the URL after policy.
+    OpenUrlRequest { id: HostRequestId, url: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -382,6 +401,8 @@ pub struct TerminalTab {
     focus_in_sub: Option<Subscription>,
     focus_out_sub: Option<Subscription>,
     focus_subs_armed: bool,
+    /// Monotonic id source for typed host permission requests.
+    next_host_request_id: u64,
 }
 
 impl TerminalTab {
@@ -413,6 +434,7 @@ impl TerminalTab {
             focus_in_sub: None,
             focus_out_sub: None,
             focus_subs_armed: false,
+            next_host_request_id: 0,
         }
     }
 
@@ -460,6 +482,7 @@ impl TerminalTab {
             focus_in_sub: None,
             focus_out_sub: None,
             focus_subs_armed: false,
+            next_host_request_id: 0,
         }
     }
 
@@ -576,6 +599,72 @@ impl TerminalTab {
     pub fn set_frame_for_test(&mut self, frame: Arc<Frame>, cx: &mut Context<Self>) {
         self.render.set_frame(frame);
         cx.notify();
+    }
+
+    /// Last canvas paint origin (test/harness only).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn last_paint_origin_for_test(&self) -> Option<gpui::Point<Pixels>> {
+        self.render.last_paint_origin()
+    }
+
+    /// Resolved cell metrics (test/harness only).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn cell_metrics_for_test(&self) -> Option<render::metrics::CellMetrics> {
+        self.render.cell_metrics.clone()
+    }
+
+    /// Invoke the production left-click hyperlink path (harness only).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn debug_mouse_down_for_test(
+        &mut self,
+        position: gpui::Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.on_mouse_down(
+            &MouseDownEvent {
+                button: MouseButton::Left,
+                position,
+                ..Default::default()
+            },
+            window,
+            cx,
+        );
+    }
+
+    pub(crate) fn on_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.button != MouseButton::Left {
+            return;
+        }
+        let Some(frame) = self.render.latest_frame() else {
+            return;
+        };
+        let Some(metrics) = self.render.cell_metrics.clone() else {
+            return;
+        };
+        let Some(origin) = self.render.last_paint_origin() else {
+            return;
+        };
+        let Some((col, row)) =
+            hit_test::pixel_to_cell(origin, &metrics, event.position, frame.cols, frame.rows)
+        else {
+            return;
+        };
+        let Some(url) = hit_test::uri_for_gesture(frame.as_ref(), col, row) else {
+            return;
+        };
+        let Some(engine) = self.runtime.as_ref().and_then(|r| r.engine.as_ref()) else {
+            return;
+        };
+        let _ = engine.enqueue_presentation(
+            engine::presentation::EnginePresentationEvent::HyperlinkOpen { url },
+        );
+        self.drain_presentation_events(cx);
     }
 
     fn write_input_allowed(&self) -> bool {
@@ -957,8 +1046,12 @@ impl TerminalTab {
                 engine::presentation::EnginePresentationEvent::TitleChanged(title) => {
                     channel_titles.push(title);
                 }
-                engine::presentation::EnginePresentationEvent::HyperlinkOpen { .. } => {
-                    // Task 4 fills.
+                engine::presentation::EnginePresentationEvent::HyperlinkOpen { url } => {
+                    if let Some(url) = engine::presentation::validate_open_url(&url) {
+                        let id = HostRequestId(self.next_host_request_id);
+                        self.next_host_request_id = self.next_host_request_id.wrapping_add(1);
+                        cx.emit(TerminalEvent::OpenUrlRequest { id, url });
+                    }
                 }
                 engine::presentation::EnginePresentationEvent::ClipboardWrite { .. } => {
                     // 2b owns policy/registration. 2d: no-op (do not emit Allow).

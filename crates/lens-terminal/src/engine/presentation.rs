@@ -63,9 +63,78 @@ pub fn sanitize_reported_title(raw: &str) -> Option<String> {
     Some(bounded)
 }
 
+pub fn validate_open_url(raw: &str) -> Option<String> {
+    use url::Url;
+
+    if raw.is_empty() || raw.len() > MAX_HYPERLINK_URI_BYTES {
+        return None;
+    }
+    if raw.as_bytes().first().is_some_and(u8::is_ascii_whitespace)
+        || raw.as_bytes().last().is_some_and(u8::is_ascii_whitespace)
+    {
+        return None;
+    }
+    if raw.chars().any(|c| {
+        let u = c as u32;
+        u <= 0x1F || u == 0x7F || c.is_whitespace() || c == '\\'
+    }) {
+        return None;
+    }
+    let parsed = Url::parse(raw).ok()?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return None;
+    }
+    let host = parsed.host_str()?;
+    if host.is_empty() {
+        return None;
+    }
+    Some(raw.to_owned())
+}
+
+fn starts_url_scheme_at(cells: &[char], i: usize) -> bool {
+    fn prefix_at(cells: &[char], i: usize, prefix: &str) -> bool {
+        prefix
+            .chars()
+            .enumerate()
+            .all(|(j, ch)| cells.get(i + j) == Some(&ch))
+    }
+    prefix_at(cells, i, "https://") || prefix_at(cells, i, "http://")
+}
+
+/// Scan by Unicode scalar / cell index. Build a dense cell vector (one char per
+/// cell) and search for `http://` / `https://` spans in cell space — never use
+/// raw `str::find` byte offsets as `col`.
+pub fn plain_url_covering_cell(row_text: &str, col: usize) -> Option<String> {
+    let cells: Vec<char> = row_text.chars().collect();
+    if col >= cells.len() {
+        return None;
+    }
+    let mut i = 0;
+    while i < cells.len() {
+        if starts_url_scheme_at(&cells, i) {
+            let end = cells[i..]
+                .iter()
+                .position(|c| c.is_whitespace() || matches!(c, '"' | '\'' | ')' | '(' | '<' | '>'))
+                .map(|rel| i + rel)
+                .unwrap_or(cells.len());
+            if col >= i && col < end {
+                let url: String = cells[i..end].iter().collect();
+                return validate_open_url(&url);
+            }
+            i = end.max(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{MAX_REPORTED_TITLE_CHARS, resolve_drain_title, sanitize_reported_title};
+    use super::{
+        MAX_REPORTED_TITLE_CHARS, plain_url_covering_cell, resolve_drain_title,
+        sanitize_reported_title, validate_open_url,
+    };
 
     #[test]
     fn sanitize_strips_controls_and_bounds_length() {
@@ -107,5 +176,34 @@ mod tests {
     fn channel_fifo_last_wins_when_slot_empty() {
         let resolved = resolve_drain_title(None, &["First".into(), "Last".into()]);
         assert_eq!(resolved.as_deref(), Some("Last"));
+    }
+
+    #[test]
+    fn validate_open_url_accepts_https_rejects_dangerous() {
+        assert_eq!(
+            validate_open_url("https://example.com/a"),
+            Some("https://example.com/a".into())
+        );
+        assert_eq!(validate_open_url("javascript:alert(1)"), None);
+        assert_eq!(validate_open_url("data:text/html,hi"), None);
+        assert_eq!(validate_open_url("file:///etc/passwd"), None);
+        assert_eq!(validate_open_url(" https://example.com"), None);
+        assert_eq!(validate_open_url("https://example.com "), None);
+        assert_eq!(validate_open_url("https://example.com/\r\nINJECT"), None);
+        assert_eq!(validate_open_url(r"https://example.com\path"), None);
+        assert_eq!(validate_open_url("https://#frag"), None);
+        assert_eq!(validate_open_url("https://?x"), None);
+        assert_eq!(validate_open_url("http://"), None);
+        assert_eq!(validate_open_url("ftp://example.com"), None);
+    }
+
+    #[test]
+    fn plain_url_covering_cell_uses_cell_index_not_bytes() {
+        let row = "見 https://example.com/x";
+        assert_eq!(
+            plain_url_covering_cell(row, 2).as_deref(),
+            Some("https://example.com/x")
+        );
+        assert_eq!(plain_url_covering_cell(row, 0), None);
     }
 }
