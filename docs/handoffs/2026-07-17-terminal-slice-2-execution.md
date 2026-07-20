@@ -107,20 +107,19 @@ These were folded from the gpt-5.6 review — the plans contain the tests; keep 
   real macOS display (Tab→`\t`, Enter→`\r`, Shift+a→"A", ArrowUp→`\x1b[A`, all single-emit — no double-emit).
   Full per-task log + all review findings/adjudications: ledger `.superpowers/sdd/progress.md` (Slice 2 section).
 
-## ⚠ NEXT SESSION — FIRST action: fix deferred Critical **C2** (before or as part of 2d)
+## ✅ Critical **C2** — CLOSED (2026-07-20). Superseded; see header.
 
-The broad 2a-slice review found one Critical too substantial/security-sensitive to patch at session end:
-**retained-engine egress survives the reconnect/downgrade boundary and is epoch-unrevocable.** The egress
-channel is an untyped shared `Vec<u8>`; bytes already queued past the worker can't be revoked by the worker's
-final-egress epoch check. Consequences: (a) on retained-engine reconnect a new bridge (`bridge.rs:39`) drains
-pre-disconnect user bytes → **stale input replays to the fresh connection**; (b) a Write→ReadOnly downgrade
-(`lib.rs:975/1102`) can't revoke write bytes already in egress → **stale write input replays after an
-unauthorized downgrade (read-only-enforcement bypass — security).** Candidate fix: **drain the egress channel
-when respawning a bridge onto a retained engine** (covers downgrade too, since downgrade = teardown + read-only
-reconnect). BUT requires a decision: **is input the user typed during `Reconnecting` flushed, or sent
-post-reconnect?** That touches 1d reconnect-input semantics — design first, then implement. NOT a quick patch.
+The 2a-slice review's deferred Critical (retained-engine egress survives the reconnect/downgrade
+boundary, epoch-unrevocable) is **CLOSED** — full slice `fd79d54..2921da8`, plan
+`docs/superpowers/plans/2026-07-18-terminal-c2-per-transport-egress.md`. The untyped shared `Vec<u8>`
+egress became a swappable typed `Sender<EgressFrame>` owned by the worker (in-order `SetEgress`), each
+bridge owning its own receiver, so emitted residue stays on the OLD channel (drain-dropped on stop);
+plus an `access_epoch` bump on every teardown revokes un-encoded upstream input. C1 (false
+EngineStopped) closed by-construction; C2 (reply-source) narrowed with a documented join-before-attach
+residual (only live if a live-bridge teardown path is added). The Reconnecting-input-semantics decision
+was resolved in 1d. **Nothing to do here — proceed straight to 2d.**
 
-## Then: execute **2d** (presentation) on top of 2a
+## NEXT: execute **2d** (presentation) on top of 2a
 
 `docs/superpowers/plans/2026-07-17-terminal-slice-2d-presentation.md` — self-contained, lands on 2a's committed
 code (declares its own presentation surface + `VtEngine::new` `presentation_tx` arity). Same flow:
