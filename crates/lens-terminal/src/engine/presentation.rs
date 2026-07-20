@@ -1,7 +1,6 @@
 //! Engine→host presentation events (titles, hyperlinks, clipboard).
 
 pub const PRESENTATION_CHANNEL_CAP: usize = 64;
-#[expect(dead_code, reason = "Task 2 title sanitize bounds to this limit")]
 pub const MAX_REPORTED_TITLE_CHARS: usize = 512;
 #[expect(dead_code, reason = "Task 3 hyperlink validation uses this limit")]
 pub const MAX_HYPERLINK_URI_BYTES: usize = 8192;
@@ -47,9 +46,53 @@ pub(crate) fn resolve_drain_title(
     }
 }
 
+/// Sanitize and bound an OSC-reported title for `reported_title` only.
+pub fn sanitize_reported_title(raw: &str) -> Option<String> {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        let cu = ch as u32;
+        if cu <= 0x1F || cu == 0x7F || (0x80..=0x9F).contains(&cu) {
+            continue;
+        }
+        out.push(ch);
+    }
+    let trimmed = out.trim_matches(|c: char| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0C'));
+    if trimmed.is_empty() {
+        return None;
+    }
+    let bounded: String = trimmed.chars().take(MAX_REPORTED_TITLE_CHARS).collect();
+    Some(bounded)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::resolve_drain_title;
+    use super::{MAX_REPORTED_TITLE_CHARS, resolve_drain_title, sanitize_reported_title};
+
+    #[test]
+    fn sanitize_strips_controls_and_bounds_length() {
+        let dirty = format!("ab\u{0007}cd{}", "X".repeat(600));
+        let clean = sanitize_reported_title(&dirty).expect("Some");
+        assert!(!clean.contains('\u{0007}'));
+        assert_eq!(clean.chars().count(), MAX_REPORTED_TITLE_CHARS);
+        assert!(clean.starts_with("abcd"));
+    }
+
+    #[test]
+    fn sanitize_trims_ascii_whitespace_before_truncate() {
+        let mut s = String::from("   ");
+        s.push_str(&"Y".repeat(510));
+        s.push_str("   ");
+        let clean = sanitize_reported_title(&s).expect("Some");
+        assert_eq!(clean.chars().count(), 510);
+        assert!(!clean.starts_with(' '));
+        assert!(!clean.ends_with(' '));
+    }
+
+    #[test]
+    fn sanitize_empty_after_controls_returns_none() {
+        assert_eq!(sanitize_reported_title("\u{0007}\u{001b}"), None);
+        assert_eq!(sanitize_reported_title("   "), None);
+    }
 
     #[test]
     fn slot_authoritative_over_stale_channel_title_on_drain() {

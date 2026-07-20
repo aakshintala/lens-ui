@@ -19,7 +19,7 @@ use thiserror::Error;
 use super::command::{KeyInput, ScrollDelta};
 use super::frame::{CellStyle, CursorPos, Frame, FrameCell, FrameRow, Rgb, UnderlineStyle};
 use super::key_map::encode_key_pure;
-use super::presentation::EnginePresentationEvent;
+use super::presentation::{EnginePresentationEvent, sanitize_reported_title};
 use super::worker::WakerSlot;
 
 type OnReplyFn = Box<dyn FnMut(&[u8]) + 'static>;
@@ -95,18 +95,30 @@ impl VtEngine {
         // path may already hold one clone of that sender.
         let title_slot = Arc::clone(&latest_title_slot);
         let title_tx = presentation_tx;
+        let waker_for_title = waker.clone();
         terminal.on_title_changed(move |term| {
-            let Ok(raw) = term.title() else {
+            let Ok(title) = term.title() else {
                 return;
             };
-            let raw = raw.to_owned();
-            title_slot.store(Some(Arc::new(raw.clone())));
-            let _ = title_tx.try_send(EnginePresentationEvent::TitleChanged(raw));
-            if let Some(w) = waker.as_ref()
-                && let Ok(guard) = w.lock()
-                && let Some(f) = guard.as_ref()
-            {
-                f();
+            let wake = || {
+                if let Some(w) = waker_for_title.as_ref()
+                    && let Ok(guard) = w.lock()
+                    && let Some(f) = guard.as_ref()
+                {
+                    f();
+                }
+            };
+            match sanitize_reported_title(title) {
+                Some(clean) => {
+                    title_slot.store(Some(Arc::new(clean.clone())));
+                    let _ = title_tx.try_send(EnginePresentationEvent::TitleChanged(clean));
+                    wake();
+                }
+                None => {
+                    title_slot.store(None);
+                    let _ = title_tx.try_send(EnginePresentationEvent::TitleChanged(String::new()));
+                    wake();
+                }
             }
         })?;
 
@@ -336,6 +348,22 @@ mod tests {
             cell_w_px: 8,
             cell_h_px: 16,
         }
+    }
+
+    #[test]
+    fn osc2_title_is_sanitized_before_enqueue() {
+        use std::time::Duration;
+
+        use super::*;
+        use crate::engine::presentation::{EnginePresentationEvent, PRESENTATION_CHANNEL_CAP};
+
+        let (tx, rx) = crossbeam_channel::bounded(PRESENTATION_CHANNEL_CAP);
+        let mut engine = VtEngine::new(&test_config(), |_| {}, tx).unwrap();
+        // SOH (0x01) embeds a strippable C0 control; BEL (0x07) would terminate the OSC
+        // sequence in libghostty before the title callback sees the full payload.
+        engine.feed(b"\x1b]2;Hi\x01There\x1b\\");
+        let ev = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(ev, EnginePresentationEvent::TitleChanged("HiThere".into()));
     }
 
     #[test]

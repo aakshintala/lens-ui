@@ -20,7 +20,7 @@ pub use inspect::EngineInspect;
 )]
 pub use presentation::{
     ClipboardLocation, ClipboardMimePart, EnginePresentationEvent, MAX_HYPERLINK_URI_BYTES,
-    MAX_REPORTED_TITLE_CHARS, PRESENTATION_CHANNEL_CAP,
+    MAX_REPORTED_TITLE_CHARS, PRESENTATION_CHANNEL_CAP, sanitize_reported_title,
 };
 pub use vt::{EngineConfig, EngineError, VtEngine};
 pub use worker::{EgressFrame, EgressKind};

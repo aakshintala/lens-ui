@@ -1446,6 +1446,7 @@ fn apply_title_to_presentation(presentation: &mut Presentation, title: String) {
     } else {
         presentation.reported_title = Some(title);
     }
+    // NEVER touch presentation.identity_title here.
 }
 
 fn starting_presentation(target: &TerminalTarget, options: &TerminalOpenOptions) -> Presentation {
@@ -1538,6 +1539,24 @@ mod tests {
             cell_w_px: 8,
             cell_h_px: 16,
         }
+    }
+
+    #[test]
+    fn apply_title_event_updates_reported_only() {
+        let mut presentation = Presentation {
+            lifecycle: Lifecycle::Live,
+            access: AccessMode::Write,
+            identity_title: "main:workspace".into(),
+            reported_title: None,
+            progress: None,
+            output_gap: false,
+            input_discarded: false,
+            detached_detail: None,
+            reattach_available: false,
+        };
+        apply_title_to_presentation(&mut presentation, "Shell Title".into());
+        assert_eq!(presentation.identity_title, "main:workspace");
+        assert_eq!(presentation.reported_title.as_deref(), Some("Shell Title"));
     }
 
     fn wait_for_engine_frame(engine: &EngineHandle) -> Arc<Frame> {
