@@ -32,7 +32,8 @@ fn full_redraw_bytes(cols: u16, rows: u16) -> Vec<u8> {
 }
 
 fn seeded_engine() -> VtEngine {
-    let mut engine = VtEngine::new(&bench_config(), |_| {}).expect("engine");
+    let (tx, _rx) = crossbeam_channel::bounded(1);
+    let mut engine = VtEngine::new(&bench_config(), |_| {}, tx).expect("engine");
     engine.feed(&full_redraw_bytes(BENCH_COLS, BENCH_ROWS));
     engine
 }
@@ -41,7 +42,10 @@ fn bench_vt_parse(c: &mut Criterion) {
     let bytes = full_redraw_bytes(BENCH_COLS, BENCH_ROWS);
     c.bench_function("engine_vt_parse_200x50_redraw", |b| {
         b.iter_batched(
-            || VtEngine::new(&bench_config(), |_| {}).expect("engine"),
+            || {
+                let (tx, _rx) = crossbeam_channel::bounded(1);
+                VtEngine::new(&bench_config(), |_| {}, tx).expect("engine")
+            },
             |mut engine| {
                 engine.feed(black_box(&bytes));
                 engine
@@ -93,7 +97,8 @@ fn bench_key_encode_arrow_up(c: &mut Criterion) {
     c.bench_function("key_encode_arrow_up", |b| {
         b.iter_batched(
             || {
-                let mut engine = VtEngine::new(&bench_config(), |_| {}).expect("engine");
+                let (tx, _rx) = crossbeam_channel::bounded(1);
+                let mut engine = VtEngine::new(&bench_config(), |_| {}, tx).expect("engine");
                 engine.feed(b"\x1b[?1h");
                 engine
             },

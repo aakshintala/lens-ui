@@ -4,6 +4,7 @@ pub mod frame;
 pub mod handle;
 pub mod inspect;
 pub mod key_map;
+pub mod presentation;
 pub mod vt;
 pub mod worker;
 
@@ -13,5 +14,13 @@ mod reconnect_seed;
 pub use frame::CursorPos;
 pub use handle::{EngineHandle, FeedError};
 pub use inspect::EngineInspect;
+#[expect(
+    unused_imports,
+    reason = "re-exported presentation surface for Slice 2d+"
+)]
+pub use presentation::{
+    ClipboardLocation, ClipboardMimePart, EnginePresentationEvent, MAX_HYPERLINK_URI_BYTES,
+    MAX_REPORTED_TITLE_CHARS, PRESENTATION_CHANNEL_CAP,
+};
 pub use vt::{EngineConfig, EngineError, VtEngine};
 pub use worker::{EgressFrame, EgressKind};

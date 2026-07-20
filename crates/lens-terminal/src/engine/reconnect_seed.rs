@@ -147,7 +147,11 @@ fn retained_reconnect_seed_does_not_duplicate_scrollback() {
     let cfg = reconnect_config();
     let rows = cfg.rows;
 
-    let mut engine = VtEngine::new(&cfg, |_| {}).expect("VtEngine");
+    let mut engine = VtEngine::new(&cfg, |_| {}, {
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        tx
+    })
+    .expect("VtEngine");
     engine.feed(&legs.leg1_seed);
     let sb0 = engine.scrollback_rows_for_test();
     engine.feed(&legs.leg2_seed);

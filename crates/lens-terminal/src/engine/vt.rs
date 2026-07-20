@@ -3,7 +3,10 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
+use arc_swap::ArcSwapOption;
+use crossbeam_channel::Sender;
 use libghostty_vt::render::{CellIterator, RenderState, RowIterator};
 use libghostty_vt::screen::CellWide;
 use libghostty_vt::style::{RgbColor, Style, StyleColor, Underline};
@@ -16,6 +19,8 @@ use thiserror::Error;
 use super::command::{KeyInput, ScrollDelta};
 use super::frame::{CellStyle, CursorPos, Frame, FrameCell, FrameRow, Rgb, UnderlineStyle};
 use super::key_map::encode_key_pure;
+use super::presentation::EnginePresentationEvent;
+use super::worker::WakerSlot;
 
 type OnReplyFn = Box<dyn FnMut(&[u8]) + 'static>;
 
@@ -48,6 +53,7 @@ pub struct VtEngine {
     reply_buffer: Rc<RefCell<Vec<u8>>>,
     #[expect(dead_code, reason = "worker invokes after take_replies in Task 4")]
     on_reply: OnReplyFn,
+    latest_title_slot: Arc<ArcSwapOption<String>>,
 }
 
 impl VtEngine {
@@ -55,6 +61,23 @@ impl VtEngine {
     pub fn new(
         cfg: &EngineConfig,
         on_reply: impl FnMut(&[u8]) + 'static,
+        presentation_tx: Sender<EnginePresentationEvent>,
+    ) -> Result<Self, EngineError> {
+        Self::new_shared(
+            cfg,
+            on_reply,
+            presentation_tx,
+            Arc::new(ArcSwapOption::from(None)),
+            None,
+        )
+    }
+
+    pub(crate) fn new_shared(
+        cfg: &EngineConfig,
+        on_reply: impl FnMut(&[u8]) + 'static,
+        presentation_tx: Sender<EnginePresentationEvent>,
+        latest_title_slot: Arc<ArcSwapOption<String>>,
+        waker: Option<WakerSlot>,
     ) -> Result<Self, EngineError> {
         let reply_buffer = Rc::new(RefCell::new(Vec::new()));
         let buf = Rc::clone(&reply_buffer);
@@ -65,6 +88,26 @@ impl VtEngine {
         })?;
         terminal.on_pty_write(move |_term, data| {
             buf.borrow_mut().extend_from_slice(data);
+        })?;
+
+        // Bare title enqueue — Task 2 wraps with sanitize/bound inside this closure.
+        // Slice 2b re-threads `presentation_tx` for `on_clipboard_write`; the title
+        // path may already hold one clone of that sender.
+        let title_slot = Arc::clone(&latest_title_slot);
+        let title_tx = presentation_tx;
+        terminal.on_title_changed(move |term| {
+            let Ok(raw) = term.title() else {
+                return;
+            };
+            let raw = raw.to_owned();
+            title_slot.store(Some(Arc::new(raw.clone())));
+            let _ = title_tx.try_send(EnginePresentationEvent::TitleChanged(raw));
+            if let Some(w) = waker.as_ref()
+                && let Ok(guard) = w.lock()
+                && let Some(f) = guard.as_ref()
+            {
+                f();
+            }
         })?;
 
         Ok(Self {
@@ -78,7 +121,15 @@ impl VtEngine {
             cell_h_px: cfg.cell_h_px,
             reply_buffer,
             on_reply: Box::new(on_reply) as OnReplyFn,
+            latest_title_slot,
         })
+    }
+
+    /// Take and clear the latest OSC title (authoritative when the channel is full).
+    pub fn take_latest_title(&self) -> Option<String> {
+        self.latest_title_slot
+            .swap(None)
+            .map(|title| (*title).clone())
     }
 
     /// Encode a key event against the terminal's live modes.
@@ -289,7 +340,8 @@ mod tests {
 
     #[test]
     fn builds_frame_with_sgr_and_colors() {
-        let mut e = VtEngine::new(&test_config(), |_| {}).unwrap();
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        let mut e = VtEngine::new(&test_config(), |_| {}, tx).unwrap();
         e.feed(b"\x1b[1;31mHi\x1b[0m\r\n");
         let f = e.build_frame().unwrap();
         assert_eq!((f.cols, f.rows), (20, 3));
@@ -308,7 +360,8 @@ mod tests {
 
     #[test]
     fn builds_frame_with_wide_chars_and_emoji() {
-        let mut e = VtEngine::new(&test_config(), |_| {}).unwrap();
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        let mut e = VtEngine::new(&test_config(), |_| {}, tx).unwrap();
         e.feed("a日b😀c".as_bytes());
         let f = e.build_frame().unwrap();
         let row = &f.grid[0].cells;
@@ -333,7 +386,8 @@ mod tests {
 
     #[test]
     fn build_frame_cursor_none_when_scrolled_out_of_viewport() {
-        let mut e = VtEngine::new(&test_config(), |_| {}).unwrap();
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        let mut e = VtEngine::new(&test_config(), |_| {}, tx).unwrap();
         for i in 0..20 {
             e.feed(format!("line{i}\r\n").as_bytes());
         }

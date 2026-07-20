@@ -12,6 +12,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError};
 use super::command::{InputAck, KeyInput};
 use super::frame::Frame;
 use super::inspect::InspectShared;
+use super::presentation::{EnginePresentationEvent, PRESENTATION_CHANNEL_CAP};
 use super::vt::{EngineConfig, VtEngine};
 
 pub(crate) type WakerSlot = Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>;
@@ -131,11 +132,19 @@ pub(crate) enum EngineCommand {
 pub(crate) struct WorkerChannels {
     pub cmd_tx: Sender<EngineCommand>,
     pub cmd_rx: Receiver<EngineCommand>,
+    pub presentation_tx: Sender<EnginePresentationEvent>,
+    pub presentation_rx: Receiver<EnginePresentationEvent>,
 }
 
 pub(crate) fn worker_channels() -> WorkerChannels {
     let (cmd_tx, cmd_rx) = crossbeam_channel::bounded(CMD_CHANNEL_CAP);
-    WorkerChannels { cmd_tx, cmd_rx }
+    let (presentation_tx, presentation_rx) = crossbeam_channel::bounded(PRESENTATION_CHANNEL_CAP);
+    WorkerChannels {
+        cmd_tx,
+        cmd_rx,
+        presentation_tx,
+        presentation_rx,
+    }
 }
 
 #[expect(
@@ -156,9 +165,17 @@ pub(crate) fn spawn_worker(
     #[cfg(any(test, feature = "test-util"))] worker_stall_gate: Arc<AtomicBool>,
     chunk_barrier: Arc<TestChunkBarrier>,
     access_epoch: Arc<AtomicU64>,
+    presentation_tx: Sender<EnginePresentationEvent>,
+    latest_title_slot: Arc<ArcSwapOption<String>>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
-        let mut engine = match VtEngine::new(&cfg, |_| {}) {
+        let mut engine = match VtEngine::new_shared(
+            &cfg,
+            |_| {},
+            presentation_tx,
+            latest_title_slot,
+            Some(Arc::clone(&waker)),
+        ) {
             Ok(e) => e,
             Err(e) => {
                 eprintln!("lens-terminal engine: failed to create VtEngine: {e}");

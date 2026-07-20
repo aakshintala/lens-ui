@@ -946,6 +946,30 @@ impl TerminalTab {
         }
     }
 
+    fn drain_presentation_events(&mut self, cx: &mut Context<Self>) {
+        let Some(engine) = self.runtime.as_ref().and_then(|r| r.engine.as_ref()) else {
+            return;
+        };
+        if let Some(title) = engine.take_latest_title() {
+            apply_title_to_presentation(&mut self.presentation, title);
+            cx.emit(TerminalEvent::PresentationChanged);
+        }
+        while let Ok(ev) = engine.presentation_rx().try_recv() {
+            match ev {
+                engine::presentation::EnginePresentationEvent::TitleChanged(title) => {
+                    apply_title_to_presentation(&mut self.presentation, title);
+                    cx.emit(TerminalEvent::PresentationChanged);
+                }
+                engine::presentation::EnginePresentationEvent::HyperlinkOpen { .. } => {
+                    // Task 4 fills.
+                }
+                engine::presentation::EnginePresentationEvent::ClipboardWrite { .. } => {
+                    // 2b owns policy/registration. 2d: no-op (do not emit Allow).
+                }
+            }
+        }
+    }
+
     /// Forward visibility to the engine worker; repaint when shown.
     #[cfg_attr(
         not(test),
@@ -1233,6 +1257,7 @@ fn spawn_foreground_sampler(
                             if weak
                                 .update(cx, |tab, cx| {
                                     tab.sample_latest_frame_from_engine();
+                                    tab.drain_presentation_events(cx);
                                     cx.notify();
                                 })
                                 .is_err()
@@ -1366,6 +1391,7 @@ impl Render for TerminalTab {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_focus_subscriptions(window, cx);
         self.sample_latest_frame_from_engine();
+        self.drain_presentation_events(cx);
         // The one shared canvas builder (I6). No frame yet → modeled
         // placeholder (`identity — lifecycle`); a frame → full-snapshot paint.
         // Never panics.
@@ -1410,6 +1436,14 @@ pub fn open(
     })
     .detach();
     entity
+}
+
+fn apply_title_to_presentation(presentation: &mut Presentation, title: String) {
+    if title.is_empty() {
+        presentation.reported_title = None;
+    } else {
+        presentation.reported_title = Some(title);
+    }
 }
 
 fn starting_presentation(target: &TerminalTarget, options: &TerminalOpenOptions) -> Presentation {

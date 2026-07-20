@@ -106,7 +106,8 @@ fn replay_attach_produces_coherent_frame() {
     let bytes = load_replay_bytes(ATTACH_CAPTURE);
     assert!(!bytes.is_empty(), "capture must yield VT bytes");
 
-    let mut engine = VtEngine::new(&default_config(), |_| {}).expect("engine");
+    let (tx, _rx) = crossbeam_channel::bounded(1);
+    let mut engine = VtEngine::new(&default_config(), |_| {}, tx).expect("engine");
     engine.feed(&bytes);
     let frame = engine.build_frame().expect("frame");
     assert_eq!((frame.cols, frame.rows), (80, 24));
@@ -121,7 +122,8 @@ fn replay_resize_reflows_without_panic() {
         "resize capture must have pre/post chunks"
     );
 
-    let mut engine = VtEngine::new(&default_config(), |_| {}).expect("engine");
+    let (tx, _rx) = crossbeam_channel::bounded(1);
+    let mut engine = VtEngine::new(&default_config(), |_| {}, tx).expect("engine");
     engine.feed(&chunks[0]);
     engine
         .resize(120, 40)

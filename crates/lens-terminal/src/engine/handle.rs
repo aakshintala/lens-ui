@@ -11,6 +11,7 @@ use thiserror::Error;
 use super::forwarder::InputForwarder;
 use super::frame::Frame;
 use super::inspect::{EngineInspect, InspectShared};
+use super::presentation::EnginePresentationEvent;
 use super::vt::EngineConfig;
 use super::worker::{self, EngineCommand, TestChunkBarrier, WakerSlot};
 use crate::engine::command::ScrollDelta;
@@ -39,6 +40,9 @@ pub struct EngineHandle {
     frame_ready: Arc<AtomicBool>,
     waker: WakerSlot,
     inspect: Arc<InspectShared>,
+    presentation_rx: Receiver<EnginePresentationEvent>,
+    presentation_tx: crossbeam_channel::Sender<EnginePresentationEvent>,
+    latest_title_slot: Arc<ArcSwapOption<String>>,
     join: Option<JoinHandle<()>>,
     /// Per-handle build-failure injection counter (see `spawn_worker`). Test-only
     /// — set via `test_inject_build_failures`, shared with this handle's worker.
@@ -56,20 +60,29 @@ impl std::fmt::Debug for EngineHandle {
 
 impl EngineHandle {
     pub fn spawn(cfg: EngineConfig) -> Self {
-        let worker::WorkerChannels { cmd_tx, cmd_rx } = worker::worker_channels();
-        Self::spawn_from_parts(cfg, cmd_tx, cmd_rx)
+        let worker::WorkerChannels {
+            cmd_tx,
+            cmd_rx,
+            presentation_tx,
+            presentation_rx,
+        } = worker::worker_channels();
+        Self::spawn_from_parts(cfg, cmd_tx, cmd_rx, presentation_tx, presentation_rx)
     }
 
     #[cfg(test)]
     fn spawn_with_cmd_cap(cfg: EngineConfig, cmd_cap: usize) -> Self {
         let (cmd_tx, cmd_rx) = crossbeam_channel::bounded(cmd_cap);
-        Self::spawn_from_parts(cfg, cmd_tx, cmd_rx)
+        let (presentation_tx, presentation_rx) =
+            crossbeam_channel::bounded(super::presentation::PRESENTATION_CHANNEL_CAP);
+        Self::spawn_from_parts(cfg, cmd_tx, cmd_rx, presentation_tx, presentation_rx)
     }
 
     fn spawn_from_parts(
         cfg: EngineConfig,
         cmd_tx: Sender<EngineCommand>,
         cmd_rx: Receiver<EngineCommand>,
+        presentation_tx: crossbeam_channel::Sender<EnginePresentationEvent>,
+        presentation_rx: Receiver<EnginePresentationEvent>,
     ) -> Self {
         let frame_slot = Arc::new(ArcSwapOption::from(None));
         let frame_ready = Arc::new(AtomicBool::new(false));
@@ -78,6 +91,7 @@ impl EngineHandle {
         let test_build_failures = Arc::new(AtomicUsize::new(0));
         let chunk_barrier = Arc::new(TestChunkBarrier::new());
         let access_epoch = Arc::new(AtomicU64::new(0));
+        let latest_title_slot = Arc::new(ArcSwapOption::from(None));
         #[cfg(any(test, feature = "test-util"))]
         let worker_stall_gate = Arc::new(AtomicBool::new(false));
         let input_forwarder = InputForwarder::spawn(cmd_tx.clone(), Arc::clone(&access_epoch));
@@ -94,6 +108,8 @@ impl EngineHandle {
             Arc::clone(&worker_stall_gate),
             Arc::clone(&chunk_barrier),
             Arc::clone(&access_epoch),
+            presentation_tx.clone(),
+            Arc::clone(&latest_title_slot),
         );
 
         Self {
@@ -106,6 +122,9 @@ impl EngineHandle {
             frame_ready,
             waker,
             inspect,
+            presentation_rx,
+            presentation_tx,
+            latest_title_slot,
             join: Some(join),
             #[cfg(test)]
             test_build_failures,
@@ -227,6 +246,24 @@ impl EngineHandle {
 
     pub fn inspect(&self) -> EngineInspect {
         self.inspect.snapshot()
+    }
+
+    pub fn presentation_rx(&self) -> &Receiver<EnginePresentationEvent> {
+        &self.presentation_rx
+    }
+
+    pub fn enqueue_presentation(&self, ev: EnginePresentationEvent) -> Result<(), FeedError> {
+        self.presentation_tx.try_send(ev).map_err(|e| match e {
+            TrySendError::Full(_) => FeedError::Full,
+            TrySendError::Disconnected(_) => FeedError::Stopped,
+        })
+    }
+
+    /// Take and clear the latest OSC title (authoritative when the channel is full).
+    pub fn take_latest_title(&self) -> Option<String> {
+        self.latest_title_slot
+            .swap(None)
+            .map(|title| (*title).clone())
     }
 
     /// Test hook: the next `count` `build_frame` attempts on **this handle's**
@@ -1119,6 +1156,62 @@ mod tests {
         assert!(drained[1..].iter().all(|b| b == b"a"));
         assert_eq!(h.inspect().user_egress_rejected, 1);
         h.stop();
+    }
+
+    #[test]
+    fn engine_handle_exposes_presentation_rx_after_title_feed() {
+        use crate::engine::presentation::EnginePresentationEvent;
+
+        let h = EngineHandle::spawn(EngineConfig {
+            cols: 40,
+            rows: 8,
+            max_scrollback: 32,
+            cell_w_px: 8,
+            cell_h_px: 16,
+        });
+        h.feed(b"\x1b]2;ViaHandle\x1b\\".to_vec()).unwrap();
+        let title = h
+            .take_latest_title()
+            .or_else(|| {
+                h.presentation_rx()
+                    .recv_timeout(Duration::from_secs(2))
+                    .ok()
+                    .and_then(|ev| match ev {
+                        EnginePresentationEvent::TitleChanged(t) => Some(t),
+                        _ => None,
+                    })
+            })
+            .expect("presentation title");
+        assert_eq!(title, "ViaHandle");
+        h.stop();
+    }
+
+    #[test]
+    fn latest_title_wins_when_channel_full() {
+        use crate::engine::presentation::EnginePresentationEvent;
+        use crate::engine::vt::VtEngine;
+
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let mut engine = VtEngine::new(&test_config(), |_| {}, tx.clone()).unwrap();
+        tx.try_send(EnginePresentationEvent::TitleChanged("Stale".into()))
+            .unwrap();
+        assert!(
+            tx.try_send(EnginePresentationEvent::TitleChanged("Blocked".into()))
+                .is_err(),
+            "channel must be full"
+        );
+        engine.feed(b"\x1b]2;FinalTitle\x1b\\");
+        assert_eq!(
+            engine.take_latest_title().as_deref(),
+            Some("FinalTitle"),
+            "latest-title slot must hold the final OSC title when channel is saturated"
+        );
+        let first = rx.try_recv().unwrap();
+        assert!(
+            matches!(first, EnginePresentationEvent::TitleChanged(t) if t == "Stale"),
+            "channel retains the first enqueued event"
+        );
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
