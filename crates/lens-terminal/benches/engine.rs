@@ -133,7 +133,6 @@ fn bench_presentation_title_callback_throughput(c: &mut Criterion) {
                 for _ in 0..TITLE_FEED_ROUNDS {
                     engine.feed(black_box(title_bytes));
                 }
-                black_box(engine.take_latest_title());
                 engine
             },
             BatchSize::SmallInput,

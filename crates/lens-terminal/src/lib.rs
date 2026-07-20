@@ -1039,12 +1039,12 @@ impl TerminalTab {
         let Some(engine) = self.runtime.as_ref().and_then(|r| r.engine.as_ref()) else {
             return;
         };
-        let slot_title = engine.take_latest_title();
+        let slot_update = engine.take_latest_title();
         let mut channel_events = Vec::new();
         while let Ok(ev) = engine.presentation_rx().try_recv() {
             channel_events.push(ev);
         }
-        let result = engine::presentation::collect_presentation_drain(slot_title, channel_events);
+        let result = engine::presentation::collect_presentation_drain(slot_update, channel_events);
         for url in &result.validated_hyperlink_urls {
             let id = HostRequestId(self.next_host_request_id);
             self.next_host_request_id = self.next_host_request_id.wrapping_add(1);
@@ -1053,9 +1053,16 @@ impl TerminalTab {
                 url: url.clone(),
             });
         }
-        if let Some(title) = result.applied_title.clone() {
-            apply_title_to_presentation(&mut self.presentation, title);
-            cx.emit(TerminalEvent::PresentationChanged);
+        match &result.title_outcome {
+            engine::presentation::TitleDrainOutcome::Set(title) => {
+                apply_title_to_presentation(&mut self.presentation, title.clone());
+                cx.emit(TerminalEvent::PresentationChanged);
+            }
+            engine::presentation::TitleDrainOutcome::Clear => {
+                apply_title_to_presentation(&mut self.presentation, String::new());
+                cx.emit(TerminalEvent::PresentationChanged);
+            }
+            engine::presentation::TitleDrainOutcome::NoChange => {}
         }
         engine.record_presentation_drain_inspect(&result);
     }

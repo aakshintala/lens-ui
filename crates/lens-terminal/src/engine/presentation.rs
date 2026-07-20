@@ -29,39 +29,58 @@ pub enum EnginePresentationEvent {
     },
 }
 
-/// Resolve which OSC title wins when draining presentation events.
-///
-/// The latest-title slot is authoritative when present; channel `TitleChanged`
-/// values are wake-only in that case. With no slot title, channel titles apply
-/// in FIFO order and the last one wins.
-pub(crate) fn resolve_drain_title(
-    slot_title: Option<String>,
-    channel_titles: &[String],
-) -> Option<String> {
-    if let Some(title) = slot_title {
-        Some(title)
-    } else {
-        channel_titles.last().cloned()
+/// Tri-state latest-title slot value — distinguishes set vs clear vs no pending update.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TitleUpdate {
+    Set(String),
+    Clear,
+}
+
+/// Authoritative title outcome from the latest-title slot at drain time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TitleDrainOutcome {
+    Set(String),
+    Clear,
+    NoChange,
+}
+
+/// Resolve `reported_title` solely from the latest-title slot (channel is wake-only).
+pub(crate) fn resolve_title_from_slot(slot_update: Option<TitleUpdate>) -> TitleDrainOutcome {
+    match slot_update {
+        None => TitleDrainOutcome::NoChange,
+        Some(TitleUpdate::Set(title)) => TitleDrainOutcome::Set(title),
+        Some(TitleUpdate::Clear) => TitleDrainOutcome::Clear,
     }
 }
 
 /// Outcome of draining presentation channel events + the latest-title slot.
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PresentationDrainResult {
-    pub applied_title: Option<String>,
+    pub title_outcome: TitleDrainOutcome,
     pub validated_hyperlink_urls: Vec<String>,
 }
 
+impl Default for PresentationDrainResult {
+    fn default() -> Self {
+        Self {
+            title_outcome: TitleDrainOutcome::NoChange,
+            validated_hyperlink_urls: Vec::new(),
+        }
+    }
+}
+
 /// Collect presentation drain effects from the slot + channel batch.
+///
+/// Channel `TitleChanged` events are drained (prevent channel backup / coalesce
+/// wakes) but do **not** influence `title_outcome` — the slot is authoritative.
 pub(crate) fn collect_presentation_drain(
-    slot_title: Option<String>,
+    slot_update: Option<TitleUpdate>,
     channel_events: impl IntoIterator<Item = EnginePresentationEvent>,
 ) -> PresentationDrainResult {
-    let mut channel_titles = Vec::new();
     let mut validated_hyperlink_urls = Vec::new();
     for ev in channel_events {
         match ev {
-            EnginePresentationEvent::TitleChanged(title) => channel_titles.push(title),
+            EnginePresentationEvent::TitleChanged(_) => {}
             EnginePresentationEvent::HyperlinkOpen { url } => {
                 if let Some(url) = validate_open_url(&url) {
                     validated_hyperlink_urls.push(url);
@@ -71,7 +90,7 @@ pub(crate) fn collect_presentation_drain(
         }
     }
     PresentationDrainResult {
-        applied_title: resolve_drain_title(slot_title, &channel_titles),
+        title_outcome: resolve_title_from_slot(slot_update),
         validated_hyperlink_urls,
     }
 }
@@ -84,7 +103,7 @@ pub(crate) fn record_presentation_drain_inspect(
     for _ in &result.validated_hyperlink_urls {
         inspect.record_hyperlink_open();
     }
-    if result.applied_title.is_some() {
+    if !matches!(result.title_outcome, TitleDrainOutcome::NoChange) {
         inspect.record_title_applied();
     }
 }
@@ -176,9 +195,10 @@ pub fn plain_url_covering_cell(row_text: &str, col: usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        EnginePresentationEvent, MAX_REPORTED_TITLE_CHARS, PresentationDrainResult,
-        collect_presentation_drain, plain_url_covering_cell, record_presentation_drain_inspect,
-        resolve_drain_title, sanitize_reported_title, validate_open_url,
+        EnginePresentationEvent, MAX_REPORTED_TITLE_CHARS, PRESENTATION_CHANNEL_CAP,
+        PresentationDrainResult, TitleDrainOutcome, TitleUpdate, collect_presentation_drain,
+        plain_url_covering_cell, record_presentation_drain_inspect, sanitize_reported_title,
+        validate_open_url,
     };
     use crate::engine::inspect::{InspectEventKind, InspectShared};
 
@@ -210,18 +230,46 @@ mod tests {
 
     #[test]
     fn slot_authoritative_over_stale_channel_title_on_drain() {
-        let resolved = resolve_drain_title(Some("FinalTitle".into()), &["Stale".into()]);
+        let result = collect_presentation_drain(
+            Some(TitleUpdate::Set("FinalTitle".into())),
+            [EnginePresentationEvent::TitleChanged("Stale".into())],
+        );
         assert_eq!(
-            resolved.as_deref(),
-            Some("FinalTitle"),
-            "slot must win over a stale channel TitleChanged (pre-fix applied channel last → Stale)"
+            result.title_outcome,
+            TitleDrainOutcome::Set("FinalTitle".into()),
+            "slot must win over stale channel TitleChanged events"
         );
     }
 
     #[test]
-    fn channel_fifo_last_wins_when_slot_empty() {
-        let resolved = resolve_drain_title(None, &["First".into(), "Last".into()]);
-        assert_eq!(resolved.as_deref(), Some("Last"));
+    fn slot_empty_means_no_title_change_despite_channel_titles() {
+        let result = collect_presentation_drain(
+            None,
+            [
+                EnginePresentationEvent::TitleChanged("First".into()),
+                EnginePresentationEvent::TitleChanged("Last".into()),
+            ],
+        );
+        assert_eq!(result.title_outcome, TitleDrainOutcome::NoChange);
+    }
+
+    #[test]
+    fn slot_clear_authoritative_when_channel_full_of_stale_titles() {
+        let stale_channel: Vec<_> = (0..PRESENTATION_CHANNEL_CAP)
+            .map(|i| EnginePresentationEvent::TitleChanged(format!("stale{i}")))
+            .collect();
+        let result = collect_presentation_drain(Some(TitleUpdate::Clear), stale_channel);
+        assert_eq!(result.title_outcome, TitleDrainOutcome::Clear);
+        let mut reported_title = Some("lingering-stale".into());
+        match result.title_outcome {
+            TitleDrainOutcome::Clear => reported_title = None,
+            TitleDrainOutcome::Set(title) => reported_title = Some(title),
+            TitleDrainOutcome::NoChange => {}
+        }
+        assert_eq!(
+            reported_title, None,
+            "Clear slot must clear reported_title even when channel holds stale non-empty titles"
+        );
     }
 
     #[test]
@@ -258,7 +306,7 @@ mod tests {
         let inspect = InspectShared::new(40, 8, 32);
         inspect.set_enabled(true);
         let result = collect_presentation_drain(
-            Some("Applied".into()),
+            Some(TitleUpdate::Set("Applied".into())),
             std::iter::empty::<EnginePresentationEvent>(),
         );
         record_presentation_drain_inspect(&inspect, &result);
@@ -297,7 +345,7 @@ mod tests {
     fn presentation_inspect_drain_counters_zero_when_disabled() {
         let inspect = InspectShared::new(40, 8, 32);
         let result = PresentationDrainResult {
-            applied_title: Some("Applied".into()),
+            title_outcome: TitleDrainOutcome::Set("Applied".into()),
             validated_hyperlink_urls: vec!["https://example.com/x".into()],
         };
         record_presentation_drain_inspect(&inspect, &result);

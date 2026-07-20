@@ -166,7 +166,7 @@ pub(crate) fn spawn_worker(
     chunk_barrier: Arc<TestChunkBarrier>,
     access_epoch: Arc<AtomicU64>,
     presentation_tx: Sender<EnginePresentationEvent>,
-    latest_title_slot: Arc<ArcSwapOption<String>>,
+    latest_title_slot: Arc<ArcSwapOption<super::presentation::TitleUpdate>>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut engine = match VtEngine::new_shared(

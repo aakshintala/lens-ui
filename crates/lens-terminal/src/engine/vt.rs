@@ -21,7 +21,7 @@ use super::command::{KeyInput, ScrollDelta};
 use super::frame::{CellStyle, CursorPos, Frame, FrameCell, FrameRow, Rgb, UnderlineStyle};
 use super::key_map::encode_key_pure;
 use super::presentation::{
-    EnginePresentationEvent, MAX_HYPERLINK_URI_BYTES, sanitize_reported_title,
+    EnginePresentationEvent, MAX_HYPERLINK_URI_BYTES, TitleUpdate, sanitize_reported_title,
 };
 use super::worker::WakerSlot;
 use crate::engine::inspect::InspectShared;
@@ -57,7 +57,7 @@ pub struct VtEngine {
     reply_buffer: Rc<RefCell<Vec<u8>>>,
     #[expect(dead_code, reason = "worker invokes after take_replies in Task 4")]
     on_reply: OnReplyFn,
-    latest_title_slot: Arc<ArcSwapOption<String>>,
+    latest_title_slot: Arc<ArcSwapOption<TitleUpdate>>,
 }
 
 impl VtEngine {
@@ -81,7 +81,7 @@ impl VtEngine {
         cfg: &EngineConfig,
         on_reply: impl FnMut(&[u8]) + 'static,
         presentation_tx: Sender<EnginePresentationEvent>,
-        latest_title_slot: Arc<ArcSwapOption<String>>,
+        latest_title_slot: Arc<ArcSwapOption<TitleUpdate>>,
         waker: Option<WakerSlot>,
         inspect: Option<Arc<InspectShared>>,
     ) -> Result<Self, EngineError> {
@@ -123,7 +123,7 @@ impl VtEngine {
                     {
                         insp.record_title_slot_overwrite();
                     }
-                    title_slot.store(Some(Arc::new(clean.clone())));
+                    title_slot.store(Some(Arc::new(TitleUpdate::Set(clean.clone()))));
                     if let Err(TrySendError::Full(_)) =
                         title_tx.try_send(EnginePresentationEvent::TitleChanged(clean))
                         && let Some(insp) = inspect_for_title.as_ref()
@@ -139,7 +139,7 @@ impl VtEngine {
                     {
                         insp.record_title_slot_overwrite();
                     }
-                    title_slot.store(None);
+                    title_slot.store(Some(Arc::new(TitleUpdate::Clear)));
                     if let Err(TrySendError::Full(_)) =
                         title_tx.try_send(EnginePresentationEvent::TitleChanged(String::new()))
                         && let Some(insp) = inspect_for_title.as_ref()
@@ -166,11 +166,18 @@ impl VtEngine {
         })
     }
 
-    /// Take and clear the latest OSC title (authoritative when the channel is full).
-    pub fn take_latest_title(&self) -> Option<String> {
+    /// Take and clear the latest OSC title update (authoritative at drain).
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "production drain uses EngineHandle::take_latest_title"
+        )
+    )]
+    pub(crate) fn take_latest_title(&self) -> Option<TitleUpdate> {
         self.latest_title_slot
             .swap(None)
-            .map(|title| (*title).clone())
+            .map(|update| (*update).clone())
     }
 
     /// Encode a key event against the terminal's live modes.

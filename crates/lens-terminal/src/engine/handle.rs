@@ -42,7 +42,7 @@ pub struct EngineHandle {
     inspect: Arc<InspectShared>,
     presentation_rx: Receiver<EnginePresentationEvent>,
     presentation_tx: crossbeam_channel::Sender<EnginePresentationEvent>,
-    latest_title_slot: Arc<ArcSwapOption<String>>,
+    latest_title_slot: Arc<ArcSwapOption<super::presentation::TitleUpdate>>,
     join: Option<JoinHandle<()>>,
     /// Per-handle build-failure injection counter (see `spawn_worker`). Test-only
     /// — set via `test_inject_build_failures`, shared with this handle's worker.
@@ -260,10 +260,10 @@ impl EngineHandle {
     }
 
     /// Take and clear the latest OSC title (authoritative when the channel is full).
-    pub fn take_latest_title(&self) -> Option<String> {
+    pub(crate) fn take_latest_title(&self) -> Option<super::presentation::TitleUpdate> {
         self.latest_title_slot
             .swap(None)
-            .map(|title| (*title).clone())
+            .map(|update| (*update).clone())
     }
 
     pub(crate) fn record_presentation_drain_inspect(
@@ -1167,7 +1167,7 @@ mod tests {
 
     #[test]
     fn engine_handle_exposes_presentation_rx_after_title_feed() {
-        use crate::engine::presentation::EnginePresentationEvent;
+        use crate::engine::presentation::{EnginePresentationEvent, TitleUpdate};
 
         let h = EngineHandle::spawn(EngineConfig {
             cols: 40,
@@ -1179,6 +1179,10 @@ mod tests {
         h.feed(b"\x1b]2;ViaHandle\x1b\\".to_vec()).unwrap();
         let title = h
             .take_latest_title()
+            .map(|update| match update {
+                TitleUpdate::Set(title) => title,
+                TitleUpdate::Clear => String::new(),
+            })
             .or_else(|| {
                 h.presentation_rx()
                     .recv_timeout(Duration::from_secs(2))
@@ -1195,7 +1199,9 @@ mod tests {
 
     #[test]
     fn latest_title_wins_when_channel_full() {
-        use crate::engine::presentation::{EnginePresentationEvent, resolve_drain_title};
+        use crate::engine::presentation::{
+            EnginePresentationEvent, TitleDrainOutcome, TitleUpdate, collect_presentation_drain,
+        };
         use crate::engine::vt::VtEngine;
 
         let (tx, rx) = crossbeam_channel::bounded(1);
@@ -1210,8 +1216,8 @@ mod tests {
         engine.feed(b"\x1b]2;FinalTitle\x1b\\");
         let slot = engine.take_latest_title();
         assert_eq!(
-            slot.as_deref(),
-            Some("FinalTitle"),
+            slot,
+            Some(TitleUpdate::Set("FinalTitle".into())),
             "latest-title slot must hold the final OSC title when channel is saturated"
         );
         let first = rx.try_recv().unwrap();
@@ -1221,9 +1227,11 @@ mod tests {
         };
         assert_eq!(stale, "Stale");
         assert!(rx.try_recv().is_err());
+        let result =
+            collect_presentation_drain(slot, [EnginePresentationEvent::TitleChanged(stale)]);
         assert_eq!(
-            resolve_drain_title(slot, &[stale]).as_deref(),
-            Some("FinalTitle"),
+            result.title_outcome,
+            TitleDrainOutcome::Set("FinalTitle".into()),
             "drain apply must not let a stale channel title overwrite the slot"
         );
     }
