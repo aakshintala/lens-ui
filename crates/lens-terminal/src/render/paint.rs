@@ -612,6 +612,7 @@ mod tests {
             wide,
             selected: false,
             style: CellStyle::default(),
+            hyperlink_uri: None,
         }
     }
 

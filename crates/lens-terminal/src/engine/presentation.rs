@@ -2,7 +2,6 @@
 
 pub const PRESENTATION_CHANNEL_CAP: usize = 64;
 pub const MAX_REPORTED_TITLE_CHARS: usize = 512;
-#[expect(dead_code, reason = "Task 3 hyperlink validation uses this limit")]
 pub const MAX_HYPERLINK_URI_BYTES: usize = 8192;
 
 #[derive(Clone, Debug, PartialEq, Eq)]

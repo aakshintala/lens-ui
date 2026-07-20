@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 /// Resolved 24-bit color. No Ghostty/gpui type crosses the Frame seam.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rgb {
@@ -45,6 +47,7 @@ pub struct FrameCell {
     pub wide: bool,
     pub selected: bool,
     pub style: CellStyle,
+    pub hyperlink_uri: Option<Arc<str>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

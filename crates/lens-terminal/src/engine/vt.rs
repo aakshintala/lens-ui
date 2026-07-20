@@ -2,6 +2,7 @@
 //! **The only module that names a `libghostty_vt` type.**
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -19,7 +20,9 @@ use thiserror::Error;
 use super::command::{KeyInput, ScrollDelta};
 use super::frame::{CellStyle, CursorPos, Frame, FrameCell, FrameRow, Rgb, UnderlineStyle};
 use super::key_map::encode_key_pure;
-use super::presentation::{EnginePresentationEvent, sanitize_reported_title};
+use super::presentation::{
+    EnginePresentationEvent, MAX_HYPERLINK_URI_BYTES, sanitize_reported_title,
+};
 use super::worker::WakerSlot;
 
 type OnReplyFn = Box<dyn FnMut(&[u8]) + 'static>;
@@ -215,7 +218,9 @@ impl VtEngine {
         let rows = snapshot.rows()?;
 
         let mut grid = Vec::new();
+        let mut uri_intern: HashMap<Vec<u8>, Arc<str>> = HashMap::new();
         let mut row_iter = self.rows.update(&snapshot)?;
+        let mut row_y: u32 = 0;
         while let Some(row) = row_iter.next() {
             let mut cell_iter = self.cells.update(row)?;
             let mut row_cells = Vec::new();
@@ -229,6 +234,7 @@ impl VtEngine {
                     continue;
                 }
 
+                let raw_cell = cell.raw_cell()?;
                 let graphemes = cell.graphemes()?;
                 let fg = cell.fg_color()?.map(rgb_from_ghostty).unwrap_or(default_fg);
                 let bg = cell.bg_color()?.map(rgb_from_ghostty);
@@ -239,6 +245,11 @@ impl VtEngine {
                 } else {
                     graphemes.iter().collect()
                 };
+                let hyperlink_uri = if raw_cell.has_hyperlink().unwrap_or(false) {
+                    read_hyperlink_uri(&self.terminal, this_col, row_y, &mut uri_intern)
+                } else {
+                    None
+                };
 
                 row_cells.push(FrameCell {
                     col: this_col,
@@ -248,9 +259,11 @@ impl VtEngine {
                     wide: matches!(wide, CellWide::Wide),
                     selected,
                     style,
+                    hyperlink_uri,
                 });
             }
             grid.push(FrameRow { cells: row_cells });
+            row_y += 1;
         }
 
         Ok(Frame {
@@ -261,6 +274,43 @@ impl VtEngine {
             grid,
             cursor: viewport_cursor_pos(&self.terminal, cols, rows),
         })
+    }
+}
+
+fn read_hyperlink_uri(
+    terminal: &Terminal<'_, '_>,
+    col: u16,
+    row: u32,
+    intern: &mut HashMap<Vec<u8>, Arc<str>>,
+) -> Option<Arc<str>> {
+    let grid_ref = terminal
+        .grid_ref(Point::Viewport(PointCoordinate { x: col, y: row }))
+        .ok()?;
+    let mut buf = vec![0u8; 512];
+    loop {
+        match grid_ref.hyperlink_uri(&mut buf) {
+            Ok(0) => return None,
+            Ok(n) => {
+                if n > MAX_HYPERLINK_URI_BYTES {
+                    return None;
+                }
+                let bytes = &buf[..n];
+                if let Some(existing) = intern.get(bytes) {
+                    return Some(Arc::clone(existing));
+                }
+                let s = std::str::from_utf8(bytes).ok()?.to_owned();
+                let arc: Arc<str> = Arc::from(s);
+                intern.insert(bytes.to_vec(), Arc::clone(&arc));
+                return Some(arc);
+            }
+            Err(libghostty_vt::error::Error::OutOfSpace { required }) => {
+                if required <= buf.len() || required > MAX_HYPERLINK_URI_BYTES {
+                    return None;
+                }
+                buf.resize(required, 0);
+            }
+            Err(_) => return None,
+        }
     }
 }
 
@@ -348,6 +398,33 @@ mod tests {
             cell_w_px: 8,
             cell_h_px: 16,
         }
+    }
+
+    #[test]
+    fn osc8_hyperlink_populates_frame_cell_uri() {
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        let mut e = VtEngine::new(&test_config(), |_| {}, tx).unwrap();
+        // OSC 8 hyperlink open/close uses ST (`\x1b\\`) — BEL terminates early in libghostty.
+        e.feed(b"\x1b]8;;https://example.com/x\x1b\\link\x1b]8;;\x1b\\");
+        let f = e.build_frame().unwrap();
+        let cell = f.grid[0]
+            .cells
+            .iter()
+            .find(|c| c.grapheme == "l")
+            .expect("linked cell");
+        assert_eq!(cell.hyperlink_uri.as_deref(), Some("https://example.com/x"));
+    }
+
+    #[test]
+    fn osc8_closer_clears_subsequent_cells() {
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        let mut e = VtEngine::new(&test_config(), |_| {}, tx).unwrap();
+        e.feed(b"\x1b]8;;https://example.com\x1b\\L\x1b]8;;\x1b\\X");
+        let f = e.build_frame().unwrap();
+        let l = f.grid[0].cells.iter().find(|c| c.grapheme == "L").unwrap();
+        let x = f.grid[0].cells.iter().find(|c| c.grapheme == "X").unwrap();
+        assert_eq!(l.hyperlink_uri.as_deref(), Some("https://example.com"));
+        assert_eq!(x.hyperlink_uri, None);
     }
 
     #[test]

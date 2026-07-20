@@ -25,6 +25,7 @@ fn narrow_cell(col: u16, grapheme: &str) -> FrameCell {
         wide: false,
         selected: false,
         style: CellStyle::default(),
+        hyperlink_uri: None,
     }
 }
 
@@ -66,6 +67,7 @@ pub fn sgr_frame() -> Frame {
         wide: false,
         selected,
         style,
+        hyperlink_uri: None,
     };
     let s = |f: fn(&mut CellStyle)| {
         let mut st = CellStyle::default();
