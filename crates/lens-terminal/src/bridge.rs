@@ -67,13 +67,17 @@ pub(crate) fn spawn_bridge(
 impl BridgeHandle {
     /// Synchronously ask the bridge loop to stop, WITHOUT joining. Idempotent.
     ///
-    /// C2 invariant: the foreground calls this at the top of teardown, before any
-    /// egress swap can drop this bridge's sender. Once `stop` is set, a bridge that
-    /// then observes its egress channel `Disconnected` recognises the teardown and
-    /// exits quietly instead of emitting a false [`BridgeEvent::EngineStopped`]
-    /// (see the egress-`Disconnected` arm in `bridge_loop`). It also guarantees the
-    /// old bridge has ceased feeding the engine before the next connection's egress
-    /// is attached, so a post-teardown reply can never land on the new channel.
+    /// The foreground calls this at the top of teardown, before any egress swap can
+    /// drop this bridge's sender. Once `stop` is set, a bridge that then observes its
+    /// egress channel `Disconnected` recognises the teardown and exits quietly instead
+    /// of emitting a false [`BridgeEvent::EngineStopped`] (see the egress-`Disconnected`
+    /// arm in `bridge_loop`). That closes Critical 1 (false EngineStopped tearing down
+    /// the fresh transport) by construction.
+    ///
+    /// This only *requests* stop — the bridge thread keeps running until it next
+    /// observes the flag. It does NOT on its own quiesce feeding, so it does not fully
+    /// close the reply-source path (Critical 2). See the C2 invariant documented in
+    /// `TerminalTab::teardown_transport_off_foreground`.
     pub fn signal_stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
         let _ = self.stop_tx.try_send(());

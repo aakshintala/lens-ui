@@ -877,9 +877,17 @@ impl TerminalTab {
             // Signal the outgoing bridge to stop SYNCHRONOUSLY, before the (detached,
             // possibly-delayed) join and before the next connection can attach its
             // egress. This sets the bridge's `stop` flag so a subsequent egress-sender
-            // drop is recognised as teardown (suppressed, not a false EngineStopped),
-            // and ensures the old bridge stops feeding the engine before the new
-            // channel is live — a post-teardown reply can never reach it (C2).
+            // drop is recognised as teardown (suppressed, not a false EngineStopped =
+            // Critical 1, closed by construction).
+            //
+            // C2 (reply-source) invariant — NOT closed by construction here: signal_stop
+            // does not wait for the bridge to stop feeding. It is safe today only because
+            // every teardown trigger is a bridge self-stop event (LoopExit::Stop) — the
+            // outgoing bridge has already left its loop before we reach here, so it
+            // cannot feed the engine after the next connection's egress attaches. A
+            // future teardown path that fires while the bridge is still live (e.g. a
+            // server-driven downgrade wired through on_host_event) MUST add
+            // join-before-attach (or SetEgress(None) fencing) to keep C2 closed.
             if let Some(b) = &bridge {
                 b.signal_stop();
             }
