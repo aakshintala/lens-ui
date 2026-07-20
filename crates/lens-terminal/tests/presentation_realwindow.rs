@@ -2,27 +2,37 @@
 //!
 //! NOT under `#[gpui::test]`: gpui's `NoopTextSystem` false-greens hit-testing.
 //! This `harness = false` binary opens a real GPUI window, paints a focused
-//! [`TerminalTab`] with an OSC-8 hyperlink cell, and dispatches a left
-//! mouse-down at the cell center. Asserts `TerminalEvent::OpenUrlRequest`
-//! (click only — hover deferred).
+//! [`TerminalTab`] with a multi-cell OSC-8 frame, clicks a plain cell (negative)
+//! then the link cell (positive), and asserts `TerminalEvent::OpenUrlRequest`
+//! only on the correct cell (click only — hover deferred).
 
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    Application, Bounds, Context, Render, TitlebarOptions, Window, WindowBounds, WindowOptions,
-    point, prelude::*, px, size,
+    Application, Bounds, Context, Pixels, Point, Render, TitlebarOptions, Window, WindowBounds,
+    WindowOptions, point, prelude::*, px, size,
 };
+use lens_terminal::render_test_api::CellMetrics;
 use lens_terminal::{
     CellStyle, EngineConfig, EngineHandle, Frame, FrameCell, FrameRow, HostRequestId, Rgb,
     TerminalEvent, TerminalTab,
 };
 
+const FRAME_COLS: u16 = 4;
+const FRAME_ROWS: u16 = 2;
+const LINK_COL: u16 = 2;
+const LINK_ROW: u16 = 1;
+const LINK_URL: &str = "https://osc.example/click";
+const PLAIN_COL: u16 = 0;
+const PLAIN_ROW: u16 = 0;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
     PrimePaint,
-    DispatchClick,
+    ClickPlainCell,
+    ClickLinkCell,
     Done,
 }
 
@@ -37,42 +47,68 @@ fn fail(msg: &str) -> ! {
     std::process::exit(1);
 }
 
+fn default_fg() -> Rgb {
+    Rgb {
+        r: 200,
+        g: 200,
+        b: 200,
+    }
+}
+
+fn frame_cell(col: u16, grapheme: char, hyperlink_uri: Option<Arc<str>>) -> FrameCell {
+    FrameCell {
+        col,
+        grapheme: grapheme.to_string(),
+        fg: default_fg(),
+        bg: None,
+        wide: false,
+        selected: false,
+        style: CellStyle::default(),
+        hyperlink_uri,
+    }
+}
+
 fn osc8_frame() -> Frame {
-    let uri = Arc::<str>::from("https://osc.example/click");
-    Frame {
-        cols: 1,
-        rows: 1,
-        default_fg: Rgb {
-            r: 200,
-            g: 200,
-            b: 200,
-        },
-        default_bg: Rgb { r: 0, g: 0, b: 0 },
-        grid: vec![FrameRow {
-            cells: vec![FrameCell {
-                col: 0,
-                grapheme: "X".into(),
-                fg: Rgb {
-                    r: 200,
-                    g: 200,
-                    b: 200,
+    let link_uri = Arc::<str>::from(LINK_URL);
+    let mut grid = Vec::with_capacity(usize::from(FRAME_ROWS));
+    for row in 0..FRAME_ROWS {
+        let mut cells = Vec::with_capacity(usize::from(FRAME_COLS));
+        for col in 0..FRAME_COLS {
+            let is_link = row == LINK_ROW && col == LINK_COL;
+            cells.push(frame_cell(
+                col,
+                if is_link { 'X' } else { '.' },
+                if is_link {
+                    Some(Arc::clone(&link_uri))
+                } else {
+                    None
                 },
-                bg: None,
-                wide: false,
-                selected: false,
-                style: CellStyle::default(),
-                hyperlink_uri: Some(uri),
-            }],
-        }],
+            ));
+        }
+        grid.push(FrameRow { cells });
+    }
+    Frame {
+        cols: FRAME_COLS,
+        rows: FRAME_ROWS,
+        default_fg: default_fg(),
+        default_bg: Rgb { r: 0, g: 0, b: 0 },
+        grid,
         cursor: None,
     }
+}
+
+fn cell_center(origin: Point<Pixels>, metrics: &CellMetrics, col: u16, row: u16) -> Point<Pixels> {
+    point(
+        origin.x + metrics.cell_w * (f32::from(col) + 0.5),
+        origin.y + metrics.cell_h * (f32::from(row) + 0.5),
+    )
 }
 
 impl HarnessView {
     fn new(cx: &mut Context<Self>) -> Self {
         let cfg = EngineConfig {
-            cols: 10,
-            rows: 5,
+            cols: FRAME_COLS,
+            rows: FRAME_ROWS,
             max_scrollback: 32,
             cell_w_px: 8,
             cell_h_px: 16,
@@ -97,6 +133,29 @@ impl HarnessView {
             captured,
         }
     }
+
+    fn paint_ready(&self, cx: &Context<Self>) -> bool {
+        self.tab.read(cx).last_paint_origin_for_test().is_some()
+            && self.tab.read(cx).cell_metrics_for_test().is_some()
+    }
+
+    fn dispatch_click(&self, col: u16, row: u16, window: &mut Window, cx: &mut Context<Self>) {
+        let origin = self
+            .tab
+            .read(cx)
+            .last_paint_origin_for_test()
+            .expect("paint origin");
+        let metrics = self
+            .tab
+            .read(cx)
+            .cell_metrics_for_test()
+            .expect("cell metrics");
+        let pos = cell_center(origin, &metrics, col, row);
+        let tab = self.tab.clone();
+        tab.update(cx, |tab, cx| {
+            tab.debug_mouse_down_for_test(pos, window, cx);
+        });
+    }
 }
 
 impl Render for HarnessView {
@@ -106,41 +165,31 @@ impl Render for HarnessView {
 
         match phase {
             Phase::PrimePaint => {
-                let origin = self.tab.read(cx).last_paint_origin_for_test();
-                let metrics = self.tab.read(cx).cell_metrics_for_test();
-                if origin.is_some() && metrics.is_some() {
-                    *self.phase.borrow_mut() = Phase::DispatchClick;
+                if self.paint_ready(cx) {
+                    *self.phase.borrow_mut() = Phase::ClickPlainCell;
                 }
             }
-            Phase::DispatchClick => {
-                let origin = self
-                    .tab
-                    .read(cx)
-                    .last_paint_origin_for_test()
-                    .expect("paint origin after prime");
-                let metrics = self
-                    .tab
-                    .read(cx)
-                    .cell_metrics_for_test()
-                    .expect("cell metrics after prime");
-                let pos = point(
-                    origin.x + metrics.cell_w * 0.5,
-                    origin.y + metrics.cell_h * 0.5,
-                );
-                let tab = self.tab.clone();
-                tab.update(cx, |tab, cx| {
-                    tab.debug_mouse_down_for_test(pos, window, cx);
-                });
-                let captured = self.captured.borrow();
-                match captured.as_ref() {
-                    Some((id, url)) if url == "https://osc.example/click" => {
-                        println!("presentation_realwindow: OpenUrlRequest OK id={id:?} url={url}");
+            Phase::ClickPlainCell => {
+                self.dispatch_click(PLAIN_COL, PLAIN_ROW, window, cx);
+                if self.captured.borrow().is_some() {
+                    fail("plain-cell click must not emit OpenUrlRequest");
+                }
+                println!("presentation_realwindow: plain-cell click OK (no OpenUrlRequest)");
+                *self.phase.borrow_mut() = Phase::ClickLinkCell;
+            }
+            Phase::ClickLinkCell => {
+                self.dispatch_click(LINK_COL, LINK_ROW, window, cx);
+                match self.captured.borrow().clone() {
+                    Some((id, url)) if url == LINK_URL => {
+                        println!(
+                            "presentation_realwindow: link-cell OpenUrlRequest OK id={id:?} url={url}"
+                        );
                         *self.phase.borrow_mut() = Phase::Done;
                     }
                     Some((id, url)) => {
                         fail(&format!("unexpected OpenUrlRequest id={id:?} url={url}"));
                     }
-                    None => fail("click did not emit OpenUrlRequest"),
+                    None => fail("link-cell click did not emit OpenUrlRequest"),
                 }
             }
             Phase::Done => {
