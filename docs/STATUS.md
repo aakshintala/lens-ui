@@ -65,13 +65,19 @@ _Last curated 2026-07-21 (B-2 packing/scroll/culling SHIPPED + merged to main un
   **being executed by a separate agent.** Don't double-drive. Design = single-owner engine + one
   ordered command stream (memory [[terminal-slice-2-design-ghostty-precedent]]).
 
-- **🐛 Known bug (OPEN, unowned) — turn counter only bumps on `response.completed`.** A
-  cancel/incomplete/failed terminal event never bumps `state.stream.turn`, so the card never flashes
-  `Wave::Ready` ("just finished") — the completion is invisible to an unfocused watcher. Root cause +
-  fix shape (add `Failed`/`Incomplete`/`Cancelled` arms in `crates/lens-core/src/reduce/mod.rs:132`
-  region) in handoff `docs/handoffs/2026-07-21-turn-counter-non-completed-terminal-bug.md`; memory
-  [[turn-counter-noncompleted-bug]]. Fix on **main**; textual merge-collision with T-0 (`lens-transript`)
-  in the same match block — logically independent. Surfaced by the transcript T-0 review.
+- **✅ Fixed 2026-07-21 — turn counter only bumped on `response.completed`.** Cancel/incomplete turns
+  now bump `state.stream.turn` so the card flashes `Wave::Ready` ("just finished"). As-built (differs
+  from the original handoff shape after two codex reviews): **Incomplete/Cancelled** bump the counter;
+  **Failed** does NOT (it surfaces via `Wave::Failed`, and status is not folded atomically with the
+  event — bumping would flash a transient green). All three **discard** open scratch (not finalize) —
+  committing a synthetic local partial would permanently duplicate omnigent's durable `interrupted`
+  `/items` row (messages reconcile by `item_id` only). `crates/lens-core/src/reduce/{mod,folds}.rs`;
+  handoff `docs/handoffs/2026-07-21-turn-counter-non-completed-terminal-bug.md` (as-built appended);
+  memory [[turn-counter-noncompleted-bug]]. **Two deferred follow-ups:** (1) live-verify whether
+  omnigent sends a durable `interrupted` partial on `/items` — if NOT, discard loses the partial and a
+  finalize+reconcile fix is needed; (2) native `turn.completed/failed/cancelled` events are deferred →
+  `Unknown` → ignored, so the same bug persists on the native-runner surface. Merge-collision with T-0
+  (`lens-transript`) in the same `reduce` match block stands — logically independent, textual merge only.
 
 - **📋 SPEC-GAPS backlog** — independent, un-specced/partial items tracked in
   [`docs/SPEC-GAPS.md`](./SPEC-GAPS.md) (incl. #10 keyboard shortcuts + macOS app menu, Cmd+Q dead).

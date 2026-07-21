@@ -138,6 +138,39 @@ pub fn reduce(state: &mut SessionState, event: &ServerStreamEvent, clock: &dyn C
                 u.push(StreamUpdate::StatusChanged(state.status));
                 u
             }
+            // Interrupted completions (user cancel / length-stop). Bump the monotonic
+            // Ready counter so an unfocused watcher gets the "just finished, glance" edge
+            // the same as Completed. `Failed` is intentionally NOT here: its surface is
+            // Wave::Failed (status/last_task_error), and status is not folded atomically
+            // with this event, so bumping Ready would flash a transient green first.
+            // The open partial is DISCARDED, not finalized: committing a synthetic local
+            // message would permanently duplicate omnigent's durable `interrupted` /items
+            // row (messages reconcile by item_id only, no content correlation). Clearing
+            // still prevents the accumulator from contaminating the next turn.
+            ResponseEvent::Incomplete | ResponseEvent::Cancelled => {
+                state.stream.open_message = None;
+                state.stream.open_reasoning = None;
+                state.stream.turn = state.stream.turn.saturating_add(1);
+                smallvec![
+                    StreamUpdate::ScratchChanged(Arc::new(state.stream.clone())),
+                    StreamUpdate::StatusChanged(state.status),
+                ]
+            }
+            // Failed discards its open partial too — same contamination + duplicate
+            // reasoning as above — but does NOT bump the Ready counter: a failed turn
+            // surfaces via Wave::Failed, and bumping would flash a transient green while
+            // status catches up. Status flows via the separate SessionEvent::Status path.
+            ResponseEvent::Failed => {
+                // Non-short-circuiting `|`: both takes MUST run so an open message AND an
+                // open reasoning are both cleared — `||` would skip the second on the first.
+                let cleared = state.stream.open_message.take().is_some()
+                    | state.stream.open_reasoning.take().is_some();
+                if cleared {
+                    smallvec![StreamUpdate::ScratchChanged(Arc::new(state.stream.clone()))]
+                } else {
+                    smallvec![]
+                }
+            }
             ResponseEvent::ReasoningClosed { .. } => {
                 let had = state.stream.open_reasoning.is_some();
                 let mut u = items::finalize_reasoning(state, clock);
@@ -206,6 +239,139 @@ mod tests {
         });
         let scratch = scratch.expect("Completed must emit ScratchChanged for turn bump");
         assert_eq!(scratch.turn, s.stream.turn);
+    }
+
+    #[test]
+    fn cancelled_discards_partial_and_bumps_turn() {
+        let mut s = empty_state();
+        let clock = ManualClock::new(1_700_000_000_000);
+        // partial assistant text streamed, then the turn is cancelled mid-flight.
+        reduce(
+            &mut s,
+            &ServerStreamEvent::Response(ResponseEvent::OutputTextDelta {
+                delta: "partial".into(),
+                message_id: None,
+                index: None,
+                last: None,
+            }),
+            &clock,
+        );
+        let u = reduce(
+            &mut s,
+            &ServerStreamEvent::Response(ResponseEvent::Cancelled),
+            &clock,
+        );
+        // Ready trigger: the completion counter advances just like Completed.
+        assert_eq!(s.stream.turn, 1);
+        // The partial is DISCARDED, not committed: committing a synthetic local
+        // message would permanently duplicate omnigent's durable `interrupted` item
+        // on /items catch-up (messages reconcile by item_id only). Clearing still
+        // prevents the dangling accumulator from contaminating the next turn.
+        assert!(s.stream.open_message.is_none());
+        assert!(
+            !s.items
+                .iter()
+                .any(|i| matches!(&i.kind, crate::domain::ItemKind::Message { .. })),
+            "cancelled turn must NOT commit a synthetic partial (duplicate hazard)"
+        );
+        let scratch = u
+            .iter()
+            .find_map(|update| match update {
+                StreamUpdate::ScratchChanged(scratch) => Some(Arc::clone(scratch)),
+                _ => None,
+            })
+            .expect("Cancelled must emit ScratchChanged for turn bump");
+        assert_eq!(scratch.turn, 1);
+        assert!(
+            u.iter()
+                .any(|update| matches!(update, StreamUpdate::StatusChanged(_))),
+            "Cancelled must emit StatusChanged"
+        );
+    }
+
+    #[test]
+    fn incomplete_bumps_turn_and_emits_scratch() {
+        let mut s = empty_state();
+        let clock = ManualClock::new(1_700_000_000_000);
+        let u = reduce(
+            &mut s,
+            &ServerStreamEvent::Response(ResponseEvent::Incomplete),
+            &clock,
+        );
+        assert_eq!(s.stream.turn, 1);
+        assert!(
+            u.iter()
+                .any(|update| matches!(update, StreamUpdate::ScratchChanged(_))),
+            "Incomplete must emit ScratchChanged for turn bump"
+        );
+    }
+
+    #[test]
+    fn failed_does_not_bump_turn() {
+        // Failed surfaces via Wave::Failed (status/last_task_error), not Ready. The
+        // status change is not folded atomically with this event, so bumping the Ready
+        // counter here would flash a transient green before Failed renders.
+        let mut s = empty_state();
+        let clock = ManualClock::new(1_700_000_000_000);
+        reduce(
+            &mut s,
+            &ServerStreamEvent::Response(ResponseEvent::Failed),
+            &clock,
+        );
+        assert_eq!(s.stream.turn, 0);
+    }
+
+    #[test]
+    fn failed_discards_scratch_without_bumping() {
+        // A failed turn must not leave its streamed partial dangling — the next turn's
+        // deltas would append into the stale accumulator. Discard like Incomplete/
+        // Cancelled, but WITHOUT the Ready counter bump.
+        let mut s = empty_state();
+        let clock = ManualClock::new(1_700_000_000_000);
+        reduce(
+            &mut s,
+            &ServerStreamEvent::Response(ResponseEvent::OutputTextDelta {
+                delta: "partial".into(),
+                message_id: None,
+                index: None,
+                last: None,
+            }),
+            &clock,
+        );
+        let u = reduce(
+            &mut s,
+            &ServerStreamEvent::Response(ResponseEvent::Failed),
+            &clock,
+        );
+        assert_eq!(s.stream.turn, 0, "Failed must not bump the Ready counter");
+        assert!(
+            s.stream.open_message.is_none(),
+            "Failed must discard scratch"
+        );
+        assert!(
+            !s.items
+                .iter()
+                .any(|i| matches!(&i.kind, crate::domain::ItemKind::Message { .. })),
+            "Failed must NOT commit a synthetic partial"
+        );
+        assert!(
+            u.iter()
+                .any(|update| matches!(update, StreamUpdate::ScratchChanged(_))),
+            "Failed must emit ScratchChanged when it clears live scratch"
+        );
+    }
+
+    #[test]
+    fn compaction_failed_does_not_bump_turn() {
+        // compaction is housekeeping, not a response turn — it must not flash Ready.
+        let mut s = empty_state();
+        let clock = ManualClock::new(1_700_000_000_000);
+        reduce(
+            &mut s,
+            &ServerStreamEvent::Response(ResponseEvent::CompactionFailed),
+            &clock,
+        );
+        assert_eq!(s.stream.turn, 0);
     }
 
     #[test]

@@ -1,5 +1,11 @@
 # Bug: turn-completion counter only bumps on `response.completed`
 
+> **✅ RESOLVED 2026-07-21 — see "As-built resolution" at the bottom.** The fix
+> shipped on `main` but with a **different shape** than the "Fix shape" section
+> below proposed: two codex reviews overturned "bump Failed unconditionally" and
+> "finalize is mandatory." The original analysis is kept intact for the record;
+> read the as-built section for what actually landed and why.
+
 **Date:** 2026-07-21 · **Status:** OPEN, unowned — ready for a fresh session to fix.
 **Surfaced by:** transcript T-0 design review (turn-identity work) — carved out as a
 **separate, independent bug** because it lives in the card/summary Ready-policy path,
@@ -117,3 +123,66 @@ This fix adds arms to that same match. Whoever lands second reconciles the arms 
 touch roughly `reduce/mod.rs:98-172`. The two changes are logically independent (T-0 =
 per-item `response_id` identity; this = the `stream.turn` Ready counter), so no design
 conflict, just a textual merge in one function.
+
+---
+
+## As-built resolution (2026-07-21)
+
+Shipped on `main`. Touches `crates/lens-core/src/reduce/mod.rs` (match arms) and
+`reduce/folds.rs` (`fold_response_marker` routing). **The mechanism the original
+root-cause described was slightly off:** the terminal events were not falling
+through the `mod.rs` catch-all — they were intercepted earlier in
+`fold_response_marker` (`Failed | Incomplete | Cancelled => smallvec![]`) and
+early-returned empty. Same net effect, different site. The fix routes
+`Incomplete | Cancelled` (and `Failed`) out of that marker and into real `reduce`
+match arms.
+
+**Two codex (gpt-5.6) reviews changed the design** from the "Fix shape" section:
+
+1. **Do NOT bump on `Failed`.** The handoff claimed bumping unconditionally was
+   safe because the wave ladder keeps `Wave::Failed` above `Ready`. That's only
+   true *after* `status == Failed` is folded — and status arrives via a **separate**
+   `SessionEvent::Status` event, **not atomically** with `response.failed`. In the
+   window between the two, an unfocused card would flash a **transient green Ready**
+   (`wave.rs:29` needs `status==Failed || last_task_error`; `wave.rs:52` fires Ready
+   on `Idle + fresh last_completed_at`). So **only `Incomplete | Cancelled` bump.**
+   `Failed` keeps its own surface (`Wave::Failed`) and never flashes Ready.
+
+2. **DISCARD open scratch, do NOT finalize it.** The handoff argued finalize was
+   mandatory to avoid cross-turn contamination. But finalizing a partial with
+   `message_id: None` invents `msg_local_N` and commits it — and omnigent's durable
+   `interrupted` `/items` row has its own server id. Message reconciliation keys on
+   `item_id` **only** (`live_key_for_store_item`, `runloop.rs:237` — secondary keys
+   exist only for `FunctionCall*`), so the two never fold → **permanent duplicate row
+   surviving restart** (consistent with memory `omnigent-two-id-space-reconciliation`).
+   Discarding (`open_message = None; open_reasoning = None`) still prevents
+   contamination, avoids the duplicate, and avoids finding-4 blank items.
+
+**Final semantics:**
+- `Incomplete | Cancelled` → discard scratch + `turn += 1` + `ScratchChanged` + `StatusChanged`.
+- `Failed` → discard scratch (emit `ScratchChanged` iff something was cleared) + **no bump**.
+- `CompactionFailed` → unchanged marker (housekeeping, not a turn — never bumped).
+
+**End-to-end coverage** is by composition of existing + new tests (no redundant
+card test added): reducer bumps `stream.turn` (new `reduce::tests`) →
+`CardSummary.last_completed_turn = s.stream.turn` (`actor/summary.rs:71`) →
+`fold_summary` stamps `last_completed_at` on advance (`card/model.rs:378`) →
+`derive_wave` → `Wave::Ready` (`card/wave.rs:99`). Gate green: 247 lens-core +
+58 lens-ui tests, clippy clean, fmt clean (workspace clippy red only on the
+pre-existing `spikes/board-container` dirt, outside the production `-p` gate).
+
+### Deferred follow-ups (NOT done — need a live omnigent 0.5.1 run)
+
+1. **Live-verify the durable partial.** Does omnigent emit an assistant message
+   with `interrupted=true` on `/items` after a user-cancel / length-stop? The
+   "discard" choice is correct **iff** it does (server is the SSOT). If it does
+   **not**, discard silently loses the streamed partial from the transcript and the
+   right fix becomes finalize + message reconciliation (content/response
+   correlation so `msg_local_N` folds into the canonical row). Drive an interrupt
+   live, capture `/items`, then confirm or revisit.
+2. **Native `turn.*` terminal family.** `turn.completed` / `turn.failed` /
+   `turn.cancelled` are deferred in `lens-client` (`stream/event.rs` → routed to
+   `ServerStreamEvent::Unknown`), so a Codex-native turn that emits only its native
+   terminal (no `response.*`) still never bumps the counter — **the same bug on the
+   native-runner surface.** Out of scope here (the fix covers the `response.*`
+   surface); model the `turn.*` variants when a native runner needs Ready.
