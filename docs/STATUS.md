@@ -9,7 +9,29 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Open threads & next up
 
-- **▶ ACTIVE: shared terminal workstream — Slices 0/1a/1b merged; 1c DONE; 1d COMPLETE (live-proven); Slice 2 SERIAL: 2a (input) DONE + C2 CLOSED + ▶▶ 2d (presentation) EXECUTED + DONE (2026-07-20): all 6 tasks (titles/hyperlinks/OSC-8/click→OpenUrlRequest/inspect+benches), each grok-reviewed + fix waves, Opus whole-slice = SHIP, title-clear-vs-full-channel divergence FIXED (tri-state slot), REAL-WINDOW GATE PASSED on a real macOS display (presentation_realwindow click→OpenUrlRequest e2e + render_realwindow perf all in-budget). Full 2d slice `bdd8695..5e6f28b` (11 commits). `terminal-ws` unpushed since 2d (backup push + `main` merge = user's call). NEXT: 2b (clipboard/OSC-52) → 2c (mouse). Driver: `docs/handoffs/2026-07-17-terminal-slice-2-execution.md`; ledger `.superpowers/sdd/progress.md`.**
+- **▶ ACTIVE: shared terminal workstream — Slices 0/1a/1b merged; 1c DONE; 1d COMPLETE (live-proven); Slice 2 SERIAL: 2a (input) DONE + C2 CLOSED, 2d (presentation) DONE + real-window-gated, ▶▶ 2b (clipboard/OSC-52 + Cmd+V paste) EXECUTED + DONE (2026-07-21): all 5 tasks (OSC-52 on_clipboard_write cap-before-clone → foreground ClipboardPolicy seam + ClipboardWriteRequest/Notice + on_host_event → EngineCommand::Paste bracketed engine-side never-drop/epoch → Cmd+V intercept read-only-gated/multiline-warn/capped → demo Deny-default + benches + inspect + live rider), each codex-gpt5.6-reviewed + fix waves, Opus whole-slice = SHIP-WITH-FIXES (caught a cross-task read-only-gate bypass on the deferred-warn paste path — dispatch_paste now gates, regression-tested) → fixed. Full 2b slice `018820b..57bccde` (11 commits). FINAL FULL GATE GREEN (fmt + workspace clippy + lens-terminal test-util,live-tests clippy + 132 lib tests + benches + demo). `terminal-ws` unpushed (backup push + `main` merge = user's call). NEXT: 2c (mouse — opens with XTSHIFTESCAPE `mouse_shift_capture` safe-FFI spike). Driver: `docs/handoffs/2026-07-17-terminal-slice-2-execution.md`; ledger `.superpowers/sdd/progress.md`.**
+    - **▶ SLICE 2b (clipboard/OSC-52 write + Cmd+V paste) — DONE (2026-07-21).** RE-CUT per the
+      2026-07-20 spec amendment to **OSC-52 output-clipboard write policy + Cmd+V paste ONLY**
+      (selection + Cmd+C copy MOVED to 2c — they share 2c's mouse-capture stack + XTSHIFTESCAPE
+      arbitration). Policy state is session-scoped behind an injectable **`ClipboardPolicy`** trait
+      (in-memory `SessionClipboardPolicy` now; `lens-ui` injects a persisted impl later). Executed
+      subagent-driven: composer-2.5 per task + **codex `gpt-5.6-sol` high-effort** cross-family
+      per-task reviews (user rule 2026-07-21: gpt-5.6 always via codex, never Cursor) + fix waves +
+      Opus whole-slice. Security-critical ordering all in place: cap-before-clone (1 MiB, before any
+      owned alloc), post-encode epoch-recheck (covers empty output), reject-not-truncate paste (1 MiB),
+      OSC-52 reads never reach the callback, read-only gate on BOTH the immediate and deferred-warn
+      paste paths. Plan `docs/superpowers/plans/2026-07-20-terminal-slice-2b-clipboard-paste.md`.
+      **Documented deferrals (carried, not bugs):** (1) **always-warn-on-multiline** — the foreground
+      has no live mode-2004 (bracketed-paste) snapshot until 2c, so 2b uses the safe over-approximation
+      (warn on any multiline, suppressible via "don't warn again"); suppressing the warn while bracketed
+      paste is active is deferred to 2c. (2) **Menu Edit→Paste (`OsAction::Paste`) not wired** — only the
+      Cmd+V keystroke path is intercepted (`handle_key_down`); the app-menu paste command is a distinct
+      gpui path deferred to `lens-ui` menu integration (the standalone demo has no app menu). (3) **empty
+      OSC-52 write still mints a host prompt** (writes empty string on Allow) — left intentionally, since
+      suppressing could drop a legitimate "clear clipboard" intent; the bounded pending map rate-limits nag.
+      **No real-window rider run this slice** (paste round-trip is an env-gated manual leg; the Cmd+V
+      intercept is hermetically proven by the `real_cmd_v_keystroke_routes_to_paste_not_key_encoder` test
+      via a FIFO sentinel) — running it live is the user's call.
   - **▶ SLICE 2 (interaction) — RE-CUT TO SERIAL; 2a + C2 + 2d DONE (2026-07-20).** 2d (presentation)
     executed subagent-driven (composer-2.5 per task + grok-4.5 cross-family per-task reviews + fix waves +
     Opus whole-slice = SHIP); the Opus review caught a title-clear-vs-full-channel invariant divergence
