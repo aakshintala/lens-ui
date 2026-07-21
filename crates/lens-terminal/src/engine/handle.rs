@@ -1046,6 +1046,75 @@ mod tests {
     }
 
     #[test]
+    fn mouse_any_buttonless_move_with_mouse_local_not_reported() {
+        // codex whole-slice F4: unlatched Any-mode hover motion must honor the local
+        // override (mouse_local/Shift/ForceLocal), not leak to the PTY.
+        let h = EngineHandle::spawn(test_config());
+        let rx = h.attach_test_egress();
+        h.feed(TRACKING_ANY_SGR.to_vec()).expect("feed tracking");
+        let mut g = base_mouse_gesture(MouseEventKind::Move, None);
+        g.mouse_local = true;
+        let ack = send_mouse(&h, g);
+        assert_eq!(ack.disposition, GestureDisposition::Ignored);
+        assert!(
+            rx.try_recv().is_err(),
+            "mouse_local hover must not egress a report"
+        );
+        h.stop();
+    }
+
+    #[test]
+    fn mouse_select_subthreshold_jitter_still_local_clicks() {
+        // codex whole-slice F8: a sub-threshold jitter move during a click must not be
+        // promoted to a drag (which would suppress the hyperlink LocalClick).
+        let h = EngineHandle::spawn(test_config());
+        let _rx = h.attach_test_egress();
+        h.feed(b"hello".to_vec()).expect("feed"); // no tracking -> Left selects
+        let down = send_mouse(
+            &h,
+            base_mouse_gesture(MouseEventKind::Down, Some(MouseButtonKind::Left)),
+        );
+        assert_eq!(down.disposition, GestureDisposition::Selected);
+        // Zero-distance jitter move at the same cell/pixel (below Ghostty's drag threshold).
+        let _ = send_mouse(
+            &h,
+            base_mouse_gesture(MouseEventKind::Move, Some(MouseButtonKind::Left)),
+        );
+        let up = send_mouse(
+            &h,
+            base_mouse_gesture(MouseEventKind::Up, Some(MouseButtonKind::Left)),
+        );
+        assert_eq!(
+            up.disposition,
+            GestureDisposition::LocalClick,
+            "sub-threshold jitter must still resolve as a click"
+        );
+        h.stop();
+    }
+
+    #[test]
+    fn wheel_huge_delta_caps_notch_count() {
+        // codex whole-slice F3: a pathological delta is bounded to MAX_WHEEL_NOTCHES (32),
+        // strictly below the egress channel cap (64), so the count is the cap, not the
+        // channel limit.
+        let h = EngineHandle::spawn(test_config());
+        let rx = h.attach_test_egress();
+        h.feed(TRACKING_BUTTON_SGR.to_vec()).expect("feed tracking");
+        enqueue_set_access(&h, true);
+        // The ack is sent only after the wheel arm finishes emitting every notch, so by
+        // the time send_wheel returns all frames are already queued — drain non-blocking.
+        let ack = send_wheel(&h, base_wheel(1000));
+        assert_eq!(ack.disposition, GestureDisposition::Reported);
+        let mut count = 0;
+        while rx.try_recv().is_ok() {
+            count += 1;
+        }
+        assert!(count > 0, "some notches must egress");
+        assert!(count <= 32, "notch count must be capped, got {count}");
+        h.stop();
+    }
+
+    #[test]
     fn mouse_set_access_false_suppresses_latched_move_and_up() {
         let h = EngineHandle::spawn(test_config());
         let rx = h.attach_test_egress();

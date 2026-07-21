@@ -2153,7 +2153,9 @@ fn gpui_scroll_to_lens(delta: gpui::ScrollDelta) -> Option<ScrollDelta> {
             if lines == 0 {
                 None
             } else {
-                Some(ScrollDelta::Lines(-lines))
+                // saturating_neg guards against `-i32::MIN` overflow (panics in debug) for
+                // a pathological scroll delta (codex whole-slice F3).
+                Some(ScrollDelta::Lines(lines.saturating_neg()))
             }
         }
         gpui::ScrollDelta::Pixels(p) => {

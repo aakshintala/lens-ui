@@ -28,6 +28,10 @@ const DEFAULT_BUILD_INTERVAL: Duration = Duration::from_millis(16);
 
 pub(crate) const MAX_FEED_CHUNK: usize = 4096;
 const PENDING_PROBE_CAP: usize = 32;
+/// Upper bound on wheel notches reported for a single `Wheel` command. A physical
+/// notch is 1-few lines; this caps a pathological delta so the report loop can never
+/// spin unboundedly (codex whole-slice F3).
+const MAX_WHEEL_NOTCHES: u32 = 32;
 
 /// Deterministic sync for Stop-preempt-between-chunks test (`cfg(test)` only).
 pub(crate) struct TestChunkBarrier {
@@ -597,9 +601,17 @@ fn handle_command(
                 // `ScrollViewport::Delta`, where negative == up (into scrollback). So a
                 // wheel-up gesture (negative lines) reports Button::Four. (codex T5 review.)
                 let up = w.lines < 0;
-                let notches = w.lines.unsigned_abs();
+                // Bound the notch count so a pathological scroll delta cannot spin the
+                // worker for billions of iterations (codex whole-slice F3).
+                let notches = w.lines.unsigned_abs().min(MAX_WHEEL_NOTCHES);
                 let mut encoded = Vec::new();
                 for _ in 0..notches {
+                    // Re-check the LIVE access epoch before every notch: a downgrade on the
+                    // foreground can bump the epoch mid-loop, and the remaining notches must
+                    // not leak onto the PTY (parity with emit_mouse_report; codex F1).
+                    if w.access_epoch != access_epoch.load(Ordering::Acquire) {
+                        break;
+                    }
                     match engine.encode_mouse_report(&MouseReportEv {
                         action: MouseEventKind::Down,
                         button: None,
@@ -1160,9 +1172,10 @@ fn handle_mouse_move(
             }
             GestureOwner::Select => {
                 if let Some((col, row)) = g.cell {
-                    if let Some(latch) = mouse_state.latch.as_mut() {
-                        latch.dragged = true;
-                    }
+                    // Do NOT force `latch.dragged` here: a sub-threshold jitter move would
+                    // otherwise turn a click into a drag and suppress the hyperlink
+                    // LocalClick. Feed the gesture machine and let Ghostty's own drag
+                    // threshold (`gesture_dragged`, consulted at Up) decide (codex F8).
                     match engine.apply_selection_drag(col, row, g.px_x, g.px_y) {
                         Ok(true) => {
                             *dirty = true;
@@ -1184,7 +1197,14 @@ fn handle_mouse_move(
         && tracking == MouseTracking::Any
         && write_allowed
         && g.access_epoch == current_epoch
+        && !g.mods.shift
+        && !g.mouse_local
+        && g.policy == MouseReportPolicy::Auto
     {
+        // Buttonless (unlatched) Any-mode motion is subject to the SAME local-override
+        // arbitration as a Down: Shift, the mouse-local toggle, or ForceLocal suppress it
+        // (codex whole-slice F4). Without this, hover motion leaks to the PTY despite the
+        // user's local-selection intent.
         let ev = mouse_report_ev(g, false);
         let outcome = emit_mouse_report(engine, egress, inspect, access_epoch, g.access_epoch, &ev);
         (outcome.encoded, outcome.disposition)
