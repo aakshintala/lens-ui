@@ -2332,6 +2332,52 @@ mod tests {
         assert_eq!(engine.access_epoch(), before + 1);
     }
 
+    // Regression (codex T5 review, CRITICAL): teardown must revoke report authority
+    // engine-side via an ordered SetAccess(false). The epoch bump alone is insufficient —
+    // a gesture enqueued during the reconnect/detached window carries the freshly-bumped
+    // epoch and passes the epoch gate, so a stale engine `write_allowed == true` would leak
+    // mouse reports onto the next connection. Proof: after teardown, a wheel under active
+    // tracking (same-epoch, would otherwise report) must fall back to local scroll.
+    #[gpui::test]
+    async fn teardown_revokes_engine_report_authority(cx: &mut gpui::TestAppContext) {
+        use crate::engine::command::{GestureDisposition, KeyMods, MouseAck};
+
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        // Button-event tracking + SGR: a wheel would report while writable.
+        engine
+            .feed(b"\x1b[?1002h\x1b[?1006h".to_vec())
+            .expect("feed tracking");
+        engine.build_now().expect("build");
+        let _ = wait_for_engine_frame(engine.as_ref());
+
+        let tab = cx.new(|cx| TerminalTab::with_engine_for_test(Arc::clone(&engine), cx));
+        tab.update(cx, |tab, cx| tab.teardown_transport_off_foreground(cx));
+
+        // Enqueued AFTER teardown → carries the bumped epoch (epoch gate passes); only the
+        // ordered SetAccess(false) can suppress the report. FIFO forwarder makes this
+        // deterministic (SetAccess(false) precedes this wheel) — no sleep needed.
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded::<MouseAck>(1);
+        engine
+            .enqueue_wheel(WheelInput {
+                lines: -1,
+                cell: None,
+                px_x: 0.0,
+                px_y: 0.0,
+                mods: KeyMods::default(),
+                access_epoch: 0,
+                ack: Some(ack_tx),
+            })
+            .expect("enqueue wheel");
+        let ack = ack_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("wheel ack");
+        assert_eq!(
+            ack.disposition,
+            GestureDisposition::ScrolledLocal,
+            "teardown must revoke write_allowed so a post-teardown report becomes local scroll"
+        );
+    }
+
     #[gpui::test]
     async fn inspect_disabled_child_rings_cheap(cx: &mut gpui::TestAppContext) {
         let engine = Arc::new(EngineHandle::spawn(test_cfg()));
