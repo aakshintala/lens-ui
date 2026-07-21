@@ -54,15 +54,29 @@ _Last curated 2026-07-21 (transcript T-1 spec written; resliced T-1..T-7 — sub
     is complete after **T-7**. No functionality is deferred *out* of the workstream — the earlier
     "composer/interrupt/permissions belong elsewhere" framing was the error and is corrected: they are
     **T-7**, in-scope.
+  - **T-0 — Authoritative turn identity (lens-core / lens-client).** *Prerequisite surfaced by the T-1
+    cross-family review (2026-07-21).* Make the server **`response_id`** the single authoritative turn
+    signal; today the catch-up path **discards** it — `wire_to_domain_item` (`actor/runloop.rs:221-233`)
+    hard-codes `turn: 0` + fetch-time `created_at`, so disk-sourced history has no turn boundaries or real
+    timestamps. Work: map wire `response_id` + `created_at` on catch-up (stop discarding); live-reduce
+    stamps the active `response_id` (from `SessionEvent::Status`, `event.rs:51-54`) onto items; carry
+    `response_id` on `BlockContext` (backing/replacing `turn: u32`); expose active `response_id` for
+    liveness. Also fixes the "failed/incomplete/cancelled turns never bump turn" merge bug (a new
+    `response_id` = a new turn regardless of end reason). **Prereq:** re-capture 0.5.1 `/items` to pin the
+    field shape (0.3.0 capture shows field `ln` with user=`turn_` / agent=`resp_` / resource=`conv_`
+    namespaces; 0.5.1 openapi says `response_id` required). Blocks T-1.
   - **T-1 — ViewBlock projection pipeline (pure).** §3/§4. Pure staged pipeline over `&[Item]` +
     `StreamScratch` → `Vec<ViewBlock>`; new `reduce/view.rs` in **lens-core**; exhaustive `ItemKind`
     match; no gpui, fully unit-testable. The spine. **SPEC WRITTEN 2026-07-21**
-    (`docs/specs/2026-07-21-transcript-t1-viewblock-projection-design.md`) — cross-family review in
-    flight; **plan in a new session.** Key resolutions: staged (filter→project→group) not uniform pipe;
-    `WorkSection` drops `open` (render owns) + carries item-derivable `meta` only (model/token/cost are
-    session-level → T-6); liveness via `scratch.turn` vs `ctx.turn`; **`OptimisticUser` dropped** (pending
-    is composer-owned → T-7); **`SubAgentSpan` dropped** (child-session model → T-5); `ReconnectBreak`
-    emission → T-2.
+    (`docs/specs/2026-07-21-transcript-t1-viewblock-projection-design.md`); **cross-family reviewed**
+    (Grok 4.5 + GPT-5.6) → revised; **plan in a new session.** Key resolutions: staged
+    (filter→project→group) not uniform pipe; turn identity = authoritative **`response_id`** (from T-0),
+    NOT a `scratch.turn` heuristic; `group_work_section` groups agent work by `response_id`, user messages
+    + non-response items are ordinal-positioned siblings; liveness = turn's `response_id` == session active
+    `response_id`; `WorkSection` drops `open` (render owns) and drops `meta` entirely (all fields need
+    per-turn data → **T-6**); streaming variants carry `&MessageAcc`/`&ReasoningAcc` (stable identity);
+    **`OptimisticUser` dropped** (pending is composer-owned → T-7); **`SubAgentSpan` dropped**
+    (child-session model → T-5); `ReconnectBreak` emission → T-2.
   - **T-2 — Focused view scaffold + virtualized disk-sourced surface.** §16/§17. Mount focused `ContentTab`
     in `#chat-slot`; lift `RowSource` (id-keyed retained store) from spike to production; native
     `list()`/`ListState`/`ListAlignment::Bottom`; D23 disk-paint (finalized from `TranscriptStore`, live
@@ -84,10 +98,12 @@ _Last curated 2026-07-21 (transcript T-1 spec written; resliced T-1..T-7 — sub
     span, peek, output-in-transcript); **navigate-into-child** shares the shell's session-focus machinery
     (the one cross-surface seam). Reuses T-4's span/output render. Prereq: reducer child-session fold.
   - **T-6 — Turn lifecycle, compaction, agent-changed, todos, minor items.** §4/§10/§11/§13/§14.
-    Work-section collapse lifecycle (expand/override state — T-1 emits no `open`), the chip's
-    model/token/cost line (**prereq:** per-turn usage deltas, a state-model change — snapshot cumulative at
-    each `response.completed`), compaction marker, AgentChanged marker, inline todos (forms 1–3), minor
-    items, reconnect break. **← History view complete here.**
+    Work-section collapse lifecycle (expand/override state — T-1 emits no `open`); the whole
+    `WorkSectionMeta` (duration/model/tokens/cost/agent-transitions — T-1 emits none). **Prereq for the
+    chip's model/token/cost:** model `response.completed.response.usage` — per-turn usage/model IS on the
+    wire (`openapi.json:2573+`) but `ResponseEvent::Completed` is currently a unit variant that discards
+    it; retain it per-turn. Compaction marker, AgentChanged marker, inline todos (forms 1–3), minor items,
+    reconnect break. **← History view complete here.**
   - **T-7 — Composer & complete live turn (the chat closer).** §15/§18. Always-sends composer; optimistic
     user bubble (`⋯ sending` → settle on `session.input.consumed` → `⚠ failed·retry`); **Esc-interrupt**
     (+ new lens-core `Interrupt` command + lens-client call — server already echoes `session.interrupted`/
