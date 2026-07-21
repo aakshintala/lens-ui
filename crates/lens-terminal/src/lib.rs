@@ -1109,6 +1109,9 @@ impl TerminalTab {
     }
 
     fn dispatch_paste(&mut self, bytes: Vec<u8>, cx: &mut Context<Self>) {
+        if !self.write_input_allowed() {
+            return;
+        }
         if bytes.len() > MAX_PASTE_BYTES {
             self.reject_over_cap_paste(cx);
             return;
@@ -2671,6 +2674,57 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn deferred_paste_allow_after_readonly_downgrade_is_suppressed(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::ClipboardItem;
+
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let egress = engine.attach_test_egress();
+        let tab = cx.new(|cx| TerminalTab::with_engine_for_test(Arc::clone(&engine), cx));
+        tab.update(cx, |tab, _cx| tab.set_inspect_enabled(true));
+        let (events, _sub) = subscribe_terminal_events(cx, &tab);
+        while egress.try_recv().is_ok() {}
+
+        cx.write_to_clipboard(ClipboardItem::new_string("a\nb".to_string()));
+        tab.update(cx, |tab, cx| tab.debug_paste_for_test(cx));
+
+        let request_id = match &events.borrow()[0] {
+            TerminalEvent::PasteWarnRequest { id, line_count } => {
+                assert_eq!(*line_count, 2);
+                *id
+            }
+            other => panic!("expected PasteWarnRequest, got {other:?}"),
+        };
+        tab.update(cx, |tab, _cx| {
+            assert_eq!(tab.debug_pending_paste_ids_for_test(), vec![request_id]);
+            let snap = tab.inspect().engine.expect("engine inspect");
+            assert_eq!(snap.pastes_sent, 0);
+            tab.presentation.access = AccessMode::ReadOnly;
+        });
+
+        tab.update(cx, |tab, cx| {
+            tab.on_host_event(
+                TerminalHostEvent::HostRequestResponse {
+                    id: request_id,
+                    decision: HostRequestDecision::AllowSession,
+                },
+                cx,
+            );
+        });
+
+        tab.update(cx, |tab, _cx| {
+            let snap = tab.inspect().engine.expect("engine inspect");
+            assert_eq!(snap.pastes_sent, 0);
+            assert!(tab.debug_pending_paste_ids_for_test().is_empty());
+        });
+        assert!(
+            egress.try_recv().is_err(),
+            "read-only downgrade must suppress deferred paste egress"
+        );
+    }
+
+    #[gpui::test]
     async fn read_only_tab_ignores_cmd_v(cx: &mut gpui::TestAppContext) {
         use gpui::ClipboardItem;
 
@@ -2716,8 +2770,10 @@ mod tests {
         use crate::engine::presentation::{ClipboardLocation, EnginePresentationEvent};
 
         let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let egress = engine.attach_test_egress();
         let tab = cx.new(|cx| TerminalTab::with_engine_for_test(Arc::clone(&engine), cx));
         tab.update(cx, |tab, _cx| tab.set_inspect_enabled(true));
+        while egress.try_recv().is_ok() {}
 
         engine
             .feed(osc52_vt_write_bytes(b"inspect-exposure"))
@@ -2738,6 +2794,12 @@ mod tests {
 
         cx.write_to_clipboard(ClipboardItem::new_string("paste".to_string()));
         tab.update(cx, |tab, cx| tab.debug_paste_for_test(cx));
+
+        let paste_frame = egress
+            .recv_timeout(Duration::from_secs(2))
+            .expect("paste must emit egress after OSC-52 feed");
+        assert_eq!(paste_frame.kind, EgressKind::Input);
+        assert_eq!(paste_frame.bytes, b"paste");
 
         tab.update(cx, |tab, _cx| {
             let snap = tab.inspect().engine.expect("engine inspect");
