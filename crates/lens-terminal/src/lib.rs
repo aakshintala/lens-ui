@@ -670,6 +670,37 @@ impl TerminalTab {
         false
     }
 
+    /// Enqueue a Left mouse-down at a cell through the engine (no window/paint needed),
+    /// so the live rider can exercise the encode→egress→PTY mouse-report round-trip.
+    #[cfg(feature = "live-tests")]
+    pub fn debug_mouse_down_at_cell_for_test(
+        &self,
+        col: u16,
+        row: u16,
+        px_x: f32,
+        px_y: f32,
+    ) -> bool {
+        let Some(engine) = self.engine_handle() else {
+            return false;
+        };
+        engine
+            .enqueue_mouse_gesture(engine::command::MouseGesture {
+                kind: engine::command::MouseEventKind::Down,
+                button: Some(engine::command::MouseButtonKind::Left),
+                mods: engine::command::KeyMods::default(),
+                cell: Some((col, row)),
+                px_x,
+                px_y,
+                time: std::time::Duration::ZERO,
+                mouse_local: false,
+                policy: engine::command::MouseReportPolicy::Auto,
+                click_seq: 0,
+                access_epoch: 0,
+                ack: None,
+            })
+            .is_ok()
+    }
+
     #[cfg(feature = "live-tests")]
     pub fn debug_abort_attach_for_test(&mut self, cx: &mut Context<Self>) {
         // Take ONLY the attach (leave the bridge running so it observes Closed(Network)

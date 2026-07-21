@@ -21,13 +21,19 @@
 //! | `LENS_OMNIGENT_TERMINAL_ID` | target A | Attach to existing terminal |
 //! | `LENS_OMNIGENT_TERMINAL_NAME` + `LENS_OMNIGENT_SESSION_KEY` | target B | Open-or-create |
 //! | `LENS_LIVE_CLIPBOARD_PASTE` | no | Set to `1` to run P5 paste round-trip |
+//! | `LENS_LIVE_MOUSE_REPORT` | no | Set to `1` to run P6 mouse-report round-trip (Slice 2c) |
+//!
+//! **Slice 2c (Task 8):** optional P6 leg when `LENS_LIVE_MOUSE_REPORT=1` — enables
+//! DEC mouse tracking (`?1000h?1006h`) via a shell `printf`, runs `cat -v` so stdin
+//! echoes visibly, simulates a Left press through the engine (encode → egress → PTY),
+//! and asserts the SGR report (`^[[<0;…`) round-trips back into the frame.
 //!
 //! # Skip vs fail
 //!
 //! - **Skip (exit 0):** `LENS_OMNIGENT_URL` or `LENS_OMNIGENT_SESSION_ID` absent;
 //!   or URL+session present but no valid terminal target.
 //! - **Fail (exit 1):** env configured but client handshake or any driver phase times out.
-//! - **Pass (exit 0):** phases P1–P4 complete; P5 runs only when `LENS_LIVE_CLIPBOARD_PASTE=1`.
+//! - **Pass (exit 0):** phases P1–P4 complete; P5/P6 run only when their env flag is `1`.
 //!
 //! Run manually against omnigent 0.5.1 — **not** part of `cargo test --workspace`:
 //!
@@ -332,10 +338,66 @@ fn spawn_driver(tab: Entity<TerminalTab>, marker: String, cx: &mut App) {
             eprintln!("terminal_live: P5 paste round-trip OK");
         }
 
+        if live_mouse_report_enabled() {
+            // Enable mouse tracking (as terminal OUTPUT) then run `cat -v` so the shell
+            // echoes subsequent stdin VISIBLY (ESC shown as `^[`), including the SGR mouse
+            // report the engine encodes and sends when we simulate a press.
+            let started = weak
+                .update(cx, |tab, _| {
+                    tab.debug_send_input_for_test(
+                        b"printf '\\033[?1000h\\033[?1006h'; cat -v\r".to_vec(),
+                    )
+                })
+                .unwrap_or(false);
+            if !started {
+                fail_phase("P6 mouse report: enable-tracking/cat dispatch failed");
+            }
+            // Settle: let the printf enable tracking on the engine terminal and cat start.
+            let settle = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < settle {
+                cx.background_executor().timer(POLL_INTERVAL).await;
+            }
+            // Simulate a Left press; engine encodes SGR -> egress -> PTY -> cat -v echoes.
+            let pressed = weak
+                .update(cx, |tab, _| {
+                    tab.debug_mouse_down_at_cell_for_test(2, 0, 20.0, 4.0)
+                })
+                .unwrap_or(false);
+            if !pressed {
+                fail_phase("P6 mouse report: mouse-down dispatch failed");
+            }
+            // cat -v renders the report's ESC as `^[`, so the frame shows `[<0;...`.
+            let p6_deadline = Instant::now() + OVERALL_DEADLINE;
+            let mut p6_ok = false;
+            while Instant::now() < p6_deadline {
+                let visible = weak
+                    .update(cx, |tab, _| {
+                        tab.debug_latest_frame_for_test()
+                            .is_some_and(|f| frame_contains_marker(&f, "[<0;"))
+                    })
+                    .unwrap_or(false);
+                if visible {
+                    p6_ok = true;
+                    break;
+                }
+                cx.background_executor().timer(POLL_INTERVAL).await;
+            }
+            if !p6_ok {
+                fail_phase("P6 mouse report: SGR report not echoed back in frame");
+            }
+            eprintln!("terminal_live: P6 mouse report round-trip OK");
+        }
+
         eprintln!("terminal_live: PASS");
         std::process::exit(0);
     })
     .detach();
+}
+
+fn live_mouse_report_enabled() -> bool {
+    std::env::var("LENS_LIVE_MOUSE_REPORT")
+        .ok()
+        .is_some_and(|v| v == "1")
 }
 
 fn live_clipboard_paste_enabled() -> bool {
