@@ -118,12 +118,21 @@ async fn card_offscreen_in_focus_rail_resumes_animating_on_return(cx: &mut gpui:
         vcx.executor().advance_clock(Duration::from_millis(50));
         vcx.run_until_parked();
     }
-    let (bottom_hidden, bottom_timer) = vcx.read(|cx| {
+    let (bottom_visible, bottom_timer) = vcx.read(|cx| {
         let v = &board_handle.read(cx).card_views_for_test()[&bottom];
         (v.read(cx).is_visible(), v.read(cx).timer_running_for_test())
     });
-    assert!(!bottom_hidden, "off-screen rail card must be gated hidden");
+    assert!(!bottom_visible, "off-screen rail card must be gated hidden");
     assert!(!bottom_timer, "hidden card's anim timer must be dropped");
+    let (top_visible, top_timer) = vcx.read(|cx| {
+        let v = &board_handle.read(cx).card_views_for_test()[&top];
+        (v.read(cx).is_visible(), v.read(cx).timer_running_for_test())
+    });
+    assert!(
+        top_visible,
+        "on-screen rail control must stay visible in focus mode (gate must not blanket-hide)"
+    );
+    assert!(top_timer, "on-screen rail control must keep animating in focus mode");
     let settled = rc_bottom.get();
     for _ in 0..5 {
         vcx.executor().advance_clock(Duration::from_millis(50));
@@ -187,6 +196,7 @@ async fn card_offscreen_resumes_when_board_mounts_focused(cx: &mut gpui::TestApp
     });
     vcx.run_until_parked();
 
+    let top = ids[0].clone(); // on-screen control
     let bottom = ids[N - 1].clone();
     let rc_bottom = vcx.read(|cx| {
         board_handle.read(cx).card_views_for_test()[&bottom]
@@ -200,12 +210,21 @@ async fn card_offscreen_resumes_when_board_mounts_focused(cx: &mut gpui::TestApp
         vcx.executor().advance_clock(Duration::from_millis(50));
         vcx.run_until_parked();
     }
-    let (bottom_hidden, bottom_timer) = vcx.read(|cx| {
+    let (bottom_visible, bottom_timer) = vcx.read(|cx| {
         let v = &board_handle.read(cx).card_views_for_test()[&bottom];
         (v.read(cx).is_visible(), v.read(cx).timer_running_for_test())
     });
-    assert!(!bottom_hidden, "off-screen rail card must be gated hidden");
+    assert!(!bottom_visible, "off-screen rail card must be gated hidden");
     assert!(!bottom_timer, "hidden card's anim timer must be dropped");
+    let (top_visible, top_timer) = vcx.read(|cx| {
+        let v = &board_handle.read(cx).card_views_for_test()[&top];
+        (v.read(cx).is_visible(), v.read(cx).timer_running_for_test())
+    });
+    assert!(
+        top_visible,
+        "on-screen rail control must stay visible in focus mode (gate must not blanket-hide)"
+    );
+    assert!(top_timer, "on-screen rail control must keep animating in focus mode");
     let settled = rc_bottom.get();
     for _ in 0..5 {
         vcx.executor().advance_clock(Duration::from_millis(50));
