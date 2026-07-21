@@ -1,7 +1,8 @@
 # T-2 — Focused view scaffold + live disk-sourced surface (design)
 
 **Date:** 2026-07-21
-**Status:** DESIGN — awaiting user review, then `writing-plans`.
+**Status:** REVISED (rev 2) after GPT-5.6 (codex) cross-family review — awaiting user
+review, then `writing-plans`.
 **Owner:** Lens design effort
 **Type:** Implementation slice (build), transcript workstream T-2 of T-0..T-7 (+ T-2b).
 
@@ -9,87 +10,108 @@ Implements `docs/design/conversation-transcript.md` §16 (the scrolling surface)
 §17 (edge states: disk-paint → reconcile, historical hydration) — the **first real
 consumer** of the T-1 `Vec<ViewBlock>` projection. Mounts a focused transcript into
 the shell's `#chat-slot`, backed by a store-side replica that reads finalized items
-from disk (D23) and splices the live tail from the actor's scratch, rendered through
-gpui's native `list()`.
+from disk and splices the live tail from the actor's scratch, rendered through gpui's
+native `list()`.
 
 This is an **implementation decomposition** of an already-complete product design. It
 does not reopen product questions; it resolves the lens-ui/gpui specifics and the
 actor-feed consumption the render surface needs.
 
-Sibling slices (STATUS "transcript fan-out"): **T-0** authoritative turn identity ✅ ·
-**T-1** pure ViewBlock projection ✅ · **T-2b** disk windowing + scroll-back paging +
-bounded-tail reconcile (**next after T-2**) · T-3 content/markdown · T-4 tool spans +
-resource markers (**+ live in-progress tool-tail feed extension**) · T-5 sub-agent
-spans · T-6 turn lifecycle + `WorkSectionMeta` · T-7 composer & live turn.
+Sibling slices: **T-0** authoritative turn identity ✅ · **T-1** pure ViewBlock
+projection ✅ · **T-2b** disk windowing + scroll-back paging + bounded-tail reconcile
+(**next after T-2**) · T-3 content/markdown · T-4 tool spans + resource markers
+(**+ live in-progress tool-tail feed extension**) · T-5 sub-agent spans · T-6 turn
+lifecycle + `WorkSectionMeta` · T-7 composer & live turn.
 
 ---
 
-## 0. What the code-map established (2026-07-21)
+## 0. What the code-map + review established (2026-07-21)
 
-Before scoping, a read-only exploration mapped the *actual* current state (memories
-were stale). Load-bearing facts:
+A read-only exploration mapped the actual code; the GPT-5.6 review (rev-2 below)
+verified the load-bearing claims and broke several first-draft assumptions. Facts the
+design now rests on, with citations:
 
 - **The feed is single-consumer.** `(feed_tx, feed_rx) = async_channel::bounded(64)` is
-  created in `FleetStore::spawn_live_session` (`crates/lens-ui/src/fleet/store.rs:171`)
-  and `feed_rx` is **moved into** `spawn_session_poller` (`store.rs:202`,
-  `fleet/poller.rs:10`). There is **no broadcast/tee**; a second `async_channel`
-  receiver would *steal* frames, not fan them out. So a second detailed consumer must
-  be reached **through the existing poller**, not via a new channel.
-- **On focus, the actor says "read from disk yourself."** `SessionCommand::Promote`
-  (`actor/runloop.rs:518`) emits `Detailed(Rebased(scalars_baseline(state)))` — and
-  `scalars_baseline` **clears `items`** (`runloop.rs:1141`, D23) — then flips
-  `output.mode = Detailed`. `Rebased` carries **no items**; the baseline transcript
-  comes from disk.
-- **The three deltas T-2 needs already exist** (`reduce/update.rs`): `TranscriptAdvanced
-  { committed_ordinal }` (`:20`, = highest ordinal on disk inclusive, `next_ordinal-1`),
-  `ScratchChanged(Arc<StreamScratch>)` (`:26`), `ActiveResponseChanged(Option<ResponseId>)`
-  (T-0). `ItemAppended/Updated` are **deleted** (D23). The card poller currently
-  **no-ops** `TranscriptAdvanced`/`ActiveResponseChanged` with comments reserving them
-  for "the T-2 transcript replica" (`card/model.rs:236,244`).
-- **The transcript DB is a per-session file**, `{data_dir}/{session_id}.db`, WAL
-  (`fleet/live.rs:71`, `open_stores`). The actor owns an exclusive write `Connection`
-  (`SqliteTranscriptStore { conn: Connection }`, `persist/transcript.rs:17`;
-  `Connection` is `!Sync`). WAL permits a **second read connection** to the same file.
-- **`TranscriptStore` has no ranged read** — only full-table `load_items`
-  (`persist/transcript.rs:253`) and `store_frontier`. No `WHERE ordinal < ? LIMIT`,
-  no byte-budget, no bounded-tail reconcile.
-- **`GET /items` is already paginated** (`after`/`before`/`limit`/`order` cursor,
-  `lens-client/src/sessions.rs:472,1292`). The "Bucket-C blocking dep" the earlier
-  handoff flagged on T-2 is effectively satisfied on the network side.
-- **`ContentTab` is an inert marker.** `pub trait ContentTab {}` — no methods, nothing
-  bounds on it; the real mount seam is the concrete `TabHandle { view: AnyView, title,
-  focus_handle }` (`slot/mod.rs:6,8`). `#chat-slot` renders a literal `"chat"` string
-  (`board/mod.rs:266`).
-- **The RowSource machinery exists in the spike** (`spikes/transcript-virtual/`):
-  `RowSource` trait, id-keyed retained `RowStore { order: Vec<RowId>, entities:
-  HashMap<RowId, Entity<RowState>> }`, `finalize_handoff(UpsertById|ClearRecreate)`,
-  and native `list(list_state, closure)` with `ListState::new(n, ListAlignment::Bottom,
-  OVERDRAW)`. It is fixture-driven; no production disk-sourced upsert.
+  created in `FleetStore::spawn_live_session` (`fleet/store.rs:171`) and `feed_rx` is
+  **moved into** `spawn_session_poller` (`store.rs:202`, `poller.rs:10`). No
+  broadcast/tee; a cloned receiver would *steal* frames. A second detailed consumer must
+  be reached **through the poller**. ✅ verified.
+- **On focus the actor says "read from disk yourself."** `Promote` (`runloop.rs:518`)
+  emits `Detailed(Rebased(scalars_baseline))` — `scalars_baseline` **clears `items`**
+  (`runloop.rs:1141`, D23) — then flips `output.mode = Detailed`. ✅ verified.
+- **The forward watermark exists but is NOT the whole disk-change story.**
+  `TranscriptAdvanced { committed_ordinal }` (`reduce/update.rs:20`) is emitted after a
+  terminal-status commit, `committed_ordinal = next_ordinal-1` (`runloop.rs:663,1188`).
+  **But disk mutates below the watermark**: `reconcile_store_item`
+  (`persist/transcript.rs:286-340`) does `UPDATE items SET item_id/kind/payload/response_id
+  WHERE ordinal=?` and `DELETE … WHERE ordinal=? AND provisional=1` at **existing**
+  ordinals during catch-up (`runloop.rs:379-416`); message reconciliation rewrites
+  content at the same id/ordinal (`transcript.rs:611+`); a re-fire of an already-persisted
+  id updates in place and emits **no** `TranscriptAdvanced` (`runloop.rs:2234` test).
+  So a **forward-delta-only** model with `ord ≤ last_rendered ⇒ no-op` **misses
+  authoritative below-watermark changes** — §3.4 adds a reconcile-range re-read. ⚠ this
+  broke the first draft.
+- **The finalize handoff is NOT atomic across scratch→disk.** On the canonical Message /
+  `Completed`, the reducer clears `open_message` and pushes `ScratchChanged`
+  **synchronously** (`reduce/mod.rs:118-145`), while the committed row reaches the
+  replica only via an **async** disk read on `TranscriptAdvanced`. Naively dropping the
+  streaming row on `ScratchChanged` leaves a frame with the row **absent** → flash.
+  §6 stages the retirement. ⚠ this broke the first draft.
+- **`finalize_message` derives the item id FROM `message_id`** (`reduce/items.rs:112-130`,
+  falling back to a synthesized `local_id` when `message_id` is `None`). So for keyed
+  messages the streaming id **equals** the finalized item id **by construction** — no
+  byte-verification needed. The gaps are the `None` fallback and that **`ReasoningAcc`
+  carries no id** (`domain/item.rs:129-142`). ✅ verified (simplifies the first draft).
+- **`reduce/reconcile.rs` is pending-USER reconciliation, not transcript-id** — the
+  first draft mis-cited it; item reconciliation lives in `persist/transcript.rs`. ✅
+  corrected.
+- **The transcript DB is per-session**, `{data_dir}/{session_id}.db`, WAL
+  (`fleet/live.rs:71`). The actor owns an exclusive write `Connection` (`!Sync`,
+  `persist/transcript.rs:17`). A second reader is WAL-compatible **but**
+  `SqliteTranscriptStore::open` runs **DDL/migrations/metadata writes** (`persist/db.rs:36-67`)
+  and sets **no busy timeout** — so it is not a safe read handle as-is (§3.3). ✅ verified.
+- **`load_items` returns items WITHOUT ordinals** (`transcript.rs:253-260`); the frontier
+  is a **separate** query (`transcript.rs:263-283`). Reading them independently observes
+  two snapshots → §3.3 adds one transactional `(ordinal, Item) + watermark` primitive.
+  ✅ verified.
+- **`gpui::list()`'s render closure is `'static`** (gpui-0.2.2 `elements/list.rs:21-30`);
+  the spike captures an entity and re-enters it, with `RowState` owning **cloned** text
+  (`spikes/transcript-virtual/src/rowsource.rs:13-37`). A render-local **borrowed**
+  `Vec<ViewBlock>` cannot be captured. §6 projects into **owned** presentations. ⚠ this
+  broke the first draft's "no clone in the tree."
+- **`GET /items` is already paginated** (`lens-client/src/sessions.rs:472,1292`).
+- **`ContentTab` is an inert marker**; the mount seam is the concrete `TabHandle`
+  (`slot/mod.rs:6,8`); `#chat-slot` renders a literal `"chat"` (`board/mod.rs:266`). ✅
+  verified. Second WAL reader compatible once opened correctly. ✅ verified.
+- **`ActorOutcome::TransportChanged` carries `reconcile_in_flight`** (`actor/outcome.rs:17`)
+  but the poller **discards** it with `..` (`poller.rs:94-105`). §9 routes it. ✅ verified.
 
 ---
 
 ## 1. Scope & boundaries
 
-**T-2 owns:** the focused transcript **surface** — mount it, feed a store-side replica
-the detailed frames, source finalized rows from disk and the live tail from scratch,
-project through T-1, render through native `list()`, and satisfy the four §16 scroll
-contracts. It renders **every** `ViewBlock` variant, using **stub** content for the
-blocks T-3/T-4 own (message/reasoning markdown, tool-span archetypes) — the stubs are
-replaced, not extended around.
+**T-2 owns** the focused transcript **surface**: mount it; feed a store-side replica the
+detailed frames; source finalized rows from disk (baseline + forward-delta + **reconcile
+re-read**) and the live tail from scratch; project through T-1 into **owned row
+presentations**; render through native `list()`; satisfy the four §16 scroll contracts;
+meet the frame-budget perf gate. It renders **every** `ViewBlock` variant, using **stub**
+content for T-3/T-4-owned blocks (the stubs are replaced, not extended around).
 
 **T-2 does NOT own** (each → its slice):
 
 | Concern | Why not T-2 | Slice |
 |---|---|---|
-| Byte-budgeted **windowed baseline** (don't load-all on open) | Scale; small/medium sessions work on load-all | **T-2b** |
-| **Scroll-back paging** (load *older* items on scroll-up) | Scale; forward-delta suffices for the live surface | **T-2b** |
-| **Bounded-tail reconcile** (scope reconcile to the resident tail) | Scale; full-history reconcile is a >1s stall only on multi-day sessions | **T-2b** |
-| Rich **message/reasoning** content (markdown, safe-prefix) | Its own vendor+patch effort | T-3 |
-| **Tool-span** archetypes / native tools / resource-marker render | Its own render effort | T-4 |
-| **Live in-progress tool-tail** (actor shipping above-watermark working items) | A lens-core *feed extension*; in-progress tool spans first matter where tool-span render lives | **T-4** |
-| `WorkSectionMeta` chip (duration/model/tokens/cost) | Needs per-turn data T-1/T-2 can't supply | T-6 |
-| Composer / interrupt / elicitation dock | The chat closer | T-7 |
-| Polymorphic **`ContentTab`** mount protocol | Needs a *second* real UI surface to design against; deferred to terminal-UI-integration (SPEC-GAPS cross-spec-risks) | future |
+| Byte-budgeted **windowed baseline** (don't load-all on open; bound resident RAM) | Scale; small/medium sessions work on load-all | **T-2b** |
+| **Scroll-back paging** (load *older* items on scroll-up) | Scale | **T-2b** |
+| **Bounded-tail** scoping of the reconcile re-read | Scale (T-2 re-reads the whole resident set on reconcile — correct but O(N); rare event) | **T-2b** |
+| Rich message/reasoning content, tool-span archetypes | Own render efforts | T-3, T-4 |
+| **Live in-progress tool-tail** (actor ships above-watermark working items) | A lens-core feed extension; belongs with tool-span render | **T-4** |
+| `WorkSectionMeta` chip, composer/interrupt/elicitation | Later slices | T-6, T-7 |
+| Polymorphic `ContentTab` protocol | Needs a 2nd real surface | future (SPEC-GAPS) |
+
+**In T-2 for correctness (NOT deferred):** the reconcile-range re-read (below-watermark
+changes, §3.4), the transactional read-only reader + busy timeout (§3.3), the staged
+finalize handoff (§6), the per-frame-bounded owned-presentation render (§6/§8).
 
 ---
 
@@ -97,99 +119,113 @@ replaced, not extended around.
 
 ```
 focus_session(id)  (fleet/store.rs)
-  ├─ Demote(prev), Promote(id)           → actor(id) flips to Detailed, emits Rebased(scalars)
-  └─ create FocusedTranscript replica    (store-side entity; opens a 2nd READ conn to {id}.db)
+  ├─ install FocusedTranscript replica FIRST (store-side; retains reader factory: data_dir+conn_id+id)
+  │     └─ open READ-ONLY reader (busy_timeout) to {id}.db on a dedicated reader worker
+  │     └─ enqueue baseline read (focus-generation G)  ── serialized through the reader worker ──┐
+  ├─ Demote(prev), Promote(id)  → actor(id): Detailed, emits Rebased(scalars)                    │
+  └─ poller drains each ActorFeed BATCH → FleetStore.fold_session_feed(id, batch, cx):           │
+        Summary(u)                 → SessionCard.fold_summary  (chrome; unchanged)               │
+        Detailed(Rebased scalars)  → replica: refresh scalars ONLY (never clear items)           │
+        Detailed(ScratchChanged)   → replica: update live tail; STAGE finalize retirement        │
+        Detailed(TranscriptAdvanced{ord}) → replica: enqueue forward-delta read (ord, G)         │
+        Detailed(ActiveResponseChanged(r)) → replica: set active_response                        │
+        Detailed(Reconnected{gap})  → replica: if gap != Some(0), inject ReconnectBreak marker   │
+        (TransportChanged reconcile_in_flight true→false) → replica: enqueue reconcile re-read    │
+        │                                                                                        │
+        ▼  reader worker applies each result on the UI thread (drop if focus-generation != G):   │
+     (ordinal, Item, watermark) rows → build owned RowPresentation → id-keyed upsert into RowStore┘
         │
-        ▼  baseline (async, off-UI-thread): load_items → id-keyed upsert into RowStore
-        │
-   ┌────┴─────────────── the ONE poller (per session) dispatches each ActorFeed frame ──┐
-   │  Summary(u)                 → SessionCard.fold_summary  (chrome; unchanged)         │
-   │  Detailed(Rebased scalars)  → replica: refresh scalars ONLY (never clear items)     │
-   │  Detailed(ScratchChanged)   → replica: live tail (StreamingMessage/Reasoning)       │
-   │  Detailed(TranscriptAdvanced{committed_ordinal})                                    │
-   │                             → replica: forward-delta read (last_rendered, ord] →    │
-   │                               id-keyed upsert (flash-free finalize handoff)         │
-   │  Detailed(ActiveResponseChanged(r)) → replica: set active_response (liveness)       │
-   │  Detailed(Reconnected{gap})         → replica: inject ReconnectBreak marker if gap  │
-   └─────────────────────────────────────────────────────────────────────────────────────┘
-        │
-        ▼  render (per frame):
-     project_all/project_filtered(&items, &scratch, active_response) → Vec<ViewBlock>   (T-1)
-        → map each block to a stable row id → list()/ListState/ListAlignment::Bottom
-        → each retained RowState entity renders STUB content from its ViewBlock
+        ▼  project on INPUT CHANGE (items/scratch/active_response), NOT per frame:
+     project_all/project_filtered(&items, &scratch, active_response) → Vec<ViewBlock>  (T-1, borrow-only)
+        → materialize OWNED RowPresentation per block → upsert retained Entity<RowState>
+        → ListState::splice/reset on order/count/height change
+     render: list(state, closure)  — closure is 'static: captures the entity + owned RowId order snapshot
 ```
 
-Disk is the source of truth for finalized rows; RAM scratch is the source for the live
-tail above the watermark. The two never overlap (D23 split-at-the-watermark).
+Disk is authoritative for finalized rows; RAM scratch is the live tail; the staged
+handoff (§6) bridges them without an absent frame.
 
 ---
 
-## 3. Forced decisions (the code leaves no real alternative)
+## 3. Decisions
 
-### 3.1 Feed fan-out = one poller, two sinks — dispatch centralizes in `FleetStore`
+### 3.1 Feed fan-out = one poller draining BATCHES through `FleetStore`
 
-There is no broadcast on the feed and the receiver is already owned by the poller, so
-the poller stays the **sole** consumer and **fans out**: `Summary` → the card;
-`Detailed` → the card's existing `fold_detailed` (chrome scalars) **and**, when this
-session is focused, the `FocusedTranscript` replica.
+The feed is single-consumer, so the poller stays sole receiver and **routes each drained
+batch** (not frame-by-frame) via a `FleetStore` method — `fold_session_feed(session_id,
+batch, cx)` — that fans `Summary` → the card and `Detailed` → the card's `fold_detailed`
+(chrome) **and**, when focused, the `FocusedTranscript` replica. The poller captures a
+**`WeakEntity<FleetStore>`** (a strong capture would cycle task↔entity). Batch routing
+lets the replica recognize *scratch-clear + watermark in one batch* as a single finalize
+episode (§6). No broadcast channel; recreating the actor with a second sender is
+impossible post-spawn (it holds the sole `Sender`).
 
-The replica is created *after* the poller (on focus), so the poller cannot capture it
-at spawn. Resolution: the poller folds each frame through a **`FleetStore` method**
-(e.g. `fold_session_feed(session_id, frame, cx)`) that owns the routing —
-`FleetStore` gains `focused_transcript: Option<(SessionId, Entity<FocusedTranscript>)>`
-and routes `Detailed` frames to it when `session_id` matches. This centralizes
-dispatch and keeps the poller a thin pump. (Alternatives — a broadcast channel, or
-recreating the actor with a second sender — are rejected: the former is new plumbing
-for one consumer, the latter is impossible post-spawn since the actor holds the sole
-`Sender`.)
+### 3.2 The replica lives store-side (fleet layer), installed before `Promote`
 
-### 3.2 The replica lives store-side (fleet layer), not in the view
+`FocusedTranscript` is a gpui `Entity` owned by `FleetStore`, **created on focus before
+`Promote` is sent** (so it is ready for the `Rebased` + first frames), dropped on
+`Demote`. `#chat-slot`'s `ContentTab` is a **pure renderer** of the replica. Store owns
+data, view renders it (the shipped card pattern).
 
-`FocusedTranscript` is a gpui `Entity` owned by `FleetStore`, created on `Promote`,
-dropped on `Demote` — the same ownership/lifecycle as `SessionCard`. The `#chat-slot`
-`ContentTab` is a **pure renderer** that reads the replica entity. Rationale: the
-poller (in the fleet layer) drives the replica; if the view owned it, the poller would
-need a handle *into* a view — a backwards seam. Store owns data, view renders it
-(consistent with the shipped card pattern and the state-model "SessionStore is a gpui
-replica" decision).
+**Missing plumbing to add:** `FleetStore` currently discards `data_dir`/connection
+context after spawn (`store.rs:64-70`). It must **retain a per-session reader factory**
+(`data_dir` + `conn_id` + `session_id`) so the replica can open its reader. `focus_session`
+gains access to that context.
 
-### 3.3 The replica opens its own read connection; all reads off the UI thread
+### 3.3 A dedicated reader worker with a read-only handle + transactional primitive
 
-The actor keeps its exclusive write `Connection`. The replica opens a **second
-`TranscriptStore` read handle** to `{data_dir}/{session_id}.db` (WAL → concurrent
-reads are safe while the actor writes). Every disk read (baseline + forward-delta)
-runs in a background task; results are applied to the RowStore on the UI thread. The
-replica holds the read handle behind a `Send` guard usable from the background task
-(mechanism — dedicated reader task vs `Mutex<Connection>` vs per-read open — is a plan
-detail; `Connection` is `Send` but `!Sync`).
+The actor keeps its exclusive write `Connection`. The replica does **all** disk reads on
+**one dedicated background reader worker** (serialized — never independent spawns) owning
+a `Box<dyn TranscriptReader + Send>`:
 
-The read handle is the `TranscriptStore` **trait**, so the fake fleet (tests) injects
-an in-memory implementation and the replica is exercisable without a real DB.
+- **New `TranscriptReader` interface** — read/query-only, separate from the write
+  `TranscriptStore`. Opened via a **read-only opener** that does **no** DDL/migration/
+  metadata writes (unlike `SqliteTranscriptStore::open`) and sets a **bounded
+  `busy_timeout`** (WAL readers can still see `SQLITE_BUSY`; the default handler is null).
+- **One transactional read primitive** returning `Vec<(ordinal, Item)>` **plus the exact
+  snapshot watermark**, in a single transaction — so items and frontier are one snapshot
+  (`load_items` returns no ordinals and the frontier is a separate query → two snapshots,
+  a race). Two shapes: forward-delta `(after, through]` and full-resident (T-2) /
+  windowed (T-2b) baseline + reconcile re-read.
+- **Focus-generation token `G`.** Every read is tagged with the focus generation; a
+  result whose `G` ≠ the current focus is dropped, so a stale read from a prior focus
+  can't land on the new session's rows.
+- Read transactions are short; a `Mutex` (if used) is never locked on the gpui thread.
 
-### 3.4 One small store primitive is in-scope: a forward-delta ranged read
+### 3.4 Two disk-read paths: forward-delta (fast) + reconcile re-read (correctness)
 
-`TranscriptStore` gains **one** method — read `(after_ordinal, through_ordinal]` in
-ordinal order (`WHERE ordinal > ? AND ordinal <= ? ORDER BY ordinal`). This is what
-makes D23's "replica reads `(last_rendered, committed_ordinal]`" real; without it the
-replica re-scans the whole table on every commit. It is **not** T-2b: T-2b is the
-byte-budgeted *window* (bounded resident set), *backward* scroll-back paging, and
-*bounded-tail reconcile*. The forward-delta read is a forward tail-growth primitive
-both slices use.
+- **Forward-delta (live growth):** on `TranscriptAdvanced{ord}` with `ord >
+  last_rendered`, enqueue a `(last_rendered, ord]` read; id-keyed upsert; advance
+  `last_rendered`.
+- **Reconcile re-read (below-watermark changes):** provisional reconcile rewrites/deletes
+  rows at **existing** ordinals (§0). So on a **reconcile episode** — detected by
+  `TransportChanged.reconcile_in_flight` transitioning **true→false** (routed to the
+  replica, §9) — enqueue a **full resident-range re-read** and **id-keyed reconcile**
+  against the RowStore: changed ids update in place, folded-away provisional rows are
+  removed, new ids inserted. This is O(resident) but only on the (rare) reconcile
+  episode; **T-2b** bounds it to the resident tail. Upsert-by-id makes it flash-free.
 
-T-2 baseline load = full `load_items`. T-2b swaps that baseline for a byte-budgeted
-tail window and adds the backward page primitive.
+The one small write-side addition to `TranscriptStore`/`SqliteTranscriptStore` is the
+ranged/transactional read primitive backing the reader (shared by T-2 and T-2b).
 
-### 3.5 `ReconnectBreak` is a replica-injected synthetic marker
+### 3.5 `ReconnectBreak` = replica-injected synthetic marker (gap ≠ Some(0))
 
-No `ReconnectBreak` exists anywhere, and by design it has **no backing item** (why T-1
-deferred it). It is a **UI-only** marker the replica injects into its row order — not
-an `Item`, not a projection output. Trigger: `StreamUpdate::Reconnected` carrying a
-**real gap**. The reducer computes a reconnect `gap: Option<u64>` (`snapshot.rs:98`)
-but `StreamUpdate::Reconnected` may not currently carry it — if not, **widen the
-variant to `Reconnected { gap: Option<u64> }`** (a minor, additive lens-core touch;
-cross-family reviewed). The marker occupies a synthetic `RowId` (markers get ids
-outside the item-id space) or renders as an inter-row separator (plan detail). `↻`
-appears **only on a real gap** (§17), never on a clean reconnect.
+No `ReconnectBreak` exists; by design it has no backing item (why T-1 deferred it). It is
+a **UI-only** marker injected into the row order — not an `Item`, not projection output.
+
+- **Widen** `StreamUpdate::Reconnected` to `Reconnected { gap: Option<u64> }` (it carries
+  none today; `reduce/update.rs:62`). Minor additive lens-core change.
+- **Condition:** inject on `gap != Some(0)` — matching the reducer, which treats every
+  value **except `Some(0)`** as a discontinuity (`reduce/snapshot.rs:98-111`); `None` is a
+  discontinuity too (the first draft's "None ⇒ no marker" was backwards).
+- **Lifecycle (honest limitation):** markers live in the ephemeral focused replica and are
+  **lost on `Demote`**; a gap while unfocused (Summary mode delivers no detailed frames)
+  is never marked. **T-2's success criterion is narrowed to "gaps observed while
+  continuously focused."** A durable per-session discontinuity ledger (survives defocus)
+  is deferred to **T-6** (turn-lifecycle/reconnect-break render owner). Never persisted as
+  an `Item`.
+- Occupies a synthetic `RowId` outside the item-id space (or renders as an inter-row
+  separator — plan detail).
 
 ---
 
@@ -197,199 +233,214 @@ appears **only on a real gap** (§17), never on a clean reconnect.
 
 New module tree in **lens-ui** (`crates/lens-ui/src/`):
 
-- `focused/mod.rs` — `FocusedTranscript` replica entity (state + feed folding).
-- `focused/rowsource.rs` — production `RowSource` + `RowStore` lifted from the spike
-  (id-keyed retained entities, upsert-not-recreate).
-- `focused/view.rs` — the gpui `Render` surface: `list()` wiring, scroll contracts,
-  stub row renderers. Constructed via `focused_transcript_tab(replica, cx) -> TabHandle`.
-- `slot/mod.rs` — add the `focused_transcript_tab` factory; **`ContentTab` untouched**.
+- `focused/mod.rs` — `FocusedTranscript` replica (state, batch folding, staged finalize).
+- `focused/reader.rs` — the dedicated reader worker + `TranscriptReader` client + focus-
+  generation gating.
+- `focused/rowsource.rs` — production `RowSource`/`RowStore` (id-keyed retained entities;
+  **owned `RowPresentation`**; `ListState::splice/reset` discipline) lifted from the spike.
+- `focused/view.rs` — the gpui `Render` surface: `list()` wiring, scroll contracts, stub
+  row renderers. Built via `focused_transcript_tab(replica, cx) -> TabHandle`.
+- `slot/mod.rs` — add `focused_transcript_tab`; **`ContentTab` untouched**.
+- `fleet/store.rs`, `fleet/poller.rs` — retain the reader factory; `fold_session_feed`
+  batch routing via `WeakEntity`.
 
-The **one** lens-core touch: the forward-delta ranged read on the `TranscriptStore`
-trait + its `SqliteTranscriptStore` impl (`persist/`), and — if needed — widening
-`StreamUpdate::Reconnected` to carry `gap` (`reduce/update.rs` + emit site).
+**lens-core touches (small but real):** the transactional/ranged read primitive +
+read-only opener + `busy_timeout` (`persist/`); widen `StreamUpdate::Reconnected` with
+`gap`; **add an id to `ReasoningAcc`** threaded to `finalize_reasoning` for stable
+reasoning identity (mirroring `finalize_message`'s `message_id` — confirm the exact
+threading against `finalize_reasoning` in planning). Each cross-family reviewed.
 
 ---
 
 ## 5. The `FocusedTranscript` replica
 
-**State:**
+**State:** `items: Vec<Item>` (resident finalized transcript; ordinal-keyed) ·
+`scratch: Arc<StreamScratch>` · `active_response: Option<ResponseId>` ·
+`last_rendered_ordinal: i64` · `rows: RowStore` (id-keyed retained `Entity<RowState>`
+holding **owned** `RowPresentation`) · `pending_finalize: HashMap<RowId, RowPresentation>`
+(staged §6) · `markers: Vec<(RowId, Marker)>` · `focus_generation: u64` · the reader
+worker handle + `session_id`.
 
-- `items: Vec<Item>` — the resident finalized transcript (T-2: the whole thing; T-2b:
-  a windowed tail). Canonical for projection input.
-- `scratch: Arc<StreamScratch>` — the latest live tail (from `ScratchChanged`).
-- `active_response: Option<ResponseId>` — liveness (from `ActiveResponseChanged`).
-- `last_rendered_ordinal: i64` — high-water mark of resident finalized items.
-- `rows: RowStore` — id-keyed retained `Entity<RowState>` (identity across `list()`
-  recycle + finalize handoff).
-- `markers: Vec<(RowId, Marker)>` — synthetic UI-only rows (e.g. `ReconnectBreak`).
-- the `TranscriptStore` read handle + `session_id`/`conn_id`.
-
-**Fold rules (the detailed frames):**
+**Batch fold rules:**
 
 | Frame | Replica action |
 |---|---|
-| `Rebased(scalars)` | Update status/title/active-response scalars **only**. Never clear `items` (append-only → clearing would remount every row = the D23 anti-pattern). Independent of the baseline load, which is kicked at replica **creation** (§2 — the read handle + session id are known then; disk already holds the committed prefix for an existing session). |
-| `ScratchChanged(s)` | `self.scratch = s`; re-render (live tail changes). |
-| `TranscriptAdvanced{ord}` | If `ord > last_rendered_ordinal`: background forward-delta read `(last_rendered, ord]` → on UI thread, id-keyed **upsert** into `rows`, extend `items`, set `last_rendered = ord`. |
-| `ActiveResponseChanged(r)` | `self.active_response = r`; re-render (a turn went live/settled → grouping flips). |
-| `Reconnected{gap}` | If `gap` is a real gap, inject a `ReconnectBreak` marker at the current tail. |
+| `Rebased(scalars)` | Update status/title/active-response scalars **only**. Never clear `items` (append-only would remount every row). Baseline read was enqueued at **create** (§2). |
+| `ScratchChanged(s)` | `self.scratch = s`. If an accumulator that was open is now cleared, **stage** its last presentation into `pending_finalize` keyed by its RowId (§6) — do **not** drop the row. Re-project. |
+| `TranscriptAdvanced{ord}` | If `ord > last_rendered`: enqueue forward-delta `(last_rendered, ord]` read (gen G). |
+| `ActiveResponseChanged(r)` | `self.active_response = r`. Re-project (grouping flips). |
+| `Reconnected{gap}` | If `gap != Some(0)`, inject a `ReconnectBreak` marker at the tail. |
+| `TransportChanged{reconcile_in_flight}` | Drive the debounced `syncing…` indicator (§9); on true→false, enqueue the reconcile re-read (§3.4). |
 
-**Projection at render:** `project_all(&self.items, &self.scratch, self.active_response
-.as_ref())` (or `project_filtered(.., splice_reasoning=false)` for the History-view
-caller running `hide_reasoning` — see §8). The result is a transient `Vec<ViewBlock>`
-whose lifetime is the `render` call; the `list()` closure indexes it.
+**Projection** runs **on input change** (any of `items`/`scratch`/`active_response`
+mutated), not per frame: `project_all(&items, &scratch, active_response.as_ref())` (or
+`project_filtered(.., splice_reasoning=false)` for the History-view/`hide_reasoning`
+caller, §8) → materialize owned presentations → upsert (§6).
 
 ---
 
-## 6. RowSource, row identity, and the flash-free finalize (the crux)
+## 6. RowSource, owned presentations, and the staged finalize (the crux)
 
-**Impedance mismatch.** Projection is borrow-only and transient (`Vec<ViewBlock<'a>>`,
-`'a` = the resident `items`). The `RowStore` is retained id-keyed entities so `list()`
-recycle and (T-3's) markdown state survive across frames. T-2 bridges them:
+**Why owned, not borrowed.** `project_*` returns `Vec<ViewBlock<'a>>` borrowing `items`/
+`scratch`; `gpui::list()`'s closure is **`'static`** and cannot capture a render-local
+borrowed `Vec`, and a `'static Entity<RowState>` cannot retain a borrowed `ViewBlock`
+(§0). So T-1's borrow-only projection stays a pure fn, and **T-2 materializes each block
+into an owned, minimal `RowPresentation`** (kind + text/flags the stub renderer needs —
+not the whole `Item`). The bounded per-row copy is accepted; **"zero clone in the render
+tree" is not a workable invariant** and is dropped. Projection runs on input change; the
+`list()` closure captures only the entity + an owned `Vec<RowId>` order snapshot and
+re-enters the entity to render its owned presentation. `ListState::splice`/`reset` is
+called whenever order/count/height changes (spike `NOTES.md:196-203`).
 
-1. Each `render`, project into a local `Vec<ViewBlock>`.
-2. Map each block to a **stable `RowId`**:
-   - `Item(it)` → the item's store id.
-   - `ToolSpan { call, .. }` → the call item's store id.
-   - `WorkSection { response_id, .. }` → derived from `response_id`.
-   - `StreamingMessage(acc)` → `acc.message_id`; `StreamingReasoning(acc)` → the
-     reasoning stream id.
-   - injected markers → their synthetic `RowId`.
-3. **id-keyed upsert**: a row id already in `RowStore` reuses its `Entity<RowState>`;
-   a new id mints one. **Never clear-and-recreate** (spike-proven: clear-recreate
-   remounts the viewport; upsert preserves entity id, markdown init, and bottom-pin —
-   D23 MANDATORY).
-4. The retained entity renders **stub** content from the current `ViewBlock` (T-3/T-4
-   replace the stubs).
+**Stable `RowId` assignment (identity across finalize).** A `RowId` is assigned **when an
+accumulator opens**, reused when it finalizes:
 
-**The flash-free finalize hazard (correctness-critical).** A streaming message renders
-as `StreamingMessage(acc)` keyed by `acc.message_id`. When it finalizes, the item is
-committed to disk and read back as `Item`, keyed by its **store id**. If
-`message_id != store_id`, the upsert sees the streaming row *disappear* and a *new*
-committed row *appear* → remount → flash + scroll-jump — the exact failure the upsert
-exists to prevent. Per [[omnigent-two-id-space-reconciliation]] the live SSE id and the
-store id **can** differ (proven for scaffold `fc_*` function-calls; **unverified for
-messages**).
+- **Message** — `message_id` if present, else a **session-monotonic synthetic id** (the
+  `None` case). Because `finalize_message` derives the item id from `message_id` (§0),
+  the committed row's id **equals** the streaming RowId for keyed messages; for the
+  synthetic case the replica maps its synthetic RowId → the finalized `local_id`.
+- **Reasoning** — needs an id (`ReasoningAcc` has none): **add one** (§4) so streaming and
+  finalized reasoning share a RowId; else a synthetic-id map as for messages.
+- `Item` → store id · `ToolSpan{call}` → call's store id · `WorkSection{response_id}` →
+  from `response_id` · markers → synthetic ids.
 
-**Resolution + build order:**
-1. **First, byte-verify** whether the streaming `message_id` equals the persisted item
-   id for the target harnesses (reuse the golden SSE captures / a live rider). If they
-   match, use `message_id` directly as the row id and the hazard evaporates.
-2. If they differ, the replica adopts the store id for the provisional streaming row on
-   finalize, using the **existing** id reconciliation (`reduce/reconcile.rs`, the D16/D19
-   item-id reconcile that already maps live↔store ids) — the streaming row keeps its
-   `Entity`, only its `RowId` key is rekeyed.
-3. Either way: a **mandatory test** asserts the `EntityId` of the message row is
-   identical before and after finalize (the spike's negative control was `EntityId
-   86v1→31v3` on clear-recreate; the invariant is *no* remount).
+**Staged retirement (no absent frame).** Finalize is **not** atomic: `ScratchChanged`
+clears the accumulator synchronously; the disk row arrives on a later async read (§0).
+So on the clearing `ScratchChanged`, the replica **keeps rendering the last accumulator
+presentation** for that RowId (stashed in `pending_finalize`) instead of dropping the
+row. When the forward-delta read delivers the committed row for that RowId, the replica
+**swaps the presentation in place** (same RowId, same `Entity`) and clears the
+`pending_finalize` entry. Batch routing (§3.1) lets the replica see scratch-clear +
+watermark as one episode, minimizing the staged interval. The row is **never absent**;
+its `EntityId` never changes.
+
+**Test (MANDATORY, real-window harness — `#[gpui::test]` fakes the text system and
+false-greens paint/identity, per [[gpui-test-noop-text-system]]/[[terminal-realwindow-harness-pitfalls]]):**
+a streaming→finalize sequence asserts, **on every intervening paint**, that the message
+row's `EntityId` is unchanged, the row is **present** (row count never dips), content is
+correct, and `ListOffset` (bottom-pin) holds. Endpoint-only `EntityId` equality is
+insufficient.
 
 ---
 
 ## 7. The scroll surface — the four §16 contracts
 
 Native `list()` / `ListState` / `ListAlignment::Bottom` (spike verdict
-[[transcript-virtualization-spike-2026-07]], 7/7). T-2 implements:
+[[transcript-virtualization-spike-2026-07]], 7/7):
 
-1. **Stick-to-bottom, don't yank.** `ListAlignment::Bottom` auto-follows while pinned
-   (`logical_scroll_top()` reads `item_ix == count` at bottom). The moment the user
-   scrolls up, auto-follow **pauses** (detect via the logical anchor moving off the
-   tail). Resume on scroll-to-bottom or pill click.
-2. **`↓ N new · jump to latest` pill** — shown **only when scrolled up**; `N` counts
-   rows appended since auto-follow paused. Click → scroll to bottom + resume.
-3. **Scroll anchoring** on finalize / above-viewport height change — `list()`
-   compensates above-viewport reflow (spike 1b go/no-go **held**); the id-keyed upsert
-   (§6) is what makes the anchor hold (no remount to jump from).
-4. **New-session jump** — opening a session lands at the bottom (`ListAlignment::Bottom`
-   + fresh `ListState`).
+1. **Stick-to-bottom, don't yank** — `ListAlignment::Bottom` auto-follows while pinned;
+   scroll-up **pauses** auto-follow (logical anchor off the tail); resume on
+   scroll-to-bottom / pill.
+2. **`↓ N new · jump to latest` pill** — only when scrolled up; `N` = rows appended since
+   pause; click → bottom + resume.
+3. **Scroll anchoring** on finalize / above-viewport height change — `list()` compensates
+   above-viewport reflow (spike 1b held); the id-keyed upsert + staged finalize (§6) keep
+   the anchor (no remount/absent row to jump from). `ListState::splice/reset` on
+   order/count/height change.
+4. **New-session jump** — open lands at bottom (fresh `ListState` + `Bottom`).
 
-`list()` handles **render virtualization** (windowing of *painting*) for free — this is
-distinct from T-2b's **disk windowing** (bounding the resident *item set*). T-2 paints
-windowed over a fully-resident `items`.
+`list()` gives **render virtualization** (windowed *painting*) for free — distinct from
+T-2b's **disk windowing** (bounded resident *set*). Per-frame work is O(visible) because
+projection is cached off-frame (§6), not recomputed per paint.
 
 ---
 
 ## 8. Surface reuse — Chat column vs History view
 
-The same `FocusedTranscript` + `list()` surface backs both the **Chat column** (T-7
-adds the composer) and the read-only **History view** (§18, no composer). The only
-projection difference: the History view for archived/sleeping sessions runs the
-Stage-1 `hide_reasoning` filter and therefore **must** call `project_filtered(..,
-splice_reasoning=false)`, or live reasoning would leak past the filter (T-1 spec §5.2,
-the `splice_reasoning` seam). T-2 wires the Chat-column caller (unfiltered); the
-History-view caller is a thin variant. No separate "history renderer" (§17).
+The same replica + `list()` backs the **Chat column** (T-7 adds the composer) and the
+read-only **History view** (§18, no composer). Only projection differs: the History view
+runs Stage-1 `hide_reasoning` and therefore calls `project_filtered(.., splice_reasoning
+=false)`, or live reasoning leaks past the filter (T-1 §5.2). No separate history
+renderer (§17).
 
 ---
 
 ## 9. Edge states (§17)
 
 - **Disk-paint → reconcile.** On focus, the replica paints from SQLite instantly
-  (baseline `load_items`), then the actor's transport-only reconnect + forward
-  catch-up (`GET /items`, existing) advances the watermark; the replica reads forward
-  and upserts. Content is flash-free (id-keyed; §6). A **debounced `syncing…`
-  indicator** shows only if reconcile takes >~150 ms (drive off the existing
-  `ActorOutcome::TransportChanged { reconcile_in_flight }` the poller already handles
-  for the card overlay).
-- **Empty session.** Clean empty state; the composer (T-7) will dock below. T-2 shows
-  the empty transcript.
-- **Historical hydration.** Items from `GET /items` land on disk via the actor and
-  reach the replica through the *same* `TranscriptAdvanced` → forward-read path as live
-  — one projection, no separate path.
+  (baseline read), then the actor's transport-only reconnect + forward catch-up advances
+  the watermark (forward-delta) and reconciles provisional rows (reconcile re-read, §3.4).
+  Flash-free (id-keyed). **Debounced `syncing…`** shows only if reconcile takes >~150 ms —
+  driven off `ActorOutcome::TransportChanged.reconcile_in_flight`, which the poller
+  **currently discards** (`poller.rs:94`) and must now route to the replica; the 150 ms
+  debounce + cancellation is tested.
+- **Empty session** — clean empty state; composer (T-7) docks below.
+- **Historical hydration** — `GET /items` items land on disk via the actor and reach the
+  replica through the same forward-delta/reconcile paths — one projection (§17).
 
 ---
 
 ## 10. Testing strategy
 
-- **Replica fold unit tests** (fake fleet + in-memory `TranscriptStore`): each detailed
-  frame drives the documented state change; `Rebased` refreshes scalars without
-  touching `items`; `TranscriptAdvanced` triggers exactly one forward-delta read of the
-  right range; out-of-order / duplicate `TranscriptAdvanced` (ord ≤ high-water) is a
-  no-op.
-- **Flash-free finalize (MANDATORY, §6):** a streaming message → finalize sequence
-  asserts the message row's `EntityId` is **unchanged** across the transition
-  (real-window harness, per [[gpui-test-noop-text-system]] / [[terminal-realwindow-harness-pitfalls]]
-  — `#[gpui::test]` fakes the text system and would false-green paint/identity; the run
-  is the only proof).
-- **Scroll contracts:** stick-to-bottom pins at the tail; scroll-up pauses auto-follow
-  and shows the pill with the correct `N`; pill click resumes at bottom; append while
-  scrolled-up does **not** yank. (Real-window harness; the virtualization spike proved
-  the primitives — these test *our* pill/pause state machine over them.)
-- **ReconnectBreak:** `Reconnected{gap: Some}` injects exactly one marker at the tail;
-  `gap: None` injects none.
-- **Poller fan-out:** one `Detailed` frame updates both the card chrome and the focused
-  replica; an unfocused session's frame never touches a replica.
-- **Forward-delta read primitive** (lens-core): ranged read returns `(after, through]`
-  in ordinal order; empty range → empty; respects `UNIQUE(ordinal)`.
+Beyond the §6 mandatory finalize test:
+
+- **Replica batch-fold units** (fake fleet + in-memory `TranscriptReader`): each frame
+  drives the documented state change; `Rebased` refreshes scalars without touching
+  `items`; `TranscriptAdvanced` enqueues exactly one `(after, through]` read; a stale
+  `ord ≤ last_rendered` is a no-op **on the forward path** but below-watermark changes are
+  caught by the reconcile path.
+- **Baseline/delta ordering** — a delta arriving before baseline installs must not
+  regress; baseline + deltas serialize through the reader worker; watermark targets
+  coalesce until baseline lands.
+- **Below-watermark reconcile** — a provisional row rewritten/rekeyed/deleted at an
+  existing ordinal (via `reconcile_store_item`) is reflected after the reconcile re-read;
+  a tool-id rekey maps old→new RowId without remount.
+- **Stale-read gating** — a read completing after a focus switch (generation changed) is
+  dropped and cannot land on the new session's rows.
+- **Reconnect semantics** — `Some(0)` → no marker; `None` and `Some(N>0)` → exactly one
+  marker; a gap while unfocused produces none (narrowed criterion).
+- **Concurrent reader/writer** — reader tolerates `SQLITE_BUSY` under the busy timeout
+  while the actor writes.
+- **`ListState` invalidation** — order/count mutation calls `splice`/`reset`; no stale
+  window.
+- **Poller fan-out** — one `Detailed` batch updates card chrome + focused replica; an
+  unfocused session's batch never touches a replica.
+- **`syncing…` debounce** — shows only >150 ms; cancels if reconcile finishes sooner.
+- **Perf gate (release-mode benchmark)** — steady-state re-project + upsert + paint at
+  realistic transcript sizes stays within the frame budget (`.agents/performance.md`
+  8.3 ms/11.1 ms; `.agents/rust-ui.md` allocation-light). Proves the off-frame projection
+  actually bounds per-frame cost to O(visible).
+
+Real-window harness for identity/paint/scroll (the run is the only proof); in-memory
+`TranscriptReader` for fold logic.
 
 ---
 
 ## 11. Dependencies
 
-- **On T-0** (done) — `active_response` liveness + `ActiveResponseChanged`.
-- **On T-1** (done) — `project_all`/`project_filtered`/`group_work_section`, the
-  `ViewBlock` enum, the `splice_reasoning` seam.
-- **On the RowSource spike** — lifted from `spikes/transcript-virtual/` to production.
-- **`GET /items` pagination** — already in lens-client (no new work).
-- **Blocks:** T-2b (swaps baseline→window, adds scroll-back + bounded reconcile), T-3
-  (fills message/reasoning stubs), T-4 (fills tool-span stubs + the live-tool-tail feed
-  extension).
-- **Coordination:** `terminal-ws` concurrently touches `reduce/`; T-2's lens-core touch
-  is small (one ranged-read method + maybe the `Reconnected` widening) — second-to-merge
+- **On T-0/T-1** (done) — liveness + the projection API + `splice_reasoning` seam.
+- **Lifts** the RowSource spike to production (owned presentations, not fixtures).
+- **`GET /items` pagination** — already in lens-client.
+- **New lens-core surface T-2 introduces** (each cross-family reviewed): the
+  transactional/ranged `TranscriptReader` read primitive + read-only opener +
+  `busy_timeout`; `StreamUpdate::Reconnected { gap }`; an id on `ReasoningAcc` threaded to
+  `finalize_reasoning`; routing `reconcile_in_flight` to the focused replica.
+- **Blocks:** T-2b (windowed baseline + scroll-back + bounded reconcile scoping), T-3
+  (message/reasoning stubs), T-4 (tool-span stubs + live-tool-tail feed extension).
+- **Coordination:** `terminal-ws` concurrently touches `reduce/` — T-2's `reduce/update.rs`
+  touch (`Reconnected { gap }`) and `persist/` additions are small; second-to-merge
   reconciles.
 
 ---
 
 ## 12. Success criteria
 
-- Focusing a session mounts a live transcript in `#chat-slot`; blurring tears it down.
-- Finalized rows come from disk (D23 split-at-watermark); the live tail (streaming
-  message + reasoning) comes from scratch; the two never overlap or duplicate.
-- The streaming→finalized handoff is **flash-free** (row `EntityId` unchanged) — proven
-  in a real-window run.
-- All four §16 scroll contracts hold; the `↓ N new` pill pauses/resumes correctly.
-- Every `ViewBlock` variant renders (stubs for T-3/T-4 content); no variant panics or
-  is dropped.
-- `ReconnectBreak` appears only on a real gap.
-- `xtask gate` green (fmt/clippy -D warnings/tests/drift).
-- No byte-budgeted windowing, scroll-back paging, or bounded-tail reconcile leaks into
-  T-2 (those are T-2b); `ContentTab` is left an inert marker.
+- Focusing mounts a live transcript in `#chat-slot`; blurring tears it down; the replica
+  is installed **before** `Promote`.
+- Finalized rows come from disk; the live tail from scratch; the **staged finalize** shows
+  **no absent frame and no remount** (row `EntityId` stable, row count never dips) —
+  proven on every intervening paint in a real-window run.
+- Below-watermark provisional changes (rewrite/rekey/delete) are reflected via the
+  reconcile re-read; forward growth via forward-delta; both flash-free.
+- Reads are serialized through one worker, opened **read-only with a busy timeout**,
+  transactional `(ordinal, Item) + watermark`, and **focus-generation-gated**.
+- All four §16 scroll contracts hold; `↓ N new` pauses/resumes; `ListState` invalidation
+  correct.
+- Steady-state render meets the frame budget (release benchmark); per-frame cost is
+  O(visible), not O(resident).
+- `ReconnectBreak` appears on `gap != Some(0)` while continuously focused; never persisted.
+- Every `ViewBlock` variant renders (stubs for T-3/T-4); none panics or is dropped.
+- `xtask gate` green.
+- No byte-budgeted windowing / scroll-back paging / bounded-reconcile-scoping leaks into
+  T-2 (those are T-2b); `ContentTab` left an inert marker.
 ```
