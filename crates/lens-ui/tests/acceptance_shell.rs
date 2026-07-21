@@ -132,7 +132,10 @@ async fn card_offscreen_in_focus_rail_resumes_animating_on_return(cx: &mut gpui:
         top_visible,
         "on-screen rail control must stay visible in focus mode (gate must not blanket-hide)"
     );
-    assert!(top_timer, "on-screen rail control must keep animating in focus mode");
+    assert!(
+        top_timer,
+        "on-screen rail control must keep animating in focus mode"
+    );
     let settled = rc_bottom.get();
     for _ in 0..5 {
         vcx.executor().advance_clock(Duration::from_millis(50));
@@ -224,7 +227,10 @@ async fn card_offscreen_resumes_when_board_mounts_focused(cx: &mut gpui::TestApp
         top_visible,
         "on-screen rail control must stay visible in focus mode (gate must not blanket-hide)"
     );
-    assert!(top_timer, "on-screen rail control must keep animating in focus mode");
+    assert!(
+        top_timer,
+        "on-screen rail control must keep animating in focus mode"
+    );
     let settled = rc_bottom.get();
     for _ in 0..5 {
         vcx.executor().advance_clock(Duration::from_millis(50));
