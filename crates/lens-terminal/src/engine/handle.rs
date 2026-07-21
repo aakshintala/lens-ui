@@ -135,8 +135,8 @@ impl EngineHandle {
 
     /// Enqueue a user-input command via the off-fg forwarder (never blocks the caller).
     ///
-    /// Stamps the current [`access_epoch`](Self::bump_access_epoch) onto `Key` / `Focus` at
-    /// enqueue time.
+    /// Stamps the current [`access_epoch`](Self::bump_access_epoch) onto `Key` / `Paste` /
+    /// `Focus` at enqueue time.
     pub(crate) fn enqueue_input(&self, mut cmd: EngineCommand) -> Result<(), FeedError> {
         let epoch = self.access_epoch.load(Ordering::Acquire);
         match &mut cmd {

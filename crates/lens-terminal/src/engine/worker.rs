@@ -552,12 +552,12 @@ fn handle_command(
                 (Vec::new(), false)
             } else {
                 match engine.encode_paste(&input.bytes) {
-                    Ok(bytes) if bytes.is_empty() => (bytes, true),
                     Ok(bytes) => {
                         if cmd_epoch != access_epoch.load(Ordering::Acquire) {
                             (Vec::new(), false)
+                        } else if bytes.is_empty() {
+                            (bytes, true)
                         } else {
-                            inspect.record_keys_encoded();
                             let delivered =
                                 try_emit_user_input(egress.as_ref(), EgressKind::Input, &bytes);
                             if delivered {
