@@ -5,7 +5,7 @@ the current forward-looking state only. **Full dated session entries live in
 [`STATUS-ARCHIVE.md`](./STATUS-ARCHIVE.md)** — write each session's detail there
 and roll older "Recent" pointers off this page as they age.
 
-_Last curated 2026-07-21 (transcript T-1 spec written; resliced T-1..T-7 — sub-agent promoted to T-5)._
+_Last curated 2026-07-21 (transcript **T-0 executed + live-rider passed** on `lens-transript`; T-1 next — plan it)._
 
 ---
 
@@ -54,17 +54,22 @@ _Last curated 2026-07-21 (transcript T-1 spec written; resliced T-1..T-7 — sub
     is complete after **T-7**. No functionality is deferred *out* of the workstream — the earlier
     "composer/interrupt/permissions belong elsewhere" framing was the error and is corrected: they are
     **T-7**, in-scope.
-  - **T-0 — Authoritative turn identity (lens-core / lens-client).** *Prerequisite surfaced by the T-1
-    cross-family review (2026-07-21).* Make the server **`response_id`** the single authoritative turn
-    signal; today the catch-up path **discards** it — `wire_to_domain_item` (`actor/runloop.rs:221-233`)
-    hard-codes `turn: 0` + fetch-time `created_at`, so disk-sourced history has no turn boundaries or real
-    timestamps. Work: map wire `response_id` + `created_at` on catch-up (stop discarding); live-reduce
-    stamps the active `response_id` (from `SessionEvent::Status`, `event.rs:51-54`) onto items; carry
-    `response_id` on `BlockContext` (backing/replacing `turn: u32`); expose active `response_id` for
-    liveness. Also fixes the "failed/incomplete/cancelled turns never bump turn" merge bug (a new
-    `response_id` = a new turn regardless of end reason). **Prereq:** re-capture 0.5.1 `/items` to pin the
-    field shape (0.3.0 capture shows field `ln` with user=`turn_` / agent=`resp_` / resource=`conv_`
-    namespaces; 0.5.1 openapi says `response_id` required). Blocks T-1.
+  - **T-0 — Authoritative turn identity (lens-core / lens-client). ✅ DONE 2026-07-21**
+    (`c8e0c63..d6c7e4f` on `lens-transript`, unmerged; plan
+    `docs/plans/2026-07-21-transcript-t0-turn-identity.md`, design
+    `docs/specs/2026-07-21-transcript-t0-turn-identity-design.md`). Server **`response_id`** is now the
+    single authoritative turn signal: lens-client retains it on `stream::Item` + `ResponseEvent::InProgress`;
+    catch-up maps it (was hard-coded `turn:0`); `BlockContext.response_id: Option<ResponseId>` **replaces**
+    `turn: u32`; live items are stamped with their **own** wire id (synthesized items fall back to the new
+    `SessionState.active_response` scalar, never fabricating); `response.in_progress` sets `active_response`
+    + emits `StreamUpdate::ActiveResponseChanged`, cleared on every terminal `response.*`; persisted
+    additively (SCHEMA_VERSION still 3, legacy `turn` col kept, written 0) + promoted in reconcile. Executed
+    subagent-driven (composer impl + codex gpt-5.6 cross-family review per task + Opus synthesis); full gate
+    green. **Live rider PASSED** (`crates/lens-core/tests/t0_live_rider.rs` replays real 0.5.1 SSE through the
+    built stack; plus a fresh `/items` drift-drive re-confirmed `response_id` present / `created_at` null).
+    **Descoped by evidence:** real `created_at`/durations → **T-6** (null on `/items`, snapshot-only, epoch
+    **seconds**); the `stream.turn` non-completed Ready-counter bug is a **separate** Board handoff, not T-0.
+    **Unblocks T-1** (a real `active_response` signal now exists; transcript replica *consumption* = T-2).
   - **T-1 — ViewBlock projection pipeline (pure).** §3/§4. Pure staged pipeline over `&[Item]` +
     `StreamScratch` → `Vec<ViewBlock>`; new `reduce/view.rs` in **lens-core**; exhaustive `ItemKind`
     match; no gpui, fully unit-testable. The spine. **SPEC WRITTEN 2026-07-21**

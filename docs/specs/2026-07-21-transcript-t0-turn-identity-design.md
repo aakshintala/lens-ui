@@ -1,7 +1,11 @@
 # T-0 — Authoritative turn identity (design)
 
 **Date:** 2026-07-21 (rev 2 — cross-family reviewed + live-0.5.1-verified)
-**Status:** Design — planned (`docs/plans/2026-07-21-transcript-t0-turn-identity.md`).
+**Status:** ✅ **EXECUTED + live-rider passed** 2026-07-21 (`c8e0c63..d6c7e4f`, branch `lens-transript`,
+unmerged). Plan `docs/plans/2026-07-21-transcript-t0-turn-identity.md`. Cross-family reviewed per task
+(codex gpt-5.6) + Opus synthesis; full gate green. Live rider: `crates/lens-core/tests/t0_live_rider.rs`
+(replays real 0.5.1 SSE through the built stack) + a fresh `/items` drift-drive (response_id present,
+created_at null — §7 confirmed).
 **Owner:** Lens design effort
 **Type:** Implementation slice (build), transcript workstream **T-0** of T-0..T-7 —
 the prerequisite surfaced by the T-1 cross-family review.
