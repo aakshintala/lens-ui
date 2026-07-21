@@ -44,6 +44,37 @@ pub enum BoardItemKind {
     },
 }
 
+/// A node in the ordered board walk (`board_tree`). Recursive so nested groups
+/// work by construction — depth-1 is committed/tested; deeper is PROVISIONAL
+/// until B-5 makes nested groups reachable (spec §1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BoardNode<'a> {
+    /// A loose card item (`kind == Card`).
+    Card(&'a BoardItem),
+    /// A group and its ordered child nodes.
+    Group {
+        item: &'a BoardItem,
+        members: Vec<BoardNode<'a>>,
+    },
+}
+
+impl<'a> BoardNode<'a> {
+    /// All leaf card sessions under this node, in walk order (a loose card → 1;
+    /// a group → its members flattened). Powers the packer member count and the
+    /// per-tile session list the renderer looks card views up by.
+    pub fn leaf_sessions(&self) -> Vec<&'a SessionId> {
+        match self {
+            BoardNode::Card(item) => match &item.kind {
+                BoardItemKind::Card { session, .. } => vec![session],
+                BoardItemKind::Group { .. } => vec![],
+            },
+            BoardNode::Group { members, .. } => {
+                members.iter().flat_map(|m| m.leaf_sessions()).collect()
+            }
+        }
+    }
+}
+
 /// In-memory board layout: ordered boards plus a flat item forest keyed by parent links.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct BoardLayout {
@@ -504,6 +535,35 @@ impl BoardLayout {
         sibs.sort_by_key(|i| i.ordinal);
         sibs
     }
+
+    /// Ordered walk of a board's item forest — the packer input (§4). Top-level
+    /// items in ordinal order; each group recurses into its children. **Archived
+    /// groups (and their subtrees) are skipped** — they belong to the Archive
+    /// surface (B-6). Depth-1 committed; deeper recursive-by-construction (§1).
+    pub fn board_tree(&self, board_id: &BoardId) -> Result<Vec<BoardNode<'_>>, BoardError> {
+        if !self.boards.iter().any(|b| &b.id == board_id) {
+            return Err(BoardError::BoardNotFound);
+        }
+        Ok(self.nodes_under(board_id, None))
+    }
+
+    fn nodes_under(
+        &self,
+        board_id: &BoardId,
+        parent: Option<&BoardItemId>,
+    ) -> Vec<BoardNode<'_>> {
+        self.children(board_id, parent)
+            .into_iter()
+            .filter_map(|item| match &item.kind {
+                BoardItemKind::Card { .. } => Some(BoardNode::Card(item)),
+                BoardItemKind::Group { archived: true, .. } => None, // → Archive (B-6)
+                BoardItemKind::Group { .. } => Some(BoardNode::Group {
+                    item,
+                    members: self.nodes_under(board_id, Some(&item.id)),
+                }),
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -535,6 +595,92 @@ mod tests {
 
     fn conn() -> ConnectionId {
         ConnectionId::new("conn_1")
+    }
+
+    fn group_item(id: &str, ordinal: i32, archived: bool) -> BoardItem {
+        BoardItem {
+            id: BoardItemId::new(id),
+            board_id: BoardId::new(DEFAULT_BOARD_ID),
+            parent_item_id: None,
+            ordinal,
+            kind: BoardItemKind::Group {
+                name: id.into(),
+                color_token: None,
+                collapsed: false,
+                archived,
+            },
+            created_at: 1_700_000_000_000,
+        }
+    }
+
+    fn card_item(id: &str, session: &str, parent: Option<&str>, ordinal: i32) -> BoardItem {
+        BoardItem {
+            id: BoardItemId::new(id),
+            board_id: BoardId::new(DEFAULT_BOARD_ID),
+            parent_item_id: parent.map(BoardItemId::new),
+            ordinal,
+            kind: BoardItemKind::Card {
+                conn: conn(),
+                session: sess(session),
+            },
+            created_at: 1_700_000_000_000,
+        }
+    }
+
+    #[test]
+    fn board_tree_orders_loose_cards_by_ordinal() {
+        let mut layout = layout_with_default_board();
+        layout.items = vec![
+            card_item("c2", "s2", None, 2),
+            card_item("c1", "s1", None, 1),
+        ];
+        let board = BoardId::new(DEFAULT_BOARD_ID);
+        let nodes = layout.board_tree(&board).unwrap();
+        let sessions: Vec<_> = nodes.iter().flat_map(|n| n.leaf_sessions()).collect();
+        assert_eq!(sessions, vec![&sess("s1"), &sess("s2")]);
+    }
+
+    #[test]
+    fn board_tree_nests_group_members() {
+        let mut layout = layout_with_default_board();
+        layout.items = vec![
+            group_item("g1", 1, false),
+            card_item("c1", "s1", Some("g1"), 1),
+            card_item("c2", "s2", Some("g1"), 2),
+            card_item("c3", "s3", None, 2), // loose after the group
+        ];
+        let board = BoardId::new(DEFAULT_BOARD_ID);
+        let nodes = layout.board_tree(&board).unwrap();
+        assert_eq!(nodes.len(), 2); // group node + loose card
+        match &nodes[0] {
+            BoardNode::Group { members, .. } => {
+                assert_eq!(members.len(), 2);
+                assert_eq!(nodes[0].leaf_sessions(), vec![&sess("s1"), &sess("s2")]);
+            }
+            _ => panic!("first node must be the group"),
+        }
+        assert!(matches!(nodes[1], BoardNode::Card(_)));
+    }
+
+    #[test]
+    fn board_tree_skips_archived_group() {
+        let mut layout = layout_with_default_board();
+        layout.items = vec![
+            group_item("g_arch", 1, true),
+            card_item("c1", "s1", Some("g_arch"), 1), // under archived group → skipped
+            card_item("c2", "s2", None, 2),
+        ];
+        let board = BoardId::new(DEFAULT_BOARD_ID);
+        let nodes = layout.board_tree(&board).unwrap();
+        let sessions: Vec<_> = nodes.iter().flat_map(|n| n.leaf_sessions()).collect();
+        assert_eq!(sessions, vec![&sess("s2")]); // archived subtree absent
+    }
+
+    #[test]
+    fn board_tree_unknown_board_errs() {
+        let layout = layout_with_default_board();
+        let err = layout.board_tree(&BoardId::new("nope")).unwrap_err();
+        assert_eq!(err, BoardError::BoardNotFound);
     }
 
     #[test]
