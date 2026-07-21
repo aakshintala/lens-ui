@@ -913,9 +913,19 @@ fn report_motion_allowed(tracking: MouseTracking, has_latch: bool) -> bool {
 }
 
 fn mouse_report_ev(g: &MouseGesture, any_button_pressed: bool) -> MouseReportEv {
+    mouse_report_ev_with_button(g, g.button, any_button_pressed)
+}
+
+/// Build a report event overriding the button (used when a Button-mode motion omits the
+/// button but a latch holds it — codex whole-slice F5).
+fn mouse_report_ev_with_button(
+    g: &MouseGesture,
+    button: Option<MouseButtonKind>,
+    any_button_pressed: bool,
+) -> MouseReportEv {
     MouseReportEv {
         action: g.kind,
-        button: g.button,
+        button,
         wheel: None,
         mods: g.mods,
         px_x: g.px_x,
@@ -1082,6 +1092,13 @@ fn handle_mouse_down(
         return (Vec::new(), GestureDisposition::Ignored);
     };
 
+    // Do not clobber an in-flight gesture with a second button-down (chording): keep the
+    // original latch and no-op the new press, rather than orphaning the first gesture
+    // (codex whole-slice F7). A single-button model is sufficient for 2c.
+    if mouse_state.latch.is_some() {
+        return (Vec::new(), GestureDisposition::Ignored);
+    }
+
     let write_allowed = mouse_state.write_allowed;
     let tracking = engine.read_live_tracking();
     if should_report_at_down(g, tracking, write_allowed) {
@@ -1093,6 +1110,10 @@ fn handle_mouse_down(
             dragged: false,
         });
         mouse_state.any_button_pressed = true;
+        // A new report gesture starts a fresh motion-dedup scope: reset so this gesture's
+        // first same-cell motion re-emits regardless of a prior gesture's last cell
+        // (codex whole-slice F6, ownership invalidation).
+        engine.reset_mouse_coalesce();
         if write_allowed && g.access_epoch == current_epoch {
             let ev = mouse_report_ev(g, true);
             let outcome =
@@ -1149,6 +1170,11 @@ fn handle_mouse_move(
 ) -> (Vec<u8>, GestureDisposition) {
     let write_allowed = mouse_state.write_allowed;
     let tracking = engine.read_live_tracking();
+    // Tracking turned off invalidates the motion-dedup scope: reset so a later re-enable at
+    // the same cell re-emits instead of coalescing against a stale cell (codex F6).
+    if tracking == MouseTracking::None {
+        engine.reset_mouse_coalesce();
+    }
     if let Some(latch) = mouse_state.latch.as_ref() {
         match latch.owner {
             GestureOwner::Report => {
@@ -1161,10 +1187,14 @@ fn handle_mouse_move(
                 if !report_motion_allowed(tracking, true) {
                     return (Vec::new(), GestureDisposition::Ignored);
                 }
-                if tracking == MouseTracking::Button && g.button.is_none() {
-                    return (Vec::new(), GestureDisposition::Ignored);
-                }
-                let ev = mouse_report_ev(g, mouse_state.any_button_pressed);
+                // The event may omit the button (some platforms send a plain move during a
+                // drag); the latch is authoritative for the held button, so fall back to it
+                // rather than dropping the motion in Button mode (codex whole-slice F5).
+                let ev = mouse_report_ev_with_button(
+                    g,
+                    g.button.or(Some(latch.button)),
+                    mouse_state.any_button_pressed,
+                );
                 let outcome =
                     emit_mouse_report(engine, egress, inspect, access_epoch, g.access_epoch, &ev);
                 apply_emit_epoch_revocation(mouse_state, &outcome);
@@ -1271,9 +1301,18 @@ fn handle_mouse_up(
                     } else if let Some((col, row)) = g.cell {
                         match engine.clear_selection() {
                             Ok(true) => {
-                                let _ = presentation_tx
-                                    .try_send(EnginePresentationEvent::LocalClick { col, row });
-                                (Vec::new(), GestureDisposition::LocalClick)
+                                // A full presentation channel drops the click: report it
+                                // honestly (Ignored + inspect) rather than acking a
+                                // LocalClick that never reached the foreground (codex F9).
+                                match presentation_tx
+                                    .try_send(EnginePresentationEvent::LocalClick { col, row })
+                                {
+                                    Ok(()) => (Vec::new(), GestureDisposition::LocalClick),
+                                    Err(_) => {
+                                        inspect.record_local_click_dropped();
+                                        (Vec::new(), GestureDisposition::Ignored)
+                                    }
+                                }
                             }
                             _ => (Vec::new(), GestureDisposition::Ignored),
                         }

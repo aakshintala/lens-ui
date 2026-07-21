@@ -60,6 +60,7 @@ pub struct EngineInspect {
     pub copy_started: u64,
     pub copy_completed: u64,
     pub copy_empty: u64,
+    pub local_clicks_dropped: u64,
     pub recent: Vec<InspectEvent>,
 }
 
@@ -98,6 +99,7 @@ pub(crate) struct InspectShared {
     copy_started: AtomicU64,
     copy_completed: AtomicU64,
     copy_empty: AtomicU64,
+    local_clicks_dropped: AtomicU64,
     ring: Mutex<VecDeque<InspectEvent>>,
 }
 
@@ -136,6 +138,7 @@ impl InspectShared {
             copy_started: AtomicU64::new(0),
             copy_completed: AtomicU64::new(0),
             copy_empty: AtomicU64::new(0),
+            local_clicks_dropped: AtomicU64::new(0),
             ring: Mutex::new(VecDeque::with_capacity(RING_CAP)),
         }
     }
@@ -350,6 +353,15 @@ impl InspectShared {
         self.copy_empty.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A `LocalClick` presentation event could not be delivered (channel full) — the
+    /// hyperlink open is lost. Recorded so the drop is observable (codex whole-slice F9).
+    pub fn record_local_click_dropped(&self) {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        self.local_clicks_dropped.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn set_visible(&self, visible: bool) {
         self.visible.store(visible, Ordering::Relaxed);
     }
@@ -410,6 +422,7 @@ impl InspectShared {
             copy_started: self.copy_started.load(Ordering::Relaxed),
             copy_completed: self.copy_completed.load(Ordering::Relaxed),
             copy_empty: self.copy_empty.load(Ordering::Relaxed),
+            local_clicks_dropped: self.local_clicks_dropped.load(Ordering::Relaxed),
             recent,
         }
     }
@@ -441,6 +454,7 @@ mod tests {
         assert_eq!(snap.copy_started, 0);
         assert_eq!(snap.copy_completed, 0);
         assert_eq!(snap.copy_empty, 0);
+        assert_eq!(snap.local_clicks_dropped, 0);
         h.stop();
     }
 }

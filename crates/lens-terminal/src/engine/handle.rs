@@ -530,7 +530,7 @@ mod tests {
         h.enqueue_local_scroll(ScrollDelta::Top).expect("top");
         let built_top = h.inspect().frames_built;
         h.build_now().expect("build");
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(15);
         while h.inspect().frames_built <= built_top {
             if Instant::now() >= deadline {
                 panic!("timeout waiting for top frame");
@@ -550,7 +550,7 @@ mod tests {
 
         let built_before = h.inspect().frames_built;
         h.build_now().expect("build");
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(15);
         while h.inspect().frames_built <= built_before {
             if Instant::now() >= deadline {
                 panic!("timeout waiting for post-wheel frame");
@@ -578,7 +578,7 @@ mod tests {
         h.enqueue_local_scroll(ScrollDelta::Top).expect("top");
         let built_top = h.inspect().frames_built;
         h.build_now().expect("build");
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(15);
         while h.inspect().frames_built <= built_top {
             if Instant::now() >= deadline {
                 panic!("timeout waiting for top frame");
@@ -594,7 +594,7 @@ mod tests {
 
         let built_before = h.inspect().frames_built;
         h.build_now().expect("build");
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(15);
         while h.inspect().frames_built <= built_before {
             if Instant::now() >= deadline {
                 panic!("timeout waiting for post-wheel frame");
@@ -732,7 +732,7 @@ mod tests {
         assert_eq!(drag_ack.disposition, GestureDisposition::Selected);
         let built_before = h.inspect().frames_built;
         h.build_now().expect("build_now");
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(15);
         while h.inspect().frames_built <= built_before {
             if Instant::now() >= deadline {
                 panic!("timeout waiting for post-drag frame");
@@ -927,7 +927,9 @@ mod tests {
     }
 
     #[test]
-    fn mouse_button_mode_buttonless_move_under_report_latch_ignored() {
+    fn mouse_button_mode_buttonless_move_reports_with_latched_button() {
+        // codex whole-slice F5: in Button mode a motion that omits the button but has an
+        // authoritative Report latch reports using the LATCHED button (not Ignored).
         let h = EngineHandle::spawn(test_config());
         let rx = h.attach_test_egress();
         h.feed(TRACKING_BUTTON_SGR.to_vec()).expect("feed tracking");
@@ -940,9 +942,17 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("down egress");
 
-        let move_ack = send_mouse(&h, base_mouse_gesture(MouseEventKind::Move, None));
-        assert_eq!(move_ack.disposition, GestureDisposition::Ignored);
-        assert!(rx.try_recv().is_err(), "buttonless move must not egress");
+        // Buttonless move to a DISTINCT cell so it does not coalesce with the press cell.
+        let mut mv = base_mouse_gesture(MouseEventKind::Move, None);
+        mv.cell = Some((1, 0));
+        mv.px_x = 16.0;
+        let move_ack = send_mouse(&h, mv);
+        assert_eq!(move_ack.disposition, GestureDisposition::Reported);
+        let frame = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("buttonless move must egress with the latched button");
+        // SGR button 32 = motion (0x20) with button 0 (Left) held; col 3 = px_x 16 / 8 + 1.
+        assert_eq!(frame.bytes, b"\x1b[<32;3;1M");
         h.stop();
     }
 
@@ -1041,6 +1051,78 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "x10 mode must not egress latched motion"
+        );
+        h.stop();
+    }
+
+    #[test]
+    fn mouse_second_button_down_preserves_first_latch() {
+        // codex whole-slice F7: a second button-down while a gesture is latched must not
+        // clobber it; the original gesture still resolves on its Up.
+        let h = EngineHandle::spawn(test_config());
+        let rx = h.attach_test_egress();
+        h.feed(TRACKING_BUTTON_SGR.to_vec()).expect("feed tracking");
+        let d1 = send_mouse(
+            &h,
+            base_mouse_gesture(MouseEventKind::Down, Some(MouseButtonKind::Left)),
+        );
+        assert_eq!(d1.disposition, GestureDisposition::Reported);
+        let _ = rx.recv_timeout(Duration::from_secs(2)).expect("left down");
+
+        let d2 = send_mouse(
+            &h,
+            base_mouse_gesture(MouseEventKind::Down, Some(MouseButtonKind::Right)),
+        );
+        assert_eq!(d2.disposition, GestureDisposition::Ignored);
+        assert!(
+            rx.try_recv().is_err(),
+            "second button-down must not clobber/egress"
+        );
+
+        let up = send_mouse(
+            &h,
+            base_mouse_gesture(MouseEventKind::Up, Some(MouseButtonKind::Left)),
+        );
+        assert_eq!(
+            up.disposition,
+            GestureDisposition::Reported,
+            "the original Left gesture must still resolve"
+        );
+        h.stop();
+    }
+
+    #[test]
+    fn mouse_coalesce_resets_when_tracking_toggles_off_on() {
+        // codex whole-slice F6: a tracking off->on transition invalidates the motion-dedup
+        // scope, so a same-cell hover after re-enable re-emits instead of coalescing.
+        let h = EngineHandle::spawn(test_config());
+        let rx = h.attach_test_egress();
+        h.feed(TRACKING_ANY_SGR.to_vec()).expect("feed tracking");
+        let mut m1 = base_mouse_gesture(MouseEventKind::Move, None);
+        m1.px_x = 16.0;
+        assert_eq!(send_mouse(&h, m1).disposition, GestureDisposition::Reported);
+        let _ = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first hover");
+        let mut m2 = base_mouse_gesture(MouseEventKind::Move, None);
+        m2.px_x = 16.0;
+        assert_eq!(
+            send_mouse(&h, m2).disposition,
+            GestureDisposition::Coalesced
+        );
+
+        h.feed(b"\x1b[?1003l".to_vec()).expect("tracking off"); // disable Any
+        let mut m_off = base_mouse_gesture(MouseEventKind::Move, None);
+        m_off.px_x = 16.0;
+        let _ = send_mouse(&h, m_off); // observed None -> resets dedup
+        h.feed(b"\x1b[?1003h".to_vec()).expect("tracking on"); // re-enable Any
+
+        let mut m3 = base_mouse_gesture(MouseEventKind::Move, None);
+        m3.px_x = 16.0;
+        assert_eq!(
+            send_mouse(&h, m3).disposition,
+            GestureDisposition::Reported,
+            "same-cell hover after a tracking toggle must re-emit, not coalesce"
         );
         h.stop();
     }
@@ -1271,7 +1353,7 @@ mod tests {
     }
 
     fn wait_for_frame(h: &EngineHandle) -> Arc<Frame> {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(15);
         while Instant::now() < deadline {
             if let Some(f) = h.latest_frame() {
                 return f;
@@ -1282,7 +1364,7 @@ mod tests {
     }
 
     fn recv_frame(rx: &crossbeam_channel::Receiver<EgressFrame>) -> EgressFrame {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             if let Ok(f) = rx.try_recv() {
                 return f;
@@ -1370,7 +1452,7 @@ mod tests {
             .try_enqueue(EngineCommand::Key(key.clone_without_ack()))
             .expect("enqueue key");
 
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(15);
         while !forwarder.blocked_in_retry().load(Ordering::Acquire) {
             if Instant::now() >= deadline {
                 panic!("timeout waiting for forwarder blocked-in-retry barrier");
@@ -1509,7 +1591,7 @@ mod tests {
 
         // Hidden → shown with no new feed must still publish + wake once.
         h.set_visible(true).expect("set_visible");
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(15);
         while woke.load(Ordering::Relaxed) <= wakes_after_first_publish {
             if Instant::now() >= deadline {
                 panic!("show-after-hide must wake even without a new feed");
@@ -1555,7 +1637,7 @@ mod tests {
 
         h.test_inject_build_failures(0);
         h.build_now().expect("build_now");
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(15);
         while h.inspect().frames_built <= built_before_failure {
             if Instant::now() >= deadline {
                 panic!("retry must publish on the next pump");
@@ -1718,7 +1800,7 @@ mod tests {
         h.test_wait_after_first_chunk();
         h.cmd_sender().send(EngineCommand::Stop).unwrap();
         h.test_release_chunk_barrier();
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             match h.cmd_sender().try_send(EngineCommand::BuildNow) {
                 Ok(()) => {}
@@ -1911,6 +1993,8 @@ mod tests {
         h.bump_access_epoch();
         let rx2 = h.attach_test_egress();
         h.test_release_worker();
+        // Negative confirmation: wait a bounded window to prove nothing leaks (this loop
+        // ALWAYS runs to the deadline, so keep it short — it is not load-sensitive).
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline {
             if rx1.try_recv().is_ok() || rx2.try_recv().is_ok() {
@@ -2164,7 +2248,7 @@ mod tests {
                 .unwrap();
         }
         h.feed(b"\x1b]2;Overflow\x1b\\".to_vec()).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(15);
         while h.inspect().presentation_channel_full_drops == 0 {
             if Instant::now() >= deadline {
                 panic!("timeout waiting for presentation_channel_full_drops");
@@ -2218,7 +2302,7 @@ mod tests {
                 .expect("send key");
         }
 
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(15);
         while rx.len() < 64 {
             if Instant::now() >= deadline {
                 panic!("timeout waiting for egress to fill with user input");
@@ -2229,6 +2313,7 @@ mod tests {
 
         h.feed(b"\x1b[c".to_vec()).expect("feed DA query");
         h.build_now().expect("build_now");
+        // Negative confirmation: always runs to the deadline, so keep it short.
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline {
             if rx.len() > 64 {

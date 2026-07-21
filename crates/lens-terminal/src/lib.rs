@@ -458,6 +458,11 @@ pub struct TerminalTab {
     report_policy: engine::command::MouseReportPolicy,
     /// Monotonic base for MouseGesture.time multi-click derivation. Slice 2c.
     mouse_time_base: std::time::Instant,
+    /// Frame captured at the most recent Left mouse-down. A `LocalClick` (hyperlink open)
+    /// resolves its cell against THIS click-time frame, not the current frame, so
+    /// intervening terminal output cannot repaint the cell and open an unclicked URL
+    /// (codex whole-slice F2 — TOCTOU).
+    pending_click_frame: Option<Arc<Frame>>,
 }
 
 const PENDING_HOST_REQUESTS_CAP: usize = 64;
@@ -501,6 +506,7 @@ impl TerminalTab {
             mouse_local: false,
             report_policy: engine::command::MouseReportPolicy::Auto,
             mouse_time_base: std::time::Instant::now(),
+            pending_click_frame: None,
         }
     }
 
@@ -555,6 +561,7 @@ impl TerminalTab {
             mouse_local: false,
             report_policy: engine::command::MouseReportPolicy::Auto,
             mouse_time_base: std::time::Instant::now(),
+            pending_click_frame: None,
         }
     }
 
@@ -925,6 +932,11 @@ impl TerminalTab {
         _cx: &mut Context<Self>,
     ) {
         let button = gpui_button_to_kind(event.button);
+        // Capture the click-time frame so a later LocalClick resolves its hyperlink against
+        // what was under the cursor at press, not a frame the terminal repainted since (F2).
+        if button == Some(engine::command::MouseButtonKind::Left) {
+            self.pending_click_frame = self.render.latest_frame();
+        }
         self.lower_mouse_gesture(
             engine::command::MouseEventKind::Down,
             button,
@@ -1557,12 +1569,21 @@ impl TerminalTab {
                 url: url.clone(),
             });
         }
-        if let Some(frame) = self.render.latest_frame() {
-            for (col, row) in &result.local_clicks {
-                if let Some(url) = hit_test::uri_for_gesture(frame.as_ref(), *col, *row) {
-                    let id = HostRequestId(self.next_host_request_id);
-                    self.next_host_request_id = self.next_host_request_id.wrapping_add(1);
-                    cx.emit(TerminalEvent::OpenUrlRequest { id, url });
+        if !result.local_clicks.is_empty() {
+            // Resolve against the click-time frame (F2). Consume it so a stale snapshot
+            // can't back a later spurious click; fall back to the current frame only if no
+            // down was captured (e.g. a click that began before the first paint).
+            let click_frame = self
+                .pending_click_frame
+                .take()
+                .or_else(|| self.render.latest_frame());
+            if let Some(frame) = click_frame {
+                for (col, row) in &result.local_clicks {
+                    if let Some(url) = hit_test::uri_for_gesture(frame.as_ref(), *col, *row) {
+                        let id = HostRequestId(self.next_host_request_id);
+                        self.next_host_request_id = self.next_host_request_id.wrapping_add(1);
+                        cx.emit(TerminalEvent::OpenUrlRequest { id, url });
+                    }
                 }
             }
         }

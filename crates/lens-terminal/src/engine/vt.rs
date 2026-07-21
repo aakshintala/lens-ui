@@ -366,6 +366,14 @@ impl VtEngine {
     }
 
     #[allow(dead_code, reason = "consumed in Task 3/4")]
+    /// Invalidate the mouse motion-dedup scope: clears the encoder's last-cell dedup and
+    /// the coalesce key so the next report re-emits even at a previously-seen cell. Called
+    /// by the worker on a new report gesture and when tracking turns off (codex F6).
+    pub(crate) fn reset_mouse_coalesce(&mut self) {
+        self.mouse_encoder.reset();
+        self.mouse_coalesce_key = None;
+    }
+
     pub(crate) fn encode_mouse_report(
         &mut self,
         ev: &MouseReportEv,
