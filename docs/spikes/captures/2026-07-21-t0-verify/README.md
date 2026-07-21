@@ -12,3 +12,8 @@ Driven 2026-07-21, claude-sdk harness, two real turns. See memory
   during a running turn: **null** (in-process harnesses don't populate it).
 
 Turn ids observed: turn-1 agent `resp_00b52ad7…`, turn-2 `resp_bcb93365…` (distinct per turn).
+
+- `interrupt-then-retry.stream.sse` — interrupt turn A (`resp_0099878e`) → `response.cancelled`
+  (carries that id) → retry turn B starts a NEW `response.in_progress` `resp_37ba30e3`
+  (`previous_response_id: null`). Confirms: cancelled-turn retry mints a distinct response_id;
+  terminal events carry the ending response's id.

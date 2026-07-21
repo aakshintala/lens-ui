@@ -213,11 +213,15 @@ adds, not a `SCHEMA_VERSION` bump; both reviewers):
 
 - **Per-turn distinct `response_id`** — live-confirmed (turn-1 `resp_00b52ad7` ≠ turn-2
   `resp_bcb93365`). Each response is its own section in T-1, no counter.
-- **Failed/incomplete/cancelled** — a retry gets a new `response_id` (**ASSUMPTION** —
-  per-turn distinctness confirmed, but a failure→retry pair was not induced; `response`
-  ids are contract-unique with `previous_response_id` linking). Flag; a live-rider check
-  during the build confirms. Even if an id were reused, T-1 would merge the retry into the
-  same section — acceptable, not corrupting.
+- **Failed/incomplete/cancelled** — a retry gets a new `response_id` — **live-confirmed**
+  for the cancelled case (2026-07-21, `captures/2026-07-21-t0-verify/interrupt-then-retry.stream.sse`):
+  interrupting turn A (`resp_0099878e`) emitted `response.cancelled` carrying that id, then
+  the retry (turn B) started a **new** `response.in_progress` = `resp_37ba30e3` with
+  `previous_response_id: null` (independent response, not a linked continuation). Each
+  `response.in_progress` allocates a fresh id per turn (scaffold: "allocates a `response_id`
+  and runs `run_turn`"), so failed/incomplete generalize. **Bonus:** the terminal
+  `response.cancelled`/`completed` event carries the ending response's `id`, so T-0's
+  clear-on-terminal (§4.2) can identify *which* response ended.
 - **Wake / disk paint** — `response_id` on every persisted item; `active_response = None`
   folds all sections.
 - **User `turn_` vs agent `resp_` namespaces** — irrelevant to grouping (user messages are

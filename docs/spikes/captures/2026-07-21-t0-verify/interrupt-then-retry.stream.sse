@@ -1,0 +1,60 @@
+event: session.heartbeat
+data: {"sequence_number": null, "type": "session.heartbeat", "server_time": null}
+
+event: session.resource.created
+data: {"sequence_number": null, "type": "session.resource.created", "resource": {"id": "terminal_tui_main", "object": "session.resource", "type": "terminal", "session_id": "conv_599b6d156fd44a8886c200d9d55c7758", "name": "tui:main", "metadata": {"terminal_name": "tui", "session_key": "main", "running": true, "tmux_socket": "/var/folders/dq/_c83wftd34g281_1002c_gl00000gn/T/omnigent-terminal-dozedgdx/tmux.sock", "tmux_target": "main", "terminal_transport": "control"}, "environment": "env_terminal_tui_main"}}
+
+event: session.changed_files.invalidated
+data: {"sequence_number": null, "type": "session.changed_files.invalidated", "session_id": "conv_599b6d156fd44a8886c200d9d55c7758", "environment_id": "default"}
+
+event: session.presence
+data: {"sequence_number": null, "type": "session.presence", "conversation_id": "conv_599b6d156fd44a8886c200d9d55c7758", "viewers": []}
+
+event: session.input.consumed
+data: {"sequence_number": null, "type": "session.input.consumed", "data": {"item_id": "msg_d10fc20ff5f34683b7be92e472286252", "type": "message", "data": {"role": "user", "content": [{"type": "input_text", "text": "Count slowly from 1 to 80, one number per line, adding a short reflective sentence after each number."}], "agent": null}, "created_by": null, "cleared_pending_id": null}}
+
+event: session.status
+data: {"sequence_number": null, "type": "session.status", "conversation_id": "conv_599b6d156fd44a8886c200d9d55c7758", "status": "running", "response_id": null, "error": null, "background_task_count": null}
+
+event: response.in_progress
+data: {"sequence_number": 1, "type": "response.in_progress", "response": {"id": "resp_0099878eae564c86aaa21a63", "object": "response", "status": "in_progress", "model": "claude-sdk", "created_at": 1784660482, "completed_at": null, "output": [], "background": false, "store": true, "usage": null, "previous_response_id": null, "conversation": null, "instructions": null, "reasoning": null, "error": null, "incomplete_details": null}}
+
+event: session.interrupted
+data: {"sequence_number": null, "type": "session.interrupted", "data": {"requested_at": 1784660485, "response_id": null}}
+
+event: response.cancelled
+data: {"sequence_number": 4, "type": "response.cancelled", "response": {"id": "resp_0099878eae564c86aaa21a63", "object": "response", "status": "cancelled", "model": "claude-sdk", "created_at": 1784660485, "completed_at": null, "output": [], "background": false, "store": true, "usage": null, "previous_response_id": null, "conversation": null, "instructions": null, "reasoning": null, "error": null, "incomplete_details": null}}
+
+event: session.status
+data: {"sequence_number": null, "type": "session.status", "conversation_id": "conv_599b6d156fd44a8886c200d9d55c7758", "status": "idle", "response_id": null, "error": null, "background_task_count": null}
+
+event: session.input.consumed
+data: {"sequence_number": null, "type": "session.input.consumed", "data": {"item_id": "msg_6a31a65801f447b885c81be23c2090ee", "type": "message", "data": {"role": "user", "content": [{"type": "input_text", "text": "[System: interrupted]\nThe user interrupted and abandoned their previous request (the user message immediately before this one). Do not resume or act on that interrupted request unless the user asks for it again; treat the next user message as the current instruction. The preceding assistant message may be incomplete."}], "agent": null}, "created_by": null, "cleared_pending_id": null}}
+
+event: session.input.consumed
+data: {"sequence_number": null, "type": "session.input.consumed", "data": {"item_id": "msg_d8f653077ea4478883069e0bddf871ad", "type": "message", "data": {"role": "user", "content": [{"type": "input_text", "text": "Never mind. Reply with exactly one word: kiwi."}], "agent": null}, "created_by": null, "cleared_pending_id": null}}
+
+event: session.status
+data: {"sequence_number": null, "type": "session.status", "conversation_id": "conv_599b6d156fd44a8886c200d9d55c7758", "status": "running", "response_id": null, "error": null, "background_task_count": null}
+
+event: response.in_progress
+data: {"sequence_number": 1, "type": "response.in_progress", "response": {"id": "resp_37ba30e3a06240e4bc1de44a", "object": "response", "status": "in_progress", "model": "claude-sdk", "created_at": 1784660489, "completed_at": null, "output": [], "background": false, "store": true, "usage": null, "previous_response_id": null, "conversation": null, "instructions": null, "reasoning": null, "error": null, "incomplete_details": null}}
+
+event: response.output_text.delta
+data: {"sequence_number": 3, "type": "response.output_text.delta", "delta": "k", "message_id": null, "index": null, "final": null}
+
+event: response.output_text.delta
+data: {"sequence_number": 4, "type": "response.output_text.delta", "delta": "iwi", "message_id": null, "index": null, "final": null}
+
+event: response.output_item.done
+data: {"sequence_number": null, "type": "response.output_item.done", "item": {"id": "msg_3c6b302100be44f3ae6c51f222e7ad6d", "response_id": "resp_37ba30e3a06240e4bc1de44a", "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": "kiwi"}], "model": "claude-sdk"}}
+
+event: session.usage
+data: {"sequence_number": null, "type": "session.usage", "conversation_id": "conv_599b6d156fd44a8886c200d9d55c7758", "context_tokens": null, "context_window": null, "total_cost_usd": 0.24537575, "usage_by_model": {"claude-opus-4-8": {"input_tokens": 6, "output_tokens": 30, "total_tokens": 36, "cache_read_input_tokens": 30629, "cache_creation_input_tokens": 36685, "total_cost_usd": 0.24537575}}}
+
+event: response.completed
+data: {"sequence_number": 6, "type": "response.completed", "response": {"id": "resp_37ba30e3a06240e4bc1de44a", "object": "response", "status": "completed", "model": "claude-sdk", "created_at": 1784660492, "completed_at": null, "output": [], "background": false, "store": true, "usage": {"input_tokens": 2, "output_tokens": 6, "output_tokens_details": {"reasoning_tokens": 0}, "total_tokens": 8, "context_tokens": 22831, "cache_read_input_tokens": 8398, "cache_creation_input_tokens": 14431, "model": "claude-opus-4-8", "cost_usd": null}, "previous_response_id": null, "conversation": null, "instructions": null, "reasoning": null, "error": null, "incomplete_details": null}}
+
+event: session.status
+data: {"sequence_number": null, "type": "session.status", "conversation_id": "conv_599b6d156fd44a8886c200d9d55c7758", "status": "idle", "response_id": null, "error": null, "background_task_count": null}
+
