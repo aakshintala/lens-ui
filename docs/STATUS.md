@@ -29,9 +29,11 @@ and roll older "Recent" pointers off this page as they age.
       gpui path deferred to `lens-ui` menu integration (the standalone demo has no app menu). (3) **empty
       OSC-52 write still mints a host prompt** (writes empty string on Allow) — left intentionally, since
       suppressing could drop a legitimate "clear clipboard" intent; the bounded pending map rate-limits nag.
-      **No real-window rider run this slice** (paste round-trip is an env-gated manual leg; the Cmd+V
-      intercept is hermetically proven by the `real_cmd_v_keystroke_routes_to_paste_not_key_encoder` test
-      via a FIFO sentinel) — running it live is the user's call.
+      **Live paste rider PASSED (2026-07-21)** — `terminal_live` P5 round-trip against a live omnigent
+      0.5.1 shell (ephemeral rider-shell bundle, zero LLM cost): real clipboard→bracketed-encode→PTY→shell
+      echo→frame paint on a real macOS display (`terminal_live: P5 paste round-trip OK` / `PASS`). P5 drives
+      the production `handle_paste` path; the Cmd+V OS-keystroke intercept stays hermetically proven by
+      `real_cmd_v_keystroke_routes_to_paste_not_key_encoder` (FIFO sentinel). 2b is now hermetically + live-proven.
   - **▶ SLICE 2 (interaction) — RE-CUT TO SERIAL; 2a + C2 + 2d DONE (2026-07-20).** 2d (presentation)
     executed subagent-driven (composer-2.5 per task + grok-4.5 cross-family per-task reviews + fix waves +
     Opus whole-slice = SHIP); the Opus review caught a title-clear-vs-full-channel invariant divergence

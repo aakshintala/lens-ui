@@ -12,9 +12,11 @@
 > + regression test `deferred_paste_allow_after_readonly_downgrade_is_suppressed`, commit `57bccde`).
 > Final full gate GREEN (fmt + workspace clippy + lens-terminal `test-util,live-tests` clippy + 132 lib
 > tests + benches `--features bench` + demo build). Memory [[terminal-slice-2b-planned-reviewed]] (now the
-> EXECUTED record). No live real-window rider run (paste round-trip is an env-gated manual leg; the Cmd+V
-> intercept is hermetically proven by `real_cmd_v_keystroke_routes_to_paste_not_key_encoder` via a FIFO
-> sentinel) — running it live is the user's call.
+> EXECUTED record). **Live paste rider PASSED (2026-07-21)** — `terminal_live` P5 round-trip vs a live
+> omnigent 0.5.1 shell (ephemeral rider-shell bundle, zero LLM cost, real macOS window): real
+> clipboard→bracketed-encode→PTY→shell-echo→frame-paint (`terminal_live: P5 paste round-trip OK` / `PASS`).
+> Recipe in [[omnigent-terminal-attach-live-run]] + ledger. The Cmd+V OS-keystroke intercept stays
+> hermetically proven (`real_cmd_v_keystroke_routes_to_paste_not_key_encoder`, FIFO sentinel).
 >
 > **⚠ REVIEWER ROUTING CHANGED (user rule 2026-07-21, in CLAUDE.md):** cross-family reviews default to
 > **`gpt-5.6`** and gpt-5.6 must **ALWAYS run via `codex exec -s read-only`, NEVER via `cursor-delegate`**
