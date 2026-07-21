@@ -44,6 +44,8 @@ Prerequisite: **2a + 2d are committed on `terminal-ws`** (`5e6f28b`+). 2b edits 
 - **Persisted** clipboard/paste preferences — `lens-ui` injects a persisted `ClipboardPolicy`; 2b ships the in-memory impl + the seam.
 - **Primary-selection / middle-click paste** — not a macOS gesture; not in scope.
 - **Progress / desktop notifications** — deferred at 2d (no binding payload accessor); unchanged.
+- **Bracketed-mode-gated warn nuance** (review finding I6): the parent design warns on multiline paste **only when bracketed paste is inactive** (mode 2004 already protects against injection when active). The foreground has **no live mode-2004 snapshot** today (2c builds the first foreground mouse-/terminal-mode snapshot), so 2b uses the **safe over-approximation: always warn on multiline** (suppressible via "don't warn again"). This is an intentional, documented deviation — suppressing the warn while bracketed paste is active is deferred until a foreground mode snapshot exists. Note this in `docs/STATUS.md` at slice end.
+- **Menu Edit→Paste (`OsAction::Paste`)** (review finding M4): the app-menu paste command is a distinct gpui path from the Cmd+V keystroke; 2b intercepts only the keystroke (`handle_key_down`). Wiring the menu action to the same `handle_paste` is deferred to `lens-ui` menu integration (the standalone demo has no app menu). Not a Cmd+V bypass — the keystroke path is fully covered.
 
 ## File Structure
 
@@ -57,7 +59,7 @@ Prerequisite: **2a + 2d are committed on `terminal-ws`** (`5e6f28b`+). 2b edits 
 | `crates/lens-terminal/src/engine/forwarder.rs` | **Modify.** `is_stale` + `send_stale_revoke_ack` gain `Paste` arms. |
 | `crates/lens-terminal/src/engine/handle.rs` | **Modify.** `enqueue_input` stamps `Paste` epoch; `record_clipboard_write_allowed/denied` + `record_paste_*` pass-throughs on the handle inspect arc. |
 | `crates/lens-terminal/src/clipboard_policy.rs` | **Create.** `ClipboardPolicy` trait + in-memory `SessionClipboardPolicy`. |
-| `crates/lens-terminal/src/lib.rs` | **Modify.** `TerminalEvent::{ClipboardWriteRequest, PasteWarnRequest}`; `HostRequestDecision::{AllowSession, DenySession}`; tab fields (`clipboard_policy`, `pending_clipboard_writes`, `pending_pastes`); fill drain clipboard arm; fill `on_host_event`; Cmd+V intercept + `handle_paste`/`dispatch_paste`; `MAX_PASTE_BYTES`/`PENDING_HOST_REQUESTS_CAP`; pure `paste_needs_warn`. |
+| `crates/lens-terminal/src/lib.rs` | **Modify.** `TerminalEvent::{ClipboardWriteRequest, ClipboardWriteNotice, PasteWarnRequest}`; `HostRequestDecision::{AllowSession, DenySession}`; tab fields (`clipboard_policy`, `pending_clipboard_writes`, `pending_pastes`); fill drain clipboard arm; fill `on_host_event`; Cmd+V intercept + `handle_paste`/`reject_over_cap_paste`/`dispatch_paste`; `MAX_PASTE_BYTES`/`PENDING_HOST_REQUESTS_CAP`; pure `paste_needs_warn`/`is_paste_keystroke`. |
 | `crates/lens-terminal/src/engine/mod.rs` | **Modify.** `pub use` `MAX_OSC52_CLIPBOARD_BYTES` if needed; `mod clipboard_policy` is at crate root (in `lib.rs`). |
 | `crates/lens-terminal/benches/engine.rs` | **Modify.** `osc52_callback_throughput` + `paste_encode_throughput` benches. |
 | `crates/lens-terminal/Cargo.toml` | **Modify.** Add `base64 = "0.22"` to `[dev-dependencies]`. |
@@ -79,28 +81,19 @@ Prerequisite: **2a + 2d are committed on `terminal-ws`** (`5e6f28b`+). 2b edits 
 - Consumes: `EnginePresentationEvent::ClipboardWrite { location: ClipboardLocation, contents: Vec<ClipboardMimePart> }`, `ClipboardLocation`, `ClipboardMimePart` (all declared in `presentation.rs`); the presentation channel `Sender` already threaded into `new_shared`.
 - Produces:
   - `pub const MAX_OSC52_CLIPBOARD_BYTES: usize = 1 << 20;` (in `presentation.rs`)
-  - `pub(crate) fn map_clipboard_location(loc: libghostty_vt::terminal::ClipboardLocation) -> ClipboardLocation`
+  - `fn map_clipboard_location(loc: libghostty_vt::terminal::ClipboardLocation) -> ClipboardLocation` (a **private fn in `vt.rs`**, next to `on_clipboard_write` — keeps `presentation.rs` Ghostty-free, review finding I7)
   - `InspectShared::record_osc52_forwarded(&self)` / `record_osc52_over_cap_drop(&self)` + `EngineInspect.osc52_forwarded` / `.osc52_over_cap_drops`
   - A registered `on_clipboard_write` closure on every `VtEngine` that caps + forwards `ClipboardWrite`.
 
-- [ ] **Step 1: Add the cap constant + location mapper (`presentation.rs`)**
+- [ ] **Step 1: Add the cap constant (`presentation.rs`)**
+
+Only the constant lives in `presentation.rs` — it stays **Ghostty-free** (zero `libghostty_vt` imports today; keep it that way, review finding I7). The `libghostty_vt::terminal::ClipboardLocation` → Lens `ClipboardLocation` mapper is defined next to the callback in `vt.rs` (Step 5), not here.
 
 ```rust
 /// Max **decoded** clipboard bytes (summed across MIME parts) an OSC 52 write may
 /// carry before it is dropped. Applied BEFORE any owned allocation. 1 MiB is well
 /// above real copy sizes; the bound stops a hostile program forcing large owned copies.
 pub const MAX_OSC52_CLIPBOARD_BYTES: usize = 1 << 20;
-
-pub(crate) fn map_clipboard_location(
-    loc: libghostty_vt::terminal::ClipboardLocation,
-) -> ClipboardLocation {
-    use libghostty_vt::terminal::ClipboardLocation as L;
-    match loc {
-        L::Standard => ClipboardLocation::Standard,
-        L::Selection => ClipboardLocation::Selection,
-        L::Primary => ClipboardLocation::Primary,
-    }
-}
 ```
 
 - [ ] **Step 2: Add the inspect counters (`inspect.rs`)**
@@ -168,6 +161,14 @@ mod clipboard_tests {
     }
 
     #[test]
+    fn osc52_write_cap_minus_one_emits() {
+        let (mut engine, rx) = engine_with_rx();
+        let below = vec![b'z'; MAX_OSC52_CLIPBOARD_BYTES - 1];
+        engine.feed(&osc52("c", &below));
+        assert!(matches!(rx.try_recv(), Ok(EnginePresentationEvent::ClipboardWrite { .. })));
+    }
+
+    #[test]
     fn osc52_write_at_cap_emits() {
         let (mut engine, rx) = engine_with_rx();
         let at = vec![b'y'; MAX_OSC52_CLIPBOARD_BYTES];
@@ -191,13 +192,38 @@ Expected: FAIL — `on_clipboard_write` not registered yet, no events on `rx`.
 
 - [ ] **Step 5: Register `on_clipboard_write` in `VtEngine::new_shared` (`vt.rs`)**
 
-Clone `presentation_tx` **before** the existing title closure moves it (the `vt.rs:100-103` note anticipates this), and register the capped, non-blocking clipboard closure. Place it right after the `on_title_changed` registration, before `Ok(Self { .. })`:
+**Ordering is load-bearing (review finding C1).** The existing code at `vt.rs:103` does `let title_tx = presentation_tx;` and then the `on_title_changed(move |term| …)` closure **moves** `title_tx`. You MUST take the clipboard clone **before** that move. Concretely:
+
+1. At `vt.rs:103`, immediately after `let title_tx = presentation_tx;` and **before** the `terminal.on_title_changed(…)?;` call, insert the clipboard-side clones:
+
+```rust
+let title_tx = presentation_tx;         // existing line (vt.rs:103)
+let clip_tx = title_tx.clone();          // NEW — MUST precede the on_title_changed move below
+let waker_for_clip = waker.clone();
+let inspect_for_clip = inspect.clone();
+```
+
+`crossbeam_channel::Sender` is `Clone`; only the ordering matters — a clone taken *after* `on_title_changed` consumes `title_tx` is a use-after-move compile error.
+
+2. Add the private location mapper near the callback (keeps `presentation.rs` Ghostty-free, finding I7):
+
+```rust
+fn map_clipboard_location(
+    loc: libghostty_vt::terminal::ClipboardLocation,
+) -> ClipboardLocation {
+    use libghostty_vt::terminal::ClipboardLocation as L;
+    match loc {
+        L::Standard => ClipboardLocation::Standard,
+        L::Selection => ClipboardLocation::Selection,
+        L::Primary => ClipboardLocation::Primary,
+    }
+}
+```
+
+3. **After** the existing `terminal.on_title_changed(…)?;` registration and before `Ok(Self { .. })`, register the capped, non-blocking clipboard closure using the `clip_tx`/`waker_for_clip`/`inspect_for_clip` you cloned in step 1:
 
 ```rust
 // --- 2b: OSC 52 clipboard-write effect (result IGNORED by OSC 52; cap + forward only) ---
-let clip_tx = title_tx.clone();               // title_tx already owns presentation_tx
-let waker_for_clip = waker.clone();
-let inspect_for_clip = inspect.clone();
 terminal.on_clipboard_write(move |_term, write| {
     let location = map_clipboard_location(write.location());
     // cap BEFORE clone: borrow (&mime,&data) refs (no data copy), sum decoded bytes.
@@ -232,12 +258,12 @@ terminal.on_clipboard_write(move |_term, write| {
 })?;
 ```
 
-Add the imports the closure needs to `vt.rs`: `ClipboardMimePart`, `map_clipboard_location`, `MAX_OSC52_CLIPBOARD_BYTES` from `super::presentation` (`TrySendError` is already imported for the title path). The closure signature is `move |_term, write|` — the binding calls `func(&term, ClipboardWrite)` (`vendor/.../terminal.rs:1686`).
+Add the imports the closure needs to `vt.rs`: `ClipboardMimePart`, `MAX_OSC52_CLIPBOARD_BYTES` from `super::presentation` (`map_clipboard_location` is now a local `fn` in `vt.rs`; `TrySendError` is already imported for the title path). The closure signature is `move |_term, write|` — the binding calls `func(&term, ClipboardWrite)` (verified `vendor/.../terminal.rs:1686`); the trait is `FnMut(&Terminal, ClipboardWrite<'_>) -> Result<(), ClipboardWriteError>`.
 
 - [ ] **Step 6: Run tests to verify they pass**
 
 Run: `cargo test -p lens-terminal --lib clipboard_tests`
-Expected: PASS (4 tests).
+Expected: PASS (5 tests — under-cap, cap−1, at-cap, over-cap-drop, read-query-no-event).
 
 - [ ] **Step 7: Gate + commit**
 
@@ -360,13 +386,25 @@ Expected: PASS (3 tests).
 
 - [ ] **Step 5: Extend the typed seams + drain result (`lib.rs`, `presentation.rs`, `inspect.rs`)**
 
-- `lib.rs`: `HostRequestDecision` gains `AllowSession, DenySession` (keep `Allow, Deny`). `TerminalEvent` gains `ClipboardWriteRequest { id: HostRequestId, location: ClipboardLocation, contents: Vec<ClipboardMimePart> }` (import both from `engine::presentation`).
+- `lib.rs`: `HostRequestDecision` gains `AllowSession, DenySession` (keep `Allow, Deny`). `TerminalEvent` gains `ClipboardWriteRequest { id: HostRequestId, location: ClipboardLocation, contents: Vec<ClipboardMimePart> }` **and** `ClipboardWriteNotice { location: ClipboardLocation, bytes: usize }` (the parent completion-matrix "**copy notice**" row — emitted whenever a clipboard write is actually performed, so the host can surface a toast/status; review finding I2). Import `ClipboardLocation`/`ClipboardMimePart` from `engine::presentation`.
 - `presentation.rs`: `PresentationDrainResult` gains `pub clipboard_writes: Vec<(ClipboardLocation, Vec<ClipboardMimePart>)>` (add to the `Default` impl `Vec::new()`); in `collect_presentation_drain`, replace the `ClipboardWrite { .. } => {}` arm with one that pushes `(location, contents)` onto `clipboard_writes`. **Update the existing `presentation_inspect_drain_counters_zero_when_disabled` test literal** (`presentation.rs:347`) to add `clipboard_writes: Vec::new()`.
 - `inspect.rs` + `handle.rs`: add `clipboard_writes_allowed`/`clipboard_writes_denied` counters (enabled-gated `record_*` like `record_hyperlink_open`) + `EngineHandle::record_clipboard_write_allowed()/denied()` pass-throughs (mirror how the drain reaches inspect via the handle arc — see `EngineHandle::record_presentation_drain_inspect`).
 
 - [ ] **Step 6: Write the failing drain + `on_host_event` tests (`lib.rs` `#[gpui::test]`)**
 
-Use the existing `#[gpui::test]` pattern in `lib.rs` (a `TestAppContext`, `cx.new(..)` a tab, capture emitted `TerminalEvent`s). Assert:
+Use the existing `#[gpui::test]` pattern in `lib.rs` (a `TestAppContext`, `cx.new(..)` a tab). Two pieces of boilerplate the sketches below rely on — wire them concretely (review finding I5):
+- **Event capture:** subscribe with a shared collector before triggering the drain, mirroring `tests/presentation_realwindow.rs:104`:
+  ```rust
+  let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::<TerminalEvent>::new()));
+  let sink = events.clone();
+  let _sub = cx.update(|cx| cx.subscribe(&tab, move |_, ev: &TerminalEvent, _| sink.borrow_mut().push(ev.clone())));
+  // ... trigger drain, then read events.borrow() ...
+  ```
+  **Hold the `_sub`** for the test's lifetime — a dropped `Subscription` silently detaches ([[terminal-realwindow-harness-pitfalls]]).
+- **Inspect counters:** the `record_*` recorders no-op when inspect is disabled (`inspect.rs`), so any `clipboard_writes_*` / `pastes_sent` assertion must first enable inspect via the existing `set_inspect_enabled(true)` seam (pattern at `lib.rs:1818`). Snapshot via the handle's inspect accessor.
+- Clipboard R/W in `#[gpui::test]` is real (TestAppContext backs it — `gpui .../test_context.rs`); `Context` derefs to `App`, so `cx.read_from_clipboard()`/`write_to_clipboard(..)` inside an entity update are valid and **not** a NoopTextSystem false-green (only font/shape/paint are faked).
+
+Assert:
 
 ```rust
 // (sketch — match the file's existing gpui-test helpers for tab construction + event capture)
@@ -410,7 +448,7 @@ Expected: FAIL first.
 for (location, contents) in result.clipboard_writes {
     match self.clipboard_policy.osc52_session_decision(&location) {
         Some(HostRequestDecision::Allow | HostRequestDecision::AllowSession) => {
-            self.write_clipboard_contents(&contents, cx);
+            self.write_clipboard_contents(&location, &contents, cx);
             if let Some(e) = self.engine_handle() { e.record_clipboard_write_allowed(); }
         }
         Some(HostRequestDecision::Deny | HostRequestDecision::DenySession) => {
@@ -429,10 +467,10 @@ for (location, contents) in result.clipboard_writes {
 }
 ```
 
-- `write_clipboard_contents(&self, contents: &[ClipboardMimePart], cx: &mut Context<Self>)`: pick the `text/plain` part if present else the first part; `cx.write_to_clipboard(gpui::ClipboardItem::new_string(part.data.clone()))`. (An empty `contents` writes nothing.)
+- `write_clipboard_contents(&self, location: &ClipboardLocation, contents: &[ClipboardMimePart], cx: &mut Context<Self>)`: pick the `text/plain` part if present else the first part; `cx.write_to_clipboard(gpui::ClipboardItem::new_string(part.data.clone()))`; then emit the copy notice `cx.emit(TerminalEvent::ClipboardWriteNotice { location: location.clone(), bytes: contents.iter().map(|p| p.data.len()).sum() })` (this is the single notice-emit site, so both the drain remembered-Allow path and the `on_host_event` Allow path surface it). An empty `contents` (or no part) writes nothing and emits no notice.
 - `engine_handle(&self) -> Option<&EngineHandle>` helper if one isn't already present (`self.runtime.as_ref()?.engine.as_ref()`).
-- Fill `on_host_event` (currently a no-op at `lib.rs:510`): on `TerminalHostEvent::HostRequestResponse { id, decision }`, find + remove the matching entry in `pending_clipboard_writes`; if found:
-  - `Allow | AllowSession` → `write_clipboard_contents`, `record_clipboard_write_allowed`; `AllowSession` also `self.clipboard_policy.remember_osc52(location, HostRequestDecision::Allow)`.
+- Fill `on_host_event` (currently a no-op at `lib.rs:510`): on `TerminalHostEvent::HostRequestResponse { id, decision }`, find + remove the matching `(id, location, contents)` entry in `pending_clipboard_writes`; if found:
+  - `Allow | AllowSession` → `self.write_clipboard_contents(&location, &contents, cx)` (which emits the `ClipboardWriteNotice`), `record_clipboard_write_allowed`; `AllowSession` also `self.clipboard_policy.remember_osc52(location, HostRequestDecision::Allow)`.
   - `Deny | DenySession` → `record_clipboard_write_denied`; `DenySession` → `remember_osc52(location, HostRequestDecision::Deny)`.
   - If no clipboard entry matches, leave for Task 4's paste-pending lookup (added there) / ignore (OpenUrl responses carry no pending state). Keep `Sleep`/`Wake` arms as they are (or `todo`-free no-ops matching current behavior).
 
@@ -573,11 +611,12 @@ fn paste_needs_warn_only_on_multiline_and_not_suppressed() {
 }
 ```
 
-Plus `#[gpui::test]` routing tests (match the file's tab-construction helpers):
-- `cmd_v_single_line_dispatches_paste` — clipboard = "hello"; Cmd+V (via `debug_paste_for_test` — Step 4) → a `Paste` command reaches the engine (assert via inspect `pastes_sent == 1`), no `PasteWarnRequest` emitted.
+Plus `#[gpui::test]` routing tests (match the file's tab-construction + the Step 6/I5 subscribe + `set_inspect_enabled(true)` boilerplate from Task 2):
+- **`real_cmd_v_keystroke_routes_to_paste_not_key_encoder`** (drives the intercept, not `debug_paste_for_test` — finding I4): set clipboard = "hi"; build a `gpui::Keystroke` with `modifiers.platform = true`, `key == "v"`; call `debug_handle_key_down_for_test` (the production `handle_key_down`); assert `pastes_sent == 1` **and no key was encoded** (`keys_encoded == 0` / no `Key` egress). This is the test that would catch a missing/broken `is_paste_keystroke` guard — without it Cmd+V hits the key encoder (`keydown_should_enqueue` returns `true` for any `platform` mod, `key_map.rs:12-14`).
+- `cmd_v_single_line_dispatches_paste` — clipboard = "hello"; `debug_paste_for_test` → `pastes_sent == 1`, no `PasteWarnRequest`.
 - `cmd_v_multiline_unsuppressed_emits_warn_no_dispatch` — clipboard = "a\nb" → exactly one `PasteWarnRequest { line_count: 2 }`, `pastes_sent == 0`, one entry in `pending_pastes`.
 - `paste_warn_allow_session_suppresses_and_dispatches` — after `HostRequestResponse{ id, AllowSession }`, `paste_warn_suppressed()` is true and the paste dispatched.
-- `over_cap_paste_rejected_sets_input_discarded` — clipboard > `MAX_PASTE_BYTES` → `presentation.input_discarded == true`, `pastes_sent == 0`, `paste_over_cap_rejects == 1`.
+- `over_cap_paste_rejected_before_pending` — clipboard > `MAX_PASTE_BYTES` (multiline, to prove it is rejected **before** the warn/pending branch) → `presentation.input_discarded == true`, `pastes_sent == 0`, `paste_over_cap_rejects == 1`, **`pending_pastes` empty** (finding I1).
 - `read_only_tab_ignores_cmd_v` — read-only tab → nothing read/dispatched.
 
 - [ ] **Step 2: Run to verify fail**
@@ -622,6 +661,12 @@ fn handle_paste(&mut self, cx: &mut Context<Self>) {
     }
     let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) else { return };
     if text.is_empty() { return; }
+    // Cap BEFORE the warn/pending branch so an over-cap payload is never stashed in
+    // pending_pastes (a count-capped-but-not-byte-capped leak otherwise; finding I1).
+    if text.len() > MAX_PASTE_BYTES {
+        self.reject_over_cap_paste(cx);
+        return;
+    }
     if paste_needs_warn(&text, self.clipboard_policy.paste_warn_suppressed()) {
         let line_count = text.lines().count();
         let id = HostRequestId(self.next_host_request_id);
@@ -637,14 +682,20 @@ fn handle_paste(&mut self, cx: &mut Context<Self>) {
     self.dispatch_paste(text.into_bytes(), cx);
 }
 
+/// Visible reject-with-marker for an over-cap paste (never silent truncation, DP5).
+fn reject_over_cap_paste(&mut self, cx: &mut Context<Self>) {
+    if let Some(e) = self.engine_handle() { e.record_paste_over_cap_reject(); }
+    if !self.presentation.input_discarded {
+        self.presentation.input_discarded = true;
+        cx.emit(TerminalEvent::PresentationChanged);
+        cx.notify();
+    }
+}
+
 fn dispatch_paste(&mut self, bytes: Vec<u8>, cx: &mut Context<Self>) {
     if bytes.len() > MAX_PASTE_BYTES {
-        if let Some(e) = self.engine_handle() { e.record_paste_over_cap_reject(); }
-        if !self.presentation.input_discarded {
-            self.presentation.input_discarded = true;
-            cx.emit(TerminalEvent::PresentationChanged);
-            cx.notify();
-        }
+        // Defensive: handle_paste already caps; a pending-paste confirm is pre-capped.
+        self.reject_over_cap_paste(cx);
         return;
     }
     let Some(engine) = self.engine_handle() else { return };
@@ -714,7 +765,14 @@ TerminalEvent::PasteWarnRequest { id, line_count } => {
 }
 ```
 
-Keep a `_ =>` catch-all for future `#[non_exhaustive]` variants (still Deny/log). *(An env-gated `LENS_DEMO_ALLOW_CLIPBOARD=1` may flip these to `Allow`/`AllowSession` to exercise the write path manually — optional; default stays Deny.)*
+```rust
+TerminalEvent::ClipboardWriteNotice { location, bytes } => {
+    // Copy notice — a program wrote the system clipboard (only fires after an Allow).
+    eprintln!("demo: ClipboardWriteNotice loc={location:?} bytes={bytes}");
+}
+```
+
+Keep a `_ =>` catch-all for future `#[non_exhaustive]` variants (still Deny/log). *(An env-gated `LENS_DEMO_ALLOW_CLIPBOARD=1` may flip the request arms to `Allow`/`AllowSession` to exercise the write + notice path manually — optional; default stays Deny.)*
 
 - [ ] **Step 2: Add the benches (`benches/engine.rs`)** — `osc52_callback_throughput` (feed a fixed OSC-52 write repeatedly through a `VtEngine`, draining `rx`) and `paste_encode_throughput` (`encode_paste` over a representative payload, bracketed on). Guard behind the existing `bench` feature; run `cargo build -p lens-terminal --benches --features bench` to confirm they compile.
 
@@ -744,6 +802,10 @@ git commit -m "feat(terminal-2b): demo clipboard/paste host policy + benches + i
 
 ## Self-Review
 
-- **Spec coverage (§2b + 2026-07-20 amendment):** OSC-52 registration + cap-before-clone (T1) · MIME/location preserved (T1) · read-denial by construction + test (T1) · foreground async policy + `ClipboardWriteRequest` + `ClipboardPolicy` seam + session decision (T2) · cap−1/cap/cap+1 tests (T1) · `Cmd+V` paste bracketed engine-side (T3) · read-only gate + multiline warn + "don't warn again" (T4) · payload cap (T4) · inspect + benches (T5) · demo host policy Deny-by-default (T5) · live rider (T5). **Selection/copy/mouse explicitly deferred to 2c** (amendment). No unmapped §2b requirement remains for this slice.
+- **Spec coverage (§2b + 2026-07-20 amendment + parent completion matrix):** OSC-52 registration + cap-before-clone (T1) · MIME/location preserved (T1) · read-denial by construction + test (T1) · foreground async policy + `ClipboardWriteRequest` + `ClipboardPolicy` seam + session decision (T2) · **copy notice `ClipboardWriteNotice` on every performed write (T2, parent matrix row)** · cap−1/cap/cap+1 tests (T1) · `Cmd+V` paste bracketed engine-side (T3) · read-only gate + multiline warn + "don't warn again" (T4) · payload cap, rejected-before-pending (T4) · inspect + benches (T5) · demo host policy Deny-by-default (T5) · live rider (T5). **Selection/copy/mouse explicitly deferred to 2c**; **bracketed-active warn-suppression + menu-paste explicitly deferred with STATUS note** (Deferred section). No unmapped §2b requirement remains for this slice.
+
+## Cross-family review disposition (grok-4.5, 2026-07-20, source-verified)
+
+Verdict **SHIP-WITH-FIXES** — all findings folded into this plan before execution: **C1** clone-before-title-move ordering (Task 1 Step 5) · **I1** paste capped before pending/warn (Task 4) · **I2** `ClipboardWriteNotice` copy notice added (Task 2 + demo) · **I3** cap−1 golden (Task 1) · **I4** real Cmd+V keystroke test driving the intercept (Task 4) · **I5** subscribe + `set_inspect_enabled` boilerplate (Task 2 Step 6) · **I6** always-warn documented deviation (Deferred) · **I7** location mapper moved to `vt.rs`, `presentation.rs` stays Ghostty-free. Confirmed-correct (do not "fix"): callback arity `|_term, write|`, decoded `&str` contents, `ClipboardContents` Clone, `paste::encode` ≤ input+12, gpui clipboard + `Context`→`App` deref, exhaustiveness site list complete, `HostRequestDecision` not `#[non_exhaustive]` (no match breaks). Full review: `.superpowers/sdd/grok-2b-plan-review.md`.
 - **Type consistency:** `ClipboardLocation`/`ClipboardMimePart`/`EnginePresentationEvent::ClipboardWrite` reused from 2d (not redefined); `HostRequestDecision` extended (not replaced); `PasteInput` mirrors `KeyInput`; `PresentationDrainResult.clipboard_writes` consumed only in the drain; `record_*` names consistent across `inspect.rs`/`handle.rs`/call sites.
 - **No placeholders:** every code step carries real code; test bodies are concrete except the `#[gpui::test]` tab-construction boilerplate, which must follow the existing helpers in `lib.rs` (noted explicitly rather than reinvented).
