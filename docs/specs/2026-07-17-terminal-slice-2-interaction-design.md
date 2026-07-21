@@ -271,6 +271,24 @@ selection/copy moved 2b→2c.)*
 - **Testing:** encode golden (engine-thread); capture/coalescing/arbitration in the
   real-window harness; live mouse-reporting vs a real mouse-mode TUI (`vim`) in the rider.
 
+> **EXECUTED 2026-07-21 (Slice 2c, Rev 3 plan).** Shipped: mouse reporting + format-aware
+> coalescing + mouse-local toggle; local selection + `Cmd+C` copy + `Cmd+A` select-all;
+> read-only report suppression (engine-authoritative). **DP3 AMENDED — arbitration is
+> engine-side at the ordered-stream position.** The foreground is a *thin lowering layer with
+> zero mode logic*: it forwards **every** mouse event immediately down the single ordered
+> command stream; the engine reads **live** tracking/format and decides report-vs-select +
+> latching + coalescing at each command's stream position against the foreground-authoritative
+> flags (shift/mouse-local/policy) carried on the command and an engine-authoritative access
+> gate (`SetAccess`). A `Frame` **mode hint was considered and REJECTED** (stale-authority: a
+> foreground snapshot cannot decide a live-mode-dependent action). A local click's hyperlink
+> is triggered by an engine-emitted `LocalClick` presentation event, resolved against the
+> **click-time frame** (per-click token) — not a later frame. **XTSHIFTESCAPE program-override
+> is RESOLVED-DEFERRED** (see Open questions). Two documented residuals: the F6 coalesce
+> tracking-off→on-with-no-move edge, and (superseded) F2 which is now fully token-correlated.
+> Proven by hermetic engine goldens + the `mouse_realwindow` real-window harness (4 phases) +
+> the live P6 rider (SGR report round-trip vs omnigent 0.5.1). The 2b always-warn-on-multiline-
+> paste nuance **remains deferred**.
+
 ### 2d — Output-side OSC presentation: titles, hyperlinks, progress, notifications
 
 - **Ours:** register effect callbacks on the engine thread → `EnginePresentationEvent` →
@@ -382,8 +400,13 @@ selection/copy moved 2b→2c.)*
 - **Progress + desktop-notification payload access** — no binding callback/getter; 2d
   opens with a spike + safe-FFI extension, else defer + amend the parent matrix. *(Blocks
   only those two 2d features, not titles/hyperlinks/OSC 52.)*
-- **XTSHIFTESCAPE (`mouse_shift_capture`) accessor** — no safe getter; 2c opens with a
-  safe-FFI accessor, else config-only arbitration + deferred override.
+- **XTSHIFTESCAPE (`mouse_shift_capture`) accessor** — **RESOLVED-DEFERRED (2026-07-21).**
+  Verified against the vendored binding **and** Ghostty upstream HEAD: `mouse_shift_capture`
+  is **not** in the C ABI (internal Zig ternary; not a DEC mode; `MOUSE_TRACKING`(11) is the
+  only mouse getter). 2c ships the fallback — arbitrate Shift-vs-report on config policy +
+  readable DEC tracking modes; the runtime toggle forces mouse-local — and **defers honoring a
+  program's `CSI > Pp s` override**. Re-vendor trigger: a `GHOSTTY_TERMINAL_DATA_MOUSE_SHIFT_
+  CAPTURE` upstream selector. Memory: `terminal-2c-xtshiftescape-not-in-c-abi`.
 - **`Frame`-pool / reuse** to erase the per-display-sample `Frame` allocation — deferred
   optimization; measured-acceptable today, contract-preserving.
 - **Option B (shared-mutex, literal Ghostty)** stays documented as the rejected

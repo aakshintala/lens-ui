@@ -521,7 +521,7 @@ Every requirement maps to a slice; deferral is explicit, never forgotten.
 | Retained-engine reconnect-seed semantics (scrollback dup / gap-marker) | 1d (acceptance test) |
 | Live vertical proof vs real omnigent | 1d |
 | Identity/replacement: `Existing`/`OpenOrCreate`, generation guard | 1d (basic guard), 3 (full) |
-| Interaction: keyboard/IME/paste/selection/copy/mouse; OSC 52 write-cap + **read-denial**; titles; hyperlink gestures | 2 |
+| Interaction: keyboard/IME/paste/selection/copy/mouse; OSC 52 write-cap + **read-denial**; titles; hyperlink gestures | 2 **(DONE 2026-07-21)** — 2a keyboard/IME, 2d titles/hyperlinks, 2b OSC-52+paste, **2c mouse reporting + format-aware coalescing + mouse-local toggle + local selection + `Cmd+C` copy + `Cmd+A` select-all + read-only report suppression**; XTSHIFTESCAPE **program-override DEFERRED** (no C-ABI accessor — re-vendor trigger `GHOSTTY_TERMINAL_DATA_MOUSE_SHIFT_CAPTURE`; memory `terminal-2c-xtshiftescape-not-in-c-abi`); 2b always-warn-on-multiline-paste nuance deferred |
 | OSC progress + background notification **payloads** | deferred → Slice-2 follow-up (libghostty-vt binding gap — see Open contract gaps; un-defer via upstream Ghostty selector **or** a hand-rolled Lens OSC tap) |
 | Lifecycle full: `ReplacementWaiting`/`Sleeping`/`Ended`, Sleep/wake (confirmed-exit teardown), supersession | 3 |
 | Fleet memory-pressure trim/disconnect + **byte-accounting FFI extension** | 3 |
