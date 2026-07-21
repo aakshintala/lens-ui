@@ -1,5 +1,20 @@
 # Handoff — Terminal Slice 2: EXECUTION (2026-07-17, SERIAL re-cut)
 
+> **UPDATE 2026-07-21 — 2b PLANNED + grok-reviewed + fixes folded → EXECUTE NEXT. A fresh
+> session's first job is now to EXECUTE the 2b plan subagent-driven (NOT re-plan it).**
+> Plan: `docs/superpowers/plans/2026-07-20-terminal-slice-2b-clipboard-paste.md` (commit `c045d11`,
+> 5 tasks). Design was brainstormed 2026-07-20 → two user-approved decisions folded into the spec
+> (`c9d2465`): **(1) RE-CUT** 2b = **OSC-52 write policy + Cmd+V paste ONLY**; **selection + Cmd+C copy
+> MOVED to 2c** (they share 2c's mouse-capture stack + XTSHIFTESCAPE arbitration). **(2)** clipboard/paste
+> policy is **session-scoped behind an injectable `ClipboardPolicy` trait** (persistence deferred to
+> lens-ui). grok-4.5 plan review = **SHIP-WITH-FIXES**; all 1 Critical + 7 Important folded (C1 clone
+> ordering, I1 paste-cap-before-pending, I2 copy-notice event, I3 cap−1, I4 real Cmd+V test, I5 test
+> boilerplate, I6 always-warn deviation, I7 mapper layering) — full review `.superpowers/sdd/grok-2b-plan-review.md`.
+> **Execute per the "Execution flow for 2b/2c" block**: composer-2.5 per task, grok-4.5 per-task cross-family
+> reviews, gate after each (incl. lens-terminal `--features test-util,live-tests`), Opus whole-slice at end.
+> Note: gpt-5.6 endpoints stall AND cursor-delegate truncates grok's long chat replies — have review
+> agents **write findings to a scratch file** (gated non-empty) rather than return them as text. Then 2c.
+
 > **UPDATE 2026-07-20 — 2a + C2 + 2d ALL DONE. NEXT = 2b (then 2c). Both 2b/2c still need PLANS.**
 > Slice **2a** (input) DONE (2026-07-17). Critical **C2** (egress-replay) CLOSED via per-transport
 > egress channels + T4 (`fd79d54..2921da8`). Slice **2d** (presentation) EXECUTED + DONE (2026-07-20):
