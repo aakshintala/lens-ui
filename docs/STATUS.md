@@ -5,7 +5,7 @@ the current forward-looking state only. **Full dated session entries live in
 [`STATUS-ARCHIVE.md`](./STATUS-ARCHIVE.md)** — write each session's detail there
 and roll older "Recent" pointers off this page as they age.
 
-_Last curated 2026-07-18 (B-1 board data model shipped; board framing updated B6–B8 → B-1..B-6)._
+_Last curated 2026-07-20 (B-2+B-3 packing & group-rendering DESIGN locked; container/culling spike next)._
 
 ---
 
@@ -16,14 +16,20 @@ _Last curated 2026-07-18 (B-1 board data model shipped; board framing updated B6
   "stable ordinal ordering" dissolved into B-1's ordinal slots, no separate sort task).
   **B-1 (data model & persistence) shipped 2026-07-18** (`8100cc8`; `lens-core` `BoardLayout` tree +
   `SqliteBoardStore`, schema v3). Remaining, in dependency order:
-  - **B-2 — packing / scroll / culling** (NEXT): vertical scroll container + adaptive auto-fill grid over
-    B-1's tree. Consumes an ordered walk — the `board_tree(board_id)` read-API is **not yet exposed**
-    (B-1 has only `children(board_id, parent)`); add the visitor when B-2 needs it. The one remaining
-    perf item — full-scale >8-card off-screen culling, never exercised on-device — rides here (no scroll
-    container exists yet, so it's not a separate task).
-  - **B-3 — group render + cost/count/age aggregation** (the mockup's `.gwrap` lanes: colored border,
-    `$cost · Nd` header + "N done" pill). Cost is **derived at render** (sum members' `cumulative_cost`);
-    B-1 stores none. B-3 owns the palette/picker (B-1 just persists the chosen `color_token`).
+  - **B-2 + B-3 — DESIGN LOCKED 2026-07-20** (merged brainstorm; spec
+    `docs/specs/2026-07-20-board-packing-and-group-rendering-design.md`; pixel SSOT
+    `docs/design/renders/board-home.html` rewritten). **Model B (groups-as-tiles) + grid-snap**,
+    **header-lane geometry** (uniform `[lane][body][gap]` cells → aligned, zero dead space, no overlap),
+    `foot(n)` footprints, hole-backfill first-fit, full-size 280×160 members + ring-in-gap,
+    **✓N-completed badge** (active count dropped), focused rail = 1-col vertical stacks. Cost still
+    **derived at render** (Σ members' `cumulative_cost`).
+    - **NEXT = container/culling SPIKE** (§20's one real spike, run in a **fresh session** per user):
+      custom scrollable surface + absolute-positioned tiles (`list()`/`uniform_list` are 1-D, can't do
+      2-D masonry); resolve scroll-offset read, render-cull by y-intersection, timer-gate-on-scroll,
+      measured off-screen CPU. Then finalize spec → **two plans** (B-2 engine, B-3 group chrome).
+    - Still owed: `board_tree(board_id)` ordered-walk read-API on `BoardLayout` (B-1 has only
+      `children`); `group_of(&SessionCard)` seam. **Collapse (render+toggle) moved to B-4**; palette/picker
+      to B-3.
   - **B-4 — drag/move + context-menu grouping** — drives B-1's `move_item`/`ungroup`/`create_group`.
   - **B-5 — multiple boards + rail switcher** — board CRUD (B-1 seeds only the default board), the
     externally-discovered-session landing policy, and `FleetStore` connection-scoping.
@@ -37,7 +43,12 @@ _Last curated 2026-07-18 (B-1 board data model shipped; board framing updated B6
     so it won't trigger the gate reset. B-2 needs its own scroll-driven gate reset or a revisit (paint-safe
     `on_next_frame` is clean on-device but a no-op in the test platform). Memory [[viewport-reentry-freeze]]
     + `docs/handoffs/2026-07-17-viewport-reentry-freeze.md`.
-  - Grounding: spec `docs/specs/2026-07-18-board-data-model-persistence-design.md`, memory [[board-b1-executed]].
+    The B-2 spike **retires** this gate (container-driven visibility replaces the paint-time
+    `last_bounds` gate + edge-triggered recovery) — see spec §4.3.
+  - Grounding: specs `2026-07-18-board-data-model-persistence-design.md` (B-1) +
+    `2026-07-20-board-packing-and-group-rendering-design.md` (B-2+B-3); handoff
+    `docs/handoffs/2026-07-20-board-b2-b3-design-and-spike.md`; memories [[board-b1-executed]],
+    [[board-b2-b3-design]].
 
 - **▶ `lens-ui` transcript fan-out** — the first real consumer of the Detailed feed + the disk
   `RowSource`/D23 render window (markdown + virtualization spikes both GO). Plugs into the slot API the
