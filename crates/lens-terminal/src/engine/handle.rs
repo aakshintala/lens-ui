@@ -14,7 +14,7 @@ use super::inspect::{EngineInspect, InspectShared};
 use super::presentation::EnginePresentationEvent;
 use super::vt::EngineConfig;
 use super::worker::{self, EngineCommand, TestChunkBarrier, WakerSlot};
-use crate::engine::command::ScrollDelta;
+use crate::engine::command::{MouseGesture, ScrollDelta};
 
 /// Backpressure / lifecycle error when sending to a stopped or saturated engine.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -136,12 +136,13 @@ impl EngineHandle {
     /// Enqueue a user-input command via the off-fg forwarder (never blocks the caller).
     ///
     /// Stamps the current [`access_epoch`](Self::bump_access_epoch) onto `Key` / `Paste` /
-    /// `Focus` at enqueue time.
+    /// `Focus` / `MouseGesture` at enqueue time.
     pub(crate) fn enqueue_input(&self, mut cmd: EngineCommand) -> Result<(), FeedError> {
         let epoch = self.access_epoch.load(Ordering::Acquire);
         match &mut cmd {
             EngineCommand::Key(input) => input.access_epoch = epoch,
             EngineCommand::Paste(input) => input.access_epoch = epoch,
+            EngineCommand::MouseGesture(gesture) => gesture.access_epoch = epoch,
             EngineCommand::Focus {
                 access_epoch: cmd_epoch,
                 ..
@@ -150,6 +151,14 @@ impl EngineHandle {
         }
         let forwarder = self.input_forwarder.as_ref().ok_or(FeedError::Stopped)?;
         forwarder.try_enqueue(cmd).map_err(|()| FeedError::Stopped)
+    }
+
+    /// Enqueue a mouse gesture via the off-fg forwarder (never blocks the caller).
+    #[allow(dead_code, reason = "foreground lowering lands in Task 5")]
+    pub(crate) fn enqueue_mouse_gesture(&self, mut gesture: MouseGesture) -> Result<(), FeedError> {
+        let epoch = self.access_epoch.load(Ordering::Acquire);
+        gesture.access_epoch = epoch;
+        self.enqueue_input(EngineCommand::MouseGesture(gesture))
     }
 
     /// Bump the access epoch (read-only downgrade). Stale `Key`/`Focus` commands still
@@ -416,7 +425,10 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
-    use crate::engine::command::{KeyAction, KeyInput, KeyMods, LensKey, PasteInput};
+    use crate::engine::command::{
+        GestureDisposition, KeyAction, KeyInput, KeyMods, LensKey, MouseAck, MouseButtonKind,
+        MouseEventKind, MouseGesture, MouseReportPolicy, PasteInput,
+    };
     use crate::engine::forwarder::InputForwarder;
     use crate::engine::inspect::InspectEventKind;
     use crate::engine::worker::{EgressFrame, EgressKind, EngineCommand};
@@ -429,6 +441,276 @@ mod tests {
             cell_w_px: 8,
             cell_h_px: 16,
         }
+    }
+
+    const TRACKING_SGR: &[u8] = b"\x1b[?1000h\x1b[?1006h";
+    const TRACKING_BUTTON_SGR: &[u8] = b"\x1b[?1002h\x1b[?1006h";
+
+    fn base_mouse_gesture(kind: MouseEventKind, button: Option<MouseButtonKind>) -> MouseGesture {
+        MouseGesture {
+            kind,
+            button,
+            mods: KeyMods::default(),
+            cell: Some((0, 0)),
+            px_x: 0.0,
+            px_y: 0.0,
+            time: Duration::ZERO,
+            write_allowed: true,
+            mouse_local: false,
+            policy: MouseReportPolicy::Auto,
+            access_epoch: 0,
+            ack: None,
+        }
+    }
+
+    fn send_mouse(h: &EngineHandle, mut gesture: MouseGesture) -> MouseAck {
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+        gesture.ack = Some(ack_tx);
+        h.enqueue_mouse_gesture(gesture).expect("enqueue mouse");
+        ack_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("mouse ack timeout")
+    }
+
+    #[test]
+    fn mouse_report_down_under_tracking_ack_reported_with_sgr_bytes() {
+        let h = EngineHandle::spawn(test_config());
+        let rx = h.attach_test_egress();
+        h.feed(TRACKING_SGR.to_vec()).expect("feed tracking");
+        let ack = send_mouse(
+            &h,
+            base_mouse_gesture(MouseEventKind::Down, Some(MouseButtonKind::Left)),
+        );
+        assert_eq!(ack.disposition, GestureDisposition::Reported);
+        assert_eq!(ack.encoded, b"\x1b[<0;1;1M");
+        let frame = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("egress timeout");
+        assert_eq!(frame.kind, EgressKind::Input);
+        assert_eq!(frame.bytes, b"\x1b[<0;1;1M");
+        h.stop();
+    }
+
+    #[test]
+    fn mouse_no_tracking_left_down_selects_without_egress() {
+        let h = EngineHandle::spawn(test_config());
+        let rx = h.attach_test_egress();
+        h.feed(b"copyme".to_vec()).expect("feed");
+        h.build_now().expect("feed build");
+        let _ = wait_for_frame(&h);
+        let ack = send_mouse(
+            &h,
+            base_mouse_gesture(MouseEventKind::Down, Some(MouseButtonKind::Left)),
+        );
+        assert_eq!(ack.disposition, GestureDisposition::Selected);
+        assert!(ack.encoded.is_empty());
+        assert!(rx.try_recv().is_err());
+        let mut drag = base_mouse_gesture(MouseEventKind::Move, Some(MouseButtonKind::Left));
+        drag.cell = Some((3, 0));
+        drag.px_x = 31.0;
+        let drag_ack = send_mouse(&h, drag);
+        assert_eq!(drag_ack.disposition, GestureDisposition::Selected);
+        let built_before = h.inspect().frames_built;
+        h.build_now().expect("build_now");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while h.inspect().frames_built <= built_before {
+            if Instant::now() >= deadline {
+                panic!("timeout waiting for post-drag frame");
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        let frame = h.latest_frame().expect("frame after drag");
+        let selected_cols: Vec<u16> = frame.grid[0]
+            .cells
+            .iter()
+            .filter(|c| c.selected)
+            .map(|c| c.col)
+            .collect();
+        assert!(
+            selected_cols.contains(&0) && selected_cols.contains(&3),
+            "expected selected cols 0 and 3, got {selected_cols:?}"
+        );
+        h.stop();
+    }
+
+    #[test]
+    fn mouse_read_only_under_tracking_selects_without_egress() {
+        let h = EngineHandle::spawn(test_config());
+        let rx = h.attach_test_egress();
+        h.feed(TRACKING_SGR.to_vec()).expect("feed tracking");
+        let mut gesture = base_mouse_gesture(MouseEventKind::Down, Some(MouseButtonKind::Left));
+        gesture.write_allowed = false;
+        let ack = send_mouse(&h, gesture);
+        assert_eq!(ack.disposition, GestureDisposition::Selected);
+        assert!(rx.try_recv().is_err());
+        h.stop();
+    }
+
+    #[test]
+    fn mouse_shift_under_tracking_selects_without_egress() {
+        let h = EngineHandle::spawn(test_config());
+        let rx = h.attach_test_egress();
+        h.feed(TRACKING_SGR.to_vec()).expect("feed tracking");
+        let mut gesture = base_mouse_gesture(MouseEventKind::Down, Some(MouseButtonKind::Left));
+        gesture.mods.shift = true;
+        let ack = send_mouse(&h, gesture);
+        assert_eq!(ack.disposition, GestureDisposition::Selected);
+        assert!(rx.try_recv().is_err());
+        h.stop();
+    }
+
+    #[test]
+    fn mouse_latch_epoch_bump_suppresses_move_without_egress() {
+        let h = EngineHandle::spawn(test_config());
+        let rx = h.attach_test_egress();
+        h.feed(TRACKING_BUTTON_SGR.to_vec()).expect("feed tracking");
+        let down_ack = send_mouse(
+            &h,
+            base_mouse_gesture(MouseEventKind::Down, Some(MouseButtonKind::Left)),
+        );
+        assert_eq!(down_ack.disposition, GestureDisposition::Reported);
+        let down_frame = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("down egress");
+        assert_eq!(down_frame.bytes, b"\x1b[<0;1;1M");
+
+        h.bump_access_epoch();
+        let move_ack = send_mouse(
+            &h,
+            base_mouse_gesture(MouseEventKind::Move, Some(MouseButtonKind::Left)),
+        );
+        assert_eq!(move_ack.disposition, GestureDisposition::Suppressed);
+        assert!(move_ack.encoded.is_empty());
+        assert!(
+            rx.try_recv().is_err(),
+            "post-downgrade move must not egress"
+        );
+        h.stop();
+    }
+
+    #[test]
+    fn mouse_non_matching_up_retains_latch_and_acks_ignored() {
+        let h = EngineHandle::spawn(test_config());
+        let down_ack = send_mouse(
+            &h,
+            base_mouse_gesture(MouseEventKind::Down, Some(MouseButtonKind::Left)),
+        );
+        assert_eq!(down_ack.disposition, GestureDisposition::Selected);
+
+        let wrong_up = send_mouse(
+            &h,
+            base_mouse_gesture(MouseEventKind::Up, Some(MouseButtonKind::Right)),
+        );
+        assert_eq!(wrong_up.disposition, GestureDisposition::Ignored);
+
+        let matching_up = send_mouse(
+            &h,
+            base_mouse_gesture(MouseEventKind::Up, Some(MouseButtonKind::Left)),
+        );
+        assert_eq!(matching_up.disposition, GestureDisposition::LocalClick);
+        h.stop();
+    }
+
+    #[test]
+    fn mouse_local_click_on_no_tracking_tap() {
+        let h = EngineHandle::spawn(test_config());
+        let _ = send_mouse(
+            &h,
+            base_mouse_gesture(MouseEventKind::Down, Some(MouseButtonKind::Left)),
+        );
+        let up_ack = send_mouse(
+            &h,
+            base_mouse_gesture(MouseEventKind::Up, Some(MouseButtonKind::Left)),
+        );
+        assert_eq!(up_ack.disposition, GestureDisposition::LocalClick);
+        let ev = h
+            .presentation_rx()
+            .recv_timeout(Duration::from_secs(2))
+            .expect("LocalClick presentation");
+        assert_eq!(ev, EnginePresentationEvent::LocalClick { col: 0, row: 0 });
+        h.stop();
+    }
+
+    #[test]
+    fn mouse_no_tracking_right_down_ignored_without_selection() {
+        let h = EngineHandle::spawn(test_config());
+        h.feed(b"hello".to_vec()).expect("feed");
+        let ack = send_mouse(
+            &h,
+            base_mouse_gesture(MouseEventKind::Down, Some(MouseButtonKind::Right)),
+        );
+        assert_eq!(ack.disposition, GestureDisposition::Ignored);
+        h.build_now().expect("build_now");
+        let frame = wait_for_frame(&h);
+        assert!(
+            frame.grid[0].cells.iter().all(|c| !c.selected),
+            "right down without tracking must not select"
+        );
+        h.stop();
+    }
+
+    #[test]
+    fn mouse_report_egress_full_parity_with_key() {
+        let h = EngineHandle::spawn(test_config());
+        let rx = h.attach_test_egress();
+        h.feed(TRACKING_SGR.to_vec()).expect("feed tracking");
+
+        let first_key = KeyInput {
+            action: KeyAction::Press,
+            key: LensKey::Z,
+            mods: KeyMods::default(),
+            utf8: Some("z".into()),
+            composing: false,
+            access_epoch: 0,
+            ack: None,
+        };
+        h.cmd_sender()
+            .send(EngineCommand::Key(first_key.clone_without_ack()))
+            .expect("send first key");
+
+        let fill_key = KeyInput {
+            action: KeyAction::Press,
+            key: LensKey::A,
+            mods: KeyMods::default(),
+            utf8: Some("a".into()),
+            composing: false,
+            access_epoch: 0,
+            ack: None,
+        };
+        for _ in 0..63 {
+            h.cmd_sender()
+                .send(EngineCommand::Key(fill_key.clone_without_ack()))
+                .expect("send fill key");
+        }
+
+        let mouse_ack = send_mouse(
+            &h,
+            base_mouse_gesture(MouseEventKind::Down, Some(MouseButtonKind::Left)),
+        );
+        assert_eq!(mouse_ack.disposition, GestureDisposition::Reported);
+        assert_eq!(mouse_ack.encoded, b"\x1b[<0;1;1M");
+        assert_eq!(h.inspect().user_egress_rejected, 1);
+
+        let (key_ack_tx, key_ack_rx) = crossbeam_channel::bounded(1);
+        h.cmd_sender()
+            .send(EngineCommand::Key(KeyInput {
+                ack: Some(key_ack_tx),
+                ..fill_key.clone_without_ack()
+            }))
+            .expect("send key with ack");
+        let key_ack = key_ack_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("key ack timeout");
+        assert!(!key_ack.accepted);
+        assert_eq!(key_ack.encoded, b"a");
+        assert_eq!(h.inspect().user_egress_rejected, 2);
+
+        let mut drained = Vec::new();
+        while let Ok(f) = rx.try_recv() {
+            drained.push(f.bytes);
+        }
+        assert_eq!(drained.len(), 64);
+        h.stop();
     }
 
     fn wait_for_frame(h: &EngineHandle) -> Arc<Frame> {

@@ -9,7 +9,10 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwapOption;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError};
 
-use super::command::{InputAck, KeyInput, PasteInput};
+use super::command::{
+    GestureDisposition, GestureOwner, InputAck, KeyInput, MouseAck, MouseButtonKind,
+    MouseEventKind, MouseGesture, MouseReportEv, MouseReportPolicy, MouseTracking, PasteInput,
+};
 use super::frame::Frame;
 use super::inspect::InspectShared;
 use super::presentation::{EnginePresentationEvent, PRESENTATION_CHANNEL_CAP};
@@ -116,6 +119,8 @@ pub(crate) enum EngineCommand {
     Feed(Vec<u8>),
     Key(KeyInput),
     Paste(PasteInput),
+    #[allow(dead_code, reason = "foreground lowering lands in Task 5")]
+    MouseGesture(MouseGesture),
     Focus {
         focused: bool,
         report: bool,
@@ -128,6 +133,21 @@ pub(crate) enum EngineCommand {
     BuildNow,
     SetEgress(Option<Sender<EgressFrame>>),
     Stop,
+}
+
+#[derive(Debug)]
+struct Latch {
+    owner: GestureOwner,
+    button: MouseButtonKind,
+    epoch: u64,
+    suppressed: bool,
+    dragged: bool,
+}
+
+#[derive(Debug, Default)]
+struct MouseState {
+    latch: Option<Latch>,
+    any_button_pressed: bool,
 }
 
 pub(crate) struct WorkerChannels {
@@ -170,6 +190,7 @@ pub(crate) fn spawn_worker(
     latest_title_slot: Arc<ArcSwapOption<super::presentation::TitleUpdate>>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
+        let presentation_tx_for_local_click = presentation_tx.clone();
         let mut engine = match VtEngine::new_shared(
             &cfg,
             |_| {},
@@ -194,6 +215,7 @@ pub(crate) fn spawn_worker(
             .checked_sub(DEFAULT_BUILD_INTERVAL)
             .unwrap_or_else(Instant::now);
         let mut egress: Option<Sender<EgressFrame>> = None;
+        let mut mouse_state = MouseState::default();
 
         loop {
             #[cfg(any(test, feature = "test-util"))]
@@ -235,6 +257,8 @@ pub(crate) fn spawn_worker(
                         &mut stopping,
                         &chunk_barrier,
                         &access_epoch,
+                        &presentation_tx_for_local_click,
+                        &mut mouse_state,
                     );
                 }
             }
@@ -257,6 +281,8 @@ pub(crate) fn spawn_worker(
                     &mut stopping,
                     &chunk_barrier,
                     &access_epoch,
+                    &presentation_tx_for_local_click,
+                    &mut mouse_state,
                 );
             }
 
@@ -312,6 +338,8 @@ fn dispatch_command(
     stopping: &mut bool,
     chunk_barrier: &TestChunkBarrier,
     access_epoch: &AtomicU64,
+    presentation_tx: &Sender<EnginePresentationEvent>,
+    mouse_state: &mut MouseState,
 ) {
     match cmd {
         EngineCommand::Feed(bytes) => handle_feed_chunked(
@@ -327,6 +355,8 @@ fn dispatch_command(
             stopping,
             chunk_barrier,
             access_epoch,
+            presentation_tx,
+            mouse_state,
         ),
         EngineCommand::Stop => *stopping = true,
         other => handle_command(
@@ -338,6 +368,8 @@ fn dispatch_command(
             visible,
             force_build,
             access_epoch,
+            presentation_tx,
+            mouse_state,
         ),
     }
 }
@@ -359,6 +391,8 @@ fn handle_feed_chunked(
     stopping: &mut bool,
     chunk_barrier: &TestChunkBarrier,
     access_epoch: &AtomicU64,
+    presentation_tx: &Sender<EnginePresentationEvent>,
+    mouse_state: &mut MouseState,
 ) {
     let total = bytes.len();
     let mut offset = 0usize;
@@ -404,6 +438,8 @@ fn handle_feed_chunked(
         stopping,
         chunk_barrier,
         access_epoch,
+        presentation_tx,
+        mouse_state,
     );
 }
 
@@ -459,6 +495,8 @@ fn drain_pending_after_feed(
     stopping: &mut bool,
     chunk_barrier: &TestChunkBarrier,
     access_epoch: &AtomicU64,
+    presentation_tx: &Sender<EnginePresentationEvent>,
+    mouse_state: &mut MouseState,
 ) {
     while let Some(cmd) = pending.pop_front() {
         if *stopping {
@@ -478,6 +516,8 @@ fn drain_pending_after_feed(
             stopping,
             chunk_barrier,
             access_epoch,
+            presentation_tx,
+            mouse_state,
         );
         if *stopping {
             return;
@@ -498,6 +538,8 @@ fn handle_command(
     visible: &mut bool,
     force_build: &mut bool,
     access_epoch: &AtomicU64,
+    presentation_tx: &Sender<EnginePresentationEvent>,
+    mouse_state: &mut MouseState,
 ) {
     let current_epoch = access_epoch.load(Ordering::Acquire);
 
@@ -508,6 +550,18 @@ fn handle_command(
         EngineCommand::SetEgress(tx) => {
             *egress = tx;
         }
+        EngineCommand::MouseGesture(g) => handle_mouse_gesture(
+            g,
+            engine,
+            egress,
+            inspect,
+            dirty,
+            force_build,
+            access_epoch,
+            current_epoch,
+            presentation_tx,
+            mouse_state,
+        ),
         EngineCommand::Key(mut input) => {
             let cmd_epoch = input.access_epoch;
             let ack_tx = input.ack.take();
@@ -722,5 +776,351 @@ fn try_emit_user_input(tx: Option<&Sender<EgressFrame>>, kind: EgressKind, bytes
         Ok(()) => true,
         Err(TrySendError::Full(_)) => false,
         Err(TrySendError::Disconnected(_)) => false,
+    }
+}
+
+fn send_mouse_ack(
+    ack_tx: Option<Sender<MouseAck>>,
+    encoded: Vec<u8>,
+    disposition: GestureDisposition,
+) {
+    if let Some(tx) = ack_tx {
+        let _ = tx.try_send(MouseAck {
+            encoded,
+            disposition,
+        });
+    }
+}
+
+fn should_report_at_down(g: &MouseGesture, tracking: MouseTracking) -> bool {
+    g.write_allowed
+        && tracking != MouseTracking::None
+        && !g.mods.shift
+        && !g.mouse_local
+        && g.policy == MouseReportPolicy::Auto
+}
+
+fn report_motion_allowed(tracking: MouseTracking, has_latch: bool) -> bool {
+    match tracking {
+        MouseTracking::X10 | MouseTracking::Normal => false,
+        MouseTracking::Button => has_latch,
+        MouseTracking::Any => true,
+        MouseTracking::None => false,
+    }
+}
+
+fn mouse_report_ev(g: &MouseGesture, any_button_pressed: bool) -> MouseReportEv {
+    MouseReportEv {
+        action: g.kind,
+        button: g.button,
+        wheel: None,
+        mods: g.mods,
+        px_x: g.px_x,
+        px_y: g.px_y,
+        any_button_pressed,
+    }
+}
+
+fn emit_mouse_report(
+    engine: &mut VtEngine,
+    egress: &Option<Sender<EgressFrame>>,
+    inspect: &InspectShared,
+    access_epoch: &AtomicU64,
+    cmd_epoch: u64,
+    ev: &MouseReportEv,
+) -> (Vec<u8>, GestureDisposition) {
+    if cmd_epoch != access_epoch.load(Ordering::Acquire) {
+        inspect.record_mouse_suppressed();
+        return (Vec::new(), GestureDisposition::Suppressed);
+    }
+    match engine.encode_mouse_report(ev) {
+        Ok(bytes) if bytes.is_empty() => {
+            inspect.record_mouse_report_coalesced();
+            (bytes, GestureDisposition::Coalesced)
+        }
+        Ok(bytes) => {
+            if cmd_epoch != access_epoch.load(Ordering::Acquire) {
+                inspect.record_mouse_suppressed();
+                return (Vec::new(), GestureDisposition::Suppressed);
+            }
+            inspect.record_mouse_encoded();
+            let delivered = try_emit_user_input(egress.as_ref(), EgressKind::Input, &bytes);
+            if delivered {
+                inspect.record_user_egress_accepted();
+            } else {
+                inspect.record_user_egress_rejected();
+            }
+            (bytes, GestureDisposition::Reported)
+        }
+        Err(e) => {
+            eprintln!("lens-terminal engine: encode_mouse_report failed: {e}");
+            (Vec::new(), GestureDisposition::Suppressed)
+        }
+    }
+}
+
+fn latch_report_suppressed(
+    mouse_state: &mut MouseState,
+    inspect: &InspectShared,
+) -> (Vec<u8>, GestureDisposition) {
+    if let Some(latch) = mouse_state.latch.as_mut() {
+        latch.suppressed = true;
+    }
+    inspect.record_mouse_suppressed();
+    (Vec::new(), GestureDisposition::Suppressed)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mouse gesture dispatch threads engine + latch + presentation"
+)]
+fn handle_mouse_gesture(
+    mut g: MouseGesture,
+    engine: &mut VtEngine,
+    egress: &mut Option<Sender<EgressFrame>>,
+    inspect: &InspectShared,
+    dirty: &mut bool,
+    force_build: &mut bool,
+    access_epoch: &AtomicU64,
+    current_epoch: u64,
+    presentation_tx: &Sender<EnginePresentationEvent>,
+    mouse_state: &mut MouseState,
+) {
+    let ack_tx = g.ack.take();
+    let (encoded, disposition) = match g.kind {
+        MouseEventKind::Down => handle_mouse_down(
+            &g,
+            engine,
+            egress,
+            inspect,
+            dirty,
+            force_build,
+            access_epoch,
+            current_epoch,
+            mouse_state,
+        ),
+        MouseEventKind::Move => handle_mouse_move(
+            &g,
+            engine,
+            egress,
+            inspect,
+            dirty,
+            force_build,
+            access_epoch,
+            current_epoch,
+            mouse_state,
+        ),
+        MouseEventKind::Up => handle_mouse_up(
+            &g,
+            engine,
+            egress,
+            inspect,
+            dirty,
+            force_build,
+            access_epoch,
+            current_epoch,
+            presentation_tx,
+            mouse_state,
+        ),
+    };
+    send_mouse_ack(ack_tx, encoded, disposition);
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mouse down threads engine + latch + egress + publish flags"
+)]
+fn handle_mouse_down(
+    g: &MouseGesture,
+    engine: &mut VtEngine,
+    egress: &mut Option<Sender<EgressFrame>>,
+    inspect: &InspectShared,
+    dirty: &mut bool,
+    force_build: &mut bool,
+    access_epoch: &AtomicU64,
+    current_epoch: u64,
+    mouse_state: &mut MouseState,
+) -> (Vec<u8>, GestureDisposition) {
+    let Some(button) = g.button else {
+        return (Vec::new(), GestureDisposition::Ignored);
+    };
+
+    let tracking = engine.read_live_tracking();
+    if should_report_at_down(g, tracking) {
+        mouse_state.latch = Some(Latch {
+            owner: GestureOwner::Report,
+            button,
+            epoch: g.access_epoch,
+            suppressed: false,
+            dragged: false,
+        });
+        mouse_state.any_button_pressed = true;
+        if g.access_epoch == current_epoch && g.write_allowed {
+            let ev = mouse_report_ev(g, true);
+            emit_mouse_report(engine, egress, inspect, access_epoch, g.access_epoch, &ev)
+        } else {
+            latch_report_suppressed(mouse_state, inspect)
+        }
+    } else if button == MouseButtonKind::Left {
+        mouse_state.latch = Some(Latch {
+            owner: GestureOwner::Select,
+            button,
+            epoch: g.access_epoch,
+            suppressed: false,
+            dragged: false,
+        });
+        if let Some((col, row)) = g.cell {
+            match engine.apply_selection_press(col, row, g.px_x, g.px_y, g.time) {
+                Ok(true) => {
+                    *dirty = true;
+                    *force_build = true;
+                    (Vec::new(), GestureDisposition::Selected)
+                }
+                Ok(false) => (Vec::new(), GestureDisposition::Ignored),
+                Err(e) => {
+                    eprintln!("lens-terminal engine: apply_selection_press failed: {e}");
+                    mouse_state.latch = None;
+                    (Vec::new(), GestureDisposition::Ignored)
+                }
+            }
+        } else {
+            (Vec::new(), GestureDisposition::Selected)
+        }
+    } else {
+        (Vec::new(), GestureDisposition::Ignored)
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mouse move threads engine + latch + egress + publish flags"
+)]
+fn handle_mouse_move(
+    g: &MouseGesture,
+    engine: &mut VtEngine,
+    egress: &mut Option<Sender<EgressFrame>>,
+    inspect: &InspectShared,
+    dirty: &mut bool,
+    force_build: &mut bool,
+    access_epoch: &AtomicU64,
+    current_epoch: u64,
+    mouse_state: &mut MouseState,
+) -> (Vec<u8>, GestureDisposition) {
+    let tracking = engine.read_live_tracking();
+    if let Some(latch) = mouse_state.latch.as_ref() {
+        match latch.owner {
+            GestureOwner::Report => {
+                if latch.suppressed {
+                    return (Vec::new(), GestureDisposition::Suppressed);
+                }
+                if latch.epoch != current_epoch || !g.write_allowed {
+                    return latch_report_suppressed(mouse_state, inspect);
+                }
+                if !report_motion_allowed(tracking, true) {
+                    return (Vec::new(), GestureDisposition::Ignored);
+                }
+                let ev = mouse_report_ev(g, mouse_state.any_button_pressed);
+                emit_mouse_report(engine, egress, inspect, access_epoch, g.access_epoch, &ev)
+            }
+            GestureOwner::Select => {
+                if let Some((col, row)) = g.cell {
+                    if let Some(latch) = mouse_state.latch.as_mut() {
+                        latch.dragged = true;
+                    }
+                    match engine.apply_selection_drag(col, row, g.px_x, g.px_y) {
+                        Ok(true) => {
+                            *dirty = true;
+                            *force_build = true;
+                            (Vec::new(), GestureDisposition::Selected)
+                        }
+                        Ok(false) => (Vec::new(), GestureDisposition::Ignored),
+                        Err(e) => {
+                            eprintln!("lens-terminal engine: apply_selection_drag failed: {e}");
+                            (Vec::new(), GestureDisposition::Ignored)
+                        }
+                    }
+                } else {
+                    (Vec::new(), GestureDisposition::Selected)
+                }
+            }
+        }
+    } else if g.button.is_none()
+        && tracking == MouseTracking::Any
+        && g.write_allowed
+        && g.access_epoch == current_epoch
+    {
+        let ev = mouse_report_ev(g, false);
+        emit_mouse_report(engine, egress, inspect, access_epoch, g.access_epoch, &ev)
+    } else {
+        (Vec::new(), GestureDisposition::Ignored)
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mouse up threads engine + latch + egress + presentation"
+)]
+fn handle_mouse_up(
+    g: &MouseGesture,
+    engine: &mut VtEngine,
+    egress: &mut Option<Sender<EgressFrame>>,
+    inspect: &InspectShared,
+    dirty: &mut bool,
+    force_build: &mut bool,
+    access_epoch: &AtomicU64,
+    current_epoch: u64,
+    presentation_tx: &Sender<EnginePresentationEvent>,
+    mouse_state: &mut MouseState,
+) -> (Vec<u8>, GestureDisposition) {
+    let Some(button) = g.button else {
+        return (Vec::new(), GestureDisposition::Ignored);
+    };
+
+    let Some(latch) = mouse_state.latch.as_ref() else {
+        return (Vec::new(), GestureDisposition::Ignored);
+    };
+
+    if latch.button != button {
+        return (Vec::new(), GestureDisposition::Ignored);
+    }
+
+    let latch = mouse_state.latch.take().expect("latch present");
+    match latch.owner {
+        GestureOwner::Report => {
+            mouse_state.any_button_pressed = false;
+            if latch.suppressed {
+                (Vec::new(), GestureDisposition::Suppressed)
+            } else if latch.epoch != current_epoch || !g.write_allowed {
+                inspect.record_mouse_suppressed();
+                (Vec::new(), GestureDisposition::Suppressed)
+            } else {
+                let ev = mouse_report_ev(g, false);
+                emit_mouse_report(engine, egress, inspect, access_epoch, g.access_epoch, &ev)
+            }
+        }
+        GestureOwner::Select => {
+            let dragged = latch.dragged || engine.gesture_dragged();
+            match engine.apply_selection_release(g.cell) {
+                Ok(()) => {
+                    *dirty = true;
+                    *force_build = true;
+                    if dragged {
+                        (Vec::new(), GestureDisposition::Selected)
+                    } else if let Some((col, row)) = g.cell {
+                        if engine.clear_selection().is_ok() {
+                            let _ = presentation_tx
+                                .try_send(EnginePresentationEvent::LocalClick { col, row });
+                        }
+                        (Vec::new(), GestureDisposition::LocalClick)
+                    } else {
+                        (Vec::new(), GestureDisposition::LocalClick)
+                    }
+                }
+                Err(e) => {
+                    eprintln!("lens-terminal engine: apply_selection_release failed: {e}");
+                    (Vec::new(), GestureDisposition::Ignored)
+                }
+            }
+        }
     }
 }

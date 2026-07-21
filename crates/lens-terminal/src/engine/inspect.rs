@@ -53,6 +53,9 @@ pub struct EngineInspect {
     pub pastes_sent: u64,
     pub paste_over_cap_rejects: u64,
     pub paste_warn_prompts: u64,
+    pub mouse_encoded: u64,
+    pub mouse_reports_coalesced: u64,
+    pub mouse_suppressed: u64,
     pub recent: Vec<InspectEvent>,
 }
 
@@ -84,6 +87,9 @@ pub(crate) struct InspectShared {
     pastes_sent: AtomicU64,
     paste_over_cap_rejects: AtomicU64,
     paste_warn_prompts: AtomicU64,
+    mouse_encoded: AtomicU64,
+    mouse_reports_coalesced: AtomicU64,
+    mouse_suppressed: AtomicU64,
     ring: Mutex<VecDeque<InspectEvent>>,
 }
 
@@ -115,6 +121,9 @@ impl InspectShared {
             pastes_sent: AtomicU64::new(0),
             paste_over_cap_rejects: AtomicU64::new(0),
             paste_warn_prompts: AtomicU64::new(0),
+            mouse_encoded: AtomicU64::new(0),
+            mouse_reports_coalesced: AtomicU64::new(0),
+            mouse_suppressed: AtomicU64::new(0),
             ring: Mutex::new(VecDeque::with_capacity(RING_CAP)),
         }
     }
@@ -280,6 +289,27 @@ impl InspectShared {
         self.paste_warn_prompts.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_mouse_encoded(&self) {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        self.mouse_encoded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_mouse_report_coalesced(&self) {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        self.mouse_reports_coalesced.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_mouse_suppressed(&self) {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        self.mouse_suppressed.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn set_visible(&self, visible: bool) {
         self.visible.store(visible, Ordering::Relaxed);
     }
@@ -333,6 +363,9 @@ impl InspectShared {
             pastes_sent: self.pastes_sent.load(Ordering::Relaxed),
             paste_over_cap_rejects: self.paste_over_cap_rejects.load(Ordering::Relaxed),
             paste_warn_prompts: self.paste_warn_prompts.load(Ordering::Relaxed),
+            mouse_encoded: self.mouse_encoded.load(Ordering::Relaxed),
+            mouse_reports_coalesced: self.mouse_reports_coalesced.load(Ordering::Relaxed),
+            mouse_suppressed: self.mouse_suppressed.load(Ordering::Relaxed),
             recent,
         }
     }
