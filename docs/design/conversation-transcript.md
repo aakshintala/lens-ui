@@ -131,6 +131,35 @@ so a server-added item kind is a compile error, not silent drift.
 `group_work_section`, `merge_optimistic_user`, `flatten_sub_agents` (depth-1,
 for peek), `hide_reasoning`, `with_agent_changed_markers`.
 
+> **As-built (T-1, 2026-07-21 — `crates/lens-core/src/reduce/view.rs`).** The
+> provisional enum above is the product intent; the implementation slice
+> resolved these deviations (rationale in
+> `docs/specs/2026-07-21-transcript-t1-viewblock-projection-design.md` §3.1):
+>
+> - **`WorkSection { open, blocks }` → `{ response_id: &ResponseId, blocks }`.**
+>   `open` is pure UI state (render/T-6 owns expansion); `response_id` (from T-0,
+>   authoritative) is the stable grouping key. No `meta` field — the §4 chip
+>   (duration/model/tokens/cost/transitions) needs per-turn data T-1 can't supply;
+>   deferred whole to **T-6**.
+> - **`CompactionMarker` / `AgentChangedMarker` dropped as variants** — they are
+>   1:1 item-backed, so they ride as `Item(&Item)` passthroughs; render extracts
+>   fields by matching `ItemKind`.
+> - **`StreamingMessage(&str)` / `StreamingReasoning(&str)` → borrow the whole
+>   accumulator** (`&MessageAcc` / `&ReasoningAcc`) — streaming needs
+>   `message_id` for streaming→finalized identity and `summary_text`/`encrypted`
+>   for the reasoning cases.
+> - **`OptimisticUser` removed** — pending is composer-owned, not a projection
+>   input (**T-7**); the projector takes no `pending`.
+> - **`SubAgentSpan { child: ChildRef }` removed** — sub-agents are child
+>   *sessions* (`session.child_session.*`), not a `ctx.depth` row; the in-transcript
+>   span is its own slice **T-5**. `flatten_sub_agents` stays the identity stub.
+> - **`ReconnectBreak` deferred to T-2** — zero-field marker with no backing item.
+>
+> Exhaustiveness is unaffected — the projector matches `ItemKind` with no wildcard.
+> Pipeline is staged (filters → `project` → `group_work_section`), pure and
+> borrow-only over `(items, scratch, active_response)`; `merge_text_for_display`
+> (owned-return) is not wired in.
+
 ---
 
 ## 4. Transcript skeleton & turn lifecycle — ②

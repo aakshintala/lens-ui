@@ -5,7 +5,7 @@ the current forward-looking state only. **Full dated session entries live in
 [`STATUS-ARCHIVE.md`](./STATUS-ARCHIVE.md)** — write each session's detail there
 and roll older "Recent" pointers off this page as they age.
 
-_Last curated 2026-07-21 (transcript **T-0 executed + live-rider passed** on `lens-transript`; T-1 next — plan it)._
+_Last curated 2026-07-21 (transcript **T-0 + T-1 executed** on `lens-transript`; T-1 ViewBlock projection landed w/ 21 tests + cross-family review; **T-2 next** — focused view scaffold + virtualized disk-sourced surface)._
 
 ---
 
@@ -70,11 +70,14 @@ _Last curated 2026-07-21 (transcript **T-0 executed + live-rider passed** on `le
     **Descoped by evidence:** real `created_at`/durations → **T-6** (null on `/items`, snapshot-only, epoch
     **seconds**); the `stream.turn` non-completed Ready-counter bug is a **separate** Board handoff, not T-0.
     **Unblocks T-1** (a real `active_response` signal now exists; transcript replica *consumption* = T-2).
-  - **T-1 — ViewBlock projection pipeline (pure).** §3/§4. Pure staged pipeline over `&[Item]` +
-    `StreamScratch` → `Vec<ViewBlock>`; new `reduce/view.rs` in **lens-core**; exhaustive `ItemKind`
-    match; no gpui, fully unit-testable. The spine. **SPEC WRITTEN 2026-07-21**
-    (`docs/specs/2026-07-21-transcript-t1-viewblock-projection-design.md`); **cross-family reviewed**
-    (Grok 4.5 + GPT-5.6) → revised; **plan in a new session.** Key resolutions: staged
+  - **T-1 — ViewBlock projection pipeline (pure). ✅ DONE 2026-07-21**
+    (`crates/lens-core/src/reduce/view.rs`; plan
+    `docs/plans/2026-07-21-transcript-t1-viewblock-projection.md`, spec
+    `docs/specs/2026-07-21-transcript-t1-viewblock-projection-design.md`). §3/§4. Pure staged pipeline over
+    `&[Item]` + `StreamScratch` → `Vec<ViewBlock>`; new `reduce/view.rs` in **lens-core**; exhaustive
+    `ItemKind` match; no gpui, 21 inline table-driven tests, `xtask gate` green. The spine. Built via
+    composer-2.5 + codex (gpt-5.6) cross-family review — 2 findings fixed (reused-`call_id` exactly-once;
+    ResourceEvent sibling test). **Unblocks T-2..T-7** (all render off `Vec<ViewBlock>`). Key resolutions: staged
     (filter→project→group) not uniform pipe; turn identity = authoritative **`response_id`** (from T-0),
     NOT a `scratch.turn` heuristic; `group_work_section` groups agent work by `response_id`, user messages
     + non-response items are ordinal-positioned siblings; liveness = turn's `response_id` == session active

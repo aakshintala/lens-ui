@@ -1,8 +1,10 @@
 # T-1 — ViewBlock projection pipeline (design)
 
 **Date:** 2026-07-21
-**Status:** Design — cross-family reviewed (Grok 4.5 + GPT-5.6) and revised. Ready
-for implementation plan (new session). **Blocked on T-0** (authoritative turn identity).
+**Status:** **EXECUTED 2026-07-21** (`crates/lens-core/src/reduce/view.rs`; plan
+`docs/plans/2026-07-21-transcript-t1-viewblock-projection.md`; 21 tests, `xtask gate` green;
+composer-2.5 build + codex gpt-5.6 cross-family review, 2 findings fixed). Design was
+cross-family reviewed (Grok 4.5 + GPT-5.6) and revised. T-0 dependency satisfied.
 **Owner:** Lens design effort
 **Type:** Implementation slice (build), transcript workstream T-1 of T-0..T-7.
 
