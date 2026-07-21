@@ -3,8 +3,8 @@
 
 use std::collections::HashMap;
 
+use crate::ClipboardLocation;
 use crate::HostRequestDecision;
-use crate::engine::presentation::ClipboardLocation;
 
 /// Foreground policy for permissioned clipboard writes (OSC 52) + paste warnings.
 pub trait ClipboardPolicy {
@@ -40,8 +40,8 @@ impl ClipboardPolicy for SessionClipboardPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ClipboardLocation;
     use crate::HostRequestDecision;
-    use crate::engine::presentation::ClipboardLocation;
 
     #[test]
     fn session_policy_defaults_to_no_suppression_no_decision() {

@@ -307,6 +307,7 @@ pub struct Progress {
 // ---------------------------------------------------------------------------
 
 pub use engine::frame::{CellStyle, Frame, FrameCell, FrameRow, Rgb, UnderlineStyle};
+pub use engine::presentation::{ClipboardLocation, ClipboardMimePart};
 pub use engine::{
     CursorPos, EgressFrame, EgressKind, EngineConfig, EngineError, EngineHandle, EngineInspect,
     FeedError, VtEngine,
@@ -368,12 +369,12 @@ pub enum TerminalEvent {
     /// Permissioned OSC 52 clipboard write; host responds via [`TerminalHostEvent`].
     ClipboardWriteRequest {
         id: HostRequestId,
-        location: engine::presentation::ClipboardLocation,
-        contents: Vec<engine::presentation::ClipboardMimePart>,
+        location: ClipboardLocation,
+        contents: Vec<ClipboardMimePart>,
     },
     /// Emitted whenever a clipboard write is actually performed.
     ClipboardWriteNotice {
-        location: engine::presentation::ClipboardLocation,
+        location: ClipboardLocation,
         bytes: usize,
     },
 }
