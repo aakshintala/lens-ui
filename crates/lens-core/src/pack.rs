@@ -32,12 +32,20 @@ pub struct Item {
 
 impl Item {
     pub fn card() -> Self {
-        Item { kind: Kind::Card, fc: 1, fr: 1 }
+        Item {
+            kind: Kind::Card,
+            fc: 1,
+            fr: 1,
+        }
     }
 
     pub fn group(members: usize) -> Self {
         let (fc, fr) = foot(members);
-        Item { kind: Kind::Group { members }, fc, fr }
+        Item {
+            kind: Kind::Group { members },
+            fc,
+            fr,
+        }
     }
 }
 
@@ -88,7 +96,12 @@ pub fn pack(items: &[Item], cols: usize) -> Packing {
             for c in 0..=(cols - fc) {
                 if free(&occ, r, c, fc, fr) {
                     mark(&mut occ, r, c, fc, fr);
-                    out.push(Placed { item: *it, item_index, gx: c, gy: r });
+                    out.push(Placed {
+                        item: *it,
+                        item_index,
+                        gx: c,
+                        gy: r,
+                    });
                     max_r = max_r.max(r + fr);
                     placed = true;
                     break;
@@ -98,8 +111,15 @@ pub fn pack(items: &[Item], cols: usize) -> Packing {
         }
     }
 
-    let content_height = if max_r == 0 { 0.0 } else { max_r as f32 * CELL_H - GAP };
-    Packing { tiles: out, content_height }
+    let content_height = if max_r == 0 {
+        0.0
+    } else {
+        max_r as f32 * CELL_H - GAP
+    };
+    Packing {
+        tiles: out,
+        content_height,
+    }
 }
 
 fn free(occ: &[Vec<bool>], r: usize, c: usize, w: usize, h: usize) -> bool {
@@ -193,7 +213,11 @@ mod tests {
     #[test]
     fn pack_clamps_degenerate_footprint() {
         // A hand-built zero footprint must not panic and packs as a 1×1.
-        let items = [Item { kind: Kind::Card, fc: 0, fr: 0 }];
+        let items = [Item {
+            kind: Kind::Card,
+            fc: 0,
+            fr: 0,
+        }];
         let p = pack(&items, 3);
         assert_eq!(p.tiles.len(), 1);
         assert_eq!((p.tiles[0].gx, p.tiles[0].gy), (0, 0));

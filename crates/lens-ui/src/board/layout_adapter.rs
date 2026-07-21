@@ -35,7 +35,10 @@ pub fn build_ephemeral_layout(fleet: &FleetStore) -> BoardLayout {
             board_id: board_id.clone(),
             parent_item_id: None,
             ordinal: i as i32,
-            kind: BoardItemKind::Card { conn: conn.clone(), session },
+            kind: BoardItemKind::Card {
+                conn: conn.clone(),
+                session,
+            },
             created_at: EPOCH,
         })
         .collect();
@@ -82,7 +85,11 @@ mod tests {
         let sessions: Vec<_> = nodes.iter().flat_map(|n| n.leaf_sessions()).collect();
         assert_eq!(
             sessions,
-            vec![&SessionId::new("s1"), &SessionId::new("s2"), &SessionId::new("s3")]
+            vec![
+                &SessionId::new("s1"),
+                &SessionId::new("s2"),
+                &SessionId::new("s3")
+            ]
         );
     }
 }

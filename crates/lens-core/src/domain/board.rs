@@ -547,11 +547,7 @@ impl BoardLayout {
         Ok(self.nodes_under(board_id, None))
     }
 
-    fn nodes_under(
-        &self,
-        board_id: &BoardId,
-        parent: Option<&BoardItemId>,
-    ) -> Vec<BoardNode<'_>> {
+    fn nodes_under(&self, board_id: &BoardId, parent: Option<&BoardItemId>) -> Vec<BoardNode<'_>> {
         self.children(board_id, parent)
             .into_iter()
             .filter_map(|item| match &item.kind {
