@@ -68,6 +68,7 @@ pub(crate) struct PresentationDrainResult {
     pub title_outcome: TitleDrainOutcome,
     pub validated_hyperlink_urls: Vec<String>,
     pub clipboard_writes: Vec<(ClipboardLocation, Vec<ClipboardMimePart>)>,
+    pub local_clicks: Vec<(u16, u16)>,
 }
 
 impl Default for PresentationDrainResult {
@@ -76,6 +77,7 @@ impl Default for PresentationDrainResult {
             title_outcome: TitleDrainOutcome::NoChange,
             validated_hyperlink_urls: Vec::new(),
             clipboard_writes: Vec::new(),
+            local_clicks: Vec::new(),
         }
     }
 }
@@ -90,6 +92,7 @@ pub(crate) fn collect_presentation_drain(
 ) -> PresentationDrainResult {
     let mut validated_hyperlink_urls = Vec::new();
     let mut clipboard_writes = Vec::new();
+    let mut local_clicks = Vec::new();
     for ev in channel_events {
         match ev {
             EnginePresentationEvent::TitleChanged(_) => {}
@@ -101,13 +104,16 @@ pub(crate) fn collect_presentation_drain(
             EnginePresentationEvent::ClipboardWrite { location, contents } => {
                 clipboard_writes.push((location, contents));
             }
-            EnginePresentationEvent::LocalClick { .. } => {}
+            EnginePresentationEvent::LocalClick { col, row } => {
+                local_clicks.push((col, row));
+            }
         }
     }
     PresentationDrainResult {
         title_outcome: resolve_title_from_slot(slot_update),
         validated_hyperlink_urls,
         clipboard_writes,
+        local_clicks,
     }
 }
 
@@ -364,6 +370,7 @@ mod tests {
             title_outcome: TitleDrainOutcome::Set("Applied".into()),
             validated_hyperlink_urls: vec!["https://example.com/x".into()],
             clipboard_writes: Vec::new(),
+            local_clicks: Vec::new(),
         };
         record_presentation_drain_inspect(&inspect, &result);
         let snap = inspect.snapshot();

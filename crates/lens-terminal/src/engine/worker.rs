@@ -131,6 +131,10 @@ pub(crate) enum EngineCommand {
         report: bool,
         access_epoch: u64,
     },
+    #[allow(
+        dead_code,
+        reason = "superseded by Wheel arm in Task 5 foreground lowering"
+    )]
     LocalScroll(super::command::ScrollDelta),
     Resize(u16, u16),
     SetVisible(bool),

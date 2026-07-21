@@ -206,6 +206,10 @@ impl EngineHandle {
     }
 
     /// Enqueue viewport-only scroll (allowed in read-only; bypasses the input forwarder).
+    #[allow(
+        dead_code,
+        reason = "superseded by enqueue_wheel in Task 5 foreground lowering"
+    )]
     pub(crate) fn enqueue_local_scroll(&self, delta: ScrollDelta) -> Result<(), FeedError> {
         self.cmd_tx
             .try_send(EngineCommand::LocalScroll(delta))

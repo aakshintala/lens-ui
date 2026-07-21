@@ -103,7 +103,16 @@ impl TabRenderState {
             let tab_down = tab.clone();
             let tab_up = tab.clone();
             let tab_scroll = tab.clone();
-            let tab_mouse = tab;
+            let tab_md_left = tab.clone();
+            let tab_md_middle = tab.clone();
+            let tab_md_right = tab.clone();
+            let tab_mu_left = tab.clone();
+            let tab_mu_middle = tab.clone();
+            let tab_mu_right = tab.clone();
+            let tab_move = tab.clone();
+            let tab_uo_left = tab.clone();
+            let tab_uo_middle = tab.clone();
+            let tab_uo_right = tab;
             el = el
                 .on_key_down(move |event, window, cx| {
                     tab_down.update(cx, |tab, cx| tab.handle_key_down(event, window, cx));
@@ -115,7 +124,34 @@ impl TabRenderState {
                     tab_scroll.update(cx, |tab, cx| tab.handle_scroll_wheel(event, cx));
                 })
                 .on_mouse_down(MouseButton::Left, move |event, window, cx| {
-                    tab_mouse.update(cx, |tab, cx| tab.on_mouse_down(event, window, cx));
+                    tab_md_left.update(cx, |tab, cx| tab.handle_mouse_down(event, window, cx));
+                })
+                .on_mouse_down(MouseButton::Middle, move |event, window, cx| {
+                    tab_md_middle.update(cx, |tab, cx| tab.handle_mouse_down(event, window, cx));
+                })
+                .on_mouse_down(MouseButton::Right, move |event, window, cx| {
+                    tab_md_right.update(cx, |tab, cx| tab.handle_mouse_down(event, window, cx));
+                })
+                .on_mouse_up(MouseButton::Left, move |event, window, cx| {
+                    tab_mu_left.update(cx, |tab, cx| tab.handle_mouse_up(event, window, cx));
+                })
+                .on_mouse_up(MouseButton::Middle, move |event, window, cx| {
+                    tab_mu_middle.update(cx, |tab, cx| tab.handle_mouse_up(event, window, cx));
+                })
+                .on_mouse_up(MouseButton::Right, move |event, window, cx| {
+                    tab_mu_right.update(cx, |tab, cx| tab.handle_mouse_up(event, window, cx));
+                })
+                .on_mouse_move(move |event, window, cx| {
+                    tab_move.update(cx, |tab, cx| tab.handle_mouse_move(event, window, cx));
+                })
+                .on_mouse_up_out(MouseButton::Left, move |event, window, cx| {
+                    tab_uo_left.update(cx, |tab, cx| tab.handle_mouse_up_out(event, window, cx));
+                })
+                .on_mouse_up_out(MouseButton::Middle, move |event, window, cx| {
+                    tab_uo_middle.update(cx, |tab, cx| tab.handle_mouse_up_out(event, window, cx));
+                })
+                .on_mouse_up_out(MouseButton::Right, move |event, window, cx| {
+                    tab_uo_right.update(cx, |tab, cx| tab.handle_mouse_up_out(event, window, cx));
                 });
         }
         match frame {

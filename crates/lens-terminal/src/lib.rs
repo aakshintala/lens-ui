@@ -114,8 +114,8 @@ pub mod engine_bench_api {
 use gpui::prelude::*;
 use gpui::{
     App, Bounds, Context, Entity, EntityInputHandler, EventEmitter, FocusHandle, IntoElement,
-    KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, Pixels, Render, ScrollWheelEvent,
-    Subscription, UTF16Selection, Window,
+    KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    Render, ScrollWheelEvent, Subscription, UTF16Selection, Window,
 };
 use lens_client::Client;
 use lens_client::ids::{SessionId, TerminalId};
@@ -126,7 +126,7 @@ use bridge::{BridgeEvent, spawn_bridge};
 pub use clipboard_policy::{ClipboardPolicy, SessionClipboardPolicy};
 #[cfg(any(test, feature = "test-util"))]
 use engine::command::InputAck;
-use engine::command::{KeyAction, KeyInput, LensKey, ScrollDelta};
+use engine::command::{KeyAction, KeyInput, LensKey, ScrollDelta, WheelInput};
 use engine::key_map::{gpui_mods_to_key_mods, keydown_should_enqueue, keystroke_to_lens};
 use engine::worker::EngineCommand;
 use policy::{
@@ -435,6 +435,12 @@ pub struct TerminalTab {
         Vec<engine::presentation::ClipboardMimePart>,
     )>,
     pending_pastes: VecDeque<(HostRequestId, Vec<u8>)>,
+    /// Runtime mouse-local toggle (forces local selection over reporting). Slice 2c.
+    mouse_local: bool,
+    /// Report policy carried to the engine arbiter (Auto vs ForceLocal). Slice 2c.
+    report_policy: engine::command::MouseReportPolicy,
+    /// Monotonic base for MouseGesture.time multi-click derivation. Slice 2c.
+    mouse_time_base: std::time::Instant,
 }
 
 const PENDING_HOST_REQUESTS_CAP: usize = 64;
@@ -475,6 +481,9 @@ impl TerminalTab {
             clipboard_policy: Box::new(SessionClipboardPolicy::default()),
             pending_clipboard_writes: VecDeque::new(),
             pending_pastes: VecDeque::new(),
+            mouse_local: false,
+            report_policy: engine::command::MouseReportPolicy::Auto,
+            mouse_time_base: std::time::Instant::now(),
         }
     }
 
@@ -526,6 +535,9 @@ impl TerminalTab {
             clipboard_policy: Box::new(SessionClipboardPolicy::default()),
             pending_clipboard_writes: VecDeque::new(),
             pending_pastes: VecDeque::new(),
+            mouse_local: false,
+            report_policy: engine::command::MouseReportPolicy::Auto,
+            mouse_time_base: std::time::Instant::now(),
         }
     }
 
@@ -691,9 +703,8 @@ impl TerminalTab {
         cx.notify();
     }
 
-    /// Currently-sampled frame (test/harness only). Reflects what
-    /// `on_mouse_down` would hit-test — i.e. the engine-sampled frame, so a
-    /// harness can poll until an engine-fed OSC-8 frame has propagated.
+    /// Currently-sampled frame (test/harness only). Reflects what mouse handlers
+    /// would hit-test — i.e. the engine-sampled frame.
     #[cfg(any(test, feature = "test-util"))]
     pub fn latest_frame_for_test(&self) -> Option<Arc<Frame>> {
         self.render.latest_frame()
@@ -711,7 +722,7 @@ impl TerminalTab {
         self.render.cell_metrics.clone()
     }
 
-    /// Invoke the production left-click hyperlink path (harness only).
+    /// Invoke the production left-click mouse-down path (harness only).
     #[cfg(any(test, feature = "test-util"))]
     pub fn debug_mouse_down_for_test(
         &mut self,
@@ -719,7 +730,7 @@ impl TerminalTab {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.on_mouse_down(
+        self.handle_mouse_down(
             &MouseDownEvent {
                 button: MouseButton::Left,
                 position,
@@ -728,6 +739,82 @@ impl TerminalTab {
             window,
             cx,
         );
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn debug_mouse_move_for_test(
+        &mut self,
+        position: gpui::Point<Pixels>,
+        pressed_button: Option<MouseButton>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.handle_mouse_move(
+            &MouseMoveEvent {
+                position,
+                pressed_button,
+                modifiers: Default::default(),
+            },
+            window,
+            cx,
+        );
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn debug_mouse_up_for_test(
+        &mut self,
+        position: gpui::Point<Pixels>,
+        button: MouseButton,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.handle_mouse_up(
+            &MouseUpEvent {
+                button,
+                position,
+                modifiers: Default::default(),
+                click_count: 1,
+            },
+            window,
+            cx,
+        );
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn debug_mouse_up_out_for_test(
+        &mut self,
+        position: gpui::Point<Pixels>,
+        button: MouseButton,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.handle_mouse_up_out(
+            &MouseUpEvent {
+                button,
+                position,
+                modifiers: Default::default(),
+                click_count: 1,
+            },
+            window,
+            cx,
+        );
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn debug_wheel_for_test(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
+        self.handle_scroll_wheel(event, cx);
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn debug_handle_copy_for_test(&mut self, cx: &mut Context<Self>) {
+        self.handle_copy(cx);
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn debug_select_all_for_test(&self) {
+        if let Some(engine) = self.engine_handle() {
+            let _ = engine.select_all();
+        }
     }
 
     /// Drain presentation channel events (harness only).
@@ -767,15 +854,14 @@ impl TerminalTab {
         self.clipboard_policy.paste_warn_suppressed()
     }
 
-    pub(crate) fn on_mouse_down(
+    fn lower_mouse_gesture(
         &mut self,
-        event: &MouseDownEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
+        kind: engine::command::MouseEventKind,
+        button: Option<engine::command::MouseButtonKind>,
+        position: gpui::Point<Pixels>,
+        modifiers: &gpui::Modifiers,
+        cell_override_none: bool,
     ) {
-        if event.button != MouseButton::Left {
-            return;
-        }
         let Some(frame) = self.render.latest_frame() else {
             return;
         };
@@ -785,21 +871,93 @@ impl TerminalTab {
         let Some(origin) = self.render.last_paint_origin() else {
             return;
         };
-        let Some((col, row)) =
-            hit_test::pixel_to_cell(origin, &metrics, event.position, frame.cols, frame.rows)
-        else {
+        let cell = if cell_override_none {
+            None
+        } else {
+            hit_test::pixel_to_cell(origin, &metrics, position, frame.cols, frame.rows)
+        };
+        let px_x = f32::from(position.x - origin.x);
+        let px_y = f32::from(position.y - origin.y);
+        let Some(engine) = self.engine_handle() else {
             return;
         };
-        let Some(url) = hit_test::uri_for_gesture(frame.as_ref(), col, row) else {
-            return;
-        };
-        let Some(engine) = self.runtime.as_ref().and_then(|r| r.engine.as_ref()) else {
-            return;
-        };
-        let _ = engine.enqueue_presentation(
-            engine::presentation::EnginePresentationEvent::HyperlinkOpen { url },
+        let _ = engine.enqueue_mouse_gesture(engine::command::MouseGesture {
+            kind,
+            button,
+            mods: gpui_mods_to_key_mods(modifiers),
+            cell,
+            px_x,
+            px_y,
+            time: self.mouse_time_base.elapsed(),
+            mouse_local: self.mouse_local,
+            policy: self.report_policy,
+            access_epoch: 0,
+            ack: None,
+        });
+    }
+
+    pub(crate) fn handle_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        let button = gpui_button_to_kind(event.button);
+        self.lower_mouse_gesture(
+            engine::command::MouseEventKind::Down,
+            button,
+            event.position,
+            &event.modifiers,
+            false,
         );
-        self.drain_presentation_events(cx);
+    }
+
+    pub(crate) fn handle_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        let button = event.pressed_button.and_then(gpui_button_to_kind);
+        self.lower_mouse_gesture(
+            engine::command::MouseEventKind::Move,
+            button,
+            event.position,
+            &event.modifiers,
+            false,
+        );
+    }
+
+    pub(crate) fn handle_mouse_up(
+        &mut self,
+        event: &MouseUpEvent,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        let button = gpui_button_to_kind(event.button);
+        self.lower_mouse_gesture(
+            engine::command::MouseEventKind::Up,
+            button,
+            event.position,
+            &event.modifiers,
+            false,
+        );
+    }
+
+    pub(crate) fn handle_mouse_up_out(
+        &mut self,
+        event: &MouseUpEvent,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        let button = gpui_button_to_kind(event.button);
+        self.lower_mouse_gesture(
+            engine::command::MouseEventKind::Up,
+            button,
+            event.position,
+            &event.modifiers,
+            true,
+        );
     }
 
     fn write_input_allowed(&self) -> bool {
@@ -843,13 +1001,33 @@ impl TerminalTab {
         let Some(delta) = gpui_scroll_to_lens(event.delta) else {
             return;
         };
-        let Some(rt) = &self.runtime else {
+        let ScrollDelta::Lines(lines) = delta else {
             return;
         };
-        let Some(engine) = &rt.engine else {
+        let Some(engine) = self.engine_handle() else {
             return;
         };
-        let _ = engine.enqueue_local_scroll(delta);
+        let (cell, px_x, px_y) = if let Some(frame) = self.render.latest_frame()
+            && let Some(metrics) = self.render.cell_metrics.clone()
+            && let Some(origin) = self.render.last_paint_origin()
+        {
+            let cell =
+                hit_test::pixel_to_cell(origin, &metrics, event.position, frame.cols, frame.rows);
+            let px_x = f32::from(event.position.x - origin.x);
+            let px_y = f32::from(event.position.y - origin.y);
+            (cell, px_x, px_y)
+        } else {
+            (None, 0.0, 0.0)
+        };
+        let _ = engine.enqueue_wheel(WheelInput {
+            lines,
+            cell,
+            px_x,
+            px_y,
+            mods: gpui_mods_to_key_mods(&event.modifiers),
+            access_epoch: 0,
+            ack: None,
+        });
     }
 
     fn clear_input_composition_state(&mut self) {
@@ -863,6 +1041,47 @@ impl TerminalTab {
             && !ks.modifiers.alt
             && !ks.modifiers.function
             && ks.key == "v"
+    }
+
+    fn is_copy_keystroke(ks: &gpui::Keystroke) -> bool {
+        ks.modifiers.platform
+            && !ks.modifiers.control
+            && !ks.modifiers.alt
+            && !ks.modifiers.function
+            && ks.key == "c"
+    }
+
+    fn is_select_all_keystroke(ks: &gpui::Keystroke) -> bool {
+        ks.modifiers.platform
+            && !ks.modifiers.control
+            && !ks.modifiers.alt
+            && !ks.modifiers.function
+            && ks.key == "a"
+    }
+
+    const COPY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
+    fn handle_copy(&mut self, cx: &mut Context<Self>) {
+        let Some(engine) = self.engine_handle() else {
+            return;
+        };
+        let Ok(rx) = engine.request_copy() else {
+            return;
+        };
+        cx.spawn(async move |weak, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move { rx.recv_timeout(Self::COPY_TIMEOUT).ok() })
+                .await;
+            let _ = weak.update(cx, |_t, cx| {
+                if let Some(engine::command::CopyResult { text: Some(t) }) = res
+                    && !t.is_empty()
+                {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(t));
+                }
+            });
+        })
+        .detach();
     }
 
     fn paste_needs_warn(text: &str, suppressed: bool) -> bool {
@@ -879,6 +1098,18 @@ impl TerminalTab {
         let ks = &event.keystroke;
         if Self::is_paste_keystroke(ks) {
             self.handle_paste(cx);
+            cx.stop_propagation();
+            return;
+        }
+        if Self::is_copy_keystroke(ks) {
+            self.handle_copy(cx);
+            cx.stop_propagation();
+            return;
+        }
+        if Self::is_select_all_keystroke(ks) {
+            if let Some(engine) = self.engine_handle() {
+                let _ = engine.select_all();
+            }
             cx.stop_propagation();
             return;
         }
@@ -1284,6 +1515,15 @@ impl TerminalTab {
                 id,
                 url: url.clone(),
             });
+        }
+        if let Some(frame) = self.render.latest_frame() {
+            for (col, row) in &result.local_clicks {
+                if let Some(url) = hit_test::uri_for_gesture(frame.as_ref(), *col, *row) {
+                    let id = HostRequestId(self.next_host_request_id);
+                    self.next_host_request_id = self.next_host_request_id.wrapping_add(1);
+                    cx.emit(TerminalEvent::OpenUrlRequest { id, url });
+                }
+            }
         }
         match &result.title_outcome {
             engine::presentation::TitleDrainOutcome::Set(title) => {
@@ -1855,6 +2095,16 @@ fn starting_presentation(target: &TerminalTarget, options: &TerminalOpenOptions)
     }
 }
 
+fn gpui_button_to_kind(b: gpui::MouseButton) -> Option<engine::command::MouseButtonKind> {
+    use engine::command::MouseButtonKind;
+    match b {
+        gpui::MouseButton::Left => Some(MouseButtonKind::Left),
+        gpui::MouseButton::Right => Some(MouseButtonKind::Right),
+        gpui::MouseButton::Middle => Some(MouseButtonKind::Middle),
+        _ => None,
+    }
+}
+
 fn gpui_scroll_to_lens(delta: gpui::ScrollDelta) -> Option<ScrollDelta> {
     match delta {
         gpui::ScrollDelta::Lines(p) => {
@@ -1887,6 +2137,7 @@ fn apply_newest_size_before_input(
     let _ = engine.resize(cols, rows);
     let _ = outbound.try_send(WsOutbound::Resize { cols, rows });
     *input_enabled = write_allowed;
+    let _ = engine.enqueue_set_access(write_allowed);
 }
 
 fn identity_title_of(target: &TerminalTarget) -> String {
