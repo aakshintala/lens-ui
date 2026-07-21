@@ -50,7 +50,9 @@ pub fn format_age(oldest_created_at_secs: Option<i64>, now_ms: i64) -> String {
         return "—".into();
     };
     let now_s = now_ms / 1000;
-    let secs = (now_s - created).max(0);
+    // saturating: a corrupt/extreme server-provided `created` must never overflow
+    // (debug-build panic) — the UI is no-panic (codex review, B-3).
+    let secs = now_s.saturating_sub(created).max(0);
     if secs < 3_600 {
         format!("{}m", secs / 60)
     } else if secs < 86_400 {
@@ -136,6 +138,8 @@ mod tests {
         assert_eq!(format_age(None, 3_600_000), "—");
         // future/zero clamps to 0m, never negative
         assert_eq!(format_age(Some(10_000), 0), "0m");
+        // extreme/corrupt created must not overflow-panic (saturating_sub) — no-panic UI.
+        assert!(format_age(Some(i64::MIN), 0).ends_with('d'));
     }
 
     #[test]
