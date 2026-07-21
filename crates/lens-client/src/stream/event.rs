@@ -569,7 +569,9 @@ struct RawPolicyDenied {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResponseEvent {
-    InProgress,
+    InProgress {
+        response_id: Option<String>,
+    },
     Completed,
     OutputTextDelta {
         delta: String,
@@ -640,6 +642,7 @@ pub enum Item {
         id: String,
         role: String,
         content: Vec<MessageContentBlock>,
+        response_id: Option<String>,
     },
     /// `arguments` is the raw JSON string as it arrives on the wire (unparsed —
     /// the state model owns parsing). `agent` is a wire wart: it is the
@@ -652,17 +655,20 @@ pub enum Item {
         arguments: String,
         status: String,
         agent: Option<String>,
+        response_id: Option<String>,
     },
     FunctionCallOutput {
         id: String,
         call_id: String,
         output: String,
+        response_id: Option<String>,
     },
     Error {
         id: String,
         source: Option<String>,
         code: Option<String>,
         message: Option<String>,
+        response_id: Option<String>,
     },
     /// A persisted resource lifecycle item (`/items` only; the live stream carries
     /// these as `session.resource.*` SessionEvents instead). `resource_type` is
@@ -672,6 +678,7 @@ pub enum Item {
         resource_id: String,
         resource_type: String,
         event_type: String,
+        response_id: Option<String>,
     },
     /// Forward-compat for item types not yet modeled. Retains `id` so the state
     /// model can still reconcile it by `id` (typed-client §7 step 5).
@@ -956,7 +963,16 @@ impl ResponseEvent {
     fn from_frame(frame: &SseFrame) -> Option<Self> {
         let d = &frame.data;
         Some(match frame.event.as_str() {
-            "response.in_progress" => ResponseEvent::InProgress,
+            "response.in_progress" => {
+                let obj: serde_json::Value = serde_json::from_str(d).ok()?;
+                ResponseEvent::InProgress {
+                    response_id: obj
+                        .pointer("/response/id")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned),
+                }
+            }
             "response.completed" => ResponseEvent::Completed,
             "response.reasoning.started" => ResponseEvent::ReasoningStarted,
             "response.output_text.delta" => {
@@ -1054,6 +1070,19 @@ impl Item {
         }
     }
 
+    /// The server `response_id` this item belongs to, if the wire carried one.
+    /// `None` for the `Other` catch-all and for pre-response_id wire rows.
+    pub fn response_id(&self) -> Option<&str> {
+        match self {
+            Item::Message { response_id, .. }
+            | Item::FunctionCall { response_id, .. }
+            | Item::FunctionCallOutput { response_id, .. }
+            | Item::Error { response_id, .. }
+            | Item::ResourceEvent { response_id, .. } => response_id.as_deref(),
+            Item::Other { .. } => None,
+        }
+    }
+
     /// Total over a wire item object; unmodeled `type`s map to `Other`.
     pub(crate) fn from_value(v: serde_json::Value) -> Self {
         let id = v
@@ -1073,6 +1102,12 @@ impl Item {
                 .to_string()
         };
         let so = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
+        let wire_response_id = || {
+            v.get("response_id")
+                .and_then(|x| x.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        };
         match item_type.as_str() {
             "message" => {
                 let content = v
@@ -1089,6 +1124,7 @@ impl Item {
                     id,
                     role: s("role"),
                     content,
+                    response_id: wire_response_id(),
                 }
             }
             "function_call" => Item::FunctionCall {
@@ -1098,11 +1134,13 @@ impl Item {
                 arguments: s("arguments"),
                 status: s("status"),
                 agent: so("agent"),
+                response_id: wire_response_id(),
             },
             "function_call_output" => Item::FunctionCallOutput {
                 id,
                 call_id: s("call_id"),
                 output: s("output"),
+                response_id: wire_response_id(),
             },
             "error" => {
                 let data = v
@@ -1118,6 +1156,7 @@ impl Item {
                     source: data.source,
                     code: data.code,
                     message: data.message,
+                    response_id: wire_response_id(),
                 }
             }
             "resource_event" => Item::ResourceEvent {
@@ -1125,6 +1164,7 @@ impl Item {
                 resource_id: s("resource_id"),
                 resource_type: s("resource_type"),
                 event_type: s("event_type"),
+                response_id: wire_response_id(),
             },
             other => Item::Other {
                 item_type: other.to_string(),
@@ -1429,6 +1469,7 @@ mod tests {
                 resource_id: "terminal_tui_main".into(),
                 resource_type: "terminal".into(),
                 event_type: "session.resource.created".into(),
+                response_id: None,
             }
         );
         assert_eq!(item.id(), "rse_1");
@@ -1996,6 +2037,84 @@ mod tests {
                 reason: String::new(),
             })
         );
+    }
+
+    #[test]
+    fn from_value_retains_response_id_on_message() {
+        // Byte-verified: docs/spikes/captures/2026-07-21-t0-verify/turn2.stream.sse
+        let v = serde_json::json!({
+            "id": "msg_165176d0b88d46f5ba570e1ebfa73e3f",
+            "response_id": "resp_bcb93365f7aa4a0c9177e142",
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "Mercury\nVenus\nEarth\nMars"}],
+            "model": "claude-sdk"
+        });
+        let item = Item::from_value(v);
+        assert_eq!(item.response_id(), Some("resp_bcb93365f7aa4a0c9177e142"));
+    }
+
+    #[test]
+    fn from_value_response_id_absent_is_none() {
+        let v = serde_json::json!({
+            "id": "item_abc",
+            "type": "message",
+            "role": "assistant",
+            "content": []
+        });
+        let item = Item::from_value(v);
+        assert_eq!(item.response_id(), None);
+    }
+
+    #[test]
+    fn from_value_response_id_empty_string_is_none() {
+        let v = serde_json::json!({
+            "id": "item_abc",
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "response_id": ""
+        });
+        let item = Item::from_value(v);
+        assert_eq!(item.response_id(), None);
+    }
+
+    #[test]
+    fn from_value_retains_response_id_on_resource_event() {
+        // Byte-verified: docs/spikes/captures/2026-07-21-t0-verify/items_endpoint.no-created_at.json
+        let v = serde_json::json!({
+            "id": "rse_024ea4e882de4f6688d23712303e3278",
+            "response_id": "conv_599b6d156fd44a8886c200d9d55c7758",
+            "type": "resource_event",
+            "status": "completed",
+            "event_type": "session.resource.created",
+            "resource_id": "terminal_tui_main",
+            "resource_type": "terminal"
+        });
+        let item = Item::from_value(v);
+        assert_eq!(
+            item.response_id(),
+            Some("conv_599b6d156fd44a8886c200d9d55c7758")
+        );
+    }
+
+    #[test]
+    fn in_progress_carries_response_id() {
+        // Byte-verified: docs/spikes/captures/2026-07-21-t0-verify/interrupt-then-retry.stream.sse
+        let ev = parse_event(&frame(
+            "response.in_progress",
+            r#"{"sequence_number": 1, "type": "response.in_progress", "response": {"id": "resp_37ba30e3a06240e4bc1de44a", "object": "response", "status": "in_progress", "model": "claude-sdk", "created_at": 1784660489, "completed_at": null, "output": [], "background": false, "store": true, "usage": null, "previous_response_id": null, "conversation": null, "instructions": null, "reasoning": null, "error": null, "incomplete_details": null}}"#,
+        ));
+        match ev {
+            ServerStreamEvent::Response(ResponseEvent::InProgress { response_id }) => {
+                assert_eq!(
+                    response_id.as_deref(),
+                    Some("resp_37ba30e3a06240e4bc1de44a")
+                );
+            }
+            other => panic!("expected InProgress, got {other:?}"),
+        }
     }
 
     #[test]

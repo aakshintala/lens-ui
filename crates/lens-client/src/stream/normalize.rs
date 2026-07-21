@@ -129,7 +129,7 @@ mod tests {
     fn unrelated_events_pass_through_unchanged_and_in_order() {
         let mut n = Normalizer::default();
         let a = status(SessionStatusValue::Running);
-        let b = ServerStreamEvent::Response(ResponseEvent::InProgress);
+        let b = ServerStreamEvent::Response(ResponseEvent::InProgress { response_id: None });
         let c = ServerStreamEvent::Unknown {
             event_type: "x.y".into(),
         };
@@ -148,6 +148,7 @@ mod tests {
                 id: "fco_1".into(),
                 call_id: "toolu_1".into(),
                 output: "ok".into(),
+                response_id: None,
             },
         });
         assert_eq!(n.push(ev.clone()), vec![ev]);
@@ -168,6 +169,7 @@ mod tests {
                 arguments: "{}".into(),
                 status: status.into(),
                 agent: None,
+                response_id: None,
             },
         })
     }
@@ -177,6 +179,7 @@ mod tests {
                 id: item_id.into(),
                 call_id: call_id.into(),
                 output: "ok".into(),
+                response_id: None,
             },
         })
     }
@@ -271,6 +274,7 @@ mod tests {
                 id: "m1".into(),
                 role: "assistant".into(),
                 content: vec![],
+                response_id: None,
             },
         });
         assert_eq!(n.push(msg.clone()), vec![msg.clone()]);

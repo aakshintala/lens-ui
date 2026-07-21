@@ -210,7 +210,7 @@ pub(crate) fn fold_response_marker(
     ev: &ResponseEvent,
 ) -> Option<Updates> {
     Some(match ev {
-        ResponseEvent::InProgress => {
+        ResponseEvent::InProgress { .. } => {
             smallvec![StreamUpdate::StatusChanged(state.status)]
         } // P1-DECISION: liveness marker
         ResponseEvent::Failed | ResponseEvent::Incomplete | ResponseEvent::Cancelled => {
