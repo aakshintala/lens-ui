@@ -1,14 +1,20 @@
 # Handoff — Terminal Slice 2: EXECUTION (2026-07-17, SERIAL re-cut)
 
-> **UPDATE 2026-07-20 — 2a DONE + C2 CLOSED. NEXT = 2d.** Slice 2a (input) executed + DONE
-> (2026-07-17). The deferred Critical **C2 (egress-replay across reconnect/downgrade) is now CLOSED**
-> via per-transport egress channels + T4 hardening — full slice `fd79d54..2921da8`, plan
-> `docs/superpowers/plans/2026-07-18-terminal-c2-per-transport-egress.md`. C1 (false EngineStopped)
-> robust by-construction; C2 (reply-source) narrowed + **join-before-attach documented residual** (only
-> needed if a live-bridge teardown path is ever added — see the C2 invariant comment in
-> `TerminalTab::teardown_transport_off_foreground`). **A fresh session resumes at Slice 2d**
-> (presentation), then 2b → 2c. gate-green, `terminal-ws` unpushed since C2 (merge = user's call).
-> Cross-family reviews: gpt-5.6 endpoints stalled all session → grok-4.5 was used (user-approved).
+> **UPDATE 2026-07-20 — 2a + C2 + 2d ALL DONE. NEXT = 2b (then 2c). Both 2b/2c still need PLANS.**
+> Slice **2a** (input) DONE (2026-07-17). Critical **C2** (egress-replay) CLOSED via per-transport
+> egress channels + T4 (`fd79d54..2921da8`). Slice **2d** (presentation) EXECUTED + DONE (2026-07-20):
+> titles/OSC-8 hyperlinks/click→OpenUrlRequest/inspect+benches, 6 tasks composer-2.5 + grok-4.5
+> per-task reviews + fix waves + **Opus whole-slice = SHIP**. Opus caught a title-clear-vs-full-channel
+> invariant divergence (per-task reviews couldn't see it) → FIXED via a **tri-state latest-title slot**
+> (`Set|Clear` authoritative; drain never falls back to the droppable channel). The **end-of-slice
+> real-window gate PASSED** on a real macOS display and caught 3 latent bugs in the never-executed
+> Task-4 harness (frame-clobber-by-sampler / sync-read-of-async-`cx.emit` / dropped `Subscription`) —
+> all fixed; production click path was correct. Full 2d slice `bdd8695..5e6f28b`. **`terminal-ws`
+> PUSHED to `origin/terminal-ws` through 2d** (backup; **no `main` merge — user's standing call**).
+> Cross-family reviews used **grok-4.5** (`cursor-grok-4.5-high`) — gpt-5.6 endpoints stall; grok is the
+> proven 2d/C2 reviewer. Memories [[terminal-slice-2d-executed]], [[terminal-realwindow-harness-pitfalls]]
+> (READ THIS before any 2b/2c real-window test). **A fresh session's first job: WRITE THE 2b PLAN**
+> (see "Then 2b" below), then execute it subagent-driven, then plan+execute 2c.
 
 **Self-contained driver for a fresh session** whose job is to **execute** Slice 2. Planning is
 DONE and gpt-5.6-reviewed; do NOT re-plan or re-review the plan bodies — execute them.
@@ -29,10 +35,10 @@ committed code. The Task 0 plan file was deleted and its declarations folded int
 - **Design spec (ground truth):** `docs/specs/2026-07-17-terminal-slice-2-interaction-design.md`;
   parent `docs/specs/2026-07-16-terminal-workstream-design.md` (matrix + Open-contract-gaps
   amended for the progress/notification defer).
-- **Branch:** `terminal-ws` (pushed to `origin/terminal-ws`; **not** merged to `main` — user holds
-  the whole terminal workstream on-branch). Slice-2 **planning** (the design + both plan docs) is
-  **already committed** (673d8bb). The serial re-cut (this handoff + plan edits + Task-0 deletion)
-  is uncommitted at handoff time — **commit it first**, then execute.
+- **Branch:** `terminal-ws` (pushed to `origin/terminal-ws` **through 2d** @ `004d344`; **not** merged
+  to `main` — user holds the whole terminal workstream on-branch). 2a + C2 + 2d all committed + pushed.
+  Ledger `.superpowers/sdd/progress.md` (gitignored scratch, on-disk recovery map — full per-task
+  history for 2a/C2/2d).
 - **Durable context:** memories [[terminal-slice-2-design-ghostty-precedent]] (design + spike
   resolution), [[terminal-parallel-worktree-task0-foundation]] (**superseded** — records why Task 0
   was needed for the PARALLEL structure; serial dropped it), [[terminal-slice-1d-executed]],
@@ -41,24 +47,34 @@ committed code. The Task 0 plan file was deleted and its declarations folded int
 
 ## Execution order (STRICT, serial on `terminal-ws` — no worktrees, no merge)
 
-1. **2a (input) — FIRST.** Self-contained: declares AND fills egress rename, `key_encoder`/`key_event`
-   fields, `Frame.cursor`/`CursorPos`, `EngineCommand::{Key,Focus,LocalScroll}`, `input_forwarder`,
-   `ime_preedit`, `on_key_down`/`on_key_up` render hooks, `input_gate.rs`. **`VtEngine::new` keeps its
-   current arity** (no `presentation_tx`). Execute via **subagent-driven-development** per the plan
-   header — composer-2.5 per task + per-task review; cross-family review by a non-author family
-   (gpt-5.6 default — [[review-spend-policy]]; codex/gpt-5.5 = free fallback). Gate after each task.
-2. **2d (presentation) — SECOND**, on 2a's committed code. Self-contained: T1 declares the presentation
-   surface (create `engine/presentation.rs`, wire the presentation channel through
-   `WorkerChannels`/`worker_channels`/`spawn_worker`/`EngineHandle`, **add `presentation_tx` to
-   `VtEngine::new`** + update every call site, register bare `on_title_changed`, add the
-   `drain_presentation_events` render hook + presentation methods); T2 sanitize; T3 adds
-   `FrameCell.hyperlink_uri: Option<Arc<str>>` + OSC-8 extraction; T4 adds `next_host_request_id` +
-   `on_mouse_down` + URL validation/gesture. Same execution flow + cross-family review (different
-   family than 2a's reviewer for diversity).
-3. **Then 2b** (clipboard/OSC-52 policy — needs 2d's presentation egress; **owns** the
-   `on_clipboard_write` registration + the cap-before-clone that 2d deliberately deferred), **then 2c**
-   (mouse — opens with the **XTSHIFTESCAPE `mouse_shift_capture` safe-FFI spike**, still unresolved).
-   Neither is planned yet.
+1. ~~**2a (input) — FIRST.**~~ ✅ **DONE** (2026-07-17, `ef93567..78d8e0c`). Gate-green,
+   real-window keystroke-validated.
+2. ~~**2d (presentation) — SECOND.**~~ ✅ **DONE** (2026-07-20, `bdd8695..5e6f28b`). All 6 tasks +
+   grok-4.5 per-task reviews + fix waves + Opus whole-slice SHIP; tri-state title fix; real-window
+   gate passed. Memory [[terminal-slice-2d-executed]].
+3. **▶ 2b (clipboard/OSC-52) — NEXT, needs a PLAN first.** Owns what 2d deliberately deferred:
+   re-thread `presentation_tx` into an `on_clipboard_write` registration at `VtEngine` construction
+   (2d left a note at `vt.rs` ~L97 that 2b re-threads it; the title clone may already consume one
+   clone); the **cap-BEFORE-clone** on decoded OSC-52 bytes (drop/deny over-cap before allocating owned
+   MIME copies); allow/deny + allow-once/session policy + copy notice + cap−1/cap/cap+1 tests; map
+   drain → `TerminalEvent::ClipboardWriteRequest`. 2d already declared the
+   `EnginePresentationEvent::ClipboardWrite { location, contents }` variant + `ClipboardLocation` +
+   `ClipboardMimePart` — 2b fills the registration + policy. **Binding facts:** OSC-52 IGNORES callback
+   results (`terminal.rs` ~L1345 — do NOT claim `Busy` backpressure); the demo must **Deny/no-op**, never
+   auto-allow. Ground truth: `docs/specs/2026-07-17-terminal-slice-2-interaction-design.md` (OSC-52
+   policy). **Write the plan** (superpowers:writing-plans; specs→docs/specs, plans→docs/superpowers/plans
+   per [[spec-plan-location-convention]]), review it, then execute subagent-driven.
+4. **Then 2c (mouse) — LAST, needs a PLAN.** Opens with the **XTSHIFTESCAPE `mouse_shift_capture`
+   safe-FFI spike** (still unresolved — resolve it first). Mouse reporting / selection / paste.
+   Not planned.
+
+**Execution flow for 2b/2c** (same as 2a/2d): **subagent-driven-development** — composer-2.5 per task,
+**grok-4.5 (`cursor-grok-4.5-high`) cross-family per-task reviews** (gpt-5.6 endpoints stall; grok is
+proven), fix waves for Critical/Important, gate after each task incl. lens-terminal
+`--features test-util,live-tests`, then an **Opus whole-slice review** at the end. **Any real-window
+test: READ [[terminal-realwindow-harness-pitfalls]] FIRST** — 2d's never-executed harness hid 3 bugs
+(feed frames THROUGH the engine, poll `cx.emit` across renders, HOLD the `Subscription`; the RUN is the
+only proof). Run real-window gates only with a **user heads-up** (opens macOS windows).
 
 ## Why serial (and why Task 0 is gone)
 
@@ -119,13 +135,21 @@ EngineStopped) closed by-construction; C2 (reply-source) narrowed with a documen
 residual (only live if a live-bridge teardown path is added). The Reconnecting-input-semantics decision
 was resolved in 1d. **Nothing to do here — proceed straight to 2d.**
 
-## NEXT: execute **2d** (presentation) on top of 2a
+## ✅ 2d (presentation) — EXECUTED + DONE (2026-07-20). Superseded; see header.
 
-`docs/superpowers/plans/2026-07-17-terminal-slice-2d-presentation.md` — self-contained, lands on 2a's committed
-code (declares its own presentation surface + `VtEngine::new` `presentation_tx` arity). Same flow:
-subagent-driven-development, composer-2.5 per task, per-task cross-family review (a family *other* than 2a's
-gpt-5.6 for diversity — grok-4.5 or gemini-3.5 via cursor-delegate), gate incl. `--features test-util`. Then 2b, 2c.
+Full slice `bdd8695..5e6f28b` (10 code commits). 6 tasks (presentation channel + latest-title slot;
+OSC title sanitize→`reported_title`; `FrameCell.hyperlink_uri` OSC-8 extraction; click→`OpenUrlRequest`
++ `url::Url` validation; OSC-52 declared-only/deferred-to-2b; inspect counters + benches) —
+subagent-driven, composer-2.5 per task + grok-4.5 per-task reviews + fix waves + **Opus whole-slice =
+SHIP**. Opus caught a title-clear-vs-full-channel invariant divergence → FIXED via a **tri-state
+latest-title slot** (`3cfc270`). **Real-window gate PASSED** on a real display (`presentation_realwindow`
+click→OpenUrlRequest e2e + `render_realwindow` perf all in-budget) and caught 3 latent harness bugs
+(fixed, `5e6f28b`; production correct). Memories [[terminal-slice-2d-executed]] (full record) +
+[[terminal-realwindow-harness-pitfalls]].
 
-## First action (this re-cut session — DONE)
+## ▶ NEXT: PLAN then execute **2b** (clipboard/OSC-52), then plan+execute **2c** (mouse)
 
-~~Commit the serial re-cut, then execute 2a task-by-task.~~ Completed — see Progress above.
+Neither is planned. See **Execution order item 3 (2b)** and **item 4 (2c)** above for the surface each
+owns + binding facts. **First action for a fresh session: write the 2b plan** (superpowers:writing-plans;
+plans→`docs/superpowers/plans/`), cross-family review it (grok-4.5), then execute subagent-driven per the
+**"Execution flow for 2b/2c"** block above. Merge `terminal-ws`→`main` remains the **user's standing call**.
