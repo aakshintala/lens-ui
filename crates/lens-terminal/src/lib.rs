@@ -2707,25 +2707,13 @@ mod tests {
         v
     }
 
-    fn wait_for_osc52_forwarded(engine: &EngineHandle, expected: u64) {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline {
-            if engine.inspect().osc52_forwarded == expected {
-                return;
-            }
-            thread::sleep(Duration::from_millis(1));
-        }
-        panic!(
-            "osc52_forwarded expected {expected}, got {}",
-            engine.inspect().osc52_forwarded
-        );
-    }
-
     #[gpui::test]
     async fn inspect_exposes_osc52_forwarded_and_pastes_sent_counters(
         cx: &mut gpui::TestAppContext,
     ) {
         use gpui::ClipboardItem;
+
+        use crate::engine::presentation::{ClipboardLocation, EnginePresentationEvent};
 
         let engine = Arc::new(EngineHandle::spawn(test_cfg()));
         let tab = cx.new(|cx| TerminalTab::with_engine_for_test(Arc::clone(&engine), cx));
@@ -2734,7 +2722,19 @@ mod tests {
         engine
             .feed(osc52_vt_write_bytes(b"inspect-exposure"))
             .expect("feed osc52");
-        wait_for_osc52_forwarded(engine.as_ref(), 1);
+
+        let ev = engine
+            .presentation_rx()
+            .recv_timeout(Duration::from_secs(2))
+            .expect("OSC-52 clipboard write must arrive on presentation channel");
+        match ev {
+            EnginePresentationEvent::ClipboardWrite { location, contents } => {
+                assert_eq!(location, ClipboardLocation::Standard);
+                assert_eq!(contents.len(), 1);
+                assert_eq!(contents[0].data, "inspect-exposure");
+            }
+            other => panic!("expected ClipboardWrite presentation event, got {other:?}"),
+        }
 
         cx.write_to_clipboard(ClipboardItem::new_string("paste".to_string()));
         tab.update(cx, |tab, cx| tab.debug_paste_for_test(cx));
