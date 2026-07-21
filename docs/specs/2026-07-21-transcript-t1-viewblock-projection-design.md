@@ -311,9 +311,11 @@ Fixtures are hand-authored item lists (targeted, reducer-independent). `insta` o
 
 ## 8. Dependencies
 
-- **T-1 depends on T-0** — `response_id` authoritative on items (`BlockContext`),
-  active-response liveness signal, real `created_at`. T-1 cannot key turns correctly
-  without it.
+- **T-1 depends on T-0** — `response_id` authoritative on items (`BlockContext`) +
+  the active-response liveness signal. T-1 cannot key turns correctly without it.
+  (Rev-2 of the T-0 spec, after live 0.5.1 verification, **removes `created_at` from
+  T-0's scope** — it is unobtainable on the catch-up/live wires and descopes to T-6;
+  T-1 does not use it, so this is a no-op for T-1.)
 - **T-1 blocks:** T-2..T-7 (all render off `Vec<ViewBlock>`).
 - **Flagged downstream (not T-1):**
   - Live **in-progress tool calls** may not reach the projector through the shipped
@@ -321,6 +323,10 @@ Fixtures are hand-authored item lists (targeted, reducer-independent). `insta` o
     watermark — `actor/runloop.rs:~1177`). A **T-2** actor-feed sourcing dependency:
     T-1's `ToolSpan { output: None }` contract is correct as a pure function, but
     whether the caller can *supply* live in-progress items is T-2's to solve.
+  - **Liveness sourcing is now T-0, not T-2.** (The earlier note here deferring the
+    active-response signal to "a T-2 actor-feed sourcing dependency" is **superseded** —
+    T-0 rev 2 owns producing `active_response` from `response.in_progress` and exposing
+    it via `StreamUpdate::ActiveResponseChanged`. T-2 only *consumes* it in the RowSource.)
   - Modeling `response.completed.response.usage` — a **T-6** prerequisite.
 
 ---
