@@ -377,6 +377,11 @@ pub enum TerminalEvent {
         location: ClipboardLocation,
         bytes: usize,
     },
+    /// Multiline paste requires host confirmation before dispatch.
+    PasteWarnRequest {
+        id: HostRequestId,
+        line_count: usize,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -425,9 +430,13 @@ pub struct TerminalTab {
         engine::presentation::ClipboardLocation,
         Vec<engine::presentation::ClipboardMimePart>,
     )>,
+    pending_pastes: VecDeque<(HostRequestId, Vec<u8>)>,
 }
 
 const PENDING_HOST_REQUESTS_CAP: usize = 64;
+
+/// Maximum paste payload size (bytes). Over-cap pastes are rejected, never truncated.
+pub const MAX_PASTE_BYTES: usize = 1 << 20;
 
 impl TerminalTab {
     fn starting(
@@ -461,6 +470,7 @@ impl TerminalTab {
             next_host_request_id: 0,
             clipboard_policy: Box::new(SessionClipboardPolicy::default()),
             pending_clipboard_writes: VecDeque::new(),
+            pending_pastes: VecDeque::new(),
         }
     }
 
@@ -511,6 +521,7 @@ impl TerminalTab {
             next_host_request_id: 0,
             clipboard_policy: Box::new(SessionClipboardPolicy::default()),
             pending_clipboard_writes: VecDeque::new(),
+            pending_pastes: VecDeque::new(),
         }
     }
 
@@ -564,6 +575,22 @@ impl TerminalTab {
                                     .remember_osc52(location, HostRequestDecision::Deny);
                             }
                         }
+                    }
+                }
+                let paste_pos = self
+                    .pending_pastes
+                    .iter()
+                    .position(|(pending_id, _)| *pending_id == id);
+                if let Some(i) = paste_pos {
+                    let (_, bytes) = self.pending_pastes.remove(i).unwrap();
+                    match decision {
+                        HostRequestDecision::Allow | HostRequestDecision::AllowSession => {
+                            if matches!(decision, HostRequestDecision::AllowSession) {
+                                self.clipboard_policy.suppress_paste_warn();
+                            }
+                            self.dispatch_paste(bytes, cx);
+                        }
+                        HostRequestDecision::Deny | HostRequestDecision::DenySession => {}
                     }
                 }
             }
@@ -724,6 +751,18 @@ impl TerminalTab {
             .collect()
     }
 
+    /// Pending paste host-request ids (harness only).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn debug_pending_paste_ids_for_test(&self) -> Vec<HostRequestId> {
+        self.pending_pastes.iter().map(|(id, _)| *id).collect()
+    }
+
+    /// Paste-warn suppression flag (harness only).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn debug_paste_warn_suppressed_for_test(&self) -> bool {
+        self.clipboard_policy.paste_warn_suppressed()
+    }
+
     pub(crate) fn on_mouse_down(
         &mut self,
         event: &MouseDownEvent,
@@ -814,6 +853,18 @@ impl TerminalTab {
         self.pressed_keys.clear();
     }
 
+    fn is_paste_keystroke(ks: &gpui::Keystroke) -> bool {
+        ks.modifiers.platform
+            && !ks.modifiers.control
+            && !ks.modifiers.alt
+            && !ks.modifiers.function
+            && ks.key == "v"
+    }
+
+    fn paste_needs_warn(text: &str, suppressed: bool) -> bool {
+        !suppressed && text.contains('\n')
+    }
+
     /// Special/modified keys only — plain printable text is owned by [`EntityInputHandler`].
     pub(crate) fn handle_key_down(
         &mut self,
@@ -822,6 +873,11 @@ impl TerminalTab {
         cx: &mut Context<Self>,
     ) {
         let ks = &event.keystroke;
+        if Self::is_paste_keystroke(ks) {
+            self.handle_paste(cx);
+            cx.stop_propagation();
+            return;
+        }
         if !keydown_should_enqueue(&ks.key, &ks.modifiers) {
             return;
         }
@@ -917,6 +973,9 @@ impl TerminalTab {
     /// Simulate keydown for harness tests; returns whether a key command was enqueued.
     #[cfg(any(test, feature = "test-util"))]
     pub fn debug_key_down_for_test(&mut self, keystroke: gpui::Keystroke, is_held: bool) -> bool {
+        if Self::is_paste_keystroke(&keystroke) {
+            return false;
+        }
         if !keydown_should_enqueue(&keystroke.key, &keystroke.modifiers) {
             return false;
         }
@@ -948,6 +1007,12 @@ impl TerminalTab {
         cx: &mut Context<Self>,
     ) {
         self.handle_key_down(event, window, cx);
+    }
+
+    /// Invoke the production paste path (harness only).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn debug_paste_for_test(&mut self, cx: &mut Context<Self>) {
+        self.handle_paste(cx);
     }
 
     /// Invoke the production keyup handler (real-window harness).
@@ -992,6 +1057,74 @@ impl TerminalTab {
             ack: Some(ack_tx),
         });
         enqueued.then_some(ack_rx)
+    }
+
+    fn handle_paste(&mut self, cx: &mut Context<Self>) {
+        if !self.write_input_allowed() {
+            return;
+        }
+        let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) else {
+            return;
+        };
+        if text.is_empty() {
+            return;
+        }
+        // Cap BEFORE the warn/pending branch so an over-cap payload is never stashed in
+        // pending_pastes (a count-capped-but-not-byte-capped leak otherwise; finding I1).
+        if text.len() > MAX_PASTE_BYTES {
+            self.reject_over_cap_paste(cx);
+            return;
+        }
+        if Self::paste_needs_warn(&text, self.clipboard_policy.paste_warn_suppressed()) {
+            let line_count = text.lines().count();
+            let id = HostRequestId(self.next_host_request_id);
+            self.next_host_request_id = self.next_host_request_id.wrapping_add(1);
+            if self.pending_pastes.len() >= PENDING_HOST_REQUESTS_CAP {
+                self.pending_pastes.pop_front();
+            }
+            self.pending_pastes.push_back((id, text.into_bytes()));
+            if let Some(e) = self.engine_handle() {
+                e.record_paste_warn_prompt();
+            }
+            cx.emit(TerminalEvent::PasteWarnRequest { id, line_count });
+            return;
+        }
+        self.dispatch_paste(text.into_bytes(), cx);
+    }
+
+    /// Visible reject-with-marker for an over-cap paste (never silent truncation, DP5).
+    fn reject_over_cap_paste(&mut self, cx: &mut Context<Self>) {
+        if let Some(e) = self.engine_handle() {
+            e.record_paste_over_cap_reject();
+        }
+        if !self.presentation.input_discarded {
+            self.presentation.input_discarded = true;
+            cx.emit(TerminalEvent::PresentationChanged);
+            cx.notify();
+        }
+    }
+
+    fn dispatch_paste(&mut self, bytes: Vec<u8>, cx: &mut Context<Self>) {
+        if bytes.len() > MAX_PASTE_BYTES {
+            self.reject_over_cap_paste(cx);
+            return;
+        }
+        let Some(engine) = self.engine_handle() else {
+            return;
+        };
+        let ok = engine
+            .enqueue_input(EngineCommand::Paste(engine::command::PasteInput {
+                bytes,
+                access_epoch: 0,
+                ack: None,
+            }))
+            .is_ok();
+        if ok {
+            if let Some(e) = self.engine_handle() {
+                e.record_paste_sent();
+            }
+            self.clear_input_discarded(cx);
+        }
     }
 
     fn on_attached(&mut self, parts: AttachedParts, cx: &mut Context<Self>) {
@@ -2322,5 +2455,220 @@ mod tests {
             );
             assert!(ids.contains(&HostRequestId(PENDING_HOST_REQUESTS_CAP as u64)));
         });
+    }
+
+    #[test]
+    fn paste_needs_warn_only_on_multiline_and_not_suppressed() {
+        assert!(TerminalTab::paste_needs_warn("a\nb", false));
+        assert!(!TerminalTab::paste_needs_warn("ab", false));
+        assert!(!TerminalTab::paste_needs_warn("a\nb", true));
+    }
+
+    #[gpui::test]
+    async fn real_cmd_v_keystroke_routes_to_paste_not_key_encoder(cx: &mut gpui::TestAppContext) {
+        use gpui::{ClipboardItem, KeyDownEvent, Keystroke};
+
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let egress = engine.attach_test_egress();
+        let tab = cx.new(|cx| TerminalTab::with_engine_for_test(Arc::clone(&engine), cx));
+        tab.update(cx, |tab, _cx| tab.set_inspect_enabled(true));
+        while egress.try_recv().is_ok() {}
+
+        cx.write_to_clipboard(ClipboardItem::new_string("hi".to_string()));
+
+        let cmd_v = Keystroke {
+            key: "v".into(),
+            modifiers: gpui::Modifiers {
+                platform: true,
+                ..Default::default()
+            },
+            key_char: None,
+        };
+
+        let (_win, vcx) = cx.add_window_view(|_, _| gpui::Empty);
+        vcx.update(|window, cx| {
+            tab.update(cx, |tab, cx| {
+                tab.debug_handle_key_down_for_test(
+                    &KeyDownEvent {
+                        keystroke: cmd_v,
+                        is_held: false,
+                    },
+                    window,
+                    cx,
+                );
+            });
+        });
+
+        tab.update(cx, |tab, _cx| {
+            let snap = tab.inspect().engine.expect("engine inspect");
+            assert_eq!(snap.pastes_sent, 1);
+            assert_eq!(snap.keys_encoded, 0);
+        });
+        let frame = egress
+            .recv_timeout(Duration::from_secs(2))
+            .expect("paste must emit egress");
+        assert_eq!(frame.kind, EgressKind::Input);
+        assert_eq!(frame.bytes, b"hi");
+        assert!(
+            egress.try_recv().is_err(),
+            "Cmd+V must not also encode a key"
+        );
+    }
+
+    #[gpui::test]
+    async fn cmd_v_single_line_dispatches_paste(cx: &mut gpui::TestAppContext) {
+        use gpui::ClipboardItem;
+
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let tab = cx.new(|cx| TerminalTab::with_engine_for_test(Arc::clone(&engine), cx));
+        tab.update(cx, |tab, _cx| tab.set_inspect_enabled(true));
+        let (events, _sub) = subscribe_terminal_events(cx, &tab);
+
+        cx.write_to_clipboard(ClipboardItem::new_string("hello".to_string()));
+        tab.update(cx, |tab, cx| tab.debug_paste_for_test(cx));
+
+        tab.update(cx, |tab, _cx| {
+            let snap = tab.inspect().engine.expect("engine inspect");
+            assert_eq!(snap.pastes_sent, 1);
+        });
+        assert!(
+            events
+                .borrow()
+                .iter()
+                .all(|e| !matches!(e, TerminalEvent::PasteWarnRequest { .. })),
+            "single-line paste must not emit PasteWarnRequest"
+        );
+    }
+
+    #[gpui::test]
+    async fn cmd_v_multiline_unsuppressed_emits_warn_no_dispatch(cx: &mut gpui::TestAppContext) {
+        use gpui::ClipboardItem;
+
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let tab = cx.new(|cx| TerminalTab::with_engine_for_test(Arc::clone(&engine), cx));
+        tab.update(cx, |tab, _cx| tab.set_inspect_enabled(true));
+        let (events, _sub) = subscribe_terminal_events(cx, &tab);
+
+        cx.write_to_clipboard(ClipboardItem::new_string("a\nb".to_string()));
+        tab.update(cx, |tab, cx| tab.debug_paste_for_test(cx));
+
+        let evs = events.borrow();
+        let warn_count = evs
+            .iter()
+            .filter(|e| matches!(e, TerminalEvent::PasteWarnRequest { .. }))
+            .count();
+        assert_eq!(warn_count, 1);
+        match &evs[0] {
+            TerminalEvent::PasteWarnRequest { line_count, .. } => {
+                assert_eq!(*line_count, 2);
+            }
+            other => panic!("expected PasteWarnRequest, got {other:?}"),
+        }
+        tab.update(cx, |tab, _cx| {
+            let snap = tab.inspect().engine.expect("engine inspect");
+            assert_eq!(snap.pastes_sent, 0);
+            assert_eq!(snap.paste_warn_prompts, 1);
+            assert_eq!(tab.debug_pending_paste_ids_for_test().len(), 1);
+        });
+    }
+
+    #[gpui::test]
+    async fn paste_warn_allow_session_suppresses_and_dispatches(cx: &mut gpui::TestAppContext) {
+        use gpui::ClipboardItem;
+
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let tab = cx.new(|cx| TerminalTab::with_engine_for_test(Arc::clone(&engine), cx));
+        tab.update(cx, |tab, _cx| tab.set_inspect_enabled(true));
+        let (events, _sub) = subscribe_terminal_events(cx, &tab);
+
+        cx.write_to_clipboard(ClipboardItem::new_string("a\nb".to_string()));
+        tab.update(cx, |tab, cx| tab.debug_paste_for_test(cx));
+
+        let request_id = match &events.borrow()[0] {
+            TerminalEvent::PasteWarnRequest { id, .. } => *id,
+            other => panic!("expected PasteWarnRequest, got {other:?}"),
+        };
+
+        tab.update(cx, |tab, cx| {
+            tab.on_host_event(
+                TerminalHostEvent::HostRequestResponse {
+                    id: request_id,
+                    decision: HostRequestDecision::AllowSession,
+                },
+                cx,
+            );
+            assert!(tab.debug_paste_warn_suppressed_for_test());
+            assert!(tab.debug_pending_paste_ids_for_test().is_empty());
+            let snap = tab.inspect().engine.expect("engine inspect");
+            assert_eq!(snap.pastes_sent, 1);
+        });
+    }
+
+    #[gpui::test]
+    async fn over_cap_paste_rejected_before_pending(cx: &mut gpui::TestAppContext) {
+        use gpui::ClipboardItem;
+
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let tab = cx.new(|cx| TerminalTab::with_engine_for_test(Arc::clone(&engine), cx));
+        tab.update(cx, |tab, _cx| tab.set_inspect_enabled(true));
+        let (events, _sub) = subscribe_terminal_events(cx, &tab);
+
+        let over_cap = "x\n".repeat((MAX_PASTE_BYTES / 2) + 1);
+        assert!(over_cap.len() > MAX_PASTE_BYTES);
+        assert!(over_cap.contains('\n'));
+
+        cx.write_to_clipboard(ClipboardItem::new_string(over_cap));
+        tab.update(cx, |tab, cx| tab.debug_paste_for_test(cx));
+
+        tab.update(cx, |tab, _cx| {
+            assert!(tab.presentation().input_discarded);
+            let snap = tab.inspect().engine.expect("engine inspect");
+            assert_eq!(snap.pastes_sent, 0);
+            assert_eq!(snap.paste_over_cap_rejects, 1);
+            assert!(tab.debug_pending_paste_ids_for_test().is_empty());
+        });
+        assert!(
+            events
+                .borrow()
+                .iter()
+                .any(|e| matches!(e, TerminalEvent::PresentationChanged)),
+            "over-cap reject must emit PresentationChanged"
+        );
+        assert!(
+            events
+                .borrow()
+                .iter()
+                .all(|e| !matches!(e, TerminalEvent::PasteWarnRequest { .. })),
+            "over-cap must not enter pending_pastes warn path"
+        );
+    }
+
+    #[gpui::test]
+    async fn read_only_tab_ignores_cmd_v(cx: &mut gpui::TestAppContext) {
+        use gpui::ClipboardItem;
+
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let egress = engine.attach_test_egress();
+        let tab = cx.new(|cx| TerminalTab::with_engine_for_test(Arc::clone(&engine), cx));
+        tab.update(cx, |tab, _cx| tab.set_inspect_enabled(true));
+        while egress.try_recv().is_ok() {}
+
+        tab.update(cx, |tab, _cx| {
+            tab.presentation.access = AccessMode::ReadOnly;
+        });
+
+        cx.write_to_clipboard(ClipboardItem::new_string("hello".to_string()));
+        tab.update(cx, |tab, cx| tab.debug_paste_for_test(cx));
+
+        tab.update(cx, |tab, _cx| {
+            let snap = tab.inspect().engine.expect("engine inspect");
+            assert_eq!(snap.pastes_sent, 0);
+            assert_eq!(snap.paste_warn_prompts, 0);
+            assert_eq!(snap.paste_over_cap_rejects, 0);
+        });
+        assert!(
+            egress.try_recv().is_err(),
+            "read-only tab must not dispatch paste"
+        );
     }
 }

@@ -282,6 +282,18 @@ impl EngineHandle {
         self.inspect.record_clipboard_write_denied();
     }
 
+    pub fn record_paste_sent(&self) {
+        self.inspect.record_paste_sent();
+    }
+
+    pub fn record_paste_over_cap_reject(&self) {
+        self.inspect.record_paste_over_cap_reject();
+    }
+
+    pub fn record_paste_warn_prompt(&self) {
+        self.inspect.record_paste_warn_prompt();
+    }
+
     /// Test hook: the next `count` `build_frame` attempts on **this handle's**
     /// worker fail synthetically. Per-handle (not a process-global) so parallel
     /// tests cannot consume each other's injected failures.

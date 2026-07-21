@@ -230,10 +230,6 @@ impl KeyInput {
 }
 
 #[derive(Debug)]
-#[allow(
-    dead_code,
-    reason = "engine path wired; UI enqueue lands in a follow-on slice"
-)]
 pub(crate) struct PasteInput {
     pub bytes: Vec<u8>,
     pub access_epoch: u64,

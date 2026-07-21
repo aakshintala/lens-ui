@@ -115,10 +115,6 @@ pub enum EgressKind {
 pub(crate) enum EngineCommand {
     Feed(Vec<u8>),
     Key(KeyInput),
-    #[allow(
-        dead_code,
-        reason = "engine path wired; UI enqueue lands in a follow-on slice"
-    )]
     Paste(PasteInput),
     Focus {
         focused: bool,

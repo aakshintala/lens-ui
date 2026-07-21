@@ -50,6 +50,9 @@ pub struct EngineInspect {
     pub osc52_over_cap_drops: u64,
     pub clipboard_writes_allowed: u64,
     pub clipboard_writes_denied: u64,
+    pub pastes_sent: u64,
+    pub paste_over_cap_rejects: u64,
+    pub paste_warn_prompts: u64,
     pub recent: Vec<InspectEvent>,
 }
 
@@ -78,6 +81,9 @@ pub(crate) struct InspectShared {
     osc52_over_cap_drops: AtomicU64,
     clipboard_writes_allowed: AtomicU64,
     clipboard_writes_denied: AtomicU64,
+    pastes_sent: AtomicU64,
+    paste_over_cap_rejects: AtomicU64,
+    paste_warn_prompts: AtomicU64,
     ring: Mutex<VecDeque<InspectEvent>>,
 }
 
@@ -106,6 +112,9 @@ impl InspectShared {
             osc52_over_cap_drops: AtomicU64::new(0),
             clipboard_writes_allowed: AtomicU64::new(0),
             clipboard_writes_denied: AtomicU64::new(0),
+            pastes_sent: AtomicU64::new(0),
+            paste_over_cap_rejects: AtomicU64::new(0),
+            paste_warn_prompts: AtomicU64::new(0),
             ring: Mutex::new(VecDeque::with_capacity(RING_CAP)),
         }
     }
@@ -250,6 +259,27 @@ impl InspectShared {
         self.clipboard_writes_denied.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_paste_sent(&self) {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        self.pastes_sent.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_paste_over_cap_reject(&self) {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        self.paste_over_cap_rejects.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_paste_warn_prompt(&self) {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        self.paste_warn_prompts.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn set_visible(&self, visible: bool) {
         self.visible.store(visible, Ordering::Relaxed);
     }
@@ -300,6 +330,9 @@ impl InspectShared {
             osc52_over_cap_drops: self.osc52_over_cap_drops.load(Ordering::Relaxed),
             clipboard_writes_allowed: self.clipboard_writes_allowed.load(Ordering::Relaxed),
             clipboard_writes_denied: self.clipboard_writes_denied.load(Ordering::Relaxed),
+            pastes_sent: self.pastes_sent.load(Ordering::Relaxed),
+            paste_over_cap_rejects: self.paste_over_cap_rejects.load(Ordering::Relaxed),
+            paste_warn_prompts: self.paste_warn_prompts.load(Ordering::Relaxed),
             recent,
         }
     }
