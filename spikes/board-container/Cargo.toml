@@ -1,0 +1,12 @@
+[package]
+name = "board-container"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Deliberately NO `[lints] workspace = true` — spikes live outside the
+# production lint wall (see root Cargo.toml). Throwaway; answers the B-2
+# container/culling unknowns (spec §4). Fold verdict into the spec, then delete.
+
+[dependencies]
+gpui = "0.2.2"

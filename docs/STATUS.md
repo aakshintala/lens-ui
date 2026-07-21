@@ -5,7 +5,7 @@ the current forward-looking state only. **Full dated session entries live in
 [`STATUS-ARCHIVE.md`](./STATUS-ARCHIVE.md)** — write each session's detail there
 and roll older "Recent" pointers off this page as they age.
 
-_Last curated 2026-07-20 (B-2+B-3 packing & group-rendering DESIGN locked; container/culling spike next)._
+_Last curated 2026-07-20 (B-2+B-3 DESIGN locked; container/culling spike DONE → GO; two plans B-2/B-3 next)._
 
 ---
 
@@ -23,10 +23,15 @@ _Last curated 2026-07-20 (B-2+B-3 packing & group-rendering DESIGN locked; conta
     `foot(n)` footprints, hole-backfill first-fit, full-size 280×160 members + ring-in-gap,
     **✓N-completed badge** (active count dropped), focused rail = 1-col vertical stacks. Cost still
     **derived at render** (Σ members' `cumulative_cost`).
-    - **NEXT = container/culling SPIKE** (§20's one real spike, run in a **fresh session** per user):
-      custom scrollable surface + absolute-positioned tiles (`list()`/`uniform_list` are 1-D, can't do
-      2-D masonry); resolve scroll-offset read, render-cull by y-intersection, timer-gate-on-scroll,
-      measured off-screen CPU. Then finalize spec → **two plans** (B-2 engine, B-3 group chrome).
+    - **Container/culling SPIKE — DONE 2026-07-20 → GO** (all 4 unknowns; `spikes/board-container/`,
+      verdict folded into spec §4/§8; memory [[board-container-spike]]). Absolute-positioned masonry in
+      a stateful `overflow_scroll` div (explicit-content-height child = scroll extent) works; culling =
+      absent-from-child-vec (gpui never builds culled tiles, 9/56 built); container-driven timer gate via
+      `App::defer` (cards init HIDDEN) **retires the paint-time `last_bounds` gate + edge-trigger at the
+      root** and fixes the scroll-into-view freeze; overdraw = 1×CELL_H; culling ~halves idle CPU.
+    - **NEXT = write TWO plans** → `docs/plans/`: **B-2** (packer→lens-core + `board_tree` read-API +
+      scroll container + cull + timer-gate + retire old gate) and **B-3** (group chrome + rollups +
+      `group_of` seam).
     - Still owed: `board_tree(board_id)` ordered-walk read-API on `BoardLayout` (B-1 has only
       `children`); `group_of(&SessionCard)` seam. **Collapse (render+toggle) moved to B-4**; palette/picker
       to B-3.

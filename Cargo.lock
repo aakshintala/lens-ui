@@ -709,6 +709,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "board-container"
+version = "0.0.0"
+dependencies = [
+ "gpui",
+]
+
+[[package]]
 name = "bstr"
 version = "1.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

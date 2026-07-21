@@ -145,34 +145,45 @@ All derived at render; nothing new persisted (collapse flag already persisted by
 
 ---
 
-## 4. Container, scroll & culling — **SPIKE PENDING** (§20's "one real spike")
+## 4. Container, scroll & culling — **SPIKE RESOLVED: GO** (2026-07-20)
 
 `list()` / `uniform_list` are 1-D (uniform- or variable-height rows); neither does 2-D
 masonry. So the container is a **custom scrollable surface with absolutely-positioned
-tiles**, content-height from the packer. This is B-2's real implementation risk and must be
-**spiked before the B-2 plan**. Four unknowns:
+tiles**, content-height from the packer. This was B-2's real implementation risk; the spike
+(`spikes/board-container/`, real-window gpui program, harness=false per
+[[gpui-test-noop-text-system]]) resolved all four unknowns **GO**. Verdict below; full
+detail in `spikes/board-container/NOTES.md` and memory [[board-container-spike]].
 
-1. **Scroll surface** — absolute-positioned children inside an `overflow_scroll` div with an
-   explicit content height; can we **read the scroll offset** each frame (for culling + timer
-   gating)?
-2. **Render culling** — build only tiles whose `y`-range intersects
-   `[scroll_top, scroll_top + viewport_h]`. Packer geometry makes this a cheap filter; verify
-   gpui doesn't force building all children.
-3. **Timer gating on scroll** — the container computes the visible set and **starts/stops each
-   card's anim timer** from it. This **retires** the paint-time `last_bounds` gate
-   (`card/view.rs`) and the edge-triggered `recover_viewport_gates_on_reentry`
-   (`board/mod.rs`) — the current freeze hazard ([[viewport-reentry-freeze]]): today's gate is
-   edge-triggered on the focus↔board switch, so a card **scrolling** into view (no mode change)
-   never resets → frozen spinner. Container-driven visibility fixes this at the root.
-4. **Measure** — off-screen timer CPU cost via the `measure.sh` rig (RELEASE build — gate perf
-   in release per [[terminal-slice-1c-executed]]), to confirm culling actually saves CPU and
-   set the visible-range overdraw margin.
+1. **Scroll surface — GO.** Absolute-positioned tiles inside a **stateful**
+   `div().id(..).overflow_scroll().track_scroll(&handle)`, wrapping **one in-flow child of
+   explicit `content_height`** (from the packer). That explicit-height child establishes the
+   scroll extent even though every tile is `absolute` (out of flow). `ScrollHandle::offset()`
+   reads scroll each frame; **`offset.y ≤ 0` scrolled down → `scroll_top = -offset.y`**.
+   (Gotchas: div must be stateful or `overflow_scroll`/`track_scroll` aren't in scope;
+   `Pixels.0` is private → `f32::from(px)`.)
+2. **Render culling — GO.** Build only tiles whose `y`-range intersects
+   `[scroll_top - overdraw, scroll_top + viewport_h + overdraw]`. Culled tiles are simply
+   **absent from the child vec → gpui never builds them** (proven: at top, 9/56 tiles built,
+   off-screen cards' `render_count == 0`). gpui does not force-build a div's children.
+3. **Timer gating on scroll — GO; retires the old gate, fixes the freeze at the root.** The
+   container is the **sole visibility authority**. Cards init **hidden** (no timer). Each
+   frame the container computes the visible set from packer geometry (pure — no entity reads)
+   and applies `card.set_visible(bool)` **via `App::defer`**, OFF its own render path, so it
+   never touches sibling card entities inside `render`'s accessed-entity window (the
+   `.cached()` dirty-tracking landmine, [[viewport-reentry-freeze]]). `set_visible(true)`
+   spawns the anim timer; `(false)` drops it. Probe proof: card scrolled off → timer stops,
+   ticks freeze; scrolled back → **timer respawns, ticks resume** — exactly the scroll case
+   the old edge-triggered `recover_viewport_gates_on_reentry` (focus↔board only) could not
+   handle. This **retires** both the paint-time `last_bounds` gate (`card/view.rs`) and the
+   edge-trigger (`board/mod.rs`). *Init subtlety:* cards MUST start hidden — if they start
+   visible, the first `set_visible(true)` is a no-op and the timer never spawns.
+4. **Off-screen CPU — GO, culling ~halves idle CPU.** Release, 56-tile fixture, 3 cols,
+   ~9 visible, idle: **cull-ON ≈ 6.8%** vs **all-timers ≈ 15.3%** CPU → **~55% saved**; the
+   delta scales with off-screen count. Rig: `spikes/board-container/measure.sh`.
 
-**Spike deliverable:** a small real-window gpui program (harness=false per
-[[gpui-test-noop-text-system]]) proving 1–3 and a measurement for 4, with a GO/NO-GO on the
-absolute-positioned-masonry approach (fallback: a hand-rolled `uniform_list` over *rows* if
-absolute positioning in scroll misbehaves — but rows break the 2-D group tiles, so this is a
-last resort).
+**Fallback (unused):** a hand-rolled `uniform_list` over *rows* — rejected need; absolute
+masonry works. The pure packer (`spikes/board-container/src/packer.rs`, unit-tested against
+the §2.2 anchors) is ready to lift into `lens-core` for the B-2 plan.
 
 ---
 
@@ -224,6 +235,8 @@ Validated in the mockup; recorded so B-4 rebuilds it without re-deriving:
 ## 8. Open questions for implementation (not blocking design)
 
 - Exact `HEADER` / `INSET` / `GAP` px — tune on device (mockup uses 24 / 5 / 16).
-- Overdraw margin for the visible-range cull — set from the §4.4 measurement.
+- Overdraw margin for the visible-range cull — **resolved: `1 × CELL_H` (200px)**. Covers the
+  one-frame offset lag (cull uses last frame's painted offset) with zero pop-in in the spike's
+  fast programmatic scroll jumps; one row suffices.
 - Whether the board write-path (for B-4) is stubbed minimally in B-2 or left entirely to B-4 —
   B-2 is read-mostly (renders the tree); recommend leaving writes to B-4.
