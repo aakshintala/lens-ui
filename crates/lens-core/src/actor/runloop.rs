@@ -227,10 +227,7 @@ fn wire_to_domain_item(wire: &WireItem, clock: &dyn Clock) -> Option<Item> {
         ctx: BlockContext {
             agent: None,
             depth: 0,
-            response_id: wire
-                .response_id()
-                .filter(|s| !s.is_empty())
-                .map(|s| ResponseId::new(s.to_owned())),
+            response_id: ResponseId::from_wire(wire.response_id()),
         },
         created_at: clock.now_millis(),
         kind,

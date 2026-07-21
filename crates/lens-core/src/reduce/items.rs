@@ -10,20 +10,11 @@ use serde_json::Value;
 use smallvec::smallvec;
 use std::sync::Arc;
 
-pub(crate) fn wire_response_id(s: Option<&str>) -> Option<ResponseId> {
-    s.filter(|s| !s.is_empty())
-        .map(|s| ResponseId::new(s.to_owned()))
-}
-
-fn item_ctx(
-    scratch: &StreamScratch,
-    wire_response_id: Option<ResponseId>,
-    active_response: &Option<ResponseId>,
-) -> BlockContext {
+fn item_ctx(scratch: &StreamScratch, response_id: Option<ResponseId>) -> BlockContext {
     BlockContext {
         agent: scratch.current_agent.clone(),
         depth: 0, // P1-DECISION D-P1-14: sub-agent depth deferred to §9
-        response_id: wire_response_id.or_else(|| active_response.clone()),
+        response_id,
     }
 }
 
@@ -135,7 +126,8 @@ pub(crate) fn finalize_message(state: &mut SessionState, clock: &dyn Clock) -> U
             data: Value::Null,
         }],
     };
-    push_item(state, id, kind, None, None, clock)
+    let response_id = state.active_response.clone();
+    push_item(state, id, kind, None, response_id, clock)
 }
 
 pub(crate) fn finalize_reasoning(state: &mut SessionState, clock: &dyn Clock) -> Updates {
@@ -148,7 +140,8 @@ pub(crate) fn finalize_reasoning(state: &mut SessionState, clock: &dyn Clock) ->
         summary_text: acc.summary_text,
         encrypted: acc.encrypted,
     };
-    push_item(state, id, kind, None, None, clock)
+    let response_id = state.active_response.clone();
+    push_item(state, id, kind, None, response_id, clock)
 }
 
 pub(crate) fn push_compaction(
@@ -161,7 +154,8 @@ pub(crate) fn push_compaction(
         summary: String::new(),
         token_count: total_tokens.map(|t| t.max(0) as u64),
     };
-    push_item(state, id, kind, None, None, clock)
+    let response_id = state.active_response.clone();
+    push_item(state, id, kind, None, response_id, clock)
 }
 
 pub(crate) fn push_agent_changed(
@@ -172,12 +166,13 @@ pub(crate) fn push_agent_changed(
 ) -> Updates {
     let at = clock.now_millis();
     let id = local_id("agent_changed", state);
+    let response_id = state.active_response.clone();
     push_item(
         state,
         id,
         ItemKind::AgentChanged { from, to, at },
         None,
-        None,
+        response_id,
         clock,
     )
 }
@@ -190,10 +185,10 @@ pub(crate) fn push_item(
     id: ItemId,
     kind: ItemKind,
     seq: Option<u64>,
-    wire_response_id: Option<ResponseId>,
+    response_id: Option<ResponseId>,
     clock: &dyn Clock,
 ) -> Updates {
-    let ctx = item_ctx(&state.stream, wire_response_id, &state.active_response);
+    let ctx = item_ctx(&state.stream, response_id);
     if let Some(idx) = state.items.iter().position(|it| it.id == id) {
         let existing = Arc::make_mut(&mut state.items[idx]);
         existing.kind = kind;

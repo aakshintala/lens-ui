@@ -43,6 +43,7 @@ pub fn bench_push_message(
 ) -> Updates {
     use crate::domain::Role;
     use crate::domain::item::{ContentBlock, ItemKind};
+    let response_id = state.active_response.clone();
     items::push_item(
         state,
         id,
@@ -55,7 +56,7 @@ pub fn bench_push_message(
             }],
         },
         None,
-        None,
+        response_id,
         clock,
     )
 }
@@ -123,8 +124,8 @@ pub fn reduce(state: &mut SessionState, event: &ServerStreamEvent, clock: &dyn C
                             state.stream.open_message = None;
                         }
                     }
-                    let wire_response_id = items::wire_response_id(item.response_id());
-                    let mut u = items::push_item(state, id, kind, None, wire_response_id, clock);
+                    let response_id = crate::domain::ids::ResponseId::from_wire(item.response_id());
+                    let mut u = items::push_item(state, id, kind, None, response_id, clock);
                     if cleared || state.stream.current_agent != prev_agent {
                         u.push(StreamUpdate::ScratchChanged(Arc::new(state.stream.clone())));
                     }
@@ -319,6 +320,29 @@ mod tests {
                     .as_ref()
                     .map(ResponseId::as_str),
                 Some("resp_bcb93365")
+            );
+        }
+
+        #[test]
+        fn wire_item_without_response_id_does_not_borrow_active() {
+            let mut s = empty_state();
+            let clock = ManualClock::new(1_700_000_000_000);
+            reduce(&mut s, &response_in_progress("resp_A"), &clock);
+            let done_without_id = parse_response(
+                "response.output_item.done",
+                r#"{"item":{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"output_text","text":"hi"}]}}"#,
+            );
+            reduce(&mut s, &done_without_id, &clock);
+            assert_eq!(
+                s.items
+                    .last()
+                    .unwrap()
+                    .ctx
+                    .response_id
+                    .as_ref()
+                    .map(ResponseId::as_str),
+                None,
+                "wire item without response_id must not borrow active_response"
             );
         }
 

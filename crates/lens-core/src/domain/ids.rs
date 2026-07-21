@@ -35,6 +35,13 @@ macro_rules! branded_id {
 // scope (§11) — out of this spec.
 branded_id!(ItemId, CallId, ResponseId, AgentId, BoardId, BoardItemId);
 
+impl ResponseId {
+    /// Normalize wire `response_id`: absent or empty string → `None`.
+    pub fn from_wire(s: Option<&str>) -> Option<Self> {
+        s.filter(|s| !s.is_empty()).map(|s| Self::new(s.to_owned()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

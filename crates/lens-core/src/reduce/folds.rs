@@ -203,11 +203,6 @@ pub(crate) fn fold_session_field(
     })
 }
 
-fn wire_response_id(s: Option<&str>) -> Option<ResponseId> {
-    s.filter(|s| !s.is_empty())
-        .map(|s| ResponseId::new(s.to_owned()))
-}
-
 /// Response lifecycle markers + elicitation folds. Returns `None` for item-producing /
 /// scratch-routing arms handled in `reduce` or later tasks.
 pub(crate) fn fold_response_marker(
@@ -216,7 +211,7 @@ pub(crate) fn fold_response_marker(
 ) -> Option<Updates> {
     Some(match ev {
         ResponseEvent::InProgress { response_id } => {
-            let active = wire_response_id(response_id.as_deref());
+            let active = ResponseId::from_wire(response_id.as_deref());
             state.active_response = active.clone();
             smallvec![
                 StreamUpdate::StatusChanged(state.status),
