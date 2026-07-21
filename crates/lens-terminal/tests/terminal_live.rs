@@ -1,6 +1,12 @@
 //! Live terminal vertical rider (Slice 1d Task 9): `open()` → attach → input →
 //! real-window paint → forced network loss → reconnect with `output_gap`.
 //!
+//! **Slice 2b (Task 5):** optional paste round-trip leg when
+//! `LENS_LIVE_CLIPBOARD_PASTE=1` — sets the clipboard, dispatches the production
+//! paste path (same `handle_paste` as Cmd+V intercept), asserts the pasted text
+//! appears in the frame. OSC-52 program→clipboard has no hermetic live counterpart;
+//! observe manually with `LENS_DEMO_ALLOW_CLIPBOARD=1` on `lens-terminal-demo`.
+//!
 //! **Not** under `#[gpui::test]`: gpui's test platform installs a `NoopTextSystem`
 //! that fakes every font/shape/paint result, so paint assertions there are
 //! false-green. This is a `harness = false` binary that opens a **real**
@@ -14,13 +20,14 @@
 //! | `LENS_OMNIGENT_SESSION_ID` | yes | Session / conversation id |
 //! | `LENS_OMNIGENT_TERMINAL_ID` | target A | Attach to existing terminal |
 //! | `LENS_OMNIGENT_TERMINAL_NAME` + `LENS_OMNIGENT_SESSION_KEY` | target B | Open-or-create |
+//! | `LENS_LIVE_CLIPBOARD_PASTE` | no | Set to `1` to run P5 paste round-trip |
 //!
 //! # Skip vs fail
 //!
 //! - **Skip (exit 0):** `LENS_OMNIGENT_URL` or `LENS_OMNIGENT_SESSION_ID` absent;
 //!   or URL+session present but no valid terminal target.
 //! - **Fail (exit 1):** env configured but client handshake or any driver phase times out.
-//! - **Pass (exit 0):** all four phases complete.
+//! - **Pass (exit 0):** phases P1–P4 complete; P5 runs only when `LENS_LIVE_CLIPBOARD_PASTE=1`.
 //!
 //! Run manually against omnigent 0.5.1 — **not** part of `cargo test --workspace`:
 //!
@@ -36,7 +43,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    App, Application, Bounds, Entity, TitlebarOptions, WindowBounds, WindowOptions, px, size,
+    App, Application, Bounds, ClipboardItem, Entity, TitlebarOptions, WindowBounds, WindowOptions,
+    px, size,
 };
 use lens_client::ids::{ConnectionId, SessionId, TerminalId};
 use lens_client::{Auth, Client, Connection};
@@ -291,10 +299,49 @@ fn spawn_driver(tab: Entity<TerminalTab>, marker: String, cx: &mut App) {
             fail_phase("P4 reattach: lifecycle not Live with output_gap");
         }
 
+        if live_clipboard_paste_enabled() {
+            let paste_marker = format!("PASTE_{}", std::process::id());
+            let dispatched = weak
+                .update(cx, |tab, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(paste_marker.clone()));
+                    tab.debug_paste_for_test(cx);
+                    true
+                })
+                .unwrap_or(false);
+            if !dispatched {
+                fail_phase("P5 paste round-trip: paste dispatch failed");
+            }
+
+            let mut p5_ok = false;
+            while Instant::now() < deadline {
+                let visible = weak
+                    .update(cx, |tab, _| {
+                        tab.debug_latest_frame_for_test()
+                            .is_some_and(|f| frame_contains_marker(&f, &paste_marker))
+                    })
+                    .unwrap_or(false);
+                if visible {
+                    p5_ok = true;
+                    break;
+                }
+                cx.background_executor().timer(POLL_INTERVAL).await;
+            }
+            if !p5_ok {
+                fail_phase("P5 paste round-trip: pasted text not visible in frame");
+            }
+            eprintln!("terminal_live: P5 paste round-trip OK");
+        }
+
         eprintln!("terminal_live: PASS");
         std::process::exit(0);
     })
     .detach();
+}
+
+fn live_clipboard_paste_enabled() -> bool {
+    std::env::var("LENS_LIVE_CLIPBOARD_PASTE")
+        .ok()
+        .is_some_and(|v| v == "1")
 }
 
 // ---------------------------------------------------------------------------

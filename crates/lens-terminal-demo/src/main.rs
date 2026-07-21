@@ -40,8 +40,8 @@ use gpui_component::Root;
 use lens_client::ids::{ConnectionId, SessionId, TerminalId};
 use lens_client::{Auth, Client, Connection};
 use lens_terminal::{
-    HostRequestDecision, TerminalEvent, TerminalHostEvent, TerminalKey, TerminalOpenOptions,
-    TerminalTarget, open,
+    ClipboardLocation, ClipboardMimePart, HostRequestDecision, TerminalEvent, TerminalHostEvent,
+    TerminalKey, TerminalOpenOptions, TerminalTarget, open,
 };
 
 struct DemoConfig {
@@ -94,6 +94,41 @@ fn main() {
                             );
                         });
                     }
+                    TerminalEvent::ClipboardWriteRequest {
+                        id,
+                        location,
+                        contents,
+                    } => {
+                        let bytes: usize = contents.iter().map(|p: &ClipboardMimePart| p.data.len()).sum();
+                        let decision = clipboard_write_decision();
+                        eprintln!(
+                            "demo: ClipboardWriteRequest id={id:?} loc={location:?} bytes={bytes} — {decision:?} by policy"
+                        );
+                        let id = *id;
+                        this.update(cx, |tab, cx| {
+                            tab.on_host_event(
+                                TerminalHostEvent::HostRequestResponse { id, decision },
+                                cx,
+                            );
+                        });
+                    }
+                    TerminalEvent::PasteWarnRequest { id, line_count } => {
+                        let decision = paste_warn_decision();
+                        eprintln!(
+                            "demo: PasteWarnRequest id={id:?} lines={line_count} — {decision:?} by policy"
+                        );
+                        let id = *id;
+                        this.update(cx, |tab, cx| {
+                            tab.on_host_event(
+                                TerminalHostEvent::HostRequestResponse { id, decision },
+                                cx,
+                            );
+                        });
+                    }
+                    TerminalEvent::ClipboardWriteNotice { location, bytes } => {
+                        let _loc: &ClipboardLocation = location;
+                        eprintln!("demo: ClipboardWriteNotice loc={location:?} bytes={bytes}");
+                    }
                     TerminalEvent::PresentationChanged => {
                         let p = this.read(cx).presentation();
                         eprintln!(
@@ -102,9 +137,9 @@ fn main() {
                         );
                     }
                     _ => {
-                        // Forward-compat: never auto-allow unknown host requests
-                        // (Slice 2b clipboard). `#[non_exhaustive]` — catch-all required.
-                        eprintln!("demo: unhandled TerminalEvent — Deny by policy (2d no-op)");
+                        // Forward-compat: never auto-allow unknown host requests.
+                        // `#[non_exhaustive]` — catch-all required.
+                        eprintln!("demo: unhandled TerminalEvent — Deny by policy");
                     }
                 }
             });
@@ -119,6 +154,28 @@ fn main() {
         }
         cx.activate(true);
     });
+}
+
+fn demo_allow_clipboard() -> bool {
+    std::env::var("LENS_DEMO_ALLOW_CLIPBOARD")
+        .ok()
+        .is_some_and(|v| v == "1")
+}
+
+fn clipboard_write_decision() -> HostRequestDecision {
+    if demo_allow_clipboard() {
+        HostRequestDecision::Allow
+    } else {
+        HostRequestDecision::Deny
+    }
+}
+
+fn paste_warn_decision() -> HostRequestDecision {
+    if demo_allow_clipboard() {
+        HostRequestDecision::AllowSession
+    } else {
+        HostRequestDecision::Deny
+    }
 }
 
 fn load_config() -> Result<Option<DemoConfig>, String> {

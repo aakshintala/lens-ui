@@ -2,8 +2,11 @@
 
 use std::sync::Arc;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
-use lens_terminal::engine_bench_api::{encode_arrow_up_press, feed_app_cursor_mode_then_arrow_up};
+use lens_terminal::engine_bench_api::{
+    encode_arrow_up_press, encode_paste_bench, feed_app_cursor_mode_then_arrow_up,
+};
 use lens_terminal::{EngineConfig, EngineHandle, VtEngine};
 
 const BENCH_COLS: u16 = 200;
@@ -170,6 +173,56 @@ fn bench_dense_hyperlink_frame_build(c: &mut Criterion) {
     });
 }
 
+const OSC52_FEED_ROUNDS: usize = 64;
+const OSC52_WRITE_PAYLOAD: &[u8] = b"bench-osc52-payload";
+
+fn osc52_write_bytes(decoded: &[u8]) -> Vec<u8> {
+    let mut v = Vec::from(b"\x1b]52;c;");
+    v.extend_from_slice(STANDARD.encode(decoded).as_bytes());
+    v.push(0x07);
+    v
+}
+
+fn bench_osc52_callback_throughput(c: &mut Criterion) {
+    let osc52 = osc52_write_bytes(OSC52_WRITE_PAYLOAD);
+    c.bench_function("osc52_callback_throughput", |b| {
+        b.iter_batched(
+            || {
+                let (tx, rx) = crossbeam_channel::bounded(PRESENTATION_CHANNEL_CAP);
+                let engine = VtEngine::new(&bench_config(), |_| {}, tx).expect("engine");
+                (engine, rx)
+            },
+            |(mut engine, rx)| {
+                for _ in 0..OSC52_FEED_ROUNDS {
+                    engine.feed(black_box(&osc52));
+                    while rx.try_recv().is_ok() {}
+                }
+                engine
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
+const PASTE_ENCODE_PAYLOAD: &[u8] = b"hello paste bench payload\nline-two";
+
+fn bench_paste_encode_throughput(c: &mut Criterion) {
+    c.bench_function("paste_encode_throughput", |b| {
+        b.iter_batched(
+            || {
+                let (tx, _rx) = crossbeam_channel::bounded(1);
+                let mut engine = VtEngine::new(&bench_config(), |_| {}, tx).expect("engine");
+                engine.feed(b"\x1b[?2004h");
+                engine
+            },
+            |mut engine| {
+                black_box(encode_paste_bench(&mut engine, PASTE_ENCODE_PAYLOAD).expect("encode"))
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
 criterion_group!(
     engine,
     bench_vt_parse,
@@ -179,6 +232,8 @@ criterion_group!(
     bench_key_encode_arrow_up,
     bench_ordered_stream_feed_then_key_throughput,
     bench_presentation_title_callback_throughput,
-    bench_dense_hyperlink_frame_build
+    bench_dense_hyperlink_frame_build,
+    bench_osc52_callback_throughput,
+    bench_paste_encode_throughput
 );
 criterion_main!(engine);

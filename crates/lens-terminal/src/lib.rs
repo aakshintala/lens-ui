@@ -90,6 +90,10 @@ pub mod engine_bench_api {
         })
     }
 
+    pub fn encode_paste_bench(engine: &mut VtEngine, data: &[u8]) -> Result<Vec<u8>, EngineError> {
+        engine.encode_paste(data)
+    }
+
     pub fn feed_app_cursor_mode_then_arrow_up(handle: &EngineHandle) -> Result<(), FeedError> {
         handle.feed(b"\x1b[?1h".to_vec())?;
         let (ack_tx, ack_rx) = bounded(1);
@@ -2693,5 +2697,58 @@ mod tests {
             egress.try_recv().is_err(),
             "read-only tab must not dispatch paste"
         );
+    }
+
+    fn osc52_vt_write_bytes(decoded: &[u8]) -> Vec<u8> {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        let mut v = Vec::from(b"\x1b]52;c;");
+        v.extend_from_slice(STANDARD.encode(decoded).as_bytes());
+        v.push(0x07);
+        v
+    }
+
+    fn wait_for_osc52_forwarded(engine: &EngineHandle, expected: u64) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if engine.inspect().osc52_forwarded == expected {
+                return;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        panic!(
+            "osc52_forwarded expected {expected}, got {}",
+            engine.inspect().osc52_forwarded
+        );
+    }
+
+    #[gpui::test]
+    async fn inspect_exposes_osc52_forwarded_and_pastes_sent_counters(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::ClipboardItem;
+
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let tab = cx.new(|cx| TerminalTab::with_engine_for_test(Arc::clone(&engine), cx));
+        tab.update(cx, |tab, _cx| tab.set_inspect_enabled(true));
+
+        engine
+            .feed(osc52_vt_write_bytes(b"inspect-exposure"))
+            .expect("feed osc52");
+        wait_for_osc52_forwarded(engine.as_ref(), 1);
+
+        cx.write_to_clipboard(ClipboardItem::new_string("paste".to_string()));
+        tab.update(cx, |tab, cx| tab.debug_paste_for_test(cx));
+
+        tab.update(cx, |tab, _cx| {
+            let snap = tab.inspect().engine.expect("engine inspect");
+            assert_eq!(
+                snap.osc52_forwarded, 1,
+                "OSC-52 forward must be inspect-visible"
+            );
+            assert_eq!(
+                snap.pastes_sent, 1,
+                "paste dispatch must be inspect-visible"
+            );
+        });
     }
 }
