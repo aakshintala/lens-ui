@@ -65,6 +65,14 @@ _Last curated 2026-07-21 (B-2 packing/scroll/culling SHIPPED + merged to main un
   **being executed by a separate agent.** Don't double-drive. Design = single-owner engine + one
   ordered command stream (memory [[terminal-slice-2-design-ghostty-precedent]]).
 
+- **🐛 Known bug (OPEN, unowned) — turn counter only bumps on `response.completed`.** A
+  cancel/incomplete/failed terminal event never bumps `state.stream.turn`, so the card never flashes
+  `Wave::Ready` ("just finished") — the completion is invisible to an unfocused watcher. Root cause +
+  fix shape (add `Failed`/`Incomplete`/`Cancelled` arms in `crates/lens-core/src/reduce/mod.rs:132`
+  region) in handoff `docs/handoffs/2026-07-21-turn-counter-non-completed-terminal-bug.md`; memory
+  [[turn-counter-noncompleted-bug]]. Fix on **main**; textual merge-collision with T-0 (`lens-transript`)
+  in the same match block — logically independent. Surfaced by the transcript T-0 review.
+
 - **📋 SPEC-GAPS backlog** — independent, un-specced/partial items tracked in
   [`docs/SPEC-GAPS.md`](./SPEC-GAPS.md) (incl. #10 keyboard shortcuts + macOS app menu, Cmd+Q dead).
 
