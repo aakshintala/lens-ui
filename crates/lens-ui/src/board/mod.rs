@@ -248,7 +248,9 @@ impl BoardView {
                     }
                 }
                 pack::Kind::Group { .. } => {
-                    content = content.child(self.absolute_group(placed, sessions, cx));
+                    for el in self.absolute_group(placed, sessions, cx) {
+                        content = content.child(el);
+                    }
                 }
             }
         }
@@ -302,33 +304,39 @@ impl BoardView {
         placed: &pack::Placed,
         sessions: &[SessionId],
         cx: &mut Context<Self>,
-    ) -> AnyElement {
+    ) -> Vec<AnyElement> {
         let (fc, fr) = (placed.item.fc, placed.item.fr);
         let x = placed.cell_left();
         let y = placed.cell_top();
         let block_w = fc as f32 * CELL_W - GAP;
         let block_h = fr as f32 * CELL_H - GAP;
 
-        let mut ring = div()
-            .absolute()
-            .left(px(x - INSET))
-            .top(px(y - INSET))
-            .w(px(block_w + 2.0 * INSET))
-            .h(px(block_h + 2.0 * INSET))
-            .rounded(px(12.0))
-            .border_1()
-            .border_color(gpui::rgb(0x3a3a42)); // neutral; B-3 recolors per group_token
-
+        let mut out: Vec<AnyElement> = Vec::with_capacity(sessions.len() + 1);
+        // Bare neutral placeholder box in the gap (group chrome = B-3). A SIBLING
+        // of the member cards in content space — never their parent, or the group
+        // origin would apply twice.
+        out.push(
+            div()
+                .absolute()
+                .left(px(x - INSET))
+                .top(px(y - INSET))
+                .w(px(block_w + 2.0 * INSET))
+                .h(px(block_h + 2.0 * INSET))
+                .rounded(px(12.0))
+                .border_1()
+                .border_color(gpui::rgb(0x3a3a42))
+                .into_any_element(),
+        );
         for (i, session) in sessions.iter().enumerate() {
             let cc = i % fc;
             let rr = i / fc;
             let mx = INSET + cc as f32 * CELL_W;
             let my = INSET + HEADER + rr as f32 * CELL_H;
             if let Some(tile) = self.absolute_card(session, x - INSET + mx, y - INSET + my, cx) {
-                ring = ring.child(tile);
+                out.push(tile);
             }
         }
-        ring.into_any_element()
+        out
     }
 
     /// Test hook: the session ids whose tiles were built (in the visible band) at
