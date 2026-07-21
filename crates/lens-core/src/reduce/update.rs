@@ -1,7 +1,7 @@
 use crate::domain::controls::{
     Elicitation, ModelOption, PendingUserMessage, SandboxStatus, SkillSummary, Todo,
 };
-use crate::domain::ids::AgentId;
+use crate::domain::ids::{AgentId, ResponseId};
 use crate::domain::item::StreamScratch;
 use crate::domain::scalars::{ErrorInfo, SessionStatusValue};
 use crate::domain::session::SessionState;
@@ -54,6 +54,10 @@ pub enum StreamUpdate {
     TitleChanged(Option<String>),
     LastTokensChanged(Option<u64>),
     ContextWindowChanged(Option<u64>),
+    /// The session's live active response changed. `Some` on `response.in_progress`,
+    /// `None` on any terminal `response.*` (idle/unknown). Sourced from
+    /// `response.in_progress.response.id` — the only working in-process liveness source.
+    ActiveResponseChanged(Option<ResponseId>),
 
     // ── reconnect / bootstrap lifecycle (passthrough for the UI banner) ──
     Reconnecting {

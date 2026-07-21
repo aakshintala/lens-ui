@@ -3,18 +3,27 @@
 use crate::clock::Clock;
 use crate::domain::item::ReasoningAcc;
 use crate::domain::item::{BlockContext, ContentBlock, Item, ItemKind, StreamScratch};
-use crate::domain::{AgentId, CallId, ErrorSource, ItemId, Role, SessionState};
+use crate::domain::{AgentId, CallId, ErrorSource, ItemId, ResponseId, Role, SessionState};
 use crate::reduce::Updates;
 use lens_client::stream::Item as WireItem;
 use serde_json::Value;
 use smallvec::smallvec;
 use std::sync::Arc;
 
-pub(crate) fn current_ctx(scratch: &StreamScratch) -> BlockContext {
+pub(crate) fn wire_response_id(s: Option<&str>) -> Option<ResponseId> {
+    s.filter(|s| !s.is_empty())
+        .map(|s| ResponseId::new(s.to_owned()))
+}
+
+fn item_ctx(
+    scratch: &StreamScratch,
+    wire_response_id: Option<ResponseId>,
+    active_response: &Option<ResponseId>,
+) -> BlockContext {
     BlockContext {
         agent: scratch.current_agent.clone(),
         depth: 0, // P1-DECISION D-P1-14: sub-agent depth deferred to §9
-        response_id: None,
+        response_id: wire_response_id.or_else(|| active_response.clone()),
     }
 }
 
@@ -126,7 +135,7 @@ pub(crate) fn finalize_message(state: &mut SessionState, clock: &dyn Clock) -> U
             data: Value::Null,
         }],
     };
-    push_item(state, id, kind, None, clock)
+    push_item(state, id, kind, None, None, clock)
 }
 
 pub(crate) fn finalize_reasoning(state: &mut SessionState, clock: &dyn Clock) -> Updates {
@@ -139,7 +148,7 @@ pub(crate) fn finalize_reasoning(state: &mut SessionState, clock: &dyn Clock) ->
         summary_text: acc.summary_text,
         encrypted: acc.encrypted,
     };
-    push_item(state, id, kind, None, clock)
+    push_item(state, id, kind, None, None, clock)
 }
 
 pub(crate) fn push_compaction(
@@ -152,7 +161,7 @@ pub(crate) fn push_compaction(
         summary: String::new(),
         token_count: total_tokens.map(|t| t.max(0) as u64),
     };
-    push_item(state, id, kind, None, clock)
+    push_item(state, id, kind, None, None, clock)
 }
 
 pub(crate) fn push_agent_changed(
@@ -168,6 +177,7 @@ pub(crate) fn push_agent_changed(
         id,
         ItemKind::AgentChanged { from, to, at },
         None,
+        None,
         clock,
     )
 }
@@ -180,9 +190,10 @@ pub(crate) fn push_item(
     id: ItemId,
     kind: ItemKind,
     seq: Option<u64>,
+    wire_response_id: Option<ResponseId>,
     clock: &dyn Clock,
 ) -> Updates {
-    let ctx = current_ctx(&state.stream);
+    let ctx = item_ctx(&state.stream, wire_response_id, &state.active_response);
     if let Some(idx) = state.items.iter().position(|it| it.id == id) {
         let existing = Arc::make_mut(&mut state.items[idx]);
         existing.kind = kind;
@@ -362,7 +373,7 @@ mod tests {
         assert_eq!(s.stream.turn, 1);
         assert_eq!(s.items.len(), 1);
         assert!(matches!(s.items[0].kind, ItemKind::Message { .. }));
-        assert_eq!(s.items[0].ctx.response_id, None); // live stamp deferred to Task 3
+        assert_eq!(s.items[0].ctx.response_id, None); // no active_response to fall back to
         assert!(s.stream.open_message.is_none());
     }
 

@@ -41,6 +41,7 @@ pub fn apply(state: &mut SessionState, update: StreamUpdate) {
         TitleChanged(v) => state.title = v,
         LastTokensChanged(v) => state.last_total_tokens = v,
         ContextWindowChanged(v) => state.context_window = v,
+        ActiveResponseChanged(v) => state.active_response = v,
         Rebased(baseline) => *state = *baseline,
         // markers with no replica-visible payload in P3-1
         ChildSessionChanged

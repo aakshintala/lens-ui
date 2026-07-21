@@ -55,6 +55,7 @@ pub fn bench_push_message(
             }],
         },
         None,
+        None,
         clock,
     )
 }
@@ -122,7 +123,8 @@ pub fn reduce(state: &mut SessionState, event: &ServerStreamEvent, clock: &dyn C
                             state.stream.open_message = None;
                         }
                     }
-                    let mut u = items::push_item(state, id, kind, None, clock);
+                    let wire_response_id = items::wire_response_id(item.response_id());
+                    let mut u = items::push_item(state, id, kind, None, wire_response_id, clock);
                     if cleared || state.stream.current_agent != prev_agent {
                         u.push(StreamUpdate::ScratchChanged(Arc::new(state.stream.clone())));
                     }
@@ -134,8 +136,10 @@ pub fn reduce(state: &mut SessionState, event: &ServerStreamEvent, clock: &dyn C
                 let mut ru = items::finalize_reasoning(state, clock);
                 u.append(&mut ru);
                 state.stream.turn = state.stream.turn.saturating_add(1);
+                state.active_response = None;
                 u.push(StreamUpdate::ScratchChanged(Arc::new(state.stream.clone())));
                 u.push(StreamUpdate::StatusChanged(state.status));
+                u.push(StreamUpdate::ActiveResponseChanged(None));
                 u
             }
             ResponseEvent::ReasoningClosed { .. } => {
@@ -225,6 +229,172 @@ mod tests {
         });
         let scratch = scratch.expect("FunctionCall agent attribution must emit ScratchChanged");
         assert_eq!(scratch.current_agent, s.stream.current_agent);
+    }
+
+    mod active_response {
+        use super::*;
+        use crate::domain::ids::ResponseId;
+        use crate::reduce::testutil::parse_response;
+        use lens_client::stream::{ResponseEvent, ServerStreamEvent};
+        use smallvec::SmallVec;
+
+        fn response_in_progress(response_id: &str) -> ServerStreamEvent {
+            parse_response(
+                "response.in_progress",
+                &format!(r#"{{"response":{{"id":"{response_id}"}}}}"#),
+            )
+        }
+
+        fn output_item_done(response_id: &str) -> ServerStreamEvent {
+            parse_response(
+                "response.output_item.done",
+                &format!(
+                    r#"{{"item":{{"id":"msg_1","type":"message","role":"assistant","response_id":"{response_id}","content":[{{"type":"output_text","text":"hi"}}]}}}}"#
+                ),
+            )
+        }
+
+        fn reduce_batch(
+            state: &mut SessionState,
+            events: &[ServerStreamEvent],
+            clock: &dyn Clock,
+        ) -> SmallVec<[StreamUpdate; 16]> {
+            let mut all = SmallVec::new();
+            for ev in events {
+                all.extend(reduce(state, ev, clock).into_iter());
+            }
+            all
+        }
+
+        #[test]
+        fn in_progress_sets_active_and_emits() {
+            let mut s = empty_state();
+            let clock = ManualClock::new(1_700_000_000_000);
+            let updates = reduce(&mut s, &response_in_progress("resp_37ba30e3"), &clock);
+            assert_eq!(
+                s.active_response.as_ref().map(ResponseId::as_str),
+                Some("resp_37ba30e3")
+            );
+            assert!(updates.iter().any(|u| {
+                matches!(u, StreamUpdate::ActiveResponseChanged(Some(r)) if r.as_str() == "resp_37ba30e3")
+            }));
+        }
+
+        #[test]
+        fn terminal_response_clears_active_and_emits_none() {
+            let mut s = empty_state();
+            let clock = ManualClock::new(1_700_000_000_000);
+            reduce(&mut s, &response_in_progress("resp_37ba30e3"), &clock);
+            for terminal in [
+                ServerStreamEvent::Response(ResponseEvent::Completed),
+                ServerStreamEvent::Response(ResponseEvent::Failed),
+                ServerStreamEvent::Response(ResponseEvent::Incomplete),
+                ServerStreamEvent::Response(ResponseEvent::Cancelled),
+            ] {
+                let mut mid = empty_state();
+                reduce(&mut mid, &response_in_progress("resp_37ba30e3"), &clock);
+                let updates = reduce(&mut mid, &terminal, &clock);
+                assert_eq!(mid.active_response, None, "terminal {terminal:?}");
+                assert!(
+                    updates
+                        .iter()
+                        .any(|u| matches!(u, StreamUpdate::ActiveResponseChanged(None))),
+                    "terminal {terminal:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn output_item_done_stamps_own_response_id() {
+            let mut s = empty_state();
+            let clock = ManualClock::new(1_700_000_000_000);
+            reduce(&mut s, &response_in_progress("resp_bcb93365"), &clock);
+            reduce(&mut s, &output_item_done("resp_bcb93365"), &clock);
+            assert_eq!(
+                s.items
+                    .last()
+                    .unwrap()
+                    .ctx
+                    .response_id
+                    .as_ref()
+                    .map(ResponseId::as_str),
+                Some("resp_bcb93365")
+            );
+        }
+
+        #[test]
+        fn synthesized_item_falls_back_to_active_response() {
+            let mut s = empty_state();
+            let clock = ManualClock::new(1_700_000_000_000);
+            reduce(&mut s, &response_in_progress("resp_abc"), &clock);
+            reduce(
+                &mut s,
+                &ServerStreamEvent::Response(ResponseEvent::OutputTextDelta {
+                    delta: "hi".into(),
+                    message_id: None,
+                    index: None,
+                    last: None,
+                }),
+                &clock,
+            );
+            reduce(
+                &mut s,
+                &ServerStreamEvent::Response(ResponseEvent::Completed),
+                &clock,
+            );
+            assert_eq!(
+                s.items
+                    .last()
+                    .unwrap()
+                    .ctx
+                    .response_id
+                    .as_ref()
+                    .map(ResponseId::as_str),
+                Some("resp_abc")
+            );
+        }
+
+        #[test]
+        fn greedy_batch_active_item_none_settles_committed_item() {
+            let mut s = empty_state();
+            let clock = ManualClock::new(1_700_000_000_000);
+            let updates = reduce_batch(
+                &mut s,
+                &[
+                    response_in_progress("resp_A"),
+                    output_item_done("resp_A"),
+                    ServerStreamEvent::Response(ResponseEvent::Completed),
+                ],
+                &clock,
+            );
+            assert_eq!(
+                s.items
+                    .last()
+                    .unwrap()
+                    .ctx
+                    .response_id
+                    .as_ref()
+                    .map(ResponseId::as_str),
+                Some("resp_A")
+            );
+            assert_eq!(s.active_response, None);
+            assert!(matches!(
+                updates.last(),
+                Some(StreamUpdate::ActiveResponseChanged(None))
+            ));
+        }
+
+        #[test]
+        fn in_progress_stays_within_smallvec_inline_budget() {
+            let mut s = empty_state();
+            let clock = ManualClock::new(1_700_000_000_000);
+            let updates = reduce(&mut s, &response_in_progress("resp_x"), &clock);
+            assert!(
+                updates.len() <= 2,
+                "response.in_progress emitted {} updates; SmallVec inline cap is 2",
+                updates.len()
+            );
+        }
     }
 
     mod corpus {

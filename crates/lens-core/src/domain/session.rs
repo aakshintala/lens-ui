@@ -4,7 +4,7 @@
 
 use crate::domain::controls::PendingUserMessage;
 use crate::domain::controls::{Elicitation, ModelOption, SandboxStatus, SkillSummary, Todo};
-use crate::domain::ids::{AgentId, ConnectionId, HostId, RunnerId, SessionId};
+use crate::domain::ids::{AgentId, ConnectionId, HostId, ResponseId, RunnerId, SessionId};
 use crate::domain::item::{Item, StreamScratch};
 use crate::domain::scalars::{ErrorInfo, HostType, SessionLifecycle, SessionStatusValue};
 use crate::domain::usage::{Cost, PresenceViewer};
@@ -66,6 +66,8 @@ pub struct SessionState {
     // ── Lens-local transient (RAM only, never persisted) ──
     pub stream: StreamScratch,
     pub pending_user: Vec<PendingUserMessage>,
+    /// Live turn id from `response.in_progress`; `None` when idle/unknown (T-0).
+    pub active_response: Option<ResponseId>,
 
     // ── Lens-local persisted metadata ──
     pub archived: bool,
@@ -115,6 +117,7 @@ impl SessionState {
             presence: Vec::new(),
             stream: StreamScratch::default(),
             pending_user: Vec::new(),
+            active_response: None,
             archived: false,
             lifecycle: SessionLifecycle::Active,
             last_focused_at: 0,

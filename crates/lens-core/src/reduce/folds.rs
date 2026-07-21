@@ -2,8 +2,8 @@
 
 use crate::clock::Clock;
 use crate::domain::{
-    Elicitation, ElicitationId, ElicitationParams as DomainElicParams, SandboxStatus, SessionState,
-    SessionStatusValue, Todo, TodoStatus,
+    Elicitation, ElicitationId, ElicitationParams as DomainElicParams, ResponseId, SandboxStatus,
+    SessionState, SessionStatusValue, Todo, TodoStatus,
 };
 use crate::reduce::items;
 use crate::reduce::reconcile::{ReconcileSignal, reconcile_pending_user};
@@ -203,6 +203,11 @@ pub(crate) fn fold_session_field(
     })
 }
 
+fn wire_response_id(s: Option<&str>) -> Option<ResponseId> {
+    s.filter(|s| !s.is_empty())
+        .map(|s| ResponseId::new(s.to_owned()))
+}
+
 /// Response lifecycle markers + elicitation folds. Returns `None` for item-producing /
 /// scratch-routing arms handled in `reduce` or later tasks.
 pub(crate) fn fold_response_marker(
@@ -210,11 +215,17 @@ pub(crate) fn fold_response_marker(
     ev: &ResponseEvent,
 ) -> Option<Updates> {
     Some(match ev {
-        ResponseEvent::InProgress { .. } => {
-            smallvec![StreamUpdate::StatusChanged(state.status)]
-        } // P1-DECISION: liveness marker
+        ResponseEvent::InProgress { response_id } => {
+            let active = wire_response_id(response_id.as_deref());
+            state.active_response = active.clone();
+            smallvec![
+                StreamUpdate::StatusChanged(state.status),
+                StreamUpdate::ActiveResponseChanged(active),
+            ]
+        }
         ResponseEvent::Failed | ResponseEvent::Incomplete | ResponseEvent::Cancelled => {
-            smallvec![]
+            state.active_response = None;
+            smallvec![StreamUpdate::ActiveResponseChanged(None)]
         }
         ResponseEvent::CompactionInProgress | ResponseEvent::CompactionFailed => smallvec![],
         // 0.5.0 addition: a native policy DENY was surfaced. Observational, no state-model
