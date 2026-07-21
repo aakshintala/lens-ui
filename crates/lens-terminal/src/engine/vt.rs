@@ -17,7 +17,10 @@ use libghostty_vt::terminal::{Point, PointCoordinate, PointSpace};
 use libghostty_vt::{Terminal, TerminalOptions};
 use thiserror::Error;
 
-use super::command::{KeyInput, ScrollDelta};
+use super::command::{
+    KeyInput, MouseButtonKind, MouseEventKind, MouseFormat, MouseReportEv, MouseTracking,
+    ScrollDelta,
+};
 use super::frame::{CellStyle, CursorPos, Frame, FrameCell, FrameRow, Rgb, UnderlineStyle};
 use super::key_map::encode_key_pure;
 use super::presentation::{
@@ -49,12 +52,20 @@ pub enum EngineError {
 pub struct VtEngine {
     terminal: Terminal<'static, 'static>,
     render_state: RenderState<'static>,
-    rows: RowIterator<'static>,
+    row_iter: RowIterator<'static>,
     cells: CellIterator<'static>,
     key_encoder: libghostty_vt::key::Encoder<'static>,
     key_event: libghostty_vt::key::Event<'static>,
+    cols: u16,
+    rows: u16,
     cell_w_px: u32,
     cell_h_px: u32,
+    mouse_encoder: libghostty_vt::mouse::Encoder<'static>,
+    mouse_event: libghostty_vt::mouse::Event<'static>,
+    selection_gesture: libghostty_vt::selection::gesture::Gesture<'static>,
+    press_event: libghostty_vt::selection::gesture::PressEvent<'static>,
+    drag_event: libghostty_vt::selection::gesture::DragEvent<'static>,
+    release_event: libghostty_vt::selection::gesture::ReleaseEvent<'static>,
     reply_buffer: Rc<RefCell<Vec<u8>>>,
     #[expect(dead_code, reason = "worker invokes after take_replies in Task 4")]
     on_reply: OnReplyFn,
@@ -199,12 +210,20 @@ impl VtEngine {
         Ok(Self {
             terminal,
             render_state: RenderState::new()?,
-            rows: RowIterator::new()?,
+            row_iter: RowIterator::new()?,
             cells: CellIterator::new()?,
             key_encoder: libghostty_vt::key::Encoder::new()?,
             key_event: libghostty_vt::key::Event::new()?,
+            cols: cfg.cols,
+            rows: cfg.rows,
             cell_w_px: cfg.cell_w_px,
             cell_h_px: cfg.cell_h_px,
+            mouse_encoder: libghostty_vt::mouse::Encoder::new()?,
+            mouse_event: libghostty_vt::mouse::Event::new()?,
+            selection_gesture: libghostty_vt::selection::gesture::Gesture::new()?,
+            press_event: libghostty_vt::selection::gesture::PressEvent::new()?,
+            drag_event: libghostty_vt::selection::gesture::DragEvent::new()?,
+            release_event: libghostty_vt::selection::gesture::ReleaseEvent::new()?,
             reply_buffer,
             on_reply: Box::new(on_reply) as OnReplyFn,
             latest_title_slot,
@@ -294,7 +313,219 @@ impl VtEngine {
     pub fn resize(&mut self, cols: u16, rows: u16) -> Result<(), EngineError> {
         self.terminal
             .resize(cols, rows, self.cell_w_px, self.cell_h_px)?;
+        self.cols = cols;
+        self.rows = rows;
         Ok(())
+    }
+
+    #[allow(dead_code, reason = "consumed in Task 3 worker arbitration")]
+    pub(crate) fn read_live_tracking(&self) -> MouseTracking {
+        use libghostty_vt::terminal::Mode;
+        if self.terminal.mode(Mode::ANY_MOUSE).unwrap_or(false) {
+            return MouseTracking::Any;
+        }
+        if self.terminal.mode(Mode::BUTTON_MOUSE).unwrap_or(false) {
+            return MouseTracking::Button;
+        }
+        if self.terminal.mode(Mode::NORMAL_MOUSE).unwrap_or(false) {
+            return MouseTracking::Normal;
+        }
+        if self.terminal.mode(Mode::X10_MOUSE).unwrap_or(false) {
+            return MouseTracking::X10;
+        }
+        MouseTracking::None
+    }
+
+    #[allow(dead_code, reason = "consumed in Task 3/4")]
+    pub(crate) fn read_live_format(&self) -> MouseFormat {
+        use libghostty_vt::terminal::Mode;
+        if self.terminal.mode(Mode::SGR_PIXELS_MOUSE).unwrap_or(false) {
+            return MouseFormat::SgrPixels;
+        }
+        if self.terminal.mode(Mode::SGR_MOUSE).unwrap_or(false) {
+            return MouseFormat::Sgr;
+        }
+        if self.terminal.mode(Mode::URXVT_MOUSE).unwrap_or(false) {
+            return MouseFormat::Urxvt;
+        }
+        if self.terminal.mode(Mode::UTF8_MOUSE).unwrap_or(false) {
+            return MouseFormat::Utf8;
+        }
+        MouseFormat::X10
+    }
+
+    #[allow(dead_code, reason = "consumed in Task 3/4")]
+    pub(crate) fn encode_mouse_report(
+        &mut self,
+        ev: &MouseReportEv,
+    ) -> Result<Vec<u8>, EngineError> {
+        use libghostty_vt::key::Mods;
+        use libghostty_vt::mouse::{Action, Button, EncoderSize, Position};
+
+        self.mouse_encoder.set_options_from_terminal(&self.terminal);
+        self.mouse_encoder.set_size(EncoderSize {
+            screen_width: self.cell_w_px.saturating_mul(u32::from(self.cols)),
+            screen_height: self.cell_h_px.saturating_mul(u32::from(self.rows)),
+            cell_width: self.cell_w_px,
+            cell_height: self.cell_h_px,
+            padding_top: 0,
+            padding_bottom: 0,
+            padding_right: 0,
+            padding_left: 0,
+        });
+        self.mouse_encoder
+            .set_any_button_pressed(ev.any_button_pressed);
+        self.mouse_encoder
+            .set_track_last_cell(self.read_live_format() != MouseFormat::SgrPixels);
+        let action = match ev.action {
+            MouseEventKind::Down => Action::Press,
+            MouseEventKind::Up => Action::Release,
+            MouseEventKind::Move => Action::Motion,
+        };
+        let button = match ev.wheel {
+            Some(true) => Some(Button::Four),
+            Some(false) => Some(Button::Five),
+            None => ev.button.map(|b| match b {
+                MouseButtonKind::Left => Button::Left,
+                MouseButtonKind::Middle => Button::Middle,
+                MouseButtonKind::Right => Button::Right,
+            }),
+        };
+        self.mouse_event.set_action(action);
+        self.mouse_event.set_button(button);
+        self.mouse_event.set_mods(Mods::from(ev.mods));
+        self.mouse_event.set_position(Position {
+            x: ev.px_x,
+            y: ev.px_y,
+        });
+        let mut out = Vec::new();
+        self.mouse_encoder
+            .encode_to_vec(&self.mouse_event, &mut out)?;
+        Ok(out)
+    }
+
+    #[allow(dead_code, reason = "consumed in Task 3/4")]
+    pub(crate) fn apply_selection_press(
+        &mut self,
+        col: u16,
+        row: u16,
+        px_x: f32,
+        px_y: f32,
+        time: std::time::Duration,
+    ) -> Result<bool, EngineError> {
+        use libghostty_vt::selection::gesture::{Behavior, Behaviors};
+        use libghostty_vt::terminal::{Point, PointCoordinate};
+
+        let Self {
+            terminal,
+            press_event,
+            selection_gesture,
+            ..
+        } = self;
+        let gref = terminal.grid_ref(Point::Viewport(PointCoordinate {
+            x: col,
+            y: u32::from(row),
+        }))?;
+        let behaviors = Behaviors::new()
+            .with_single_click_behavior(Behavior::Cell)
+            .with_double_click_behavior(Behavior::Word)
+            .with_triple_click_behavior(Behavior::Line);
+        press_event.set_behaviors(&behaviors)?;
+        press_event.set_repeat_interval(std::time::Duration::from_secs(1))?;
+        press_event.set_position(f64::from(px_x), f64::from(px_y))?;
+        press_event.set_time(time)?;
+        let sel = press_event.apply(selection_gesture, terminal, gref)?;
+        terminal.set_selection(sel.as_ref())?;
+        Ok(true)
+    }
+
+    #[allow(dead_code, reason = "consumed in Task 3/4")]
+    pub(crate) fn apply_selection_drag(
+        &mut self,
+        col: u16,
+        row: u16,
+        px_x: f32,
+        px_y: f32,
+    ) -> Result<bool, EngineError> {
+        use libghostty_vt::selection::gesture::Geometry;
+        use libghostty_vt::terminal::{Point, PointCoordinate};
+
+        let (cols, rows, cw, ch) = (self.cols, self.rows, self.cell_w_px, self.cell_h_px);
+        let Self {
+            terminal,
+            drag_event,
+            selection_gesture,
+            ..
+        } = self;
+        let gref = terminal.grid_ref(Point::Viewport(PointCoordinate {
+            x: col,
+            y: u32::from(row),
+        }))?;
+        let geom = Geometry {
+            columns: u32::from(cols).max(1),
+            cell_width: cw.max(1),
+            padding_left: 0,
+            screen_height: ch.saturating_mul(u32::from(rows)).max(1),
+        };
+        drag_event.set_position(f64::from(px_x), f64::from(px_y))?;
+        let sel = drag_event.apply(selection_gesture, terminal, gref, geom)?;
+        terminal.set_selection(sel.as_ref())?;
+        Ok(true)
+    }
+
+    #[allow(dead_code, reason = "consumed in Task 3/4")]
+    pub(crate) fn apply_selection_release(
+        &mut self,
+        cell: Option<(u16, u16)>,
+    ) -> Result<(), EngineError> {
+        use libghostty_vt::terminal::{Point, PointCoordinate};
+
+        let Self {
+            terminal,
+            release_event,
+            selection_gesture,
+            ..
+        } = self;
+        let gref = match cell {
+            Some((c, r)) => Some(terminal.grid_ref(Point::Viewport(PointCoordinate {
+                x: c,
+                y: u32::from(r),
+            }))?),
+            None => None,
+        };
+        release_event.apply(selection_gesture, terminal, gref)?;
+        Ok(())
+    }
+
+    #[allow(dead_code, reason = "consumed in Task 3 LocalClick classification")]
+    pub(crate) fn gesture_dragged(&self) -> bool {
+        self.selection_gesture
+            .dragged(&self.terminal)
+            .unwrap_or(false)
+    }
+
+    #[allow(dead_code, reason = "consumed in Task 3/4")]
+    pub(crate) fn select_all(&mut self) -> Result<bool, EngineError> {
+        let sel = self.terminal.select_all()?;
+        let installed = sel.is_some();
+        self.terminal.set_selection(sel.as_ref())?;
+        Ok(installed)
+    }
+
+    #[allow(dead_code, reason = "consumed in Task 3/4")]
+    pub(crate) fn clear_selection(&mut self) -> Result<bool, EngineError> {
+        self.terminal.set_selection(None)?;
+        Ok(true)
+    }
+
+    #[allow(dead_code, reason = "consumed in Task 3/4")]
+    pub(crate) fn extract_selection_text(&self) -> Option<String> {
+        use libghostty_vt::selection::FormatOptions;
+        let opts = FormatOptions::default().with_unwrap(true).with_trim(true);
+        match self.terminal.format_selection_alloc(None, opts) {
+            Ok(Some(bytes)) => Some(String::from_utf8_lossy(bytes.as_ref()).into_owned()),
+            _ => None,
+        }
     }
 
     /// Snapshot the visible grid into an owned [`Frame`].
@@ -308,7 +539,7 @@ impl VtEngine {
 
         let mut grid = Vec::new();
         let mut uri_intern: HashMap<Vec<u8>, Arc<str>> = HashMap::new();
-        let mut row_iter = self.rows.update(&snapshot)?;
+        let mut row_iter = self.row_iter.update(&snapshot)?;
         let mut row_y: u32 = 0;
         while let Some(row) = row_iter.next() {
             let mut cell_iter = self.cells.update(row)?;
@@ -638,6 +869,73 @@ mod tests {
         let mut engine = VtEngine::new(&cfg, |_| {}, tx).expect("engine");
         let out = engine.encode_paste(b"a\x1bb").expect("encode"); // ESC stripped -> space
         assert_eq!(out, b"a b");
+    }
+
+    #[test]
+    fn encode_mouse_report_sgr_press_left() {
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        let mut e = VtEngine::new(&test_config(), |_| {}, tx).unwrap();
+        e.feed(b"\x1b[?1000h\x1b[?1006h");
+        let bytes = e
+            .encode_mouse_report(&MouseReportEv {
+                action: MouseEventKind::Down,
+                button: Some(MouseButtonKind::Left),
+                wheel: None,
+                mods: super::super::command::KeyMods::default(),
+                px_x: 0.0,
+                px_y: 0.0,
+                any_button_pressed: true,
+            })
+            .expect("encode");
+        assert_eq!(bytes, b"\x1b[<0;1;1M");
+    }
+
+    #[test]
+    fn selection_press_drag_release_marks_and_extracts() {
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        let mut e = VtEngine::new(&test_config(), |_| {}, tx).unwrap();
+        e.feed(b"copyme");
+        assert!(
+            e.apply_selection_press(0, 0, 0.0, 0.0, std::time::Duration::ZERO)
+                .expect("press")
+        );
+        assert!(e.apply_selection_drag(3, 0, 31.0, 0.0).expect("drag"));
+        e.apply_selection_release(Some((3, 0))).expect("release");
+        assert_eq!(e.extract_selection_text().as_deref(), Some("copy"));
+        let cols: Vec<u16> = e.build_frame().expect("f").grid[0]
+            .cells
+            .iter()
+            .filter(|c| c.selected)
+            .map(|c| c.col)
+            .collect();
+        assert!(cols.contains(&0) && cols.contains(&3), "got {cols:?}");
+        assert!(e.clear_selection().expect("clear"));
+        assert_eq!(e.extract_selection_text(), None);
+        assert!(
+            e.build_frame().expect("f").grid[0]
+                .cells
+                .iter()
+                .all(|c| !c.selected)
+        );
+    }
+
+    #[test]
+    fn select_all_extract_and_double_click_word() {
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        let mut e = VtEngine::new(&test_config(), |_| {}, tx).unwrap();
+        e.feed(b"foo bar");
+        assert!(e.select_all().expect("all"));
+        assert_eq!(
+            e.extract_selection_text().as_deref().map(str::trim),
+            Some("foo bar")
+        );
+        e.clear_selection().expect("clear");
+        e.apply_selection_press(4, 0, 32.0, 0.0, std::time::Duration::from_millis(0))
+            .expect("p1");
+        e.apply_selection_release(Some((4, 0))).expect("r1");
+        e.apply_selection_press(4, 0, 32.0, 0.0, std::time::Duration::from_millis(120))
+            .expect("p2");
+        assert_eq!(e.extract_selection_text().as_deref(), Some("bar"));
     }
 }
 

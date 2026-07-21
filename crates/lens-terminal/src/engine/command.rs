@@ -254,6 +254,26 @@ pub(crate) enum ScrollDelta {
     Bottom,
 }
 
+#[allow(dead_code, reason = "consumed in Task 3/4")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MouseTracking {
+    None,
+    X10,
+    Normal,
+    Button,
+    Any,
+}
+
+#[allow(dead_code, reason = "consumed in Task 3/4")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MouseFormat {
+    X10,
+    Utf8,
+    Sgr,
+    Urxvt,
+    SgrPixels,
+}
+
 #[allow(dead_code, reason = "consumed in Task 2/3/4")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MouseButtonKind {
