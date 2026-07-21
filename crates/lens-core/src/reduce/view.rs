@@ -93,9 +93,7 @@ pub fn project_filtered<'a>(
     splice_reasoning: bool,
 ) -> Vec<ViewBlock<'a>> {
     let mut blocks = pair_tool_spans(items);
-    if splice_reasoning
-        && let Some(r) = &scratch.open_reasoning
-    {
+    if splice_reasoning && let Some(r) = &scratch.open_reasoning {
         blocks.push(ViewBlock::StreamingReasoning(r));
     }
     if let Some(m) = &scratch.open_message {
@@ -193,7 +191,7 @@ pub fn group_work_section<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::ids::{CallId, ItemId};
+    use crate::domain::ids::{AgentId, CallId, ItemId};
     use crate::domain::item::{BlockContext, ContentBlock};
     use crate::domain::scalars::Role;
     use serde_json::Value;
@@ -301,7 +299,10 @@ mod tests {
 
     #[test]
     fn pairs_call_with_following_output() {
-        let items = vec![call("c1", None, "call_1", "completed"), output("o1", None, "call_1")];
+        let items = [
+            call("c1", None, "call_1", "completed"),
+            output("o1", None, "call_1"),
+        ];
         let refs: Vec<&Item> = items.iter().collect();
         let out = pair_tool_spans(&refs);
         assert_eq!(out.len(), 1);
@@ -310,7 +311,7 @@ mod tests {
 
     #[test]
     fn splices_reasoning_then_message_after_finalized() {
-        let items = vec![msg("m1", Some("resp_a"), Role::Assistant, "done")];
+        let items = [msg("m1", Some("resp_a"), Role::Assistant, "done")];
         let refs: Vec<&Item> = items.iter().collect();
         let scratch = scratch_with(Some(r_acc()), Some(m_acc()));
         let resp_a = ResponseId::new("resp_a");
@@ -323,7 +324,7 @@ mod tests {
 
     #[test]
     fn no_tail_when_scratch_empty() {
-        let items = vec![msg("m1", Some("resp_a"), Role::Assistant, "done")];
+        let items = [msg("m1", Some("resp_a"), Role::Assistant, "done")];
         let refs: Vec<&Item> = items.iter().collect();
         let scratch = scratch_with(None, None);
         let out = project(&refs, &scratch, None);
@@ -333,7 +334,7 @@ mod tests {
 
     #[test]
     fn message_only_tail() {
-        let items: Vec<Item> = vec![];
+        let items: [Item; 0] = [];
         let refs: Vec<&Item> = items.iter().collect();
         let scratch = scratch_with(None, Some(m_acc()));
         let out = project(&refs, &scratch, None);
@@ -346,7 +347,7 @@ mod tests {
         // When the caller applies hide_reasoning (Stage 1), it must also suppress the
         // reasoning tail. project() honors this by taking a `splice_reasoning` decision
         // from the caller — modeled here by the caller pre-filtering + passing the flag.
-        let items: Vec<Item> = vec![];
+        let items: [Item; 0] = [];
         let refs: Vec<&Item> = items.iter().collect();
         let scratch = scratch_with(Some(r_acc()), Some(m_acc()));
         // hide_reasoning path: project_filtered suppresses the reasoning tail.
@@ -357,7 +358,7 @@ mod tests {
 
     #[test]
     fn non_completed_call_without_output_is_span_with_none() {
-        let items = vec![call("c1", None, "call_1", "in_progress")];
+        let items = [call("c1", None, "call_1", "in_progress")];
         let refs: Vec<&Item> = items.iter().collect();
         let out = pair_tool_spans(&refs);
         assert_eq!(out.len(), 1);
@@ -366,7 +367,7 @@ mod tests {
 
     #[test]
     fn orphan_output_passes_through() {
-        let items = vec![output("o1", None, "call_missing")];
+        let items = [output("o1", None, "call_missing")];
         let refs: Vec<&Item> = items.iter().collect();
         let out = pair_tool_spans(&refs);
         assert_eq!(out.len(), 1);
@@ -376,7 +377,7 @@ mod tests {
     #[test]
     fn output_before_call_still_pairs_at_call_position() {
         // Output precedes its call in stream order; span takes the call's position.
-        let items = vec![
+        let items = [
             output("o1", None, "call_1"),
             msg("m1", None, Role::User, "hi"),
             call("c1", None, "call_1", "completed"),
@@ -390,7 +391,7 @@ mod tests {
 
     #[test]
     fn parallel_interleaved_calls_pair_by_call_id() {
-        let items = vec![
+        let items = [
             call("c1", None, "call_1", "completed"),
             call("c2", None, "call_2", "completed"),
             output("o2", None, "call_2"),
@@ -406,7 +407,7 @@ mod tests {
     #[test]
     fn duplicate_output_for_same_call_id_passes_through() {
         // First output wins; a second output for the same call_id is a passthrough Item, not merged.
-        let items = vec![
+        let items = [
             call("c1", None, "call_1", "completed"),
             output("o1", None, "call_1"),
             output("o1b", None, "call_1"),
@@ -432,7 +433,10 @@ mod tests {
 
     fn assert_section<'a>(vb: &'a ViewBlock<'a>, resp: &str) -> &'a [ViewBlock<'a>] {
         match vb {
-            ViewBlock::WorkSection { response_id, blocks } => {
+            ViewBlock::WorkSection {
+                response_id,
+                blocks,
+            } => {
                 assert_eq!(response_id.as_str(), resp);
                 blocks.as_slice()
             }
@@ -443,7 +447,7 @@ mod tests {
     #[test]
     fn settled_response_folds_into_section() {
         // reasoning + tool-span share resp_a; no active_response ⇒ fold.
-        let items = vec![
+        let items = [
             reasoning("r1", Some("resp_a")),
             call("c1", Some("resp_a"), "call_1", "completed"),
             output("o1", Some("resp_a"), "call_1"),
@@ -459,7 +463,7 @@ mod tests {
 
     #[test]
     fn live_response_stays_flat() {
-        let items = vec![
+        let items = [
             reasoning("r1", Some("resp_a")),
             call("c1", Some("resp_a"), "call_1", "completed"),
             output("o1", Some("resp_a"), "call_1"),
@@ -477,7 +481,7 @@ mod tests {
     #[test]
     fn user_message_and_resource_are_siblings_before_section() {
         // user msg (sibling) then resp_a work; user msg stays flat before the section.
-        let items = vec![
+        let items = [
             msg("u1", None, Role::User, "do a thing"),
             reasoning("r1", Some("resp_a")),
             msg("a1", Some("resp_a"), Role::Assistant, "final text"),
@@ -496,7 +500,7 @@ mod tests {
 
     #[test]
     fn multi_response_sequence_folds_each_separately() {
-        let items = vec![
+        let items = [
             reasoning("r1", Some("resp_a")),
             reasoning("r2", Some("resp_b")),
         ];
@@ -512,7 +516,7 @@ mod tests {
     #[test]
     fn idle_folds_all_but_active_folds_all_others() {
         // Two responses; resp_b is active ⇒ resp_a folds, resp_b flat.
-        let items = vec![
+        let items = [
             reasoning("r1", Some("resp_a")),
             reasoning("r2", Some("resp_b")),
         ];
@@ -523,12 +527,15 @@ mod tests {
         let out = group_work_section(projected, Some(&resp_b));
         assert_eq!(out.len(), 2);
         assert_section(&out[0], "resp_a");
-        assert!(matches!(out[1], ViewBlock::StreamingReasoning(_) | ViewBlock::Item(_)));
+        assert!(matches!(
+            out[1],
+            ViewBlock::StreamingReasoning(_) | ViewBlock::Item(_)
+        ));
     }
 
     #[test]
     fn streaming_tail_never_grouped() {
-        let items = vec![reasoning("r1", Some("resp_a"))];
+        let items = [reasoning("r1", Some("resp_a"))];
         let refs: Vec<&Item> = items.iter().collect();
         let scratch = scratch_with(Some(r_acc()), None);
         let projected = project(&refs, &scratch, None);
@@ -537,5 +544,120 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_section(&out[0], "resp_a");
         assert!(matches!(out[1], ViewBlock::StreamingReasoning(_)));
+    }
+
+    // Count how many input Items are represented across the ViewBlock tree (recursively).
+    fn covered_item_ids<'a>(blocks: &[ViewBlock<'a>], acc: &mut Vec<String>) {
+        for b in blocks {
+            match b {
+                ViewBlock::Item(i) => acc.push(i.id.as_str().to_string()),
+                ViewBlock::ToolSpan { call, output } => {
+                    acc.push(call.id.as_str().to_string());
+                    if let Some(o) = output {
+                        acc.push(o.id.as_str().to_string());
+                    }
+                }
+                ViewBlock::WorkSection { blocks, .. } => covered_item_ids(blocks, acc),
+                ViewBlock::StreamingReasoning(_) | ViewBlock::StreamingMessage(_) => {}
+            }
+        }
+    }
+
+    #[test]
+    fn full_pipeline_agent_changed_inside_section_live_tail() {
+        // user msg (sibling) → resp_a settled work (reasoning + agent_changed + tool) →
+        // resp_b live (flat) → streaming tail.
+        let ac = item(
+            "ac1",
+            Some("resp_a"),
+            ItemKind::AgentChanged {
+                from: AgentId::new("coder"),
+                to: AgentId::new("researcher"),
+                at: 0,
+            },
+        );
+        let items = [
+            msg("u1", None, Role::User, "go"),
+            reasoning("r1", Some("resp_a")),
+            ac,
+            call("c1", Some("resp_a"), "call_1", "completed"),
+            output("o1", Some("resp_a"), "call_1"),
+            reasoning("r2", Some("resp_b")),
+        ];
+        let refs: Vec<&Item> = items.iter().collect();
+        let scratch = scratch_with(Some(r_acc()), None);
+        let resp_b = ResponseId::new("resp_b");
+        let projected = project(&refs, &scratch, Some(&resp_b));
+        let out = group_work_section(projected, Some(&resp_b));
+        // u1 sibling | WorkSection(resp_a){reasoning, agent_changed, tool-span} | r2 flat | streaming
+        assert_eq!(out.len(), 4);
+        assert_item(&out[0], "u1");
+        let inner = assert_section(&out[1], "resp_a");
+        assert_eq!(inner.len(), 3);
+        assert_item(&inner[0], "r1");
+        assert_item(&inner[1], "ac1");
+        assert_span(&inner[2], "c1", Some("o1"));
+        assert_item(&out[2], "r2"); // resp_b live ⇒ flat
+        assert!(matches!(out[3], ViewBlock::StreamingReasoning(_)));
+    }
+
+    #[test]
+    fn disk_only_paint_folds_everything() {
+        let items = [
+            msg("u1", None, Role::User, "go"),
+            reasoning("r1", Some("resp_a")),
+            msg("a1", Some("resp_a"), Role::Assistant, "answer"),
+        ];
+        let scratch = scratch_with(None, None);
+        let out = group_work_section(project_all(&items, &scratch, None), None);
+        assert_eq!(out.len(), 3);
+        assert_item(&out[0], "u1");
+        assert_section(&out[1], "resp_a");
+        assert_item(&out[2], "a1");
+    }
+
+    #[test]
+    fn every_item_appears_exactly_once() {
+        let items = [
+            msg("u1", None, Role::User, "go"),
+            reasoning("r1", Some("resp_a")),
+            call("c1", Some("resp_a"), "call_1", "completed"),
+            output("o1", Some("resp_a"), "call_1"),
+            msg("a1", Some("resp_a"), Role::Assistant, "answer"),
+            reasoning("r2", Some("resp_b")),
+        ];
+        let scratch = scratch_with(None, None);
+        let out = group_work_section(project_all(&items, &scratch, None), None);
+        let mut covered = Vec::new();
+        covered_item_ids(&out, &mut covered);
+        covered.sort();
+        let mut expected: Vec<String> = items.iter().map(|i| i.id.as_str().to_string()).collect();
+        expected.sort();
+        assert_eq!(
+            covered, expected,
+            "every input Item must appear exactly once"
+        );
+    }
+
+    #[test]
+    fn hide_reasoning_filter_removes_items_from_coverage() {
+        // Stage-1 hide_reasoning drops reasoning; those ids are legitimately absent.
+        use crate::reduce::transforms::hide_reasoning;
+        let items = [
+            reasoning("r1", Some("resp_a")),
+            msg("a1", Some("resp_a"), Role::Assistant, "answer"),
+        ];
+        let filtered = hide_reasoning(&items); // Vec<&Item>
+        let scratch = scratch_with(Some(r_acc()), None);
+        // hide_reasoning applied ⇒ splice_reasoning = false (§5.2 filter consistency).
+        let projected = project_filtered(&filtered, &scratch, None, false);
+        let out = group_work_section(projected, None);
+        let mut covered = Vec::new();
+        covered_item_ids(&out, &mut covered);
+        assert_eq!(covered, vec!["a1".to_string()]);
+        assert!(
+            !out.iter()
+                .any(|b| matches!(b, ViewBlock::StreamingReasoning(_)))
+        );
     }
 }

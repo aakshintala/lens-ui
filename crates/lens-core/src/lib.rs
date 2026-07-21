@@ -14,4 +14,7 @@ pub use persist::{
     BoardStore, ControlStore, LiveKey, Loaded, PersistError, ReconcileOutcome, SkippedRow,
     SqliteBoardStore, SqliteControlStore, StoreMode, TranscriptStore,
 };
-pub use reduce::{StreamUpdate, Updates, reduce};
+pub use reduce::{
+    StreamUpdate, Updates, ViewBlock, group_work_section, pair_tool_spans, project, project_all,
+    project_filtered, reduce,
+};

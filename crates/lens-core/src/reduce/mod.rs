@@ -16,6 +16,9 @@ pub(crate) mod testutil;
 pub(crate) use reconcile::user_text;
 pub use reconcile::{LostSend, reconcile_held_landed};
 pub use update::{StreamUpdate, Updates};
+pub use view::{
+    ViewBlock, group_work_section, pair_tool_spans, project, project_all, project_filtered,
+};
 
 /// Wire `stream::Item` → domain `(ItemId, ItemKind)` for catch-up persist (D19).
 pub(crate) fn map_wire_item(
