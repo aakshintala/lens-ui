@@ -334,7 +334,6 @@ pub(crate) struct MouseGesture {
     pub px_x: f32,
     pub px_y: f32,      // surface-relative pixels
     pub time: Duration, // monotonic (for set_time multi-click)
-    pub write_allowed: bool,
     pub mouse_local: bool,
     pub policy: MouseReportPolicy,
     pub access_epoch: u64,             // stamped by enqueue_input
@@ -349,7 +348,6 @@ pub(crate) struct WheelInput {
     pub px_x: f32,
     pub px_y: f32,
     pub mods: KeyMods,
-    pub write_allowed: bool,
     pub access_epoch: u64,
     pub ack: Option<Sender<MouseAck>>,
 }

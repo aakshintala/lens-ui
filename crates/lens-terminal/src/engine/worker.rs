@@ -132,6 +132,8 @@ pub(crate) enum EngineCommand {
     /// Test/deterministic helper — bypass the time throttle for one publish pass.
     BuildNow,
     SetEgress(Option<Sender<EgressFrame>>),
+    /// Ordered access gate — foreground sends on open and every access change (Task 5).
+    SetAccess(bool),
     Stop,
 }
 
@@ -144,10 +146,22 @@ struct Latch {
     dragged: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct MouseState {
     latch: Option<Latch>,
     any_button_pressed: bool,
+    /// Engine-authoritative write gate at this command's stream position.
+    write_allowed: bool,
+}
+
+impl Default for MouseState {
+    fn default() -> Self {
+        Self {
+            latch: None,
+            any_button_pressed: false,
+            write_allowed: true,
+        }
+    }
 }
 
 pub(crate) struct WorkerChannels {
@@ -680,6 +694,9 @@ fn handle_command(
         EngineCommand::BuildNow => {
             *force_build = true;
         }
+        EngineCommand::SetAccess(writable) => {
+            mouse_state.write_allowed = writable;
+        }
         EngineCommand::Stop => {}
     }
 }
@@ -792,8 +809,8 @@ fn send_mouse_ack(
     }
 }
 
-fn should_report_at_down(g: &MouseGesture, tracking: MouseTracking) -> bool {
-    g.write_allowed
+fn should_report_at_down(g: &MouseGesture, tracking: MouseTracking, write_allowed: bool) -> bool {
+    write_allowed
         && tracking != MouseTracking::None
         && !g.mods.shift
         && !g.mouse_local
@@ -821,6 +838,20 @@ fn mouse_report_ev(g: &MouseGesture, any_button_pressed: bool) -> MouseReportEv 
     }
 }
 
+struct MouseReportOutcome {
+    encoded: Vec<u8>,
+    disposition: GestureDisposition,
+    epoch_revoked: bool,
+}
+
+fn apply_emit_epoch_revocation(mouse_state: &mut MouseState, outcome: &MouseReportOutcome) {
+    if outcome.epoch_revoked
+        && let Some(latch) = mouse_state.latch.as_mut()
+    {
+        latch.suppressed = true;
+    }
+}
+
 fn emit_mouse_report(
     engine: &mut VtEngine,
     egress: &Option<Sender<EgressFrame>>,
@@ -828,20 +859,32 @@ fn emit_mouse_report(
     access_epoch: &AtomicU64,
     cmd_epoch: u64,
     ev: &MouseReportEv,
-) -> (Vec<u8>, GestureDisposition) {
+) -> MouseReportOutcome {
     if cmd_epoch != access_epoch.load(Ordering::Acquire) {
         inspect.record_mouse_suppressed();
-        return (Vec::new(), GestureDisposition::Suppressed);
+        return MouseReportOutcome {
+            encoded: Vec::new(),
+            disposition: GestureDisposition::Suppressed,
+            epoch_revoked: true,
+        };
     }
     match engine.encode_mouse_report(ev) {
         Ok(bytes) if bytes.is_empty() => {
             inspect.record_mouse_report_coalesced();
-            (bytes, GestureDisposition::Coalesced)
+            MouseReportOutcome {
+                encoded: bytes,
+                disposition: GestureDisposition::Coalesced,
+                epoch_revoked: false,
+            }
         }
         Ok(bytes) => {
             if cmd_epoch != access_epoch.load(Ordering::Acquire) {
                 inspect.record_mouse_suppressed();
-                return (Vec::new(), GestureDisposition::Suppressed);
+                return MouseReportOutcome {
+                    encoded: Vec::new(),
+                    disposition: GestureDisposition::Suppressed,
+                    epoch_revoked: true,
+                };
             }
             inspect.record_mouse_encoded();
             let delivered = try_emit_user_input(egress.as_ref(), EgressKind::Input, &bytes);
@@ -850,11 +893,19 @@ fn emit_mouse_report(
             } else {
                 inspect.record_user_egress_rejected();
             }
-            (bytes, GestureDisposition::Reported)
+            MouseReportOutcome {
+                encoded: bytes,
+                disposition: GestureDisposition::Reported,
+                epoch_revoked: false,
+            }
         }
         Err(e) => {
             eprintln!("lens-terminal engine: encode_mouse_report failed: {e}");
-            (Vec::new(), GestureDisposition::Suppressed)
+            MouseReportOutcome {
+                encoded: Vec::new(),
+                disposition: GestureDisposition::Suppressed,
+                epoch_revoked: false,
+            }
         }
     }
 }
@@ -945,8 +996,9 @@ fn handle_mouse_down(
         return (Vec::new(), GestureDisposition::Ignored);
     };
 
+    let write_allowed = mouse_state.write_allowed;
     let tracking = engine.read_live_tracking();
-    if should_report_at_down(g, tracking) {
+    if should_report_at_down(g, tracking, write_allowed) {
         mouse_state.latch = Some(Latch {
             owner: GestureOwner::Report,
             button,
@@ -955,9 +1007,12 @@ fn handle_mouse_down(
             dragged: false,
         });
         mouse_state.any_button_pressed = true;
-        if g.access_epoch == current_epoch && g.write_allowed {
+        if write_allowed && g.access_epoch == current_epoch {
             let ev = mouse_report_ev(g, true);
-            emit_mouse_report(engine, egress, inspect, access_epoch, g.access_epoch, &ev)
+            let outcome =
+                emit_mouse_report(engine, egress, inspect, access_epoch, g.access_epoch, &ev);
+            apply_emit_epoch_revocation(mouse_state, &outcome);
+            (outcome.encoded, outcome.disposition)
         } else {
             latch_report_suppressed(mouse_state, inspect)
         }
@@ -1006,6 +1061,7 @@ fn handle_mouse_move(
     current_epoch: u64,
     mouse_state: &mut MouseState,
 ) -> (Vec<u8>, GestureDisposition) {
+    let write_allowed = mouse_state.write_allowed;
     let tracking = engine.read_live_tracking();
     if let Some(latch) = mouse_state.latch.as_ref() {
         match latch.owner {
@@ -1013,14 +1069,20 @@ fn handle_mouse_move(
                 if latch.suppressed {
                     return (Vec::new(), GestureDisposition::Suppressed);
                 }
-                if latch.epoch != current_epoch || !g.write_allowed {
+                if latch.epoch != current_epoch || !write_allowed {
                     return latch_report_suppressed(mouse_state, inspect);
                 }
                 if !report_motion_allowed(tracking, true) {
                     return (Vec::new(), GestureDisposition::Ignored);
                 }
+                if tracking == MouseTracking::Button && g.button.is_none() {
+                    return (Vec::new(), GestureDisposition::Ignored);
+                }
                 let ev = mouse_report_ev(g, mouse_state.any_button_pressed);
-                emit_mouse_report(engine, egress, inspect, access_epoch, g.access_epoch, &ev)
+                let outcome =
+                    emit_mouse_report(engine, egress, inspect, access_epoch, g.access_epoch, &ev);
+                apply_emit_epoch_revocation(mouse_state, &outcome);
+                (outcome.encoded, outcome.disposition)
             }
             GestureOwner::Select => {
                 if let Some((col, row)) = g.cell {
@@ -1046,11 +1108,12 @@ fn handle_mouse_move(
         }
     } else if g.button.is_none()
         && tracking == MouseTracking::Any
-        && g.write_allowed
+        && write_allowed
         && g.access_epoch == current_epoch
     {
         let ev = mouse_report_ev(g, false);
-        emit_mouse_report(engine, egress, inspect, access_epoch, g.access_epoch, &ev)
+        let outcome = emit_mouse_report(engine, egress, inspect, access_epoch, g.access_epoch, &ev);
+        (outcome.encoded, outcome.disposition)
     } else {
         (Vec::new(), GestureDisposition::Ignored)
     }
@@ -1084,18 +1147,23 @@ fn handle_mouse_up(
         return (Vec::new(), GestureDisposition::Ignored);
     }
 
-    let latch = mouse_state.latch.take().expect("latch present");
+    let write_allowed = mouse_state.write_allowed;
+    let Some(latch) = mouse_state.latch.take() else {
+        return (Vec::new(), GestureDisposition::Ignored);
+    };
     match latch.owner {
         GestureOwner::Report => {
             mouse_state.any_button_pressed = false;
             if latch.suppressed {
                 (Vec::new(), GestureDisposition::Suppressed)
-            } else if latch.epoch != current_epoch || !g.write_allowed {
+            } else if latch.epoch != current_epoch || !write_allowed {
                 inspect.record_mouse_suppressed();
                 (Vec::new(), GestureDisposition::Suppressed)
             } else {
                 let ev = mouse_report_ev(g, false);
-                emit_mouse_report(engine, egress, inspect, access_epoch, g.access_epoch, &ev)
+                let outcome =
+                    emit_mouse_report(engine, egress, inspect, access_epoch, g.access_epoch, &ev);
+                (outcome.encoded, outcome.disposition)
             }
         }
         GestureOwner::Select => {
@@ -1107,13 +1175,16 @@ fn handle_mouse_up(
                     if dragged {
                         (Vec::new(), GestureDisposition::Selected)
                     } else if let Some((col, row)) = g.cell {
-                        if engine.clear_selection().is_ok() {
-                            let _ = presentation_tx
-                                .try_send(EnginePresentationEvent::LocalClick { col, row });
+                        match engine.clear_selection() {
+                            Ok(true) => {
+                                let _ = presentation_tx
+                                    .try_send(EnginePresentationEvent::LocalClick { col, row });
+                                (Vec::new(), GestureDisposition::LocalClick)
+                            }
+                            _ => (Vec::new(), GestureDisposition::Ignored),
                         }
-                        (Vec::new(), GestureDisposition::LocalClick)
                     } else {
-                        (Vec::new(), GestureDisposition::LocalClick)
+                        (Vec::new(), GestureDisposition::Ignored)
                     }
                 }
                 Err(e) => {

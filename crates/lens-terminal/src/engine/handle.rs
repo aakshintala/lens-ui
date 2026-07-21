@@ -161,6 +161,12 @@ impl EngineHandle {
         self.enqueue_input(EngineCommand::MouseGesture(gesture))
     }
 
+    /// Enqueue an ordered access gate update (engine-authoritative `write_allowed`).
+    #[allow(dead_code, reason = "foreground access wiring lands in Task 5")]
+    pub(crate) fn enqueue_set_access(&self, writable: bool) -> Result<(), FeedError> {
+        self.enqueue_input(EngineCommand::SetAccess(writable))
+    }
+
     /// Bump the access epoch (read-only downgrade). Stale `Key`/`Focus` commands still
     /// queued in the forwarder are dropped at forward time via epoch comparison; the
     /// worker's final-egress epoch recheck (Slice 2a Task 6) is the second layer for
@@ -445,6 +451,7 @@ mod tests {
 
     const TRACKING_SGR: &[u8] = b"\x1b[?1000h\x1b[?1006h";
     const TRACKING_BUTTON_SGR: &[u8] = b"\x1b[?1002h\x1b[?1006h";
+    const TRACKING_ANY_SGR: &[u8] = b"\x1b[?1003h\x1b[?1006h";
 
     fn base_mouse_gesture(kind: MouseEventKind, button: Option<MouseButtonKind>) -> MouseGesture {
         MouseGesture {
@@ -455,7 +462,6 @@ mod tests {
             px_x: 0.0,
             px_y: 0.0,
             time: Duration::ZERO,
-            write_allowed: true,
             mouse_local: false,
             policy: MouseReportPolicy::Auto,
             access_epoch: 0,
@@ -470,6 +476,10 @@ mod tests {
         ack_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("mouse ack timeout")
+    }
+
+    fn enqueue_set_access(h: &EngineHandle, writable: bool) {
+        h.enqueue_set_access(writable).expect("set access");
     }
 
     #[test]
@@ -538,9 +548,11 @@ mod tests {
         let h = EngineHandle::spawn(test_config());
         let rx = h.attach_test_egress();
         h.feed(TRACKING_SGR.to_vec()).expect("feed tracking");
-        let mut gesture = base_mouse_gesture(MouseEventKind::Down, Some(MouseButtonKind::Left));
-        gesture.write_allowed = false;
-        let ack = send_mouse(&h, gesture);
+        enqueue_set_access(&h, false);
+        let ack = send_mouse(
+            &h,
+            base_mouse_gesture(MouseEventKind::Down, Some(MouseButtonKind::Left)),
+        );
         assert_eq!(ack.disposition, GestureDisposition::Selected);
         assert!(rx.try_recv().is_err());
         h.stop();
@@ -585,6 +597,137 @@ mod tests {
             rx.try_recv().is_err(),
             "post-downgrade move must not egress"
         );
+
+        let up_ack = send_mouse(
+            &h,
+            base_mouse_gesture(MouseEventKind::Up, Some(MouseButtonKind::Left)),
+        );
+        assert_eq!(up_ack.disposition, GestureDisposition::Suppressed);
+        assert!(rx.try_recv().is_err(), "post-downgrade up must not egress");
+        h.stop();
+    }
+
+    #[test]
+    fn mouse_latch_epoch_bump_suppresses_up_without_move_egress() {
+        let h = EngineHandle::spawn(test_config());
+        let rx = h.attach_test_egress();
+        h.feed(TRACKING_BUTTON_SGR.to_vec()).expect("feed tracking");
+        let down_ack = send_mouse(
+            &h,
+            base_mouse_gesture(MouseEventKind::Down, Some(MouseButtonKind::Left)),
+        );
+        assert_eq!(down_ack.disposition, GestureDisposition::Reported);
+        let _ = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("down egress");
+
+        h.bump_access_epoch();
+        let up_ack = send_mouse(
+            &h,
+            base_mouse_gesture(MouseEventKind::Up, Some(MouseButtonKind::Left)),
+        );
+        assert_eq!(up_ack.disposition, GestureDisposition::Suppressed);
+        assert!(rx.try_recv().is_err(), "post-downgrade up must not egress");
+        h.stop();
+    }
+
+    #[test]
+    fn mouse_set_access_false_before_down_selects_without_egress() {
+        let h = EngineHandle::spawn(test_config());
+        let rx = h.attach_test_egress();
+        h.feed(TRACKING_SGR.to_vec()).expect("feed tracking");
+        enqueue_set_access(&h, false);
+        let ack = send_mouse(
+            &h,
+            base_mouse_gesture(MouseEventKind::Down, Some(MouseButtonKind::Left)),
+        );
+        assert_eq!(ack.disposition, GestureDisposition::Selected);
+        assert!(rx.try_recv().is_err());
+        h.stop();
+    }
+
+    #[test]
+    fn mouse_set_access_false_closes_stale_writable_attack() {
+        let h = EngineHandle::spawn(test_config());
+        let rx = h.attach_test_egress();
+        h.feed(TRACKING_SGR.to_vec()).expect("feed tracking");
+        enqueue_set_access(&h, false);
+        let ack = send_mouse(
+            &h,
+            base_mouse_gesture(MouseEventKind::Down, Some(MouseButtonKind::Left)),
+        );
+        assert_eq!(
+            ack.disposition,
+            GestureDisposition::Selected,
+            "read-only must not report even with current epoch"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "stale-writable attack must not egress"
+        );
+        h.stop();
+    }
+
+    #[test]
+    fn mouse_any_mode_buttonless_move_suppressed_when_read_only() {
+        let h = EngineHandle::spawn(test_config());
+        let rx = h.attach_test_egress();
+        h.feed(TRACKING_ANY_SGR.to_vec()).expect("feed tracking");
+        enqueue_set_access(&h, false);
+        let ack = send_mouse(&h, base_mouse_gesture(MouseEventKind::Move, None));
+        assert_eq!(ack.disposition, GestureDisposition::Ignored);
+        assert!(rx.try_recv().is_err());
+        h.stop();
+    }
+
+    #[test]
+    fn mouse_button_mode_buttonless_move_under_report_latch_ignored() {
+        let h = EngineHandle::spawn(test_config());
+        let rx = h.attach_test_egress();
+        h.feed(TRACKING_BUTTON_SGR.to_vec()).expect("feed tracking");
+        let down_ack = send_mouse(
+            &h,
+            base_mouse_gesture(MouseEventKind::Down, Some(MouseButtonKind::Left)),
+        );
+        assert_eq!(down_ack.disposition, GestureDisposition::Reported);
+        let _ = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("down egress");
+
+        let move_ack = send_mouse(&h, base_mouse_gesture(MouseEventKind::Move, None));
+        assert_eq!(move_ack.disposition, GestureDisposition::Ignored);
+        assert!(rx.try_recv().is_err(), "buttonless move must not egress");
+        h.stop();
+    }
+
+    #[test]
+    fn mouse_set_access_false_suppresses_latched_move_and_up() {
+        let h = EngineHandle::spawn(test_config());
+        let rx = h.attach_test_egress();
+        h.feed(TRACKING_BUTTON_SGR.to_vec()).expect("feed tracking");
+        let down_ack = send_mouse(
+            &h,
+            base_mouse_gesture(MouseEventKind::Down, Some(MouseButtonKind::Left)),
+        );
+        assert_eq!(down_ack.disposition, GestureDisposition::Reported);
+        let _ = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("down egress");
+
+        enqueue_set_access(&h, false);
+        let move_ack = send_mouse(
+            &h,
+            base_mouse_gesture(MouseEventKind::Move, Some(MouseButtonKind::Left)),
+        );
+        assert_eq!(move_ack.disposition, GestureDisposition::Suppressed);
+        assert!(rx.try_recv().is_err());
+
+        let up_ack = send_mouse(
+            &h,
+            base_mouse_gesture(MouseEventKind::Up, Some(MouseButtonKind::Left)),
+        );
+        assert_eq!(up_ack.disposition, GestureDisposition::Suppressed);
+        assert!(rx.try_recv().is_err());
         h.stop();
     }
 
