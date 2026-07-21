@@ -73,10 +73,13 @@ _Last curated 2026-07-21 (B-2 packing/scroll/culling SHIPPED + merged to main un
   committing a synthetic local partial would permanently duplicate omnigent's durable `interrupted`
   `/items` row (messages reconcile by `item_id` only). `crates/lens-core/src/reduce/{mod,folds}.rs`;
   handoff `docs/handoffs/2026-07-21-turn-counter-non-completed-terminal-bug.md` (as-built appended);
-  memory [[turn-counter-noncompleted-bug]]. **Two deferred follow-ups:** (1) live-verify whether
-  omnigent sends a durable `interrupted` partial on `/items` — if NOT, discard loses the partial and a
-  finalize+reconcile fix is needed; (2) native `turn.completed/failed/cancelled` events are deferred →
-  `Unknown` → ignored, so the same bug persists on the native-runner surface. Merge-collision with T-0
+  memory [[turn-counter-noncompleted-bug]]. **Live-verified 2026-07-21:** interrupted a streaming
+  claude-sdk turn vs omnigent 0.5.1 — the partial is flushed via `response.output_item.done` (durable
+  `/items` row under a **server** id) BEFORE `response.cancelled`, so the reducer commits it under that id
+  and the Cancelled-arm discard is a no-op for the message → partial preserved, no loss, no duplicate
+  (discard validated; the omnigent source's "Phase 2 TODO / not persisted" docstring is wrong). **One
+  follow-up remains:** native `turn.completed/failed/cancelled` are deferred → `Unknown` → ignored, so the
+  same bug persists on the native-runner surface. Merge-collision with T-0
   (`lens-transript`) in the same `reduce` match block stands — logically independent, textual merge only.
 
 - **📋 SPEC-GAPS backlog** — independent, un-specced/partial items tracked in

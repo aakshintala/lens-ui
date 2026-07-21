@@ -171,15 +171,34 @@ card test added): reducer bumps `stream.turn` (new `reduce::tests`) →
 58 lens-ui tests, clippy clean, fmt clean (workspace clippy red only on the
 pre-existing `spikes/board-container` dirt, outside the production `-p` gate).
 
-### Deferred follow-ups (NOT done — need a live omnigent 0.5.1 run)
+### Deferred follow-ups
 
-1. **Live-verify the durable partial.** Does omnigent emit an assistant message
-   with `interrupted=true` on `/items` after a user-cancel / length-stop? The
-   "discard" choice is correct **iff** it does (server is the SSOT). If it does
-   **not**, discard silently loses the streamed partial from the transcript and the
-   right fix becomes finalize + message reconciliation (content/response
-   correlation so `msg_local_N` folds into the canonical row). Drive an interrupt
-   live, capture `/items`, then confirm or revisit.
+1. **✅ RESOLVED 2026-07-21 by a live run — discard is validated.** Drove a
+   streaming `claude-sdk` turn against live omnigent 0.5.1 (`08285468`, server
+   `127.0.0.1:6767`), interrupted mid-`output_text` via
+   `POST /v1/sessions/{id}/events {"type":"interrupt"}`, then `GET /items`. Result:
+   - The partial assistant message **IS persisted** durably to `/items` — one row,
+     server id `msg_fa3a1e40…`, `status: "completed"`, ~4.9 KB of the partial essay,
+     `interrupted` **unset** (that flag is native-turn-only per `openapi.json:1834`).
+     No duplicate.
+   - Event ordering on cancel: `output_text.delta`×N (`message_id: null`) →
+     `session.interrupted` → **`response.output_item.done`** (flushes the canonical
+     `msg_fa3a1e40`) → `response.cancelled` → `session.status`(idle) →
+     `session.input.consumed` (`[System: interrupted]` **user** marker).
+   - **Reducer trace:** `output_item.done` hits the `OutputItemDone` arm, which (for a
+     `message_id:None` preview) commits the canonical message under the **server** id
+     and clears `open_message` — *before* `response.cancelled` reaches the Cancelled
+     arm. So the Cancelled-arm discard is a **no-op for the message**: the partial is
+     preserved (server row), nothing is lost, and no synthetic `msg_local_N` is minted
+     → **no finding-2 duplicate.**
+   - **Note — the source docstring lies.** `omnigent/runner/app.py:10271`
+     (`_append_cancellation_items`) marks "flush partial content on interrupt" as an
+     unimplemented `.. todo:: Phase 2`, implying the partial is *not* persisted. The
+     live run proves it **is** (via the `output_item.done` flush path, not that
+     function). Memory `live-event-recapture-findings` applies: verify live, don't
+     trust the source comment. **Discard is the correct defensive choice** for any path
+     where `output_item.done` does *not* precede cancel (finalize would mint a synthetic
+     id and risk duplicating the server row; discard defers to `/items`).
 2. **Native `turn.*` terminal family.** `turn.completed` / `turn.failed` /
    `turn.cancelled` are deferred in `lens-client` (`stream/event.rs` → routed to
    `ServerStreamEvent::Unknown`), so a Codex-native turn that emits only its native
