@@ -9,7 +9,7 @@ pub const MAX_HYPERLINK_URI_BYTES: usize = 8192;
 /// above real copy sizes; the bound stops a hostile program forcing large owned copies.
 pub const MAX_OSC52_CLIPBOARD_BYTES: usize = 1 << 20;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ClipboardLocation {
     Standard,
     Selection,
@@ -63,6 +63,7 @@ pub(crate) fn resolve_title_from_slot(slot_update: Option<TitleUpdate>) -> Title
 pub(crate) struct PresentationDrainResult {
     pub title_outcome: TitleDrainOutcome,
     pub validated_hyperlink_urls: Vec<String>,
+    pub clipboard_writes: Vec<(ClipboardLocation, Vec<ClipboardMimePart>)>,
 }
 
 impl Default for PresentationDrainResult {
@@ -70,6 +71,7 @@ impl Default for PresentationDrainResult {
         Self {
             title_outcome: TitleDrainOutcome::NoChange,
             validated_hyperlink_urls: Vec::new(),
+            clipboard_writes: Vec::new(),
         }
     }
 }
@@ -83,6 +85,7 @@ pub(crate) fn collect_presentation_drain(
     channel_events: impl IntoIterator<Item = EnginePresentationEvent>,
 ) -> PresentationDrainResult {
     let mut validated_hyperlink_urls = Vec::new();
+    let mut clipboard_writes = Vec::new();
     for ev in channel_events {
         match ev {
             EnginePresentationEvent::TitleChanged(_) => {}
@@ -91,12 +94,15 @@ pub(crate) fn collect_presentation_drain(
                     validated_hyperlink_urls.push(url);
                 }
             }
-            EnginePresentationEvent::ClipboardWrite { .. } => {}
+            EnginePresentationEvent::ClipboardWrite { location, contents } => {
+                clipboard_writes.push((location, contents));
+            }
         }
     }
     PresentationDrainResult {
         title_outcome: resolve_title_from_slot(slot_update),
         validated_hyperlink_urls,
+        clipboard_writes,
     }
 }
 
@@ -352,6 +358,7 @@ mod tests {
         let result = PresentationDrainResult {
             title_outcome: TitleDrainOutcome::Set("Applied".into()),
             validated_hyperlink_urls: vec!["https://example.com/x".into()],
+            clipboard_writes: Vec::new(),
         };
         record_presentation_drain_inspect(&inspect, &result);
         let snap = inspect.snapshot();

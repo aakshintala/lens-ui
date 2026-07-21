@@ -25,7 +25,7 @@
 //!   callback) and [`TerminalTab::presentation`] (latest atomic
 //!   title/lifecycle/access/progress).
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -34,6 +34,7 @@ use crossbeam_channel::Sender;
 use lens_client::WsOutbound;
 
 mod bridge;
+mod clipboard_policy;
 mod engine;
 mod hit_test;
 mod input_gate;
@@ -118,6 +119,7 @@ use lens_client::{AttachOptions, TerminalResource, attach};
 use serde::{Deserialize, Serialize};
 
 use bridge::{BridgeEvent, spawn_bridge};
+pub use clipboard_policy::{ClipboardPolicy, SessionClipboardPolicy};
 #[cfg(any(test, feature = "test-util"))]
 use engine::command::InputAck;
 use engine::command::{KeyAction, KeyInput, LensKey, ScrollDelta};
@@ -325,6 +327,8 @@ pub struct HostRequestId(pub u64);
 pub enum HostRequestDecision {
     Allow,
     Deny,
+    AllowSession,
+    DenySession,
 }
 
 /// The single typed **inbound** seam: host → tab. Delivered via
@@ -361,6 +365,17 @@ pub enum TerminalEvent {
     PresentationChanged,
     /// User clicked a validated hyperlink; host may open the URL after policy.
     OpenUrlRequest { id: HostRequestId, url: String },
+    /// Permissioned OSC 52 clipboard write; host responds via [`TerminalHostEvent`].
+    ClipboardWriteRequest {
+        id: HostRequestId,
+        location: engine::presentation::ClipboardLocation,
+        contents: Vec<engine::presentation::ClipboardMimePart>,
+    },
+    /// Emitted whenever a clipboard write is actually performed.
+    ClipboardWriteNotice {
+        location: engine::presentation::ClipboardLocation,
+        bytes: usize,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -403,7 +418,15 @@ pub struct TerminalTab {
     focus_subs_armed: bool,
     /// Monotonic id source for typed host permission requests.
     next_host_request_id: u64,
+    clipboard_policy: Box<dyn ClipboardPolicy>,
+    pending_clipboard_writes: VecDeque<(
+        HostRequestId,
+        engine::presentation::ClipboardLocation,
+        Vec<engine::presentation::ClipboardMimePart>,
+    )>,
 }
+
+const PENDING_HOST_REQUESTS_CAP: usize = 64;
 
 impl TerminalTab {
     fn starting(
@@ -435,6 +458,8 @@ impl TerminalTab {
             focus_out_sub: None,
             focus_subs_armed: false,
             next_host_request_id: 0,
+            clipboard_policy: Box::new(SessionClipboardPolicy::default()),
+            pending_clipboard_writes: VecDeque::new(),
         }
     }
 
@@ -483,6 +508,8 @@ impl TerminalTab {
             focus_out_sub: None,
             focus_subs_armed: false,
             next_host_request_id: 0,
+            clipboard_policy: Box::new(SessionClipboardPolicy::default()),
+            pending_clipboard_writes: VecDeque::new(),
         }
     }
 
@@ -505,10 +532,41 @@ impl TerminalTab {
         self.presentation.clone()
     }
 
-    /// The single typed inbound seam. Slice 0 accepts and ignores events; the
-    /// concrete handling lands with the slice that owns each variant.
-    pub fn on_host_event(&mut self, _event: TerminalHostEvent, _cx: &mut Context<Self>) {
-        // Slice 1d+ dispatches Sleep/wake/reset/etc.
+    /// The single typed inbound seam.
+    pub fn on_host_event(&mut self, event: TerminalHostEvent, cx: &mut Context<Self>) {
+        match event {
+            TerminalHostEvent::Sleep | TerminalHostEvent::Wake => {}
+            TerminalHostEvent::HostRequestResponse { id, decision } => {
+                let pos = self
+                    .pending_clipboard_writes
+                    .iter()
+                    .position(|(pending_id, _, _)| *pending_id == id);
+                if let Some(i) = pos {
+                    let (_, location, contents) = self.pending_clipboard_writes.remove(i).unwrap();
+                    match decision {
+                        HostRequestDecision::Allow | HostRequestDecision::AllowSession => {
+                            self.write_clipboard_contents(&location, &contents, cx);
+                            if let Some(e) = self.engine_handle() {
+                                e.record_clipboard_write_allowed();
+                            }
+                            if matches!(decision, HostRequestDecision::AllowSession) {
+                                self.clipboard_policy
+                                    .remember_osc52(location, HostRequestDecision::Allow);
+                            }
+                        }
+                        HostRequestDecision::Deny | HostRequestDecision::DenySession => {
+                            if let Some(e) = self.engine_handle() {
+                                e.record_clipboard_write_denied();
+                            }
+                            if matches!(decision, HostRequestDecision::DenySession) {
+                                self.clipboard_policy
+                                    .remember_osc52(location, HostRequestDecision::Deny);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Enable/disable the render Inspect ring (zero-cost when disabled).
@@ -638,6 +696,31 @@ impl TerminalTab {
             window,
             cx,
         );
+    }
+
+    /// Drain presentation channel events (harness only).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn debug_drain_presentation_for_test(&mut self, cx: &mut Context<Self>) {
+        self.drain_presentation_events(cx);
+    }
+
+    /// Seed OSC 52 session policy (harness only).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn debug_remember_osc52_for_test(
+        &mut self,
+        location: engine::presentation::ClipboardLocation,
+        decision: HostRequestDecision,
+    ) {
+        self.clipboard_policy.remember_osc52(location, decision);
+    }
+
+    /// Pending clipboard host-request ids (harness only).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn debug_pending_clipboard_ids_for_test(&self) -> Vec<HostRequestId> {
+        self.pending_clipboard_writes
+            .iter()
+            .map(|(id, _, _)| *id)
+            .collect()
     }
 
     pub(crate) fn on_mouse_down(
@@ -1073,6 +1156,66 @@ impl TerminalTab {
             engine::presentation::TitleDrainOutcome::NoChange => {}
         }
         engine.record_presentation_drain_inspect(&result);
+        for (location, contents) in result.clipboard_writes {
+            match self.clipboard_policy.osc52_session_decision(&location) {
+                Some(HostRequestDecision::Allow | HostRequestDecision::AllowSession) => {
+                    self.write_clipboard_contents(&location, &contents, cx);
+                    if let Some(e) = self.engine_handle() {
+                        e.record_clipboard_write_allowed();
+                    }
+                }
+                Some(HostRequestDecision::Deny | HostRequestDecision::DenySession) => {
+                    if let Some(e) = self.engine_handle() {
+                        e.record_clipboard_write_denied();
+                    }
+                }
+                None => {
+                    let id = HostRequestId(self.next_host_request_id);
+                    self.next_host_request_id = self.next_host_request_id.wrapping_add(1);
+                    if self.pending_clipboard_writes.len() >= PENDING_HOST_REQUESTS_CAP {
+                        self.pending_clipboard_writes.pop_front();
+                    }
+                    self.pending_clipboard_writes.push_back((
+                        id,
+                        location.clone(),
+                        contents.clone(),
+                    ));
+                    cx.emit(TerminalEvent::ClipboardWriteRequest {
+                        id,
+                        location,
+                        contents,
+                    });
+                }
+            }
+        }
+    }
+
+    fn engine_handle(&self) -> Option<&EngineHandle> {
+        self.runtime.as_ref()?.engine.as_deref()
+    }
+
+    fn write_clipboard_contents(
+        &self,
+        location: &engine::presentation::ClipboardLocation,
+        contents: &[engine::presentation::ClipboardMimePart],
+        cx: &mut Context<Self>,
+    ) {
+        if contents.is_empty() {
+            return;
+        }
+        let Some(part) = contents
+            .iter()
+            .find(|p| p.mime == "text/plain")
+            .or_else(|| contents.first())
+        else {
+            return;
+        };
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(part.data.clone()));
+        let bytes: usize = contents.iter().map(|p| p.data.len()).sum();
+        cx.emit(TerminalEvent::ClipboardWriteNotice {
+            location: location.clone(),
+            bytes,
+        });
     }
 
     /// Forward visibility to the engine worker; repaint when shown.
@@ -2001,5 +2144,182 @@ mod tests {
         let ack = rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(ack.encoded, "你好".as_bytes());
         assert!(ack.accepted);
+    }
+
+    fn test_clipboard_contents(text: &str) -> Vec<engine::presentation::ClipboardMimePart> {
+        vec![engine::presentation::ClipboardMimePart {
+            mime: "text/plain".into(),
+            data: text.into(),
+        }]
+    }
+
+    fn subscribe_terminal_events(
+        cx: &mut gpui::TestAppContext,
+        tab: &Entity<TerminalTab>,
+    ) -> (
+        std::rc::Rc<std::cell::RefCell<Vec<TerminalEvent>>>,
+        Subscription,
+    ) {
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::<TerminalEvent>::new()));
+        let sink = events.clone();
+        let tab_for_sub = tab.clone();
+        let sub = cx.update(|cx| {
+            cx.subscribe(&tab_for_sub, move |_entity, event, _cx| {
+                sink.borrow_mut().push(event.clone());
+            })
+        });
+        (events, sub)
+    }
+
+    fn enqueue_clipboard_write(
+        engine: &EngineHandle,
+        location: engine::presentation::ClipboardLocation,
+        contents: Vec<engine::presentation::ClipboardMimePart>,
+    ) {
+        engine
+            .enqueue_presentation(
+                engine::presentation::EnginePresentationEvent::ClipboardWrite {
+                    location,
+                    contents,
+                },
+            )
+            .expect("enqueue clipboard write");
+    }
+
+    #[gpui::test]
+    async fn clipboard_write_with_no_session_decision_emits_request(cx: &mut gpui::TestAppContext) {
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let tab = cx.new(|cx| TerminalTab::with_engine_for_test(Arc::clone(&engine), cx));
+        let (events, _sub) = subscribe_terminal_events(cx, &tab);
+
+        let contents = test_clipboard_contents("hello-osc52");
+        enqueue_clipboard_write(
+            engine.as_ref(),
+            engine::presentation::ClipboardLocation::Standard,
+            contents.clone(),
+        );
+        tab.update(cx, |tab, cx| tab.debug_drain_presentation_for_test(cx));
+
+        let evs = events.borrow();
+        assert_eq!(evs.len(), 1);
+        match &evs[0] {
+            TerminalEvent::ClipboardWriteRequest {
+                id,
+                location,
+                contents: got,
+            } => {
+                assert_eq!(*location, engine::presentation::ClipboardLocation::Standard);
+                assert_eq!(got, &contents);
+                tab.update(cx, |tab, _cx| {
+                    assert_eq!(tab.debug_pending_clipboard_ids_for_test(), vec![*id]);
+                });
+            }
+            other => panic!("expected ClipboardWriteRequest, got {other:?}"),
+        }
+    }
+
+    #[gpui::test]
+    async fn remembered_deny_suppresses_request_and_records_denied(cx: &mut gpui::TestAppContext) {
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let tab = cx.new(|cx| TerminalTab::with_engine_for_test(Arc::clone(&engine), cx));
+        tab.update(cx, |tab, _cx| tab.set_inspect_enabled(true));
+        tab.update(cx, |tab, _cx| {
+            tab.debug_remember_osc52_for_test(
+                engine::presentation::ClipboardLocation::Standard,
+                HostRequestDecision::Deny,
+            );
+        });
+
+        let (events, _sub) = subscribe_terminal_events(cx, &tab);
+        enqueue_clipboard_write(
+            engine.as_ref(),
+            engine::presentation::ClipboardLocation::Standard,
+            test_clipboard_contents("denied"),
+        );
+        tab.update(cx, |tab, cx| tab.debug_drain_presentation_for_test(cx));
+
+        assert!(
+            events
+                .borrow()
+                .iter()
+                .all(|e| !matches!(e, TerminalEvent::ClipboardWriteRequest { .. })),
+            "deny must suppress ClipboardWriteRequest"
+        );
+        tab.update(cx, |tab, _cx| {
+            assert!(tab.debug_pending_clipboard_ids_for_test().is_empty());
+            let snap = tab.inspect().engine.expect("engine inspect");
+            assert_eq!(snap.clipboard_writes_denied, 1);
+            assert_eq!(snap.clipboard_writes_allowed, 0);
+        });
+    }
+
+    #[gpui::test]
+    async fn host_allow_writes_clipboard_and_evicts_pending(cx: &mut gpui::TestAppContext) {
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let tab = cx.new(|cx| TerminalTab::with_engine_for_test(Arc::clone(&engine), cx));
+        let (events, _sub) = subscribe_terminal_events(cx, &tab);
+
+        let contents = test_clipboard_contents("paste-me");
+        enqueue_clipboard_write(
+            engine.as_ref(),
+            engine::presentation::ClipboardLocation::Standard,
+            contents,
+        );
+        tab.update(cx, |tab, cx| tab.debug_drain_presentation_for_test(cx));
+
+        let request_id = match &events.borrow()[0] {
+            TerminalEvent::ClipboardWriteRequest { id, .. } => *id,
+            other => panic!("expected ClipboardWriteRequest, got {other:?}"),
+        };
+
+        tab.update(cx, |tab, cx| {
+            tab.on_host_event(
+                TerminalHostEvent::HostRequestResponse {
+                    id: request_id,
+                    decision: HostRequestDecision::Allow,
+                },
+                cx,
+            );
+            assert!(tab.debug_pending_clipboard_ids_for_test().is_empty());
+            let clip = cx.read_from_clipboard().and_then(|c| c.text());
+            assert_eq!(clip.as_deref(), Some("paste-me"));
+        });
+
+        assert!(
+            events.borrow().iter().any(|e| matches!(
+                e,
+                TerminalEvent::ClipboardWriteNotice {
+                    location: engine::presentation::ClipboardLocation::Standard,
+                    bytes: 8,
+                }
+            )),
+            "Allow path must emit ClipboardWriteNotice"
+        );
+    }
+
+    #[gpui::test]
+    async fn pending_clipboard_writes_are_bounded_drop_oldest(cx: &mut gpui::TestAppContext) {
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let tab = cx.new(|cx| TerminalTab::with_engine_for_test(Arc::clone(&engine), cx));
+        let (_events, _sub) = subscribe_terminal_events(cx, &tab);
+
+        for i in 0..=PENDING_HOST_REQUESTS_CAP {
+            enqueue_clipboard_write(
+                engine.as_ref(),
+                engine::presentation::ClipboardLocation::Standard,
+                test_clipboard_contents(&format!("write-{i}")),
+            );
+            tab.update(cx, |tab, cx| tab.debug_drain_presentation_for_test(cx));
+        }
+
+        tab.update(cx, |tab, _cx| {
+            let ids = tab.debug_pending_clipboard_ids_for_test();
+            assert_eq!(ids.len(), PENDING_HOST_REQUESTS_CAP);
+            assert!(
+                !ids.contains(&HostRequestId(0)),
+                "oldest id must be evicted when cap exceeded"
+            );
+            assert!(ids.contains(&HostRequestId(PENDING_HOST_REQUESTS_CAP as u64)));
+        });
     }
 }

@@ -273,6 +273,14 @@ impl EngineHandle {
         super::presentation::record_presentation_drain_inspect(&self.inspect, result);
     }
 
+    pub fn record_clipboard_write_allowed(&self) {
+        self.inspect.record_clipboard_write_allowed();
+    }
+
+    pub fn record_clipboard_write_denied(&self) {
+        self.inspect.record_clipboard_write_denied();
+    }
+
     /// Test hook: the next `count` `build_frame` attempts on **this handle's**
     /// worker fail synthetically. Per-handle (not a process-global) so parallel
     /// tests cannot consume each other's injected failures.

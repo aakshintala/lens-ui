@@ -48,6 +48,8 @@ pub struct EngineInspect {
     pub presentation_channel_full_drops: u64,
     pub osc52_forwarded: u64,
     pub osc52_over_cap_drops: u64,
+    pub clipboard_writes_allowed: u64,
+    pub clipboard_writes_denied: u64,
     pub recent: Vec<InspectEvent>,
 }
 
@@ -74,6 +76,8 @@ pub(crate) struct InspectShared {
     presentation_channel_full_drops: AtomicU64,
     osc52_forwarded: AtomicU64,
     osc52_over_cap_drops: AtomicU64,
+    clipboard_writes_allowed: AtomicU64,
+    clipboard_writes_denied: AtomicU64,
     ring: Mutex<VecDeque<InspectEvent>>,
 }
 
@@ -100,6 +104,8 @@ impl InspectShared {
             presentation_channel_full_drops: AtomicU64::new(0),
             osc52_forwarded: AtomicU64::new(0),
             osc52_over_cap_drops: AtomicU64::new(0),
+            clipboard_writes_allowed: AtomicU64::new(0),
+            clipboard_writes_denied: AtomicU64::new(0),
             ring: Mutex::new(VecDeque::with_capacity(RING_CAP)),
         }
     }
@@ -229,6 +235,21 @@ impl InspectShared {
         self.osc52_over_cap_drops.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_clipboard_write_allowed(&self) {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        self.clipboard_writes_allowed
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_clipboard_write_denied(&self) {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        self.clipboard_writes_denied.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn set_visible(&self, visible: bool) {
         self.visible.store(visible, Ordering::Relaxed);
     }
@@ -277,6 +298,8 @@ impl InspectShared {
                 .load(Ordering::Relaxed),
             osc52_forwarded: self.osc52_forwarded.load(Ordering::Relaxed),
             osc52_over_cap_drops: self.osc52_over_cap_drops.load(Ordering::Relaxed),
+            clipboard_writes_allowed: self.clipboard_writes_allowed.load(Ordering::Relaxed),
+            clipboard_writes_denied: self.clipboard_writes_denied.load(Ordering::Relaxed),
             recent,
         }
     }
