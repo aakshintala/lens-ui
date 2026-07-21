@@ -1,4 +1,5 @@
 mod layout_adapter;
+mod rollup;
 
 use crate::PtyProbe;
 use crate::card::view::{SessionCardView, mount_cached_card};
