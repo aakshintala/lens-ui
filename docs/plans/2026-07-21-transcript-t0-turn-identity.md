@@ -6,7 +6,7 @@
 
 **Architecture:** The fields already ride the wire but the hand-written `lens-client` types drop them, so T-0 first widens `lens-client` (Task 1), then threads `response_id` through the `lens-core` domain type + catch-up mapping + persistence (Task 2), then adds the live liveness scalar and per-item live stamping with its feed delta (Task 3). `lens-client` carries raw `String` ids; `lens-core` wraps them into the existing `ResponseId` branded newtype at the wire→domain boundary.
 
-**Tech Stack:** Rust, gpui, rusqlite (SQLite), serde, `smallvec`. Tests are `cargo test`; the gate is `cargo xtask gate` (fmt + workspace clippy `-D warnings` + tests). Byte-fixtures live in `docs/spikes/captures/2026-07-21-t0-verify/`.
+**Tech Stack:** Rust, gpui, rusqlite (SQLite), serde, `smallvec`. Tests are `cargo test`; the gate is `cargo run -p xtask -- gate` (fmt + workspace clippy `-D warnings` + tests; there is no `cargo xtask` alias in this repo). Byte-fixtures live in `docs/spikes/captures/2026-07-21-t0-verify/`.
 
 **Design doc (authoritative):** `docs/specs/2026-07-21-transcript-t0-turn-identity-design.md`. Every task cites the design section it implements. Read it before starting.
 
@@ -286,7 +286,7 @@ Expected: PASS (new tests + existing suite; the `:365` assertion now checks `res
 - [ ] **Step 9: Gate + commit**
 
 ```bash
-cargo xtask gate
+cargo run -p xtask -- gate
 git add crates/lens-core/src/domain/item.rs crates/lens-core/src/actor/runloop.rs \
         crates/lens-core/src/reduce/items.rs crates/lens-core/src/persist/transcript.rs \
         crates/lens-core/src/persist/map.rs
@@ -427,7 +427,7 @@ Expected: PASS.
 - [ ] **Step 11: Gate + commit**
 
 ```bash
-cargo xtask gate
+cargo run -p xtask -- gate
 git add crates/lens-core/src/domain/session.rs crates/lens-core/src/reduce/update.rs \
         crates/lens-core/src/reduce/mod.rs crates/lens-core/src/reduce/items.rs \
         crates/lens-ui/src/card/model.rs
