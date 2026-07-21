@@ -2,6 +2,7 @@ mod layout_adapter;
 mod rollup;
 
 use crate::PtyProbe;
+use crate::card::model::SessionCard;
 use crate::card::view::{SessionCardView, mount_cached_card};
 use crate::fleet::store::FleetStore;
 use crate::slot::{TabHandle, placeholder_tab};
@@ -10,7 +11,7 @@ use gpui::{
     ParentElement, Pixels, Render, ScrollHandle, Styled, Window, div, prelude::*, px,
 };
 use layout_adapter::build_ephemeral_layout;
-use lens_core::domain::board::BoardNode;
+use lens_core::domain::board::{BoardLayout, BoardNode};
 use lens_core::domain::ids::SessionId;
 use lens_core::pack::{self, CARD_H, CARD_W, CELL_H, CELL_W, GAP, HEADER, INSET, Item};
 use std::collections::{HashMap, HashSet};
@@ -38,6 +39,25 @@ impl ShellMode {
     }
 }
 
+/// Per-tile group metadata threaded from `board_tree` into the renderer (B-3).
+/// `completed_count` is Archive-side (B-6); B-3 passes 0.
+struct GroupMeta {
+    name: String,
+    color_token: Option<String>,
+    completed_count: u32,
+}
+
+/// The chrome computed for one rendered group tile — asserted by fixture tests
+/// (the group render path is not runtime-reachable until B-4).
+#[derive(Clone, Debug)]
+pub struct GroupChromeSnapshot {
+    pub session_ids: Vec<SessionId>,
+    pub name: String,
+    pub accent: gpui::Hsla,
+    pub rollup: rollup::GroupRollup,
+    pub header: String,
+}
+
 pub struct BoardView {
     fleet: Entity<FleetStore>,
     card_views: HashMap<SessionId, Entity<SessionCardView>>,
@@ -55,6 +75,13 @@ pub struct BoardView {
     /// Session ids whose tiles were in the visible band at the last render —
     /// the cull result (test hook + Task 5's gate input).
     last_built: Vec<SessionId>,
+    /// B-3 render snapshot: the group chrome computed at the last render (test hook;
+    /// also the eventual B-4 live-inspection point). Recomputed each frame.
+    last_group_chrome: Vec<GroupChromeSnapshot>,
+    /// B-3 TEST SEAM: a hand-built layout injected in place of `build_ephemeral_layout`
+    /// so fixture tests can reach the group path (no group is runtime-creatable until
+    /// B-4). `None` in production. B-4's real store→replica seam supersedes this.
+    test_layout: Option<BoardLayout>,
 }
 
 impl BoardView {
@@ -96,6 +123,8 @@ impl BoardView {
             board_scroll: ScrollHandle::new(),
             rail_scroll: ScrollHandle::new(),
             last_built: Vec::new(),
+            last_group_chrome: Vec::new(),
+            test_layout: None,
         }
     }
 
@@ -194,23 +223,45 @@ impl BoardView {
         scroll: ScrollHandle,
         cx: &mut Context<Self>,
     ) -> (AnyElement, Vec<SessionId>) {
-        let layout = build_ephemeral_layout(self.fleet.read(cx));
+        let layout = self
+            .test_layout
+            .clone()
+            .unwrap_or_else(|| build_ephemeral_layout(self.fleet.read(cx)));
         let board_id = match layout.default_board_id() {
             Ok(id) => id.clone(),
             Err(_) => return (div().into_any_element(), Vec::new()),
         };
         let nodes = layout.board_tree(&board_id).unwrap_or_default();
 
-        // nodes → parallel (pack items, per-tile session ids)
+        // nodes → parallel (pack items, per-tile session ids, per-tile group meta)
         let mut items: Vec<Item> = Vec::with_capacity(nodes.len());
         let mut tile_sessions: Vec<Vec<SessionId>> = Vec::with_capacity(nodes.len());
+        let mut tile_groups: Vec<Option<GroupMeta>> = Vec::with_capacity(nodes.len());
         for node in &nodes {
             let sessions: Vec<SessionId> = node.leaf_sessions().into_iter().cloned().collect();
-            items.push(match node {
-                BoardNode::Card(_) => Item::card(),
-                BoardNode::Group { .. } => Item::group(sessions.len()),
-            });
+            let (item, meta) = match node {
+                BoardNode::Card(_) => (Item::card(), None),
+                BoardNode::Group { item, .. } => {
+                    let meta = match &item.kind {
+                        lens_core::domain::board::BoardItemKind::Group {
+                            name,
+                            color_token,
+                            ..
+                        } => Some(GroupMeta {
+                            name: name.clone(),
+                            color_token: color_token.clone(),
+                            // ✓N is Archive-side (B-6); B-3 has no source → 0.
+                            completed_count: 0,
+                        }),
+                        // A Group node always carries a Group kind; defensively None.
+                        _ => None,
+                    };
+                    (Item::group(sessions.len()), meta)
+                }
+            };
+            items.push(item);
             tile_sessions.push(sessions);
+            tile_groups.push(meta);
         }
 
         let cols = pack::cols_for_width(avail_width);
@@ -221,6 +272,9 @@ impl BoardView {
         let overdraw = CELL_H;
         let lo = scroll_top - overdraw;
         let hi = scroll_top + viewport_h + overdraw;
+
+        let now_ms = self.fleet.read(cx).clock().now_millis();
+        let mut group_chrome: Vec<GroupChromeSnapshot> = Vec::new();
 
         let mut content = div()
             .relative()
@@ -248,14 +302,18 @@ impl BoardView {
                     }
                 }
                 pack::Kind::Group { .. } => {
-                    for el in self.absolute_group(placed, sessions, cx) {
+                    let meta = tile_groups[placed.item_index].as_ref();
+                    let (els, snap) = self.absolute_group(placed, sessions, meta, now_ms, cx);
+                    for el in els {
                         content = content.child(el);
                     }
+                    group_chrome.push(snap);
                 }
             }
         }
 
         self.last_built = visible.clone();
+        self.last_group_chrome = group_chrome;
 
         let el = div()
             .id("board-scroll")
@@ -295,26 +353,57 @@ impl BoardView {
         )
     }
 
-    /// A group tile: a **bare neutral placeholder box** in the inter-tile gap plus
-    /// its member cards at full size in body-zones. Chrome (ring color / header /
-    /// rollups) is B-3; this arm proves the geometry and gives B-3 something to
-    /// fill. Under basis B no group is reachable at runtime — exercised in B-4.
+    /// A group tile (B-3): a colored ring + tint in the inter-tile gap, a header-lane
+    /// (`● dot · name · [spend · age] · ✓N · ⌄`) folded from member cards, plus the
+    /// members at full size in their body-zones. Returns the elements and a chrome
+    /// snapshot (fixture tests assert the snapshot; the path is not runtime-reachable
+    /// until B-4).
+    ///
+    /// NOTE (B-4): this reads member `SessionCard` entities during `render` to fold the
+    /// rollup. B-3 is runtime-dormant so this never executes live; when B-4 makes groups
+    /// live, verify this does not re-trip the `.cached()` dirty-tracking freeze
+    /// ([[viewport-reentry-freeze]]). If it does, hoist the fold into `sync_card_views`.
     fn absolute_group(
         &self,
         placed: &pack::Placed,
         sessions: &[SessionId],
+        meta: Option<&GroupMeta>,
+        now_ms: i64,
         cx: &mut Context<Self>,
-    ) -> Vec<AnyElement> {
+    ) -> (Vec<AnyElement>, GroupChromeSnapshot) {
         let (fc, fr) = (placed.item.fc, placed.item.fr);
         let x = placed.cell_left();
         let y = placed.cell_top();
         let block_w = fc as f32 * CELL_W - GAP;
         let block_h = fr as f32 * CELL_H - GAP;
 
-        let mut out: Vec<AnyElement> = Vec::with_capacity(sessions.len() + 1);
-        // Bare neutral placeholder box in the gap (group chrome = B-3). A SIBLING
-        // of the member cards in content space — never their parent, or the group
-        // origin would apply twice.
+        let name = meta.map(|m| m.name.clone()).unwrap_or_default();
+        let completed = meta.map(|m| m.completed_count).unwrap_or(0);
+        let accent = group_accent(meta.and_then(|m| m.color_token.as_deref()));
+
+        // Fold the rollup from member cards (snapshot the values we need — owned).
+        let members: Vec<SessionCard> = {
+            let fleet = self.fleet.read(cx);
+            sessions
+                .iter()
+                .filter_map(|s| fleet.cards.get(s).map(|e| e.read(cx).clone()))
+                .collect()
+        };
+        let member_refs: Vec<&SessionCard> = members.iter().collect();
+        let rollup = rollup::group_rollup(&member_refs, completed);
+        let header = rollup::group_header_text(&name, &rollup, now_ms);
+
+        let snapshot = GroupChromeSnapshot {
+            session_ids: sessions.to_vec(),
+            name: name.clone(),
+            accent,
+            rollup: rollup.clone(),
+            header: header.clone(),
+        };
+
+        let mut out: Vec<AnyElement> = Vec::with_capacity(sessions.len() + 2);
+
+        // Ring + tint box in the gap (spec §3). Sibling of the member cards.
         out.push(
             div()
                 .absolute()
@@ -324,9 +413,46 @@ impl BoardView {
                 .h(px(block_h + 2.0 * INSET))
                 .rounded(px(12.0))
                 .border_1()
-                .border_color(gpui::rgb(0x3a3a42))
+                .border_color(accent)
+                .bg(accent.opacity(0.07)) // SSOT color-mix ~7% body wash
                 .into_any_element(),
         );
+
+        // Header-lane (top HEADER-tall band): dot · name · spend · age · ✓N · caret.
+        out.push(
+            div()
+                .absolute()
+                .left(px(x))
+                .top(px(y))
+                .w(px(block_w))
+                .h(px(HEADER))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1p5()
+                .px_1p5()
+                .child(div().size(px(8.0)).rounded_full().bg(accent))
+                .child(div().text_color(gpui::rgb(0xd6d6de)).child(name.clone()))
+                .child(
+                    div()
+                        .flex_grow()
+                        .text_color(gpui::rgb(0x8a8a94))
+                        .child(format!(
+                            "{} · {}",
+                            rollup::format_group_spend(rollup.spend_usd),
+                            rollup::format_age(rollup.oldest_created_at, now_ms),
+                        )),
+                )
+                .child(
+                    div()
+                        .text_color(gpui::rgb(0x8a8a94))
+                        .child(format!("✓{completed}")),
+                )
+                .child(div().text_color(gpui::rgb(0x8a8a94)).child("⌄"))
+                .into_any_element(),
+        );
+
+        // Members at full size in body-zones (unchanged geometry from B-2).
         for (i, session) in sessions.iter().enumerate() {
             let cc = i % fc;
             let rr = i / fc;
@@ -336,13 +462,25 @@ impl BoardView {
                 out.push(tile);
             }
         }
-        out
+
+        (out, snapshot)
     }
 
     /// Test hook: the session ids whose tiles were built (in the visible band) at
     /// the last render — proves culling.
     pub fn visible_session_ids_for_test(&self) -> Vec<SessionId> {
         self.last_built.clone()
+    }
+
+    /// Test hook: the group chrome computed at the last render.
+    pub fn group_chrome_for_test(&self) -> Vec<GroupChromeSnapshot> {
+        self.last_group_chrome.clone()
+    }
+
+    /// Test hook (B-3): inject a hand-built layout so the group render path is
+    /// reachable. Production uses `build_ephemeral_layout` (no groups until B-4).
+    pub fn set_test_layout_for_test(&mut self, layout: BoardLayout) {
+        self.test_layout = Some(layout);
     }
 
     /// Acceptance-test hook: map session id → cached card view entity.
