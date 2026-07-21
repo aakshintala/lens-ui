@@ -1,3 +1,8 @@
+> **✅ SUPERSEDED — Slice 2c is DONE (2026-07-21).** All tasks T5–T8 executed, whole-slice codex
+> review (9 findings) + re-review (3) folded, `mouse_realwindow` (4 phases) + live P6 PASS, docs
+> updated. Full slice `f1922c5..c924fd9` on `terminal-ws` (unpushed — merge→main is the user's call).
+> This handoff is retained as the execution record; current state lives in `docs/STATUS.md`.
+
 # Handoff — Terminal Slice 2c (mouse) EXECUTION, resume at Task 5 (2026-07-21)
 
 **Self-contained driver for a fresh session.** The engine side of 2c (Tasks 1–4) is DONE, committed, gate-green. Resume at **Task 5** (foreground capture) → T6 → T7 → **Opus whole-slice review** → **T8** (needs a user heads-up).
