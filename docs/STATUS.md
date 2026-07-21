@@ -5,7 +5,7 @@ the current forward-looking state only. **Full dated session entries live in
 [`STATUS-ARCHIVE.md`](./STATUS-ARCHIVE.md)** — write each session's detail there
 and roll older "Recent" pointers off this page as they age.
 
-_Last curated 2026-07-20 (transcript fan-out decomposed into build-slices T-1..T-6)._
+_Last curated 2026-07-21 (transcript T-1 spec written; resliced T-1..T-7 — sub-agent promoted to T-5)._
 
 ---
 
@@ -45,18 +45,24 @@ _Last curated 2026-07-20 (transcript fan-out decomposed into build-slices T-1..T
   permissions) can fan out against `ContentTab`/`TabHandle`. Product design is **complete**
   (`docs/design/conversation-transcript.md`, §1–§21); this workstream is **implementation decomposition +
   gpui/lens-ui specifics**, not product design.
-  - **Decomposed 2026-07-20 (brainstorm) into six build-slices T-1..T-6**, each its own
-    brainstorm→spec→plan→build cycle, dependency order below. Slices are *internal build increments* (like
-    Board B-1..B-6) — the **surface** is not declared done until its closer lands. Two real surfaces fall
-    out: **History view** (read-only transcript, no composer — §18, used for archived/sleeping sessions) is
-    complete after **T-5**; **Chat column (full)** is complete after **T-6**. No functionality is deferred
-    *out* of the workstream — the earlier "composer/interrupt/permissions belong elsewhere" framing was the
-    error and is corrected: they are **T-6**, in-scope.
-  - **T-1 — ViewBlock projection pipeline (pure).** §3/§4. Pure transforms over `&[Item]` + `StreamScratch`
-    → `Vec<ViewBlock>` (`pair_tool_spans`, `group_work_section`, `merge_optimistic_user`,
-    `flatten_sub_agents`, `hide_reasoning`, `with_agent_changed_markers`); exhaustive `ItemKind` match;
-    no gpui, fully unit-testable. The spine. *(Open for its brainstorm: `lens-core` vs `lens-ui` home.)*
-    **← brainstorm this first.**
+  - **Decomposed 2026-07-20 (brainstorm) into build-slices T-1..T-7** (resliced 2026-07-21: sub-agent
+    span promoted to its own slice T-5 — it's a child-*session* feature, not a depth transform — pushing
+    turn-lifecycle→T-6, composer→T-7), each its own brainstorm→spec→plan→build cycle, dependency order
+    below. Slices are *internal build increments* (like Board B-1..B-6) — the **surface** is not declared
+    done until its closer lands. Two real surfaces fall out: **History view** (read-only transcript, no
+    composer — §18, used for archived/sleeping sessions) is complete after **T-6**; **Chat column (full)**
+    is complete after **T-7**. No functionality is deferred *out* of the workstream — the earlier
+    "composer/interrupt/permissions belong elsewhere" framing was the error and is corrected: they are
+    **T-7**, in-scope.
+  - **T-1 — ViewBlock projection pipeline (pure).** §3/§4. Pure staged pipeline over `&[Item]` +
+    `StreamScratch` → `Vec<ViewBlock>`; new `reduce/view.rs` in **lens-core**; exhaustive `ItemKind`
+    match; no gpui, fully unit-testable. The spine. **SPEC WRITTEN 2026-07-21**
+    (`docs/specs/2026-07-21-transcript-t1-viewblock-projection-design.md`) — cross-family review in
+    flight; **plan in a new session.** Key resolutions: staged (filter→project→group) not uniform pipe;
+    `WorkSection` drops `open` (render owns) + carries item-derivable `meta` only (model/token/cost are
+    session-level → T-6); liveness via `scratch.turn` vs `ctx.turn`; **`OptimisticUser` dropped** (pending
+    is composer-owned → T-7); **`SubAgentSpan` dropped** (child-session model → T-5); `ReconnectBreak`
+    emission → T-2.
   - **T-2 — Focused view scaffold + virtualized disk-sourced surface.** §16/§17. Mount focused `ContentTab`
     in `#chat-slot`; lift `RowSource` (id-keyed retained store) from spike to production; native
     `list()`/`ListState`/`ListAlignment::Bottom`; D23 disk-paint (finalized from `TranscriptStore`, live
@@ -67,15 +73,22 @@ _Last curated 2026-07-20 (transcript fan-out decomposed into build-slices T-1..T
     debounce reset, `clear_selection` on reparse, `list_state.reset` scroll-jump); markdown-vs-verbatim
     channels + user backtick-gating; sanitization pre-pass; streaming safe-prefix / stable identity;
     reasoning + capped scroll region.
-  - **T-4 — Tool spans, sub-agent spans, native tools, resource markers.** §8/§9/§12. Tool-span render
-    (archetypes, truncation tiers, inline edit diff); §8.6 in-transcript sub-agent span (peek,
-    navigate-to-child, output-in-transcript); native tools; §12 inline resource markers. **Bucket-B stubs
+  - **T-4 — Tool spans, native tools, resource markers.** §8/§9/§12. Tool-span render (archetypes,
+    truncation tiers, inline edit diff); native tools; §12 inline resource markers. **Bucket-B stubs
     live here** — "show full → editor/Review", "dock to Canvas", "open terminal" render **inert/disabled**;
     **no invented inline fallbacks** (they'd be ripped out by the real surfaces).
-  - **T-5 — Turn lifecycle, compaction, agent-changed, todos, minor items.** §4/§10/§11/§13/§14.
-    Work-section collapse lifecycle, compaction marker, AgentChanged marker, inline todos (forms 1–3),
-    minor items, reconnect break. **← History view complete here.**
-  - **T-6 — Composer & complete live turn (the chat closer).** §15/§18. Always-sends composer; optimistic
+  - **T-5 — Sub-agent spans (child-session model).** §8.6. Sub-agents are child *sessions*
+    (`session.child_session.created/updated`, linked by `parent_session_id`), **not** `ctx.depth` items —
+    so this is a real feature, not a T-1 transform. Reducer folding of `child_session.*` into a
+    parent↔child registry + live status; project `SubAgentSpan` at the spawn point; §8.6 render (collapsed
+    span, peek, output-in-transcript); **navigate-into-child** shares the shell's session-focus machinery
+    (the one cross-surface seam). Reuses T-4's span/output render. Prereq: reducer child-session fold.
+  - **T-6 — Turn lifecycle, compaction, agent-changed, todos, minor items.** §4/§10/§11/§13/§14.
+    Work-section collapse lifecycle (expand/override state — T-1 emits no `open`), the chip's
+    model/token/cost line (**prereq:** per-turn usage deltas, a state-model change — snapshot cumulative at
+    each `response.completed`), compaction marker, AgentChanged marker, inline todos (forms 1–3), minor
+    items, reconnect break. **← History view complete here.**
+  - **T-7 — Composer & complete live turn (the chat closer).** §15/§18. Always-sends composer; optimistic
     user bubble (`⋯ sending` → settle on `session.input.consumed` → `⚠ failed·retry`); **Esc-interrupt**
     (+ new lens-core `Interrupt` command + lens-client call — server already echoes `session.interrupted`/
     `response.incomplete`); **permission/elicitation dock + widget integration** (reuse the GO elicitation
