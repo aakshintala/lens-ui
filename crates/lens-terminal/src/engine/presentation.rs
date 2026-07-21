@@ -35,6 +35,9 @@ pub enum EnginePresentationEvent {
     LocalClick {
         col: u16,
         row: u16,
+        /// Click token from the originating Left Down; correlates the foreground's
+        /// click-time frame snapshot (codex F2 re-review).
+        seq: u64,
     },
 }
 
@@ -68,7 +71,7 @@ pub(crate) struct PresentationDrainResult {
     pub title_outcome: TitleDrainOutcome,
     pub validated_hyperlink_urls: Vec<String>,
     pub clipboard_writes: Vec<(ClipboardLocation, Vec<ClipboardMimePart>)>,
-    pub local_clicks: Vec<(u16, u16)>,
+    pub local_clicks: Vec<(u16, u16, u64)>,
 }
 
 impl Default for PresentationDrainResult {
@@ -104,8 +107,8 @@ pub(crate) fn collect_presentation_drain(
             EnginePresentationEvent::ClipboardWrite { location, contents } => {
                 clipboard_writes.push((location, contents));
             }
-            EnginePresentationEvent::LocalClick { col, row } => {
-                local_clicks.push((col, row));
+            EnginePresentationEvent::LocalClick { col, row, seq } => {
+                local_clicks.push((col, row, seq));
             }
         }
     }

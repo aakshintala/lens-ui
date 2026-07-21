@@ -458,17 +458,22 @@ pub struct TerminalTab {
     report_policy: engine::command::MouseReportPolicy,
     /// Monotonic base for MouseGesture.time multi-click derivation. Slice 2c.
     mouse_time_base: std::time::Instant,
-    /// Frame captured at the most recent Left mouse-down. A `LocalClick` (hyperlink open)
-    /// resolves its cell against THIS click-time frame, not the current frame, so
-    /// intervening terminal output cannot repaint the cell and open an unclicked URL
-    /// (codex whole-slice F2 — TOCTOU). RESIDUAL (documented): a single slot correlates
-    /// correctly for one click in flight (the dominant case); two Left-downs within one
-    /// drain cycle share the latest frame. A per-click token round-tripped through the
-    /// engine's `LocalClick` would fully correlate them (deferred).
-    pending_click_frame: Option<Arc<Frame>>,
+    /// Per-click frame snapshots keyed by a foreground-minted click token. A `LocalClick`
+    /// (hyperlink open) resolves its cell against the frame captured at ITS OWN Left-down
+    /// (matched by the token the engine echoes), not the current frame — so intervening
+    /// terminal output cannot repaint the cell and open an unclicked URL, and overlapping
+    /// clicks each resolve against their own down-frame (codex F2 + re-review). Bounded
+    /// ring: un-claimed entries (downs that became reports/drags) evict oldest-first.
+    pending_click_frames: VecDeque<(u64, Arc<Frame>)>,
+    /// Monotonic source for the Left-down click token.
+    next_click_seq: u64,
 }
 
 const PENDING_HOST_REQUESTS_CAP: usize = 64;
+
+/// Bound on retained per-click frame snapshots (F2). Only Left-downs that become a no-drag
+/// local click claim theirs; un-claimed entries (reports/drags) evict oldest-first.
+const CLICK_FRAME_CAP: usize = 16;
 
 /// Maximum paste payload size (bytes). Over-cap pastes are rejected, never truncated.
 pub const MAX_PASTE_BYTES: usize = 1 << 20;
@@ -509,7 +514,8 @@ impl TerminalTab {
             mouse_local: false,
             report_policy: engine::command::MouseReportPolicy::Auto,
             mouse_time_base: std::time::Instant::now(),
-            pending_click_frame: None,
+            pending_click_frames: VecDeque::new(),
+            next_click_seq: 0,
         }
     }
 
@@ -564,7 +570,8 @@ impl TerminalTab {
             mouse_local: false,
             report_policy: engine::command::MouseReportPolicy::Auto,
             mouse_time_base: std::time::Instant::now(),
-            pending_click_frame: None,
+            pending_click_frames: VecDeque::new(),
+            next_click_seq: 0,
         }
     }
 
@@ -893,6 +900,7 @@ impl TerminalTab {
         position: gpui::Point<Pixels>,
         modifiers: &gpui::Modifiers,
         cell_override_none: bool,
+        click_seq: u64,
     ) {
         let Some(frame) = self.render.latest_frame() else {
             return;
@@ -923,6 +931,7 @@ impl TerminalTab {
             time: self.mouse_time_base.elapsed(),
             mouse_local: self.mouse_local,
             policy: self.report_policy,
+            click_seq,
             access_epoch: 0,
             ack: None,
         });
@@ -935,17 +944,30 @@ impl TerminalTab {
         _cx: &mut Context<Self>,
     ) {
         let button = gpui_button_to_kind(event.button);
-        // Capture the click-time frame so a later LocalClick resolves its hyperlink against
-        // what was under the cursor at press, not a frame the terminal repainted since (F2).
-        if button == Some(engine::command::MouseButtonKind::Left) {
-            self.pending_click_frame = self.render.latest_frame();
-        }
+        // Mint a click token and snapshot the click-time frame under it, so a later
+        // LocalClick resolves its hyperlink against what was under the cursor at THIS press
+        // (matched by token) — not a frame the terminal repainted since, and correctly even
+        // with overlapping clicks (F2 + re-review).
+        let click_seq = if button == Some(engine::command::MouseButtonKind::Left) {
+            self.next_click_seq = self.next_click_seq.wrapping_add(1);
+            let seq = self.next_click_seq;
+            if let Some(frame) = self.render.latest_frame() {
+                if self.pending_click_frames.len() >= CLICK_FRAME_CAP {
+                    self.pending_click_frames.pop_front();
+                }
+                self.pending_click_frames.push_back((seq, frame));
+            }
+            seq
+        } else {
+            0
+        };
         self.lower_mouse_gesture(
             engine::command::MouseEventKind::Down,
             button,
             event.position,
             &event.modifiers,
             false,
+            click_seq,
         );
     }
 
@@ -962,6 +984,7 @@ impl TerminalTab {
             event.position,
             &event.modifiers,
             false,
+            0,
         );
     }
 
@@ -978,6 +1001,7 @@ impl TerminalTab {
             event.position,
             &event.modifiers,
             false,
+            0,
         );
     }
 
@@ -994,6 +1018,7 @@ impl TerminalTab {
             event.position,
             &event.modifiers,
             true,
+            0,
         );
     }
 
@@ -1572,22 +1597,20 @@ impl TerminalTab {
                 url: url.clone(),
             });
         }
-        if !result.local_clicks.is_empty() {
-            // Resolve against the click-time frame (F2). Consume it so a stale snapshot
-            // can't back a later spurious click; fall back to the current frame only if no
-            // down was captured (e.g. a click that began before the first paint).
-            let click_frame = self
-                .pending_click_frame
-                .take()
+        for (col, row, seq) in &result.local_clicks {
+            // Resolve against the frame captured at THIS click's own Left-down (matched by
+            // token), so intervening output can't repaint the cell and open an unclicked
+            // URL, and overlapping clicks don't cross frames (F2). Fall back to the current
+            // frame only if the down was never snapshotted (e.g. click before first paint).
+            // Inlined field access (not a &mut self method) so it coexists with `engine`.
+            let click_frame = claim_click_frame(&mut self.pending_click_frames, *seq)
                 .or_else(|| self.render.latest_frame());
-            if let Some(frame) = click_frame {
-                for (col, row) in &result.local_clicks {
-                    if let Some(url) = hit_test::uri_for_gesture(frame.as_ref(), *col, *row) {
-                        let id = HostRequestId(self.next_host_request_id);
-                        self.next_host_request_id = self.next_host_request_id.wrapping_add(1);
-                        cx.emit(TerminalEvent::OpenUrlRequest { id, url });
-                    }
-                }
+            if let Some(frame) = click_frame
+                && let Some(url) = hit_test::uri_for_gesture(frame.as_ref(), *col, *row)
+            {
+                let id = HostRequestId(self.next_host_request_id);
+                self.next_host_request_id = self.next_host_request_id.wrapping_add(1);
+                cx.emit(TerminalEvent::OpenUrlRequest { id, url });
             }
         }
         match &result.title_outcome {
@@ -2158,6 +2181,16 @@ fn starting_presentation(target: &TerminalTarget, options: &TerminalOpenOptions)
         detached_detail: None,
         reattach_available: false,
     }
+}
+
+/// Claim the click-time frame for a `LocalClick` token, dropping it and any older un-claimed
+/// snapshots (downs that became reports/drags never emit a LocalClick, so entries preceding
+/// the claimed one can never be claimed and are pruned). Free fn so it borrows only the deque
+/// field (coexists with the `engine` borrow in `drain_presentation_events`).
+fn claim_click_frame(frames: &mut VecDeque<(u64, Arc<Frame>)>, seq: u64) -> Option<Arc<Frame>> {
+    let pos = frames.iter().position(|(s, _)| *s == seq)?;
+    frames.drain(..pos);
+    frames.pop_front().map(|(_, frame)| frame)
 }
 
 fn gpui_button_to_kind(b: gpui::MouseButton) -> Option<engine::command::MouseButtonKind> {

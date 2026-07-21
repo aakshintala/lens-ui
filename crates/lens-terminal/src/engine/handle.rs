@@ -674,6 +674,7 @@ mod tests {
             time: Duration::ZERO,
             mouse_local: false,
             policy: MouseReportPolicy::Auto,
+            click_seq: 0,
             access_epoch: 0,
             ack: None,
         }
@@ -1268,7 +1269,46 @@ mod tests {
             .presentation_rx()
             .recv_timeout(Duration::from_secs(2))
             .expect("LocalClick presentation");
-        assert_eq!(ev, EnginePresentationEvent::LocalClick { col: 0, row: 0 });
+        assert_eq!(
+            ev,
+            EnginePresentationEvent::LocalClick {
+                col: 0,
+                row: 0,
+                seq: 0
+            }
+        );
+        h.stop();
+    }
+
+    #[test]
+    fn mouse_local_click_echoes_down_click_seq() {
+        // codex F2 re-review: the LocalClick carries the token from its originating Down so
+        // the foreground correlates the click-time frame.
+        let h = EngineHandle::spawn(test_config());
+        h.feed(b"hello".to_vec()).expect("feed"); // no tracking -> Left selects
+        let mut down = base_mouse_gesture(MouseEventKind::Down, Some(MouseButtonKind::Left));
+        down.click_seq = 42;
+        assert_eq!(
+            send_mouse(&h, down).disposition,
+            GestureDisposition::Selected
+        );
+        let up_ack = send_mouse(
+            &h,
+            base_mouse_gesture(MouseEventKind::Up, Some(MouseButtonKind::Left)),
+        );
+        assert_eq!(up_ack.disposition, GestureDisposition::LocalClick);
+        let ev = h
+            .presentation_rx()
+            .recv_timeout(Duration::from_secs(2))
+            .expect("LocalClick presentation");
+        assert_eq!(
+            ev,
+            EnginePresentationEvent::LocalClick {
+                col: 0,
+                row: 0,
+                seq: 42
+            }
+        );
         h.stop();
     }
 

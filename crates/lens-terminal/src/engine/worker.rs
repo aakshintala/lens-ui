@@ -157,6 +157,8 @@ struct Latch {
     epoch: u64,
     suppressed: bool,
     dragged: bool,
+    /// Click token from the Down; echoed on `LocalClick` for frame correlation (codex F2).
+    click_seq: u64,
 }
 
 #[derive(Debug)]
@@ -247,7 +249,10 @@ pub(crate) fn spawn_worker(
         loop {
             #[cfg(any(test, feature = "test-util"))]
             while worker_stall_gate.load(Ordering::Acquire) {
-                thread::yield_now();
+                // Sleep rather than busy-spin: a held worker must not monopolize a core, or
+                // (with many engines under `cargo test` parallelism) it starves other
+                // engines' build workers past their deadlines and flakes the suite.
+                thread::sleep(Duration::from_millis(1));
             }
 
             let throttle_remaining = DEFAULT_BUILD_INTERVAL.saturating_sub(last_build.elapsed());
@@ -1117,6 +1122,7 @@ fn handle_mouse_down(
             epoch: g.access_epoch,
             suppressed: false,
             dragged: false,
+            click_seq: g.click_seq,
         });
         mouse_state.any_button_pressed = true;
         // A new report gesture starts a fresh motion-dedup scope: reset so this gesture's
@@ -1139,6 +1145,7 @@ fn handle_mouse_down(
             epoch: g.access_epoch,
             suppressed: false,
             dragged: false,
+            click_seq: g.click_seq,
         });
         if let Some((col, row)) = g.cell {
             match engine.apply_selection_press(col, row, g.px_x, g.px_y, g.time) {
@@ -1316,9 +1323,13 @@ fn handle_mouse_up(
                                 // A full presentation channel drops the click: report it
                                 // honestly (Ignored + inspect) rather than acking a
                                 // LocalClick that never reached the foreground (codex F9).
-                                match presentation_tx
-                                    .try_send(EnginePresentationEvent::LocalClick { col, row })
-                                {
+                                match presentation_tx.try_send(
+                                    EnginePresentationEvent::LocalClick {
+                                        col,
+                                        row,
+                                        seq: latch.click_seq,
+                                    },
+                                ) {
                                     Ok(()) => (Vec::new(), GestureDisposition::LocalClick),
                                     Err(_) => {
                                         inspect.record_local_click_dropped();

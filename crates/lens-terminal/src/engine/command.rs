@@ -336,6 +336,10 @@ pub(crate) struct MouseGesture {
     pub time: Duration, // monotonic (for set_time multi-click)
     pub mouse_local: bool,
     pub policy: MouseReportPolicy,
+    /// Foreground-minted click token (nonzero on a Left Down). Stored in the engine's Select
+    /// latch and echoed on `LocalClick` so the foreground resolves the hyperlink against the
+    /// frame captured at THIS click's down, correlating overlapping clicks (codex F2).
+    pub click_seq: u64,
     pub access_epoch: u64,             // stamped by enqueue_input
     pub ack: Option<Sender<MouseAck>>, // tests; None in production
 }
