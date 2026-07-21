@@ -421,3 +421,38 @@ impl Render for BoardView {
         div().id("board-view").size_full().child(body)
     }
 }
+
+/// Group accent color from its persisted `color_token` (spec §3, SSOT palette
+/// `docs/design/renders/board-home.html:8-12`). Unknown / `None` → neutral slate.
+/// B-3-local resolver; promoting these to `LensTheme` tokens is a documented
+/// follow-up (matches the B-2 arm hardcoding its border color).
+fn group_accent(token: Option<&str>) -> gpui::Hsla {
+    let hex: u32 = match token {
+        Some("blue") => 0x4c8dff,
+        Some("orange") => 0xff8a3d,
+        Some("green") => 0x36c98a,
+        Some("purple") => 0xb08cff,
+        _ => 0x6b7280, // neutral slate
+    };
+    gpui::rgb(hex).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn group_accent_maps_ssot_tokens() {
+        assert_eq!(group_accent(Some("blue")), gpui::rgb(0x4c8dff).into());
+        assert_eq!(group_accent(Some("orange")), gpui::rgb(0xff8a3d).into());
+        assert_eq!(group_accent(Some("green")), gpui::rgb(0x36c98a).into());
+        assert_eq!(group_accent(Some("purple")), gpui::rgb(0xb08cff).into());
+    }
+
+    #[test]
+    fn group_accent_unknown_and_none_fall_back_to_neutral() {
+        let neutral: gpui::Hsla = gpui::rgb(0x6b7280).into();
+        assert_eq!(group_accent(None), neutral);
+        assert_eq!(group_accent(Some("chartreuse")), neutral);
+    }
+}
