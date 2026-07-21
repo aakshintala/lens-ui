@@ -12,7 +12,7 @@ use layout_adapter::build_ephemeral_layout;
 use lens_core::domain::board::BoardNode;
 use lens_core::domain::ids::SessionId;
 use lens_core::pack::{self, CARD_H, CARD_W, CELL_H, CELL_W, GAP, HEADER, INSET, Item};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Width of the left nav rail (unchanged placeholder).
 const NAV_RAIL_W: f32 = 48.0;
@@ -44,11 +44,9 @@ pub struct BoardView {
     cached_tiles: HashMap<SessionId, AnyView>,
     working_tab: TabHandle,
     pty_probe: Option<PtyProbe>,
-    /// Mode at the last `render` (the actually-displayed layout, not merely the last
-    /// observed fleet state) — drives the focus→board viewport-gate reset. Tracked in
-    /// render so it is correct even when the board first mounts already focused (no fleet
-    /// notification would establish it otherwise → the re-entry freeze would recur).
-    last_mode: Option<ShellMode>,
+    /// Session ids currently gated visible (their anim timers allowed to run).
+    /// The container is the sole authority; diffed each render, applied via defer.
+    gated_visible: HashSet<SessionId>,
     /// Scroll position of the board masonry surface (spec §4 unknown 1).
     board_scroll: ScrollHandle,
     /// Scroll position of the focused-mode rail (same container at 1 col, §5).
@@ -84,7 +82,6 @@ impl BoardView {
         let fleet_for_observe = fleet.clone();
         cx.observe(&fleet_for_observe, |board: &mut BoardView, _, cx| {
             board.sync_card_views(cx);
-            board.recover_viewport_gates_on_reentry(cx);
             cx.notify();
         })
         .detach();
@@ -94,7 +91,7 @@ impl BoardView {
             cached_tiles,
             working_tab,
             pty_probe,
-            last_mode: None,
+            gated_visible: HashSet::new(),
             board_scroll: ScrollHandle::new(),
             rail_scroll: ScrollHandle::new(),
             last_built: Vec::new(),
@@ -122,32 +119,31 @@ impl BoardView {
         self.card_views.insert(id, view);
     }
 
-    /// Viewport-gate recovery on the focus→board edge (runs in the fleet-observe effect,
-    /// never in render). A card that sat off-screen in the focus rail carries stale
-    /// off-screen `last_bounds` and a dropped anim driver; the single board re-entry render
-    /// would read it as hidden and never respawn the driver → frozen spinner/pulse. On the
-    /// transition back to the board, clear each card's gate (so the next render re-evaluates
-    /// visibility as first-frame and respawns if animating) and `notify()` the view so the
-    /// re-render lands in `dirty_views` — the same path a card-entity notify takes, which is
-    /// why the still-focused-from card (which gets a Demote notify) never froze. Doing this
-    /// in an effect (not render) keeps entity access out of `detect_accessed_entities`, which
-    /// would otherwise perturb the cached views' dirty-tracking and swallow their ticks.
-    fn recover_viewport_gates_on_reentry(&mut self, cx: &mut Context<Self>) {
-        // Compare the fleet's current mode against the last *rendered* mode (updated in
-        // `render`). The imminent board re-render advances `last_mode` to Board afterwards.
-        let mode = ShellMode::from_fleet(self.fleet.read(cx));
-        let returned_to_board =
-            mode == ShellMode::Board && matches!(self.last_mode, Some(ShellMode::Focused { .. }));
-        if !returned_to_board {
+    /// Apply the container-computed visible set to the card views — the diff since
+    /// last frame, pushed via `App::defer` so no sibling card entity is read inside
+    /// `render`'s accessed-entity window (the `.cached()` dirty-tracking landmine,
+    /// [[viewport-reentry-freeze]]). Newly-visible cards spawn their timers; newly-
+    /// hidden cards drop them. Cards absent from any surface stay hidden.
+    fn apply_visibility_gate(&mut self, want: HashSet<SessionId>, cx: &mut Context<Self>) {
+        if want == self.gated_visible {
             return;
         }
-        let views: Vec<_> = self.card_views.values().cloned().collect();
-        for view in views {
-            view.update(cx, |v, cx| {
-                v.invalidate_viewport_gate();
-                cx.notify();
-            });
-        }
+        let newly_vis: Vec<SessionId> = want.difference(&self.gated_visible).cloned().collect();
+        let newly_hid: Vec<SessionId> = self.gated_visible.difference(&want).cloned().collect();
+        let views = self.card_views.clone(); // Entity clones are cheap (Rc)
+        self.gated_visible = want;
+        cx.defer(move |app: &mut App| {
+            for id in newly_vis {
+                if let Some(v) = views.get(&id) {
+                    v.update(app, |c, cx| c.set_visible(true, cx));
+                }
+            }
+            for id in newly_hid {
+                if let Some(v) = views.get(&id) {
+                    v.update(app, |c, cx| c.set_visible(false, cx));
+                }
+            }
+        });
     }
 
     fn sync_card_views(&mut self, cx: &mut Context<Self>) {
@@ -241,9 +237,12 @@ impl BoardView {
             }
             match placed.item.kind {
                 pack::Kind::Card => {
-                    if let Some(tile) =
-                        self.absolute_card(&sessions[0], placed.cell_left(), placed.cell_top() + HEADER, cx)
-                    {
+                    if let Some(tile) = self.absolute_card(
+                        &sessions[0],
+                        placed.cell_left(),
+                        placed.cell_top() + HEADER,
+                        cx,
+                    ) {
                         content = content.child(tile);
                     }
                 }
@@ -376,23 +375,24 @@ impl Render for BoardView {
         let viewport_h = f32::from(viewport.height);
         let viewport_w = f32::from(viewport.width);
 
-        let body = match &mode {
+        let (body, visible): (_, Vec<SessionId>) = match &mode {
             ShellMode::Board => {
                 let avail = (viewport_w - NAV_RAIL_W).max(CELL_W);
-                let (surface, _visible) =
+                let (surface, visible) =
                     self.pack_and_render(avail, viewport_h, self.board_scroll.clone(), cx);
-                div()
+                let el = div()
                     .id("shell-board")
                     .flex()
                     .flex_row()
                     .size_full()
                     .child(self.render_nav_rail())
-                    .child(div().flex_grow().h_full().child(surface))
+                    .child(div().flex_grow().h_full().child(surface));
+                (el.into_any_element(), visible)
             }
             ShellMode::Focused { .. } => {
-                let (rail, _visible) =
+                let (rail, visible) =
                     self.pack_and_render(RAIL_W, viewport_h, self.rail_scroll.clone(), cx);
-                div()
+                let el = div()
                     .id("shell-focused")
                     .flex()
                     .flex_row()
@@ -412,9 +412,11 @@ impl Render for BoardView {
                             .id("working-area-slot")
                             .flex_grow()
                             .child(self.working_tab.view.clone()),
-                    )
+                    );
+                (el.into_any_element(), visible)
             }
         };
+        self.apply_visibility_gate(visible.into_iter().collect(), cx);
         div().id("board-view").size_full().child(body)
     }
 }
