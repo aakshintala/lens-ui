@@ -8,6 +8,7 @@ mod scratch;
 mod snapshot;
 pub mod transforms;
 pub mod update;
+pub mod view;
 
 #[cfg(test)]
 pub(crate) mod testutil;
