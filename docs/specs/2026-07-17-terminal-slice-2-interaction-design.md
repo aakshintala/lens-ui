@@ -184,12 +184,42 @@ bool`; **only the *authoritative mode source* (`set_options_from_terminal`) need
 
 ---
 
+## Amendment 2026-07-20 — 2b/2c re-cut + `ClipboardPolicy` seam
+
+Execution went **serial** (2a→2d→2b→2c on `terminal-ws`, no worktrees — see the execution
+handoff). Two decisions taken when planning **2b** (user-approved 2026-07-20) supersede the
+original 2b/2c phase split below:
+
+1. **Selection + copy move from 2b into 2c.** Local selection and `Cmd+C` copy need GPUI
+   mouse-drag capture + pixel→cell + motion-coalescing — the *exact* infrastructure 2c builds
+   for mouse **reporting** — and 2c's headline **shift/XTSHIFTESCAPE arbitration** literally
+   arbitrates selection-vs-report. Keeping them in 2b would build mouse capture twice (or make
+   2c reach back into 2b). So the re-cut is:
+   - **2b = OSC-52 output-clipboard write policy + `Cmd+V` paste** — both keyboard/output-only,
+     **zero mouse dependency**. This is what 2d deferred, plus paste.
+   - **2c = mouse capture → { local selection + `Cmd+C` copy, mouse reporting } + XTSHIFTESCAPE
+     arbitration + pixel→cell/coalescing** — the capture stack is built **once**.
+   The completion-matrix rows move accordingly (selection/copy → 2c; OSC-52 + paste stay 2b).
+2. **Policy state is session-scoped behind an injectable `ClipboardPolicy` seam** — the paste
+   multiline-warn "don't warn again" flag and the OSC-52 "allow for session" decision live in
+   foreground per-tab state (reset per process), behind a small trait so `lens-ui` can inject a
+   **persisted** impl later without touching 2b. The spec's earlier "**persisted**" wording for
+   these two becomes a **documented deferral** — 2b ships the in-memory demo impl + the seam.
+
+Binding facts pinned for 2b execution: `on_clipboard_write`'s result is **ignored by OSC-52**
+(callback never backpressures; policy is applied on the **foreground**, async, never in the
+callback); `ClipboardContent{ mime, data }` is already **base64-decoded** (the named byte cap is
+on summed `data.len()`, applied **before** cloning owned copies); OSC-52 **reads** never reach the
+callback (binding-level); `paste::encode(&mut, bracketed, &mut)` reads live mode 2004 engine-side.
+
 ## Per-phase design
 
 Build order: **`2a ∥ 2d` (independent) → `2b` (needs 2a *and* 2d's presentation egress) →
 `2c` (needs 2b + 2a)**. `2a`/`2d` run as parallel worktrees, each cross-family reviewed
 by a *different* family (the 1a∥1b pattern). **2b must not begin against a 2d stub that
 lacks the `EnginePresentationEvent` path** (OSC 52 arrives on it).
+*(Superseded by the 2026-07-20 amendment above: execution was serial, not worktrees; and
+selection/copy moved 2b→2c.)*
 
 ### 2a — Input path: keyboard + IME + focus + read-only gating
 
