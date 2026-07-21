@@ -101,11 +101,14 @@ impl InputForwarder {
     }
 }
 
-/// Honest revoke ack for stale Key commands — never leave the caller hanging.
+/// Honest revoke ack for stale Key/Paste commands — never leave the caller hanging.
 fn send_stale_revoke_ack(cmd: EngineCommand) {
-    if let EngineCommand::Key(mut input) = cmd
-        && let Some(tx) = input.ack.take()
-    {
+    let ack_tx = match cmd {
+        EngineCommand::Key(mut input) => input.ack.take(),
+        EngineCommand::Paste(mut input) => input.ack.take(),
+        _ => None,
+    };
+    if let Some(tx) = ack_tx {
         let _ = tx.try_send(InputAck {
             encoded: Vec::new(),
             accepted: false,
@@ -117,6 +120,7 @@ fn send_stale_revoke_ack(cmd: EngineCommand) {
 fn is_stale(cmd: &EngineCommand, current_epoch: u64) -> bool {
     match cmd {
         EngineCommand::Key(k) => k.access_epoch < current_epoch,
+        EngineCommand::Paste(p) => p.access_epoch < current_epoch,
         EngineCommand::Focus { access_epoch, .. } => *access_epoch < current_epoch,
         _ => false,
     }
@@ -167,7 +171,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::engine::command::{KeyAction, KeyInput, KeyMods, LensKey, ScrollDelta};
+    use crate::engine::command::{KeyAction, KeyInput, KeyMods, LensKey, PasteInput, ScrollDelta};
 
     fn key_with_epoch(epoch: u64) -> EngineCommand {
         EngineCommand::Key(KeyInput {
@@ -181,10 +185,20 @@ mod tests {
         })
     }
 
+    fn paste_with_epoch(epoch: u64) -> EngineCommand {
+        EngineCommand::Paste(PasteInput {
+            bytes: b"ab".to_vec(),
+            access_epoch: epoch,
+            ack: None,
+        })
+    }
+
     #[test]
     fn is_stale_drops_prior_epoch_key_and_focus_not_scroll() {
         assert!(is_stale(&key_with_epoch(0), 1));
         assert!(!is_stale(&key_with_epoch(1), 1));
+        assert!(is_stale(&paste_with_epoch(0), 1));
+        assert!(!is_stale(&paste_with_epoch(1), 1));
         assert!(is_stale(
             &EngineCommand::Focus {
                 focused: true,
@@ -208,6 +222,21 @@ mod tests {
             mods: KeyMods::default(),
             utf8: Some("z".into()),
             composing: false,
+            access_epoch: 0,
+            ack: Some(ack_tx),
+        }));
+        let ack = ack_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("stale ack");
+        assert!(!ack.accepted);
+        assert!(ack.encoded.is_empty());
+    }
+
+    #[test]
+    fn stale_paste_with_ack_gets_revoke_ack_before_drop() {
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+        send_stale_revoke_ack(EngineCommand::Paste(PasteInput {
+            bytes: b"ab".to_vec(),
             access_epoch: 0,
             ack: Some(ack_tx),
         }));

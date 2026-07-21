@@ -141,6 +141,7 @@ impl EngineHandle {
         let epoch = self.access_epoch.load(Ordering::Acquire);
         match &mut cmd {
             EngineCommand::Key(input) => input.access_epoch = epoch,
+            EngineCommand::Paste(input) => input.access_epoch = epoch,
             EngineCommand::Focus {
                 access_epoch: cmd_epoch,
                 ..
@@ -403,7 +404,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
-    use crate::engine::command::{KeyAction, KeyInput, KeyMods, LensKey};
+    use crate::engine::command::{KeyAction, KeyInput, KeyMods, LensKey, PasteInput};
     use crate::engine::forwarder::InputForwarder;
     use crate::engine::inspect::InspectEventKind;
     use crate::engine::worker::{EgressFrame, EgressKind, EngineCommand};
@@ -779,6 +780,32 @@ mod tests {
             .expect("ack timeout");
         assert_eq!(ack.encoded, b"\x1bOA");
         assert!(ack.accepted);
+        h.stop();
+    }
+
+    #[test]
+    fn paste_encodes_bracketed_against_live_mode_via_enqueue_and_egress() {
+        let h = EngineHandle::spawn(test_config());
+        let rx = h.attach_test_egress();
+        while rx.try_recv().is_ok() {}
+        h.feed(b"\x1b[?2004h".to_vec()).expect("feed");
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+        h.enqueue_input(EngineCommand::Paste(PasteInput {
+            bytes: b"ab".to_vec(),
+            access_epoch: 0,
+            ack: Some(ack_tx),
+        }))
+        .expect("enqueue paste");
+        let ack = ack_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("ack timeout");
+        assert_eq!(ack.encoded, b"\x1b[200~ab\x1b[201~");
+        assert!(ack.accepted);
+        let frame = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("egress timeout");
+        assert_eq!(frame.kind, EgressKind::Input);
+        assert_eq!(frame.bytes, b"\x1b[200~ab\x1b[201~");
         h.stop();
     }
 

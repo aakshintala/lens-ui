@@ -238,6 +238,17 @@ impl VtEngine {
         Ok(buf)
     }
 
+    /// Encode paste bytes against the live bracketed-paste mode (mode 2004).
+    pub(crate) fn encode_paste(&mut self, data: &[u8]) -> Result<Vec<u8>, EngineError> {
+        use libghostty_vt::terminal::Mode;
+        let bracketed = self.terminal.mode(Mode::BRACKETED_PASTE)?;
+        let mut work = data.to_vec(); // paste::encode mutates in place
+        let mut buf = vec![0u8; data.len() + 16]; // bracket wrapper is 12 bytes; strip/CR are 1:1
+        let n = libghostty_vt::paste::encode(&mut work, bracketed, &mut buf)?;
+        buf.truncate(n);
+        Ok(buf)
+    }
+
     /// Encode a focus gained/lost report when mode 1004 is enabled.
     pub(crate) fn encode_focus_report(
         &mut self,
@@ -596,6 +607,37 @@ mod tests {
             "cursor must be None when scrolled out of viewport, got {:?}",
             f.cursor
         );
+    }
+
+    #[test]
+    fn encode_paste_wraps_bracketed_when_mode_2004_enabled() {
+        let cfg = EngineConfig {
+            cols: 40,
+            rows: 8,
+            max_scrollback: 0,
+            cell_w_px: 8,
+            cell_h_px: 16,
+        };
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        let mut engine = VtEngine::new(&cfg, |_| {}, tx).expect("engine");
+        engine.feed(b"\x1b[?2004h"); // enable bracketed paste
+        let out = engine.encode_paste(b"ab").expect("encode");
+        assert_eq!(out, b"\x1b[200~ab\x1b[201~");
+    }
+
+    #[test]
+    fn encode_paste_plain_when_bracketed_disabled_and_strips_esc() {
+        let cfg = EngineConfig {
+            cols: 40,
+            rows: 8,
+            max_scrollback: 0,
+            cell_w_px: 8,
+            cell_h_px: 16,
+        };
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        let mut engine = VtEngine::new(&cfg, |_| {}, tx).expect("engine");
+        let out = engine.encode_paste(b"a\x1bb").expect("encode"); // ESC stripped -> space
+        assert_eq!(out, b"a b");
     }
 }
 

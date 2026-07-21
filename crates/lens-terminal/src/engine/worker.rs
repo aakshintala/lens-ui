@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwapOption;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError};
 
-use super::command::{InputAck, KeyInput};
+use super::command::{InputAck, KeyInput, PasteInput};
 use super::frame::Frame;
 use super::inspect::InspectShared;
 use super::presentation::{EnginePresentationEvent, PRESENTATION_CHANNEL_CAP};
@@ -115,6 +115,11 @@ pub enum EgressKind {
 pub(crate) enum EngineCommand {
     Feed(Vec<u8>),
     Key(KeyInput),
+    #[allow(
+        dead_code,
+        reason = "engine path wired; UI enqueue lands in a follow-on slice"
+    )]
+    Paste(PasteInput),
     Focus {
         focused: bool,
         report: bool,
@@ -532,6 +537,39 @@ fn handle_command(
                     }
                     Err(e) => {
                         eprintln!("lens-terminal engine: encode_key failed: {e}");
+                        (Vec::new(), false)
+                    }
+                }
+            };
+            if let Some(tx) = ack_tx {
+                let _ = tx.try_send(InputAck { encoded, accepted });
+            }
+        }
+        EngineCommand::Paste(mut input) => {
+            let cmd_epoch = input.access_epoch;
+            let ack_tx = input.ack.take();
+            let (encoded, accepted) = if cmd_epoch != current_epoch {
+                (Vec::new(), false)
+            } else {
+                match engine.encode_paste(&input.bytes) {
+                    Ok(bytes) if bytes.is_empty() => (bytes, true),
+                    Ok(bytes) => {
+                        if cmd_epoch != access_epoch.load(Ordering::Acquire) {
+                            (Vec::new(), false)
+                        } else {
+                            inspect.record_keys_encoded();
+                            let delivered =
+                                try_emit_user_input(egress.as_ref(), EgressKind::Input, &bytes);
+                            if delivered {
+                                inspect.record_user_egress_accepted();
+                            } else {
+                                inspect.record_user_egress_rejected();
+                            }
+                            (bytes, delivered)
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("lens-terminal engine: encode_paste failed: {e}");
                         (Vec::new(), false)
                     }
                 }
