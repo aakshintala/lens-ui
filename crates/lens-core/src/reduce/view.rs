@@ -53,14 +53,18 @@ pub fn pair_tool_spans<'a>(items: &[&'a Item]) -> Vec<ViewBlock<'a>> {
         }
     }
 
+    let mut paired: HashSet<&CallId> = HashSet::new();
     let mut out = Vec::with_capacity(items.len());
     for it in items {
         match &it.kind {
             ItemKind::FunctionCall { call_id, .. } => {
-                out.push(ViewBlock::ToolSpan {
-                    call: it,
-                    output: first_output.get(call_id).copied(),
-                });
+                // First call to claim this call_id gets the output; later same-id calls get None.
+                let output = if paired.insert(call_id) {
+                    first_output.get(call_id).copied()
+                } else {
+                    None
+                };
+                out.push(ViewBlock::ToolSpan { call: it, output });
             }
             ItemKind::FunctionCallOutput { .. } => {
                 // Orphan (no call) or duplicate/second output → passthrough; consumed → skip.
@@ -419,6 +423,22 @@ mod tests {
         assert_item(&out[1], "o1b");
     }
 
+    #[test]
+    fn reused_call_id_second_call_gets_none_output() {
+        // Two FunctionCall items share call_1; the single output pairs to the FIRST call only.
+        // The second call gets output:None — the output must not be double-counted.
+        let items = [
+            call("c1", None, "call_1", "completed"),
+            call("c2", None, "call_1", "completed"),
+            output("o1", None, "call_1"),
+        ];
+        let refs: Vec<&Item> = items.iter().collect();
+        let out = pair_tool_spans(&refs);
+        assert_eq!(out.len(), 2);
+        assert_span(&out[0], "c1", Some("o1"));
+        assert_span(&out[1], "c2", None);
+    }
+
     fn reasoning(id: &str, resp: Option<&str>) -> Item {
         item(
             id,
@@ -427,6 +447,25 @@ mod tests {
                 full_text: "think".into(),
                 summary_text: String::new(),
                 encrypted: false,
+            },
+        )
+    }
+
+    fn resource_event(id: &str) -> Item {
+        use lens_client::generated::{SessionResourceObject, Type};
+        item(
+            id,
+            None,
+            ItemKind::ResourceEvent {
+                resource: SessionResourceObject {
+                    environment: None,
+                    id: "default".into(),
+                    metadata: serde_json::Map::new(),
+                    name: "workspace".into(),
+                    object: "session.resource".into(),
+                    session_id: "conv_1".into(),
+                    type_: Type::Environment,
+                },
             },
         )
     }
@@ -480,22 +519,24 @@ mod tests {
 
     #[test]
     fn user_message_and_resource_are_siblings_before_section() {
-        // user msg (sibling) then resp_a work; user msg stays flat before the section.
+        // user msg (sibling) → resp_a work (folds) → assistant msg + ResourceEvent siblings (flat).
         let items = [
             msg("u1", None, Role::User, "do a thing"),
             reasoning("r1", Some("resp_a")),
             msg("a1", Some("resp_a"), Role::Assistant, "final text"),
+            resource_event("res1"),
         ];
         let refs: Vec<&Item> = items.iter().collect();
         let scratch = scratch_with(None, None);
         let projected = project(&refs, &scratch, None);
         let out = group_work_section(projected, None);
-        // u1 sibling, then WorkSection(resp_a){reasoning}, then a1 assistant message sibling.
-        assert_eq!(out.len(), 3);
+        // u1 sibling | WorkSection(resp_a){reasoning} | a1 sibling | res1 sibling
+        assert_eq!(out.len(), 4);
         assert_item(&out[0], "u1");
         let inner = assert_section(&out[1], "resp_a");
         assert_eq!(inner.len(), 1);
         assert_item(&out[2], "a1");
+        assert_item(&out[3], "res1");
     }
 
     #[test]
