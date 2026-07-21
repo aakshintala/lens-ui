@@ -2118,6 +2118,88 @@ mod tests {
     }
 
     #[test]
+    fn from_value_retains_response_id_on_function_call() {
+        let v = serde_json::json!({
+            "id": "fc_8a2f1c9e4b7d46a3b0e5f812c6d9047a",
+            "response_id": "resp_3f7e2a91c8b54d6e0a1f4325b9c8d7e6",
+            "type": "function_call",
+            "call_id": "toolu_01K8X2Y3Z4A5B6C7D8E9F0G1H2",
+            "name": "sys_os_shell",
+            "arguments": "{\"command\":\"pwd\"}",
+            "status": "completed"
+        });
+        let item = Item::from_value(v);
+        assert_eq!(
+            item.response_id(),
+            Some("resp_3f7e2a91c8b54d6e0a1f4325b9c8d7e6")
+        );
+    }
+
+    #[test]
+    fn from_value_retains_response_id_on_function_call_output() {
+        let v = serde_json::json!({
+            "id": "fco_5d9e3b7a1c4f48e2a6b8d0c3e5f71234",
+            "response_id": "resp_3f7e2a91c8b54d6e0a1f4325b9c8d7e6",
+            "type": "function_call_output",
+            "call_id": "toolu_01K8X2Y3Z4A5B6C7D8E9F0G1H2",
+            "output": "/Users/dev/project"
+        });
+        let item = Item::from_value(v);
+        assert_eq!(
+            item.response_id(),
+            Some("resp_3f7e2a91c8b54d6e0a1f4325b9c8d7e6")
+        );
+    }
+
+    #[test]
+    fn from_value_retains_response_id_on_error() {
+        let v = serde_json::json!({
+            "id": "err_2c4f6a8b0d1e3f5a7b9c1d3e5f7a9b1c",
+            "response_id": "resp_3f7e2a91c8b54d6e0a1f4325b9c8d7e6",
+            "type": "error",
+            "status": "completed",
+            "data": {
+                "source": "execution",
+                "code": "RuntimeError",
+                "message": "command failed"
+            }
+        });
+        let item = Item::from_value(v);
+        assert_eq!(
+            item.response_id(),
+            Some("resp_3f7e2a91c8b54d6e0a1f4325b9c8d7e6")
+        );
+    }
+
+    #[test]
+    fn in_progress_response_id_absent_is_none() {
+        let ev = parse_event(&frame(
+            "response.in_progress",
+            r#"{"sequence_number": 1, "type": "response.in_progress", "response": {"object": "response", "status": "in_progress", "model": "claude-sdk", "created_at": 1784660489, "completed_at": null, "output": [], "background": false, "store": true, "usage": null, "previous_response_id": null, "conversation": null, "instructions": null, "reasoning": null, "error": null, "incomplete_details": null}}"#,
+        ));
+        match ev {
+            ServerStreamEvent::Response(ResponseEvent::InProgress { response_id }) => {
+                assert!(response_id.is_none());
+            }
+            other => panic!("expected InProgress, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn in_progress_response_id_empty_string_is_none() {
+        let ev = parse_event(&frame(
+            "response.in_progress",
+            r#"{"sequence_number": 1, "type": "response.in_progress", "response": {"id": "", "object": "response", "status": "in_progress", "model": "claude-sdk", "created_at": 1784660489, "completed_at": null, "output": [], "background": false, "store": true, "usage": null, "previous_response_id": null, "conversation": null, "instructions": null, "reasoning": null, "error": null, "incomplete_details": null}}"#,
+        ));
+        match ev {
+            ServerStreamEvent::Response(ResponseEvent::InProgress { response_id }) => {
+                assert!(response_id.is_none());
+            }
+            other => panic!("expected InProgress, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn bytes_session_resource_deleted() {
         // Byte-verified: docs/spikes/captures/2026-06-26-live-recapture/agent-switched.sse
         let ev = parse_event(&frame(
