@@ -2497,22 +2497,45 @@ mod tests {
                     cx,
                 );
             });
+            tab.update(cx, |tab, _cx| {
+                let snap = tab.inspect().engine.expect("engine inspect");
+                assert_eq!(snap.pastes_sent, 1);
+            });
+            let up = Keystroke::parse("up").expect("parse up");
+            tab.update(cx, |tab, cx| {
+                tab.debug_handle_key_down_for_test(
+                    &KeyDownEvent {
+                        keystroke: up,
+                        is_held: false,
+                    },
+                    window,
+                    cx,
+                );
+            });
         });
+
+        let paste_frame = egress
+            .recv_timeout(Duration::from_secs(2))
+            .expect("paste must emit egress");
+        assert_eq!(paste_frame.kind, EgressKind::Input);
+        assert_eq!(paste_frame.bytes, b"hi");
+
+        let sentinel_frame = egress
+            .recv_timeout(Duration::from_secs(2))
+            .expect("sentinel key must follow paste in FIFO order");
+        assert_eq!(sentinel_frame.kind, EgressKind::Input);
+        assert_eq!(
+            sentinel_frame.bytes, b"\x1b[A",
+            "next frame must be ArrowUp sentinel, not a stray Cmd+V key encode"
+        );
 
         tab.update(cx, |tab, _cx| {
             let snap = tab.inspect().engine.expect("engine inspect");
-            assert_eq!(snap.pastes_sent, 1);
-            assert_eq!(snap.keys_encoded, 0);
+            assert_eq!(
+                snap.keys_encoded, 1,
+                "only the sentinel key should increment keys_encoded"
+            );
         });
-        let frame = egress
-            .recv_timeout(Duration::from_secs(2))
-            .expect("paste must emit egress");
-        assert_eq!(frame.kind, EgressKind::Input);
-        assert_eq!(frame.bytes, b"hi");
-        assert!(
-            egress.try_recv().is_err(),
-            "Cmd+V must not also encode a key"
-        );
     }
 
     #[gpui::test]
