@@ -80,7 +80,7 @@ pub fn pack(items: &[Item], cols: usize) -> Packing {
     };
 
     for (item_index, it) in items.iter().enumerate() {
-        let (fc, fr) = (it.fc.min(cols), it.fr);
+        let (fc, fr) = (it.fc.max(1).min(cols), it.fr.max(1));
         let mut placed = false;
         let mut r = 0usize;
         while !placed {
@@ -191,8 +191,18 @@ mod tests {
     }
 
     #[test]
+    fn pack_clamps_degenerate_footprint() {
+        // A hand-built zero footprint must not panic and packs as a 1×1.
+        let items = [Item { kind: Kind::Card, fc: 0, fr: 0 }];
+        let p = pack(&items, 3);
+        assert_eq!(p.tiles.len(), 1);
+        assert_eq!((p.tiles[0].gx, p.tiles[0].gy), (0, 0));
+        assert_eq!(p.content_height, CELL_H - GAP);
+    }
+
+    #[test]
     fn intersects_band_culls_outside() {
-        // Row-0 loose card occupies cells [0, CELL_H-GAP]; a band above it misses.
+        // Row-0 loose card occupies cells [0, CELL_H-GAP]; a band far below misses.
         let p = pack(&[Item::card()], 3);
         let t = p.tiles[0];
         assert!(t.intersects_band(0.0, CELL_H)); // visible band covers row 0
