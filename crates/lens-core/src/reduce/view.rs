@@ -114,6 +114,82 @@ pub fn project_all<'a>(
     project(&refs, scratch, active_response)
 }
 
+/// The response_id a block groups under, or None if it is a sibling / streaming tail (never grouped).
+/// Exhaustive over ItemKind — a new kind is a compile error here.
+fn grouping_key<'a>(vb: &ViewBlock<'a>) -> Option<&'a ResponseId> {
+    fn item_key(i: &Item) -> Option<&ResponseId> {
+        match &i.kind {
+            // Agent-work: group by the item's authoritative response_id.
+            ItemKind::Reasoning { .. }
+            | ItemKind::FunctionCall { .. }
+            | ItemKind::FunctionCallOutput { .. }
+            | ItemKind::NativeTool { .. }
+            | ItemKind::AgentChanged { .. } => i.ctx.response_id.as_ref(),
+            // Siblings: never grouped even if they carry a response_id.
+            ItemKind::Message { .. }
+            | ItemKind::ResourceEvent { .. }
+            | ItemKind::Compaction { .. }
+            | ItemKind::Error { .. }
+            | ItemKind::SlashCommand { .. }
+            | ItemKind::TerminalCommand { .. } => None,
+        }
+    }
+    match vb {
+        ViewBlock::Item(i) => item_key(i),
+        ViewBlock::ToolSpan { call, .. } => item_key(call),
+        ViewBlock::WorkSection { .. }
+        | ViewBlock::StreamingReasoning(_)
+        | ViewBlock::StreamingMessage(_) => None,
+    }
+}
+
+/// Stage 3: fold each settled response's consecutive agent-work run into a `WorkSection`.
+/// The response `== active_response` stays flat (live turn); all others fold.
+pub fn group_work_section<'a>(
+    blocks: Vec<ViewBlock<'a>>,
+    active_response: Option<&'a ResponseId>,
+) -> Vec<ViewBlock<'a>> {
+    let mut out: Vec<ViewBlock<'a>> = Vec::with_capacity(blocks.len());
+    let mut run: Vec<ViewBlock<'a>> = Vec::new();
+    let mut run_key: Option<&'a ResponseId> = None;
+
+    fn flush<'a>(
+        out: &mut Vec<ViewBlock<'a>>,
+        run: &mut Vec<ViewBlock<'a>>,
+        run_key: &mut Option<&'a ResponseId>,
+        active: Option<&'a ResponseId>,
+    ) {
+        if let Some(key) = run_key.take() {
+            if Some(key) == active {
+                out.append(run); // live turn: stay flat
+            } else {
+                out.push(ViewBlock::WorkSection {
+                    response_id: key,
+                    blocks: std::mem::take(run),
+                });
+            }
+        }
+        run.clear();
+    }
+
+    for vb in blocks {
+        match grouping_key(&vb) {
+            Some(key) if run_key == Some(key) => run.push(vb),
+            Some(key) => {
+                flush(&mut out, &mut run, &mut run_key, active_response);
+                run_key = Some(key);
+                run.push(vb);
+            }
+            None => {
+                flush(&mut out, &mut run, &mut run_key, active_response);
+                out.push(vb);
+            }
+        }
+    }
+    flush(&mut out, &mut run, &mut run_key, active_response);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,5 +416,126 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_span(&out[0], "c1", Some("o1"));
         assert_item(&out[1], "o1b");
+    }
+
+    fn reasoning(id: &str, resp: Option<&str>) -> Item {
+        item(
+            id,
+            resp,
+            ItemKind::Reasoning {
+                full_text: "think".into(),
+                summary_text: String::new(),
+                encrypted: false,
+            },
+        )
+    }
+
+    fn assert_section<'a>(vb: &'a ViewBlock<'a>, resp: &str) -> &'a [ViewBlock<'a>] {
+        match vb {
+            ViewBlock::WorkSection { response_id, blocks } => {
+                assert_eq!(response_id.as_str(), resp);
+                blocks.as_slice()
+            }
+            other => panic!("expected WorkSection({resp}), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn settled_response_folds_into_section() {
+        // reasoning + tool-span share resp_a; no active_response ⇒ fold.
+        let items = vec![
+            reasoning("r1", Some("resp_a")),
+            call("c1", Some("resp_a"), "call_1", "completed"),
+            output("o1", Some("resp_a"), "call_1"),
+        ];
+        let refs: Vec<&Item> = items.iter().collect();
+        let scratch = scratch_with(None, None);
+        let projected = project(&refs, &scratch, None);
+        let out = group_work_section(projected, None);
+        assert_eq!(out.len(), 1);
+        let inner = assert_section(&out[0], "resp_a");
+        assert_eq!(inner.len(), 2); // reasoning + tool-span
+    }
+
+    #[test]
+    fn live_response_stays_flat() {
+        let items = vec![
+            reasoning("r1", Some("resp_a")),
+            call("c1", Some("resp_a"), "call_1", "completed"),
+            output("o1", Some("resp_a"), "call_1"),
+        ];
+        let refs: Vec<&Item> = items.iter().collect();
+        let scratch = scratch_with(None, None);
+        let resp_a = ResponseId::new("resp_a");
+        let projected = project(&refs, &scratch, Some(&resp_a));
+        let out = group_work_section(projected, Some(&resp_a));
+        // resp_a is live ⇒ flat: reasoning + tool-span, no WorkSection.
+        assert_eq!(out.len(), 2);
+        assert!(!matches!(out[0], ViewBlock::WorkSection { .. }));
+    }
+
+    #[test]
+    fn user_message_and_resource_are_siblings_before_section() {
+        // user msg (sibling) then resp_a work; user msg stays flat before the section.
+        let items = vec![
+            msg("u1", None, Role::User, "do a thing"),
+            reasoning("r1", Some("resp_a")),
+            msg("a1", Some("resp_a"), Role::Assistant, "final text"),
+        ];
+        let refs: Vec<&Item> = items.iter().collect();
+        let scratch = scratch_with(None, None);
+        let projected = project(&refs, &scratch, None);
+        let out = group_work_section(projected, None);
+        // u1 sibling, then WorkSection(resp_a){reasoning}, then a1 assistant message sibling.
+        assert_eq!(out.len(), 3);
+        assert_item(&out[0], "u1");
+        let inner = assert_section(&out[1], "resp_a");
+        assert_eq!(inner.len(), 1);
+        assert_item(&out[2], "a1");
+    }
+
+    #[test]
+    fn multi_response_sequence_folds_each_separately() {
+        let items = vec![
+            reasoning("r1", Some("resp_a")),
+            reasoning("r2", Some("resp_b")),
+        ];
+        let refs: Vec<&Item> = items.iter().collect();
+        let scratch = scratch_with(None, None);
+        let projected = project(&refs, &scratch, None);
+        let out = group_work_section(projected, None);
+        assert_eq!(out.len(), 2);
+        assert_section(&out[0], "resp_a");
+        assert_section(&out[1], "resp_b");
+    }
+
+    #[test]
+    fn idle_folds_all_but_active_folds_all_others() {
+        // Two responses; resp_b is active ⇒ resp_a folds, resp_b flat.
+        let items = vec![
+            reasoning("r1", Some("resp_a")),
+            reasoning("r2", Some("resp_b")),
+        ];
+        let refs: Vec<&Item> = items.iter().collect();
+        let scratch = scratch_with(None, None);
+        let resp_b = ResponseId::new("resp_b");
+        let projected = project(&refs, &scratch, Some(&resp_b));
+        let out = group_work_section(projected, Some(&resp_b));
+        assert_eq!(out.len(), 2);
+        assert_section(&out[0], "resp_a");
+        assert!(matches!(out[1], ViewBlock::StreamingReasoning(_) | ViewBlock::Item(_)));
+    }
+
+    #[test]
+    fn streaming_tail_never_grouped() {
+        let items = vec![reasoning("r1", Some("resp_a"))];
+        let refs: Vec<&Item> = items.iter().collect();
+        let scratch = scratch_with(Some(r_acc()), None);
+        let projected = project(&refs, &scratch, None);
+        let out = group_work_section(projected, None);
+        // resp_a folds; the StreamingReasoning tail stays flat after it.
+        assert_eq!(out.len(), 2);
+        assert_section(&out[0], "resp_a");
+        assert!(matches!(out[1], ViewBlock::StreamingReasoning(_)));
     }
 }
