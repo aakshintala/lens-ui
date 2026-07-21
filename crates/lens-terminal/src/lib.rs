@@ -74,7 +74,7 @@ pub mod render_bench_api {
 pub mod engine_bench_api {
     use crossbeam_channel::bounded;
 
-    use crate::engine::command::{KeyAction, KeyInput, KeyMods, LensKey};
+    use crate::engine::command::{KeyAction, KeyInput, KeyMods, LensKey, MouseEventKind};
     use crate::engine::worker::EngineCommand;
     use crate::{EngineError, EngineHandle, FeedError, VtEngine};
 
@@ -92,6 +92,23 @@ pub mod engine_bench_api {
 
     pub fn encode_paste_bench(engine: &mut VtEngine, data: &[u8]) -> Result<Vec<u8>, EngineError> {
         engine.encode_paste(data)
+    }
+
+    pub fn encode_mouse_move_bench(
+        engine: &mut VtEngine,
+        px_x: f32,
+        px_y: f32,
+    ) -> Result<Vec<u8>, EngineError> {
+        use crate::engine::command::MouseReportEv;
+        engine.encode_mouse_report(&MouseReportEv {
+            action: MouseEventKind::Move,
+            button: None,
+            wheel: None,
+            mods: KeyMods::default(),
+            px_x,
+            px_y,
+            any_button_pressed: false,
+        })
     }
 
     pub fn feed_app_cursor_mode_then_arrow_up(handle: &EngineHandle) -> Result<(), FeedError> {

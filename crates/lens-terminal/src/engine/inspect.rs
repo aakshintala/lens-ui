@@ -414,3 +414,33 @@ impl InspectShared {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::engine::handle::EngineHandle;
+    use crate::engine::vt::EngineConfig;
+
+    fn test_config() -> EngineConfig {
+        EngineConfig {
+            cols: 20,
+            rows: 3,
+            max_scrollback: 100,
+            cell_w_px: 8,
+            cell_h_px: 16,
+        }
+    }
+
+    #[test]
+    fn inspect_mouse_copy_counters_default_zero() {
+        let h = EngineHandle::spawn(test_config());
+        let snap = h.inspect();
+        assert_eq!(snap.mouse_encoded, 0);
+        assert_eq!(snap.mouse_reports_coalesced, 0);
+        assert_eq!(snap.mouse_suppressed, 0);
+        assert_eq!(snap.wheel_reported, 0);
+        assert_eq!(snap.copy_started, 0);
+        assert_eq!(snap.copy_completed, 0);
+        assert_eq!(snap.copy_empty, 0);
+        h.stop();
+    }
+}

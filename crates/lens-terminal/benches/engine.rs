@@ -5,7 +5,8 @@ use std::sync::Arc;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
 use lens_terminal::engine_bench_api::{
-    encode_arrow_up_press, encode_paste_bench, feed_app_cursor_mode_then_arrow_up,
+    encode_arrow_up_press, encode_mouse_move_bench, encode_paste_bench,
+    feed_app_cursor_mode_then_arrow_up,
 };
 use lens_terminal::{EngineConfig, EngineHandle, VtEngine};
 
@@ -223,6 +224,36 @@ fn bench_paste_encode_throughput(c: &mut Criterion) {
     });
 }
 
+fn bench_mouse_encode_throughput(c: &mut Criterion) {
+    // SgrPixels never coalesces -> every call encodes (measures full encode path).
+    c.bench_function("mouse_encode_throughput", |b| {
+        b.iter_batched(
+            || {
+                let (tx, _rx) = crossbeam_channel::bounded(1);
+                let mut engine = VtEngine::new(&bench_config(), |_| {}, tx).expect("engine");
+                engine.feed(b"\x1b[?1003h\x1b[?1016h"); // Any + SgrPixels
+                engine
+            },
+            |mut engine| {
+                black_box(encode_mouse_move_bench(&mut engine, 16.0, 0.0).expect("encode"))
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
+fn bench_mouse_motion_coalesced(c: &mut Criterion) {
+    // Same-cell motion under SGR coalesces after the first -> measures the dedup fast path.
+    // Persistent engine across iterations so all but the first call coalesce.
+    let (tx, _rx) = crossbeam_channel::bounded(1);
+    let mut engine = VtEngine::new(&bench_config(), |_| {}, tx).expect("engine");
+    engine.feed(b"\x1b[?1003h\x1b[?1006h"); // Any + SGR
+    let _ = encode_mouse_move_bench(&mut engine, 16.0, 0.0); // prime the last-cell
+    c.bench_function("mouse_motion_coalesced", |b| {
+        b.iter(|| black_box(encode_mouse_move_bench(&mut engine, 16.0, 0.0).expect("encode")));
+    });
+}
+
 criterion_group!(
     engine,
     bench_vt_parse,
@@ -234,6 +265,8 @@ criterion_group!(
     bench_presentation_title_callback_throughput,
     bench_dense_hyperlink_frame_build,
     bench_osc52_callback_throughput,
-    bench_paste_encode_throughput
+    bench_paste_encode_throughput,
+    bench_mouse_encode_throughput,
+    bench_mouse_motion_coalesced
 );
 criterion_main!(engine);

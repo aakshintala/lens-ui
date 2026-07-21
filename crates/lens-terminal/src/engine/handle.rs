@@ -947,6 +947,105 @@ mod tests {
     }
 
     #[test]
+    fn mouse_normal_mode_latched_move_ignored_up_reports() {
+        let h = EngineHandle::spawn(test_config());
+        let rx = h.attach_test_egress();
+        h.feed(TRACKING_SGR.to_vec()).expect("feed tracking");
+        let down_ack = send_mouse(
+            &h,
+            base_mouse_gesture(MouseEventKind::Down, Some(MouseButtonKind::Left)),
+        );
+        assert_eq!(down_ack.disposition, GestureDisposition::Reported);
+        let _ = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("down egress");
+
+        let move_ack = send_mouse(
+            &h,
+            base_mouse_gesture(MouseEventKind::Move, Some(MouseButtonKind::Left)),
+        );
+        assert_eq!(move_ack.disposition, GestureDisposition::Ignored);
+        assert!(
+            rx.try_recv().is_err(),
+            "normal mode must not egress latched motion"
+        );
+
+        let up_ack = send_mouse(
+            &h,
+            base_mouse_gesture(MouseEventKind::Up, Some(MouseButtonKind::Left)),
+        );
+        assert_eq!(up_ack.disposition, GestureDisposition::Reported);
+        let _ = rx.recv_timeout(Duration::from_secs(2)).expect("up egress");
+        h.stop();
+    }
+
+    #[test]
+    fn mouse_button_mode_latched_move_with_button_reports() {
+        let h = EngineHandle::spawn(test_config());
+        let rx = h.attach_test_egress();
+        h.feed(TRACKING_BUTTON_SGR.to_vec()).expect("feed tracking");
+        let down_ack = send_mouse(
+            &h,
+            base_mouse_gesture(MouseEventKind::Down, Some(MouseButtonKind::Left)),
+        );
+        assert_eq!(down_ack.disposition, GestureDisposition::Reported);
+        let _ = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("down egress");
+
+        let mut mv = base_mouse_gesture(MouseEventKind::Move, Some(MouseButtonKind::Left));
+        mv.cell = Some((1, 0));
+        mv.px_x = 16.0;
+        let move_ack = send_mouse(&h, mv);
+        assert_eq!(move_ack.disposition, GestureDisposition::Reported);
+        let _ = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("move egress");
+        h.stop();
+    }
+
+    #[test]
+    fn mouse_any_mode_buttonless_move_reports_when_writable() {
+        let h = EngineHandle::spawn(test_config());
+        let rx = h.attach_test_egress();
+        h.feed(TRACKING_ANY_SGR.to_vec()).expect("feed tracking");
+        let ack = send_mouse(&h, base_mouse_gesture(MouseEventKind::Move, None));
+        assert_eq!(ack.disposition, GestureDisposition::Reported);
+        let _ = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("move egress");
+        h.stop();
+    }
+
+    const TRACKING_X10_SGR: &[u8] = b"\x1b[?9h\x1b[?1006h";
+
+    #[test]
+    fn mouse_x10_mode_latched_move_ignored() {
+        let h = EngineHandle::spawn(test_config());
+        let rx = h.attach_test_egress();
+        h.feed(TRACKING_X10_SGR.to_vec()).expect("feed tracking");
+        let down_ack = send_mouse(
+            &h,
+            base_mouse_gesture(MouseEventKind::Down, Some(MouseButtonKind::Left)),
+        );
+        assert_eq!(down_ack.disposition, GestureDisposition::Reported);
+        let _ = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("down egress");
+
+        let move_ack = send_mouse(
+            &h,
+            base_mouse_gesture(MouseEventKind::Move, Some(MouseButtonKind::Left)),
+        );
+        assert_eq!(move_ack.disposition, GestureDisposition::Ignored);
+        assert!(
+            rx.try_recv().is_err(),
+            "x10 mode must not egress latched motion"
+        );
+        h.stop();
+    }
+
+    #[test]
     fn mouse_set_access_false_suppresses_latched_move_and_up() {
         let h = EngineHandle::spawn(test_config());
         let rx = h.attach_test_egress();
