@@ -612,3 +612,51 @@ async fn shell_skeleton_acceptance(cx: &mut gpui::TestAppContext) {
         );
     });
 }
+
+/// Culling (spec §4 unknown 2): on a board tall enough to overflow, tiles below
+/// the visible band + overdraw are NOT built (absent from the child vec).
+#[gpui::test]
+async fn board_culls_offscreen_tiles(cx: &mut gpui::TestAppContext) {
+    use gpui::{Size, px};
+
+    const N: usize = 40; // 40 loose cards @ 200px cell / ~3 cols ⇒ ~14 rows ⇒ tall
+    let clock = Arc::new(ManualUiClock::new(10_000));
+    let ids: Vec<SessionId> = (0..N).map(|i| SessionId::new(format!("s{i:02}"))).collect();
+
+    let fleet = cx.update(|cx| {
+        gpui_component::init(cx);
+        lens_ui::theme::install_at_startup(cx);
+        let fleet = FleetStore::new(Arc::clone(&clock) as Arc<dyn UiClock>, cx);
+        fleet.update(cx, |f, cx| {
+            for id in &ids {
+                f.spawn_fake_session(id.clone(), cx);
+            }
+        });
+        fleet
+    });
+
+    let fleet_for_window = fleet.clone();
+    let (board_handle, vcx) = cx.add_window_view(|_, cx| {
+        let working_tab = placeholder_tab(cx);
+        BoardView::mount(fleet_for_window, working_tab, None, cx)
+    });
+    // Normal-size window: only the top few rows fit; the rest overflow the band.
+    vcx.simulate_resize(Size {
+        width: px(1000.0),
+        height: px(700.0),
+    });
+    vcx.run_until_parked();
+
+    let built = vcx.read(|cx| board_handle.read(cx).visible_session_ids_for_test());
+    assert!(!built.is_empty(), "some tiles must be built");
+    assert!(
+        built.len() < N,
+        "off-screen tiles must be culled (built {} of {N})",
+        built.len()
+    );
+    // The last card (bottom row) is far below the band → not built.
+    assert!(
+        !built.contains(&ids[N - 1]),
+        "bottom card must be culled while scrolled to top"
+    );
+}

@@ -19,7 +19,6 @@ use lens_core::domain::ids::{BoardId, BoardItemId, ConnectionId, SessionId};
 /// deterministically by session-id string (matches the retired placeholder's
 /// order). No groups — none are creatable until B-4. `created_at`/ordinals are
 /// synthetic (nothing is persisted).
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn build_ephemeral_layout(fleet: &FleetStore) -> BoardLayout {
     const EPOCH: i64 = 0;
     let board_id = BoardId::new(DEFAULT_BOARD_ID);
