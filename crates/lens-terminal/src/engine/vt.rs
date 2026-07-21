@@ -66,6 +66,8 @@ pub struct VtEngine {
     press_event: libghostty_vt::selection::gesture::PressEvent<'static>,
     drag_event: libghostty_vt::selection::gesture::DragEvent<'static>,
     release_event: libghostty_vt::selection::gesture::ReleaseEvent<'static>,
+    applied_mouse_opts: Option<(MouseTracking, MouseFormat)>,
+    applied_encoder_size: Option<(u32, u32, u32, u32)>,
     reply_buffer: Rc<RefCell<Vec<u8>>>,
     #[expect(dead_code, reason = "worker invokes after take_replies in Task 4")]
     on_reply: OnReplyFn,
@@ -224,6 +226,8 @@ impl VtEngine {
             press_event: libghostty_vt::selection::gesture::PressEvent::new()?,
             drag_event: libghostty_vt::selection::gesture::DragEvent::new()?,
             release_event: libghostty_vt::selection::gesture::ReleaseEvent::new()?,
+            applied_mouse_opts: None,
+            applied_encoder_size: None,
             reply_buffer,
             on_reply: Box::new(on_reply) as OnReplyFn,
             latest_title_slot,
@@ -362,21 +366,36 @@ impl VtEngine {
         use libghostty_vt::key::Mods;
         use libghostty_vt::mouse::{Action, Button, EncoderSize, Position};
 
-        self.mouse_encoder.set_options_from_terminal(&self.terminal);
-        self.mouse_encoder.set_size(EncoderSize {
-            screen_width: self.cell_w_px.saturating_mul(u32::from(self.cols)),
-            screen_height: self.cell_h_px.saturating_mul(u32::from(self.rows)),
-            cell_width: self.cell_w_px,
-            cell_height: self.cell_h_px,
-            padding_top: 0,
-            padding_bottom: 0,
-            padding_right: 0,
-            padding_left: 0,
-        });
+        let tracking = self.read_live_tracking();
+        let format = self.read_live_format();
+        let opts = (tracking, format);
+        if self.applied_mouse_opts != Some(opts) {
+            self.mouse_encoder.set_options_from_terminal(&self.terminal);
+            self.applied_mouse_opts = Some(opts);
+        }
+        let size_tuple = (
+            self.cell_w_px.saturating_mul(u32::from(self.cols)),
+            self.cell_h_px.saturating_mul(u32::from(self.rows)),
+            self.cell_w_px,
+            self.cell_h_px,
+        );
+        if self.applied_encoder_size != Some(size_tuple) {
+            self.mouse_encoder.set_size(EncoderSize {
+                screen_width: size_tuple.0,
+                screen_height: size_tuple.1,
+                cell_width: size_tuple.2,
+                cell_height: size_tuple.3,
+                padding_top: 0,
+                padding_bottom: 0,
+                padding_right: 0,
+                padding_left: 0,
+            });
+            self.applied_encoder_size = Some(size_tuple);
+        }
         self.mouse_encoder
             .set_any_button_pressed(ev.any_button_pressed);
         self.mouse_encoder
-            .set_track_last_cell(self.read_live_format() != MouseFormat::SgrPixels);
+            .set_track_last_cell(format != MouseFormat::SgrPixels);
         let action = match ev.action {
             MouseEventKind::Down => Action::Press,
             MouseEventKind::Up => Action::Release,
@@ -420,6 +439,7 @@ impl VtEngine {
             terminal,
             press_event,
             selection_gesture,
+            cell_w_px,
             ..
         } = self;
         let gref = terminal.grid_ref(Point::Viewport(PointCoordinate {
@@ -431,7 +451,8 @@ impl VtEngine {
             .with_double_click_behavior(Behavior::Word)
             .with_triple_click_behavior(Behavior::Line);
         press_event.set_behaviors(&behaviors)?;
-        press_event.set_repeat_interval(std::time::Duration::from_secs(1))?;
+        press_event.set_repeat_interval(std::time::Duration::from_millis(500))?;
+        press_event.set_repeat_distance(f64::from(*cell_w_px))?;
         press_event.set_position(f64::from(px_x), f64::from(px_y))?;
         press_event.set_time(time)?;
         let sel = press_event.apply(selection_gesture, terminal, gref)?;
@@ -507,9 +528,8 @@ impl VtEngine {
     #[allow(dead_code, reason = "consumed in Task 3/4")]
     pub(crate) fn select_all(&mut self) -> Result<bool, EngineError> {
         let sel = self.terminal.select_all()?;
-        let installed = sel.is_some();
         self.terminal.set_selection(sel.as_ref())?;
-        Ok(installed)
+        Ok(true)
     }
 
     #[allow(dead_code, reason = "consumed in Task 3/4")]
@@ -872,6 +892,46 @@ mod tests {
     }
 
     #[test]
+    fn encode_mouse_report_coalesces_same_cell_motion() {
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        let mut e = VtEngine::new(&test_config(), |_| {}, tx).unwrap();
+        e.feed(b"\x1b[?1003h\x1b[?1006h");
+        let ev = MouseReportEv {
+            action: MouseEventKind::Move,
+            button: None,
+            wheel: None,
+            mods: super::super::command::KeyMods::default(),
+            px_x: 16.0,
+            px_y: 0.0,
+            any_button_pressed: false,
+        };
+        let first = e.encode_mouse_report(&ev).expect("first");
+        assert!(!first.is_empty(), "first same-cell motion must emit");
+        let second = e.encode_mouse_report(&ev).expect("second");
+        assert!(second.is_empty(), "second same-cell motion must coalesce");
+    }
+
+    #[test]
+    fn encode_mouse_report_sgr_pixels_does_not_coalesce_motion() {
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        let mut e = VtEngine::new(&test_config(), |_| {}, tx).unwrap();
+        e.feed(b"\x1b[?1003h\x1b[?1006h\x1b[?1016h");
+        let ev = MouseReportEv {
+            action: MouseEventKind::Move,
+            button: None,
+            wheel: None,
+            mods: super::super::command::KeyMods::default(),
+            px_x: 16.0,
+            px_y: 0.0,
+            any_button_pressed: false,
+        };
+        let first = e.encode_mouse_report(&ev).expect("first");
+        assert!(!first.is_empty());
+        let second = e.encode_mouse_report(&ev).expect("second");
+        assert!(!second.is_empty(), "SgrPixels must emit on every motion");
+    }
+
+    #[test]
     fn encode_mouse_report_sgr_press_left() {
         let (tx, _rx) = crossbeam_channel::bounded(1);
         let mut e = VtEngine::new(&test_config(), |_| {}, tx).unwrap();
@@ -936,6 +996,35 @@ mod tests {
         e.apply_selection_press(4, 0, 32.0, 0.0, std::time::Duration::from_millis(120))
             .expect("p2");
         assert_eq!(e.extract_selection_text().as_deref(), Some("bar"));
+    }
+
+    #[test]
+    fn double_click_word_respects_repeat_interval() {
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        let mut e = VtEngine::new(&test_config(), |_| {}, tx).unwrap();
+        e.feed(b"foo bar");
+        e.apply_selection_press(4, 0, 32.0, 0.0, std::time::Duration::from_millis(0))
+            .expect("p1");
+        e.apply_selection_release(Some((4, 0))).expect("r1");
+        e.apply_selection_press(4, 0, 32.0, 0.0, std::time::Duration::from_millis(600))
+            .expect("p2");
+        assert_ne!(
+            e.extract_selection_text().as_deref(),
+            Some("bar"),
+            "gap >500ms must not widen to word"
+        );
+
+        e.clear_selection().expect("clear");
+        e.apply_selection_press(4, 0, 32.0, 0.0, std::time::Duration::from_millis(0))
+            .expect("p1_fast");
+        e.apply_selection_release(Some((4, 0))).expect("r1_fast");
+        e.apply_selection_press(4, 0, 32.0, 0.0, std::time::Duration::from_millis(120))
+            .expect("p2_fast");
+        assert_eq!(
+            e.extract_selection_text().as_deref(),
+            Some("bar"),
+            "gap <=500ms still widens to word"
+        );
     }
 }
 
