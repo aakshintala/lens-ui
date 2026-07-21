@@ -9,8 +9,15 @@ and roll older "Recent" pointers off this page as they age.
 
 ## Open threads & next up
 
-- **▶ ACTIVE: shared terminal workstream — Slices 0/1a/1b merged; 1c DONE; 1d COMPLETE (live-proven); Slice 2 RE-CUT TO SERIAL + ▶▶ 2a (input) EXECUTED + DONE (2026-07-17): all 6 tasks, gate-green, real-window keystroke-validated. `terminal-ws` PUSHED to `origin/terminal-ws` (backup; no `main` merge — user's call). ✅ C2 egress-replay Critical CLOSED (2026-07-20): per-transport egress channels `fd79d54..2921da8` + T4 hardening (C1 by-construction, C2 narrowed + join-before-attach documented residual). NEXT: 2d (presentation) → 2b (clipboard) → 2c (mouse). Driver: `docs/handoffs/2026-07-17-terminal-slice-2-execution.md`.**
-  - **▶ SLICE 2 (interaction) — RE-CUT TO SERIAL; 2a EXECUTED + DONE (2026-07-17).** Design spec
+- **▶ ACTIVE: shared terminal workstream — Slices 0/1a/1b merged; 1c DONE; 1d COMPLETE (live-proven); Slice 2 SERIAL: 2a (input) DONE + C2 CLOSED + ▶▶ 2d (presentation) EXECUTED + DONE (2026-07-20): all 6 tasks (titles/hyperlinks/OSC-8/click→OpenUrlRequest/inspect+benches), each grok-reviewed + fix waves, Opus whole-slice = SHIP, title-clear-vs-full-channel divergence FIXED (tri-state slot), REAL-WINDOW GATE PASSED on a real macOS display (presentation_realwindow click→OpenUrlRequest e2e + render_realwindow perf all in-budget). Full 2d slice `bdd8695..5e6f28b` (11 commits). `terminal-ws` unpushed since 2d (backup push + `main` merge = user's call). NEXT: 2b (clipboard/OSC-52) → 2c (mouse). Driver: `docs/handoffs/2026-07-17-terminal-slice-2-execution.md`; ledger `.superpowers/sdd/progress.md`.**
+  - **▶ SLICE 2 (interaction) — RE-CUT TO SERIAL; 2a + C2 + 2d DONE (2026-07-20).** 2d (presentation)
+    executed subagent-driven (composer-2.5 per task + grok-4.5 cross-family per-task reviews + fix waves +
+    Opus whole-slice = SHIP); the Opus review caught a title-clear-vs-full-channel invariant divergence
+    (per-task reviews structurally couldn't see it) → FIXED via tri-state latest-title slot. The end-of-slice
+    real-window gate (run on a real macOS display) caught 3 latent bugs in the never-executed Task-4 harness
+    (frame-clobber-by-sampler, sync-read-of-async-emit, dropped Subscription) → all fixed; production click path
+    was correct. Both `presentation_realwindow` (click→OpenUrlRequest e2e) and `render_realwindow` (perf all
+    in-budget; C2-era over-budget flag confirmed environmental) green. 2d slice `bdd8695..5e6f28b`. Design spec
     [`docs/specs/2026-07-17-terminal-slice-2-interaction-design.md`](./specs/2026-07-17-terminal-slice-2-interaction-design.md).
     **Task 0 DELETED — dissolved into 2a/2d** (serial removes the parallel merge hazard at the root; 2d edits 2a's
     committed code). Plans: `docs/superpowers/plans/2026-07-17-terminal-slice-2-{2a-input,2d-presentation}.md`.
