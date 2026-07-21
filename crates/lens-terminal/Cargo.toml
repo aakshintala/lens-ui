@@ -69,6 +69,12 @@ path = "tests/presentation_realwindow.rs"
 harness = false
 required-features = ["test-util"]
 
+[[test]]
+name = "mouse_realwindow"
+path = "tests/mouse_realwindow.rs"
+harness = false
+required-features = ["test-util"]
+
 # Live open()+paint+reconnect rider (Slice 1d). `harness = false` → real GPUI
 # window; env-gated skip vs fail; not part of default `cargo test --workspace`.
 [[test]]

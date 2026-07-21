@@ -273,6 +273,13 @@ impl EngineHandle {
             })
     }
 
+    /// Drive the engine-authoritative access gate from a harness (real-window mouse
+    /// read-only proof). Mirrors what the foreground sends on an access change.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn debug_set_access_for_test(&self, writable: bool) {
+        let _ = self.enqueue_set_access(writable);
+    }
+
     #[cfg(any(test, feature = "test-util"))]
     pub fn attach_test_egress(&self) -> crossbeam_channel::Receiver<super::worker::EgressFrame> {
         let (tx, rx) = crossbeam_channel::bounded(worker::EGRESS_CHANNEL_CAP);
