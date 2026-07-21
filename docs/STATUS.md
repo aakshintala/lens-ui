@@ -85,9 +85,10 @@ _Last curated 2026-07-21 (transcript **T-0 + T-1 executed** on `lens-transript`;
     per-turn data → **T-6**); streaming variants carry `&MessageAcc`/`&ReasoningAcc` (stable identity);
     **`OptimisticUser` dropped** (pending is composer-owned → T-7); **`SubAgentSpan` dropped**
     (child-session model → T-5); `ReconnectBreak` emission → T-2.
-  - **T-2 — Focused view scaffold + live disk-sourced surface. ▶ SPEC WRITTEN 2026-07-21**
-    (`docs/specs/2026-07-21-transcript-t2-focused-view-scaffold-design.md`; brainstormed → design-locked,
-    awaiting plan). §16/§17. **First real consumer of `Vec<ViewBlock>`.** Mount focused view in `#chat-slot`
+  - **T-2 — Focused view scaffold + live disk-sourced surface. ⏳ SPEC IN REVIEW-REWORK 2026-07-21**
+    (`docs/specs/2026-07-21-transcript-t2-focused-view-scaffold-design.md`; rev 2; two gpt-5.6/codex
+    review rounds — round 1 REWORK (10 findings) → rev 2 closed 5, 5 partial; round 2 surfaced 7 new
+    (3 Critical) → **still REWORK, not plan-ready**; rev 3 pending — see handoff). §16/§17. **First real consumer of `Vec<ViewBlock>`.** Mount focused view in `#chat-slot`
     via a `focused_transcript_tab(replica) -> TabHandle` factory (`ContentTab` left an inert marker — protocol
     deferred, SPEC-GAPS); a **store-side `FocusedTranscript` replica** created on `Promote`/dropped on `Demote`,
     fed the detailed frames by the **existing single poller fanning out** (no channel tee — the feed is
