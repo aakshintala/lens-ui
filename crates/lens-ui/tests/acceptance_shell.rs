@@ -662,3 +662,118 @@ async fn board_culls_offscreen_tiles(cx: &mut gpui::TestAppContext) {
         "bottom card must be culled while scrolled to top"
     );
 }
+
+/// B-3: a group tile renders ring/tint/header chrome and a rollup folded from its
+/// member cards. The group path is not runtime-reachable (no group is creatable
+/// until B-4), so the test injects a hand-built `BoardLayout` via the test seam.
+#[gpui::test]
+async fn board_group_renders_chrome_and_rollup(cx: &mut gpui::TestAppContext) {
+    use gpui::{Size, px};
+    use lens_core::domain::board::{
+        Board, BoardLayout, DEFAULT_BOARD_ID, DEFAULT_BOARD_NAME, PlacementTarget,
+    };
+    use lens_core::domain::ids::{BoardId, BoardItemId, ConnectionId};
+
+    // Clock at 2h past epoch so the oldest member (created_at=0s) ages to "2h".
+    let clock = Arc::new(ManualUiClock::new(7_200_000));
+    let s1 = SessionId::new("s1");
+    let s2 = SessionId::new("s2");
+
+    let (fleet, c1, c2) = cx.update(|cx| {
+        gpui_component::init(cx);
+        lens_ui::theme::install_at_startup(cx);
+        let fleet = FleetStore::new(Arc::clone(&clock) as Arc<dyn UiClock>, cx);
+        let (c1, c2) = fleet.update(cx, |f, cx| {
+            let c1 = f.spawn_fake_session(s1.clone(), cx);
+            let c2 = f.spawn_fake_session(s2.clone(), cx);
+            (c1, c2)
+        });
+        (fleet, c1, c2)
+    });
+    // Member card data: s1 = $1.50 @ 0s (oldest), s2 = $2.00 @ 100s.
+    cx.update(|cx| {
+        c1.update(cx, |card, _| {
+            card.cumulative_cost.total_cost_usd = Some(1.50);
+            card.created_at = Some(0);
+        });
+        c2.update(cx, |card, _| {
+            card.cumulative_cost.total_cost_usd = Some(2.00);
+            card.created_at = Some(100);
+        });
+    });
+
+    // Hand-built layout: one blue group "Refactor" with members s1, s2.
+    let board = BoardId::new(DEFAULT_BOARD_ID);
+    let g1 = BoardItemId::new("g1");
+    let mut layout = BoardLayout::default();
+    layout.boards.push(Board {
+        id: board.clone(),
+        name: DEFAULT_BOARD_NAME.into(),
+        ordinal: 0,
+        created_at: 0,
+        updated_at: 0,
+    });
+    layout
+        .create_group(&board, None, 0, "Refactor", g1.clone(), 0)
+        .unwrap();
+    layout.set_color(&g1, "blue").unwrap();
+    let conn = ConnectionId::new("c");
+    let under_group = |ordinal: i32| PlacementTarget {
+        board_id: None,
+        parent_item_id: Some(g1.clone()),
+        ordinal: Some(ordinal),
+    };
+    layout
+        .place_session(
+            conn.clone(),
+            s1.clone(),
+            &under_group(0),
+            BoardItemId::new("c1"),
+            0,
+        )
+        .unwrap();
+    layout
+        .place_session(
+            conn.clone(),
+            s2.clone(),
+            &under_group(1),
+            BoardItemId::new("c2"),
+            0,
+        )
+        .unwrap();
+
+    let fleet_for_window = fleet.clone();
+    let (board_handle, vcx) = cx.add_window_view(|_, cx| {
+        let working_tab = placeholder_tab(cx);
+        BoardView::mount(fleet_for_window, working_tab, None, cx)
+    });
+    vcx.update(|_, cx| {
+        board_handle.update(cx, |b, _| {
+            b.set_test_layout_for_test(layout);
+        });
+    });
+    vcx.simulate_resize(Size {
+        width: px(1200.0),
+        height: px(900.0),
+    });
+    vcx.run_until_parked();
+
+    let chrome = vcx.read(|cx| board_handle.read(cx).group_chrome_for_test());
+    assert_eq!(chrome.len(), 1, "exactly one group tile rendered");
+    let g = &chrome[0];
+    assert_eq!(g.name, "Refactor");
+    assert_eq!(
+        g.accent,
+        gpui::rgb(0x4c8dff).into(),
+        "blue token → SSOT blue"
+    );
+    assert_eq!(g.rollup.spend_usd, Some(3.50), "spend sums members");
+    assert_eq!(g.rollup.oldest_created_at, Some(0), "oldest member wins");
+    assert_eq!(g.rollup.completed_count, 0, "✓N is 0 until B-6");
+    assert_eq!(g.header, "Refactor · ~$3.50 · 2h · ✓0");
+    assert_eq!(g.session_ids, vec![s1.clone(), s2.clone()]);
+
+    // The member cards were built (in the visible band).
+    let built = vcx.read(|cx| board_handle.read(cx).visible_session_ids_for_test());
+    assert!(built.contains(&s1) && built.contains(&s2), "members built");
+}
