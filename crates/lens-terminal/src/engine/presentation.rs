@@ -32,6 +32,10 @@ pub enum EnginePresentationEvent {
         location: ClipboardLocation,
         contents: Vec<ClipboardMimePart>,
     },
+    LocalClick {
+        col: u16,
+        row: u16,
+    },
 }
 
 /// Tri-state latest-title slot value — distinguishes set vs clear vs no pending update.
@@ -97,6 +101,7 @@ pub(crate) fn collect_presentation_drain(
             EnginePresentationEvent::ClipboardWrite { location, contents } => {
                 clipboard_writes.push((location, contents));
             }
+            EnginePresentationEvent::LocalClick { .. } => {}
         }
     }
     PresentationDrainResult {

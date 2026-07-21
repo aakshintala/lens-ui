@@ -1,6 +1,7 @@
 //! Engine input command types for the Slice 2a input path.
 
 use crossbeam_channel::Sender;
+use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum KeyAction {
@@ -252,3 +253,106 @@ pub(crate) enum ScrollDelta {
     Top,
     Bottom,
 }
+
+#[allow(dead_code, reason = "consumed in Task 2/3/4")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MouseButtonKind {
+    Left,
+    Right,
+    Middle,
+}
+
+#[allow(dead_code, reason = "consumed in Task 2/3/4")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MouseEventKind {
+    Down,
+    Move,
+    Up,
+}
+
+#[allow(dead_code, reason = "consumed in Task 2/3/4")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum MouseReportPolicy {
+    #[default]
+    Auto,
+    ForceLocal,
+}
+
+#[allow(dead_code, reason = "consumed in Task 2/3/4")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GestureOwner {
+    Report,
+    Select,
+}
+
+#[allow(dead_code, reason = "consumed in Task 2/3/4")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GestureDisposition {
+    Reported,
+    Selected,
+    LocalClick,
+    Suppressed,
+    Ignored,
+    Coalesced,
+    ScrolledLocal,
+}
+
+#[allow(dead_code, reason = "consumed in Task 2/3/4")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MouseAck {
+    pub encoded: Vec<u8>,
+    pub disposition: GestureDisposition,
+}
+
+#[allow(dead_code, reason = "consumed in Task 2/3/4")]
+#[derive(Clone, Debug)]
+pub(crate) struct MouseGesture {
+    pub kind: MouseEventKind,
+    pub button: Option<MouseButtonKind>, // None only for buttonless Move
+    pub mods: KeyMods,                   // includes shift
+    pub cell: Option<(u16, u16)>,        // None when outside the grid (up-out / move-out)
+    pub px_x: f32,
+    pub px_y: f32,      // surface-relative pixels
+    pub time: Duration, // monotonic (for set_time multi-click)
+    pub write_allowed: bool,
+    pub mouse_local: bool,
+    pub policy: MouseReportPolicy,
+    pub access_epoch: u64,             // stamped by enqueue_input
+    pub ack: Option<Sender<MouseAck>>, // tests; None in production
+}
+
+#[allow(dead_code, reason = "consumed in Task 2/3/4")]
+#[derive(Clone, Debug)]
+pub(crate) struct WheelInput {
+    pub lines: i32, // signed, from gpui_scroll_to_lens
+    pub cell: Option<(u16, u16)>,
+    pub px_x: f32,
+    pub px_y: f32,
+    pub mods: KeyMods,
+    pub write_allowed: bool,
+    pub access_epoch: u64,
+    pub ack: Option<Sender<MouseAck>>,
+}
+
+/// Engine-internal adapter used by `encode_mouse_report` (built inside the worker arm from a
+/// `MouseGesture`/`WheelInput`).
+#[allow(dead_code, reason = "consumed in Task 2/3/4")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MouseReportEv {
+    pub action: MouseEventKind,
+    pub button: Option<MouseButtonKind>,
+    pub wheel: Option<bool /*up*/>,
+    pub mods: KeyMods,
+    pub px_x: f32,
+    pub px_y: f32,
+    pub any_button_pressed: bool,
+}
+
+#[allow(dead_code, reason = "consumed in Task 2/3/4")]
+#[derive(Clone, Debug)]
+pub struct CopyResult {
+    pub text: Option<String>,
+}
+
+#[allow(dead_code, reason = "consumed in Task 2/3/4")]
+pub(crate) type CopyResponder = crossbeam_channel::Sender<CopyResult>;
