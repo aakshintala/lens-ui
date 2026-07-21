@@ -19,7 +19,7 @@ fn msg(id: &str) -> Item {
         ctx: BlockContext {
             agent: None,
             depth: 0,
-            turn: 0,
+            response_id: None,
         },
         created_at: 1,
         kind: ItemKind::Message {

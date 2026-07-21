@@ -70,7 +70,7 @@ mod tests {
         BlockContext {
             agent: None,
             depth: 0,
-            turn: 0,
+            response_id: None,
         }
     }
 

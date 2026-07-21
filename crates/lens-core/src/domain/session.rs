@@ -213,7 +213,7 @@ mod tests {
             ctx: BlockContext {
                 agent: None,
                 depth: 0,
-                turn: 0,
+                response_id: None,
             },
             created_at: 1_700_000_000_000,
             kind: ItemKind::Message {

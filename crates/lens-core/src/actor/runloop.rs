@@ -9,6 +9,7 @@ use crate::actor::transport::{ActorTransport, ParkReason};
 use crate::clock::Clock;
 use crate::domain::SessionState;
 use crate::domain::controls::PendingUserMessage;
+use crate::domain::ids::ResponseId;
 use crate::domain::item::{BlockContext, Item, ItemKind};
 use crate::domain::scalars::SessionLifecycle;
 use crate::persist::map::item_kind_token;
@@ -226,7 +227,10 @@ fn wire_to_domain_item(wire: &WireItem, clock: &dyn Clock) -> Option<Item> {
         ctx: BlockContext {
             agent: None,
             depth: 0,
-            turn: 0,
+            response_id: wire
+                .response_id()
+                .filter(|s| !s.is_empty())
+                .map(|s| ResponseId::new(s.to_owned())),
         },
         created_at: clock.now_millis(),
         kind,
@@ -4102,7 +4106,7 @@ mod tests {
             ctx: BlockContext {
                 agent: None,
                 depth: 0,
-                turn: 0,
+                response_id: None,
             },
             created_at: 1_700_000_000_000,
             kind: ItemKind::Message {
@@ -4167,7 +4171,7 @@ mod tests {
             ctx: BlockContext {
                 agent: None,
                 depth: 0,
-                turn: 0,
+                response_id: None,
             },
             created_at: 1_700_000_000_000,
             kind: ItemKind::Message {
@@ -4950,6 +4954,51 @@ mod tests {
             })
             .map(|i| i.as_ref().clone())
             .collect()
+    }
+
+    /// Catch-up maps wire `response_id` onto domain `BlockContext` (T-0 Task 2).
+    #[test]
+    fn catch_up_maps_wire_response_id() {
+        use lens_client::sessions::ItemList;
+        use serde_json::json;
+
+        let list: ItemList = serde_json::from_value(json!({
+            "data": [{
+                "type": "message",
+                "id": "item_abc",
+                "response_id": "resp_bcb93365",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "hi"}]
+            }],
+            "has_more": false
+        }))
+        .expect("parses");
+        let wire = &list.items()[0];
+        let domain = wire_to_domain_item(wire, test_clock().as_ref()).expect("maps");
+        assert_eq!(
+            domain.ctx.response_id.as_ref().map(|r| r.as_str()),
+            Some("resp_bcb93365")
+        );
+    }
+
+    #[test]
+    fn catch_up_absent_response_id_is_none() {
+        use lens_client::sessions::ItemList;
+        use serde_json::json;
+
+        let list: ItemList = serde_json::from_value(json!({
+            "data": [{
+                "type": "message",
+                "id": "item_abc",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "hi"}]
+            }],
+            "has_more": false
+        }))
+        .expect("parses");
+        let wire = &list.items()[0];
+        let domain = wire_to_domain_item(wire, test_clock().as_ref()).expect("maps");
+        assert_eq!(domain.ctx.response_id, None);
     }
 
     /// Store-layer D30 fold sentinel on real 0.5.1 bytes. Drives the exact fold path

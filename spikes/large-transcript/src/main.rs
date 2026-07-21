@@ -62,7 +62,7 @@ fn large_item(i: i64) -> Item {
         ctx: BlockContext {
             agent: Some("coder".into()),
             depth: 0,
-            turn: (i / 4) as u32,
+            response_id: None,
         },
         created_at: 1_700_000_000_000 + i,
         kind: ItemKind::FunctionCallOutput {
@@ -82,7 +82,7 @@ fn small_item(i: i64) -> Item {
         ctx: BlockContext {
             agent: Some("coder".into()),
             depth: 0,
-            turn: (i / 4) as u32,
+            response_id: None,
         },
         created_at: 1_700_000_000_000 + i,
         kind: ItemKind::Message {
@@ -105,9 +105,9 @@ fn make_item(i: i64) -> Item {
 }
 
 /// The windowed page-load / hydrate SELECT column list. MUST match the order
-/// `row_to_item` reads: item_id, live_seq, kind, payload, agent, depth, turn,
-/// created_at.
-const ITEM_COLS: &str = "item_id, live_seq, kind, payload, agent, depth, turn, created_at";
+/// `row_to_item` reads: item_id, live_seq, kind, payload, agent, depth,
+/// created_at, response_id.
+const ITEM_COLS: &str = "item_id, live_seq, kind, payload, agent, depth, created_at, response_id";
 
 fn generate() {
     let path = db_path();
@@ -158,7 +158,7 @@ fn generate() {
                 payload,
                 item.ctx.agent,
                 item.ctx.depth as i64,
-                item.ctx.turn as i64,
+                0i64,
                 item.created_at,
             ])
             .unwrap();
@@ -286,7 +286,7 @@ fn reconcile_tail(conn: &Connection, tail_start: i64, tail_truth: &[Item]) {
             payload,
             item.ctx.agent,
             item.ctx.depth as i64,
-            item.ctx.turn as i64,
+            0i64,
             item.created_at,
         ])
         .unwrap();

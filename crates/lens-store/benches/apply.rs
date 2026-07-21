@@ -19,7 +19,7 @@ fn sample_item(id: &str) -> Item {
         ctx: BlockContext {
             agent: None,
             depth: 0,
-            turn: 0,
+            response_id: None,
         },
         created_at: 0,
         kind: ItemKind::Message {

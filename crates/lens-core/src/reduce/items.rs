@@ -14,7 +14,7 @@ pub(crate) fn current_ctx(scratch: &StreamScratch) -> BlockContext {
     BlockContext {
         agent: scratch.current_agent.clone(),
         depth: 0, // P1-DECISION D-P1-14: sub-agent depth deferred to §9
-        turn: scratch.turn,
+        response_id: None,
     }
 }
 
@@ -362,7 +362,7 @@ mod tests {
         assert_eq!(s.stream.turn, 1);
         assert_eq!(s.items.len(), 1);
         assert!(matches!(s.items[0].kind, ItemKind::Message { .. }));
-        assert_eq!(s.items[0].ctx.turn, 0); // REVIEW#1: stamped with the PRE-bump turn
+        assert_eq!(s.items[0].ctx.response_id, None); // live stamp deferred to Task 3
         assert!(s.stream.open_message.is_none());
     }
 

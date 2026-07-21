@@ -1,7 +1,7 @@
 //! The canonical conversation unit (§2.3/§2.4) + transient stream accumulators
 //! (§4.2). `Item` is the durable, reduced unit the transcript and disk hold.
 
-use crate::domain::ids::{AgentId, CallId, ItemId};
+use crate::domain::ids::{AgentId, CallId, ItemId, ResponseId};
 use crate::domain::scalars::{ErrorSource, Role};
 use lens_client::generated::SessionResourceObject;
 use serde::{Deserialize, Serialize};
@@ -16,8 +16,8 @@ pub struct BlockContext {
     pub agent: Option<String>,
     /// 0 = root, 1 = sub-agent, …
     pub depth: u32,
-    /// Turn within the response.
-    pub turn: u32,
+    /// Authoritative server response this item belongs to, when known.
+    pub response_id: Option<ResponseId>,
 }
 
 /// One block of message content (§2.3 `Message.content`). `text` for text blocks;
@@ -151,7 +151,7 @@ mod tests {
         BlockContext {
             agent: None,
             depth: 0,
-            turn: 0,
+            response_id: None,
         }
     }
 

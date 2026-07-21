@@ -2,7 +2,7 @@
 //! `items.kind` vocabulary. Serialization of our OWN enums cannot fail on a
 //! string-serializing type — the `expect` invariants below are never external data.
 
-use crate::domain::ids::{AgentId, ConnectionId, HostId, ItemId, RunnerId, SessionId};
+use crate::domain::ids::{AgentId, ConnectionId, HostId, ItemId, ResponseId, RunnerId, SessionId};
 use crate::domain::item::{BlockContext, Item, ItemKind};
 use crate::domain::scalars::{ErrorInfo, HostType, SessionLifecycle, SessionStatusValue};
 use crate::domain::session::SessionState;
@@ -164,22 +164,23 @@ pub fn row_to_session(r: &rusqlite::Row) -> rusqlite::Result<SessionState> {
 /// Reconstruct an `Item` from a transcript row. `payload` alone carries the full
 /// tagged `ItemKind` (D-P2-9); `ordinal`/`kind` columns are read-contract only.
 /// Total over decodable rows. Column order: item_id, live_seq, kind, payload,
-/// agent, depth, turn, created_at.
+/// agent, depth, created_at, response_id.
 pub fn row_to_item(r: &rusqlite::Row) -> rusqlite::Result<Item> {
     fn to_sql_err<E: std::error::Error + Send + Sync + 'static>(e: E) -> rusqlite::Error {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
     }
     let payload: String = r.get(3)?;
     let kind: ItemKind = from_json(&payload).map_err(to_sql_err)?;
+    let response_id: Option<String> = r.get(7)?;
     Ok(Item {
         id: ItemId::new(r.get::<_, String>(0)?),
         seq: r.get::<_, Option<i64>>(1)?.map(|v| v as u64),
         ctx: BlockContext {
             agent: r.get(4)?,
             depth: r.get::<_, i64>(5)? as u32,
-            turn: r.get::<_, i64>(6)? as u32,
+            response_id: response_id.map(ResponseId::new),
         },
-        created_at: r.get(7)?,
+        created_at: r.get(6)?,
         kind,
     })
 }

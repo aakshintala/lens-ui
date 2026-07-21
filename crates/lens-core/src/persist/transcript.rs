@@ -59,6 +59,12 @@ fn migrate_transcript_columns(conn: &Connection) -> Result<()> {
     {
         return Err(e.into());
     }
+    if !columns.iter().any(|c| c == "response_id")
+        && let Err(e) = conn.execute("ALTER TABLE items ADD COLUMN response_id TEXT", [])
+        && !is_duplicate_column_err(&e)
+    {
+        return Err(e.into());
+    }
     Ok(())
 }
 
@@ -123,13 +129,14 @@ impl SqliteTranscriptStore {
             None
         };
         let sql = format!(
-            "INSERT INTO items (item_id, live_seq, ordinal, kind, payload, agent, depth, turn, created_at, provisional, call_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            "INSERT INTO items (item_id, live_seq, ordinal, kind, payload, agent, depth, turn, created_at, provisional, call_id, response_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(item_id) DO UPDATE SET
                live_seq=excluded.live_seq, {ordinal_clause}, kind=excluded.kind,
                payload=excluded.payload, agent=excluded.agent, depth=excluded.depth,
                turn=excluded.turn, created_at=excluded.created_at,
-               provisional=excluded.provisional, call_id=excluded.call_id
+               provisional=excluded.provisional, call_id=excluded.call_id,
+               response_id=excluded.response_id
              RETURNING ordinal"
         );
         self.conn
@@ -143,10 +150,11 @@ impl SqliteTranscriptStore {
                     payload,
                     item.ctx.agent,
                     item.ctx.depth as i64,
-                    item.ctx.turn as i64,
+                    0i64,
                     item.created_at,
                     provisional as i64,
                     call_id,
+                    item.ctx.response_id.as_ref().map(|r| r.as_str()),
                 ],
                 |r| r.get(0),
             )
@@ -168,13 +176,13 @@ impl SqliteTranscriptStore {
         let payload = json_string(&item.kind)?;
         let kind = item_kind_token(&item.kind);
         let sql = format!(
-            "INSERT INTO items (item_id, live_seq, ordinal, kind, payload, agent, depth, turn, created_at, provisional, call_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, NULL)
+            "INSERT INTO items (item_id, live_seq, ordinal, kind, payload, agent, depth, turn, created_at, provisional, call_id, response_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, NULL, ?10)
              ON CONFLICT(item_id) DO UPDATE SET
                live_seq=excluded.live_seq, {ordinal_clause}, kind=excluded.kind,
                payload=excluded.payload, agent=excluded.agent, depth=excluded.depth,
                turn=excluded.turn, created_at=excluded.created_at,
-               provisional=0, call_id=NULL"
+               provisional=0, call_id=NULL, response_id=excluded.response_id"
         );
         self.conn.execute(
             &sql,
@@ -186,8 +194,9 @@ impl SqliteTranscriptStore {
                 payload,
                 item.ctx.agent,
                 item.ctx.depth as i64,
-                item.ctx.turn as i64,
+                0i64,
                 item.created_at,
+                item.ctx.response_id.as_ref().map(|r| r.as_str()),
             ],
         )?;
         Ok(())
@@ -243,7 +252,7 @@ impl TranscriptStore for SqliteTranscriptStore {
 
     fn load_items(&self) -> Result<Loaded<Item>> {
         let mut stmt = self.conn.prepare(
-            "SELECT item_id, live_seq, kind, payload, agent, depth, turn, created_at
+            "SELECT item_id, live_seq, kind, payload, agent, depth, created_at, response_id
              FROM items ORDER BY ordinal",
         )?;
         let mut rows = stmt.query([])?;
@@ -298,11 +307,13 @@ impl TranscriptStore for SqliteTranscriptStore {
                             [ord],
                         )?;
                         tx.execute(
-                            "UPDATE items SET kind = ?1, payload = ?2, provisional = 0
-                               WHERE item_id = ?3",
+                            "UPDATE items SET kind = ?1, payload = ?2, provisional = 0,
+                               response_id = ?3
+                               WHERE item_id = ?4",
                             rusqlite::params![
                                 item_kind_token(&store_item.kind),
                                 json_string(&store_item.kind)?,
+                                store_item.ctx.response_id.as_ref().map(|r| r.as_str()),
                                 store_item.id.as_str(),
                             ],
                         )?;
@@ -311,11 +322,13 @@ impl TranscriptStore for SqliteTranscriptStore {
                     None => {
                         tx.execute(
                             "UPDATE items SET item_id = ?1, live_seq = NULL, provisional = 0,
-                               call_id = NULL, kind = ?2, payload = ?3 WHERE ordinal = ?4",
+                               call_id = NULL, kind = ?2, payload = ?3, response_id = ?4
+                               WHERE ordinal = ?5",
                             rusqlite::params![
                                 store_item.id.as_str(),
                                 item_kind_token(&store_item.kind),
                                 json_string(&store_item.kind)?,
+                                store_item.ctx.response_id.as_ref().map(|r| r.as_str()),
                                 ord,
                             ],
                         )?;
@@ -364,7 +377,7 @@ impl TranscriptStore for SqliteTranscriptStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::ids::{CallId, ConnectionId, ItemId, SessionId};
+    use crate::domain::ids::{CallId, ConnectionId, ItemId, ResponseId, SessionId};
     use crate::domain::item::{BlockContext, ContentBlock, Item, ItemKind};
     use crate::domain::scalars::Role;
     use crate::persist::TranscriptStore;
@@ -388,14 +401,14 @@ CREATE TABLE IF NOT EXISTS items (
 );
 "#;
 
-    fn item(id: &str, turn: u32, text: &str) -> Item {
+    fn item(id: &str, response_id: Option<&str>, text: &str) -> Item {
         Item {
             id: ItemId::new(id),
             seq: Some(1),
             ctx: BlockContext {
                 agent: Some("coder".into()),
                 depth: 0,
-                turn,
+                response_id: response_id.map(ResponseId::new),
             },
             created_at: 1_700_000_000_000,
             kind: ItemKind::Message {
@@ -416,7 +429,7 @@ CREATE TABLE IF NOT EXISTS items (
             ctx: BlockContext {
                 agent: None,
                 depth: 0,
-                turn: 0,
+                response_id: None,
             },
             created_at: 1_700_000_000_100,
             kind: ItemKind::Message {
@@ -437,7 +450,7 @@ CREATE TABLE IF NOT EXISTS items (
             ctx: BlockContext {
                 agent: None,
                 depth: 0,
-                turn: 0,
+                response_id: None,
             },
             created_at: 1_700_000_000_000,
             kind: ItemKind::FunctionCall {
@@ -457,7 +470,7 @@ CREATE TABLE IF NOT EXISTS items (
             ctx: BlockContext {
                 agent: None,
                 depth: 0,
-                turn: 0,
+                response_id: None,
             },
             created_at: 1_700_000_000_000,
             kind: ItemKind::FunctionCallOutput {
@@ -551,8 +564,8 @@ CREATE TABLE IF NOT EXISTS items (
     fn store_frontier_ignores_provisional() {
         let d = tempdir().unwrap();
         let s = store(d.path());
-        s.upsert_item(0, &item("item_a", 0, "a"), false).unwrap();
-        s.upsert_item(1, &item("item_b", 0, "b"), false).unwrap();
+        s.upsert_item(0, &item("item_a", None, "a"), false).unwrap();
+        s.upsert_item(1, &item("item_b", None, "b"), false).unwrap();
         s.upsert_item(2, &function_call("fc_live", "call_1"), true)
             .unwrap();
         assert_eq!(
@@ -565,8 +578,8 @@ CREATE TABLE IF NOT EXISTS items (
     fn next_ordinal_seed_counts_provisional() {
         let d = tempdir().unwrap();
         let s = store(d.path());
-        s.upsert_item(0, &item("item_a", 0, "a"), false).unwrap();
-        s.upsert_item(1, &item("item_b", 0, "b"), false).unwrap();
+        s.upsert_item(0, &item("item_a", None, "a"), false).unwrap();
+        s.upsert_item(1, &item("item_b", None, "b"), false).unwrap();
         s.upsert_item(2, &function_call("fc_live", "call_1"), true)
             .unwrap();
         assert_eq!(s.next_ordinal_seed().unwrap(), 3);
@@ -690,8 +703,8 @@ CREATE TABLE IF NOT EXISTS items (
     fn refire_by_id_keeps_original_ordinal() {
         let d = tempdir().unwrap();
         let s = store(d.path());
-        s.upsert_item(5, &item("item_a", 0, "a"), false).unwrap();
-        s.upsert_item(99, &item("item_a", 0, "a-refire"), false)
+        s.upsert_item(5, &item("item_a", None, "a"), false).unwrap();
+        s.upsert_item(99, &item("item_a", None, "a-refire"), false)
             .unwrap();
         assert_eq!(
             s.store_frontier().unwrap(),
@@ -705,13 +718,13 @@ CREATE TABLE IF NOT EXISTS items (
     fn refire_returns_stored_ordinal_without_bumping_cursor() {
         let d = tempdir().unwrap();
         let s = store(d.path());
-        s.upsert_item(0, &item("item_a", 0, "a"), false).unwrap();
-        s.upsert_item(1, &item("item_b", 0, "b"), false).unwrap();
+        s.upsert_item(0, &item("item_a", None, "a"), false).unwrap();
+        s.upsert_item(1, &item("item_b", None, "b"), false).unwrap();
         let stored = s
-            .upsert_item(99, &item("item_a", 0, "a-refire"), false)
+            .upsert_item(99, &item("item_a", None, "a-refire"), false)
             .unwrap();
         assert_eq!(stored, 0);
-        let stored = s.upsert_item(2, &item("item_c", 0, "c"), false).unwrap();
+        let stored = s.upsert_item(2, &item("item_c", None, "c"), false).unwrap();
         assert_eq!(stored, 2);
         let rows = s.load_items().unwrap().rows;
         assert_eq!(rows.len(), 3);
@@ -722,9 +735,9 @@ CREATE TABLE IF NOT EXISTS items (
     fn upsert_items_then_load_ordered_and_self_describing() {
         let d = tempdir().unwrap();
         let s = store(d.path());
-        s.upsert_item(0, &item("item_a", 0, "a"), false).unwrap();
-        s.upsert_item(1, &item("item_b", 0, "b"), false).unwrap();
-        s.upsert_item(0, &item("item_a", 0, "a-edited"), false)
+        s.upsert_item(0, &item("item_a", None, "a"), false).unwrap();
+        s.upsert_item(1, &item("item_b", None, "b"), false).unwrap();
+        s.upsert_item(0, &item("item_a", None, "a-edited"), false)
             .unwrap();
         let items = s.load_items().unwrap().rows;
         assert_eq!(items.len(), 2);
@@ -747,13 +760,13 @@ CREATE TABLE IF NOT EXISTS items (
     fn reconcile_matches_server_truth_by_id() {
         let d = tempdir().unwrap();
         let s = store(d.path());
-        s.upsert_item(0, &item("item_a", 0, "a"), false).unwrap();
-        s.upsert_item(1, &item("item_b", 0, "b"), false).unwrap();
-        s.upsert_item(2, &item("item_c", 0, "c"), false).unwrap();
+        s.upsert_item(0, &item("item_a", None, "a"), false).unwrap();
+        s.upsert_item(1, &item("item_b", None, "b"), false).unwrap();
+        s.upsert_item(2, &item("item_c", None, "c"), false).unwrap();
         let truth = vec![
-            item("item_a", 0, "a"),
-            item("item_b", 1, "b-edited"),
-            item("item_d", 1, "d"),
+            item("item_a", None, "a"),
+            item("item_b", Some("resp_b"), "b-edited"),
+            item("item_d", None, "d"),
         ];
         s.reconcile(&truth).unwrap();
         let items = s.load_items().unwrap().rows;
@@ -765,16 +778,78 @@ CREATE TABLE IF NOT EXISTS items (
             }
             _ => panic!(),
         }
-        assert_eq!(items[1].ctx.turn, 1);
+        assert_eq!(
+            items[1].ctx.response_id.as_ref().map(|r| r.as_str()),
+            Some("resp_b")
+        );
+    }
+
+    #[test]
+    fn response_id_round_trips() {
+        use crate::domain::ids::ResponseId;
+
+        let d = tempdir().unwrap();
+        let s = store(d.path());
+        let mut it = item("item_a", None, "a");
+        it.ctx.response_id = Some(ResponseId::new("resp_abc"));
+        s.upsert_item(0, &it, false).unwrap();
+        let back = s.load_items().unwrap().rows;
+        assert_eq!(back.len(), 1);
+        assert_eq!(
+            back[0].ctx.response_id.as_ref().map(|r| r.as_str()),
+            Some("resp_abc")
+        );
+    }
+
+    #[test]
+    fn reconcile_promotes_response_id() {
+        use crate::domain::ids::ResponseId;
+
+        let d = tempdir().unwrap();
+        let s = store(d.path());
+        let provisional = user_message("msg_1", "hello");
+        s.upsert_item(0, &provisional, true).unwrap();
+
+        let mut authoritative = user_message("msg_1", "hello from store");
+        authoritative.ctx.response_id = Some(ResponseId::new("resp_abc"));
+        let live_key = LiveKey {
+            id: authoritative.id.clone(),
+            call_id: None,
+            scaffold_kind: None,
+        };
+        s.reconcile_store_item(&authoritative, &live_key).unwrap();
+
+        let back = s.load_items().unwrap().rows;
+        assert_eq!(back.len(), 1);
+        assert_eq!(
+            back[0].ctx.response_id.as_ref().map(|r| r.as_str()),
+            Some("resp_abc")
+        );
+    }
+
+    #[test]
+    fn legacy_turn_column_written_zero() {
+        use crate::domain::ids::ResponseId;
+
+        let d = tempdir().unwrap();
+        let s = store(d.path());
+        let mut it = item("item_a", None, "a");
+        it.ctx.response_id = Some(ResponseId::new("resp_abc"));
+        s.upsert_item(0, &it, false).unwrap();
+        let turn: i64 = s
+            .conn
+            .query_row("SELECT turn FROM items LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(turn, 0);
     }
 
     #[test]
     fn corrupt_item_is_skipped_not_fatal_and_good_items_survive() {
         let d = tempdir().unwrap();
         let s = store(d.path());
-        s.upsert_item(0, &item("item_a", 0, "a"), false).unwrap();
-        s.upsert_item(1, &item("item_b", 0, "b"), false).unwrap();
-        s.upsert_item(2, &item("item_c", 0, "c"), false).unwrap();
+        s.upsert_item(0, &item("item_a", None, "a"), false).unwrap();
+        s.upsert_item(1, &item("item_b", None, "b"), false).unwrap();
+        s.upsert_item(2, &item("item_c", None, "c"), false).unwrap();
         s.conn
             .execute(
                 "UPDATE items SET payload = '{\"kind\":\"quantum_tool\",\"x\":1}' WHERE item_id = 'item_b'",
