@@ -592,7 +592,11 @@ fn handle_command(
                 && engine.read_live_tracking() != MouseTracking::None
                 && w.access_epoch == current_epoch;
             let (encoded, disposition) = if report {
-                let up = w.lines > 0;
+                // Direction MUST match the local-scroll path so the same physical gesture
+                // reports the direction it would scroll. `local_scroll` feeds `w.lines` to
+                // `ScrollViewport::Delta`, where negative == up (into scrollback). So a
+                // wheel-up gesture (negative lines) reports Button::Four. (codex T5 review.)
+                let up = w.lines < 0;
                 let notches = w.lines.unsigned_abs();
                 let mut encoded = Vec::new();
                 for _ in 0..notches {

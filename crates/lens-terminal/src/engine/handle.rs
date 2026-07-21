@@ -506,7 +506,9 @@ mod tests {
         let rx = h.attach_test_egress();
         h.feed(TRACKING_BUTTON_SGR.to_vec()).expect("feed tracking");
         enqueue_set_access(&h, true);
-        let ack = send_wheel(&h, base_wheel(1));
+        // Negative lines == scroll up (matches ScrollViewport::Delta "up is negative"),
+        // which must encode as SGR button 64 (wheel up / Button::Four).
+        let ack = send_wheel(&h, base_wheel(-1));
         assert_eq!(ack.disposition, GestureDisposition::Reported);
         let frame = rx
             .recv_timeout(Duration::from_secs(2))

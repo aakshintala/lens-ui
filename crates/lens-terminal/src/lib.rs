@@ -114,8 +114,8 @@ pub mod engine_bench_api {
 use gpui::prelude::*;
 use gpui::{
     App, Bounds, Context, Entity, EntityInputHandler, EventEmitter, FocusHandle, IntoElement,
-    KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    Render, ScrollWheelEvent, Subscription, UTF16Selection, Window,
+    KeyDownEvent, KeyUpEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render,
+    ScrollWheelEvent, Subscription, UTF16Selection, Window,
 };
 use lens_client::Client;
 use lens_client::ids::{SessionId, TerminalId};
@@ -732,7 +732,7 @@ impl TerminalTab {
     ) {
         self.handle_mouse_down(
             &MouseDownEvent {
-                button: MouseButton::Left,
+                button: gpui::MouseButton::Left,
                 position,
                 ..Default::default()
             },
@@ -745,7 +745,7 @@ impl TerminalTab {
     pub fn debug_mouse_move_for_test(
         &mut self,
         position: gpui::Point<Pixels>,
-        pressed_button: Option<MouseButton>,
+        pressed_button: Option<gpui::MouseButton>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -764,7 +764,7 @@ impl TerminalTab {
     pub fn debug_mouse_up_for_test(
         &mut self,
         position: gpui::Point<Pixels>,
-        button: MouseButton,
+        button: gpui::MouseButton,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -784,7 +784,7 @@ impl TerminalTab {
     pub fn debug_mouse_up_out_for_test(
         &mut self,
         position: gpui::Point<Pixels>,
-        button: MouseButton,
+        button: gpui::MouseButton,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1424,6 +1424,16 @@ impl TerminalTab {
             // un-encoded-residue path (C2). Covers Retry AND downgrade.
             if let Some(engine) = rt.engine_ref() {
                 engine.bump_access_epoch();
+                // Engine-authoritative access: revoke report authority at the ordered
+                // stream position NOW. The epoch bump only suppresses gestures queued
+                // BEFORE teardown; a mouse gesture enqueued during the reconnect/detached
+                // window carries the freshly-bumped epoch and would pass the epoch check,
+                // so without this the engine's stale `write_allowed == true` would leak
+                // reports onto the next connection's egress. Every teardown transitions to
+                // a non-writable reconnecting/detached state; the next successful attach
+                // re-sends the correct value via `apply_newest_size_before_input`.
+                // (Closes read-only report leak — codex T5 review, CRITICAL.)
+                let _ = engine.enqueue_set_access(false);
             }
             let (bridge, attach) = rt.take_transport();
             // Signal the outgoing bridge to stop SYNCHRONOUSLY, before the (detached,
