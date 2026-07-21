@@ -1,7 +1,7 @@
 # T-0 — Authoritative turn identity (design)
 
 **Date:** 2026-07-21 (rev 2 — cross-family reviewed + live-0.5.1-verified)
-**Status:** Design — ready for implementation plan.
+**Status:** Design — planned (`docs/plans/2026-07-21-transcript-t0-turn-identity.md`).
 **Owner:** Lens design effort
 **Type:** Implementation slice (build), transcript workstream **T-0** of T-0..T-7 —
 the prerequisite surfaced by the T-1 cross-family review.
@@ -77,7 +77,7 @@ Three conclusions reshape the slice:
 | Real `created_at` / durations | Unobtainable on catch-up; needs a snapshot pass | **T-6** (§7) |
 | `stream.turn` Ready-counter bump bug | Card/summary path, orthogonal | Board agent — `docs/handoffs/2026-07-21-turn-counter-non-completed-terminal-bug.md` |
 | `response.completed.response.usage` retention | Per-turn chip data | T-6 |
-| Focused **transcript** replica consumption of the liveness delta | The only current detailed-feed replica is `CardModel` (summary-only); the transcript replica is T-2's RowSource | **T-2** (§4.3) |
+| Focused **transcript** replica consumption of the liveness delta | The only current detailed-feed replica is `SessionCard::fold_detailed` (`crates/lens-ui/src/card/model.rs:163`, retains summary state only); the transcript replica is T-2's RowSource | **T-2** (§4.3) |
 | Any rendering / gpui | T-0 is data | T-2+ |
 
 ---
@@ -126,7 +126,7 @@ ActiveResponseChanged(Option<ResponseId>),
 ```
 
 Dedicated value-carrying delta (matches `StatusChanged`/`ModelChanged`). **Budget note:**
-`Updates` is `SmallVec<[StreamUpdate; 2]>` (`update.rs:13`); the `response.in_progress`
+`Updates` is `SmallVec<[StreamUpdate; 2]>` (`update.rs:71`); the `response.in_progress`
 path must stay ≤2 updates or accept a documented spill — the plan pins this with a bench
 check (codex finding).
 
@@ -176,9 +176,10 @@ Absent/empty wire `response_id` → `None` (never fabricated).
 `ActiveResponseChanged` deposits `active_response` into the foreground replica via the
 existing value-carrying delta pattern. **Success criterion is "the actor feed exposes
 the delta"** — the *transcript* replica that reads it is T-2's RowSource (not yet built);
-the only current detailed-feed replica is `CardModel` (summary-only, `card/model.rs:163`),
-whose exhaustive match T-0 must extend with a no-op/ignore arm so it compiles (codex
-finding). Replica *consumption* for the projector is T-2.
+the only current detailed-feed replica is `SessionCard::fold_detailed`
+(**`crates/lens-ui/src/card/model.rs:163`** — lens-ui, not lens-core; retains summary state
+only), whose exhaustive `match` on `StreamUpdate` T-0 must extend with a no-op/ignore arm so
+it compiles (codex finding). Replica *consumption* for the projector is T-2.
 
 **Ordering:** reduction precedes the terminal-prefix commit; a greedy-batch
 `Active(A) → item(A) → Active(None)` may expose only `None`, which correctly presents the
@@ -200,6 +201,12 @@ adds, not a `SCHEMA_VERSION` bump; both reviewers):
 
 - Add nullable `response_id TEXT`; **retain the legacy `turn` column** (dropping it breaks
   the read-only-degrade path — older binaries still `SELECT turn`, `db.rs:27-35`).
+- **Legacy `turn` write value (plan must resolve):** the upsert currently writes
+  `item.ctx.turn as i64` (`transcript.rs:146`); once `BlockContext.turn` is removed there is
+  no value to write. Write a literal **`0`** into the retained (NOT NULL) column — it is now
+  degrade-only, and older binaries treat `turn` as a coarse grouping ordinal, so all-zero
+  collapses their degrade view to a single group (accepted degrade). `row_to_item` stops
+  rehydrating it into the (deleted) struct field.
 - Write `ctx.response_id` on upsert; `row_to_item` (`map.rs:168-184`) reads it; old rows →
   `None` until catch-up backfill.
 - **Promote authoritative metadata in reconcile** (codex finding): the reconcile branches
@@ -257,7 +264,7 @@ it exists **only** on snapshot-embedded items (epoch **seconds**). Therefore:
   terminal `response.*` clears it + emits `(None)`; synthesized finalized accumulators fall
   back to `active_response`.
 - **Delta/replica:** `ActiveResponseChanged` mirror-parity; greedy-batch ordering invariant
-  (§4.3); `CardModel` ignore-arm compiles; `SmallVec` budget bench.
+  (§4.3); `SessionCard::fold_detailed` (lens-ui) ignore-arm compiles; `SmallVec` budget bench.
 - **Persistence:** `response_id` round-trip; reconcile promotes `response_id` on a
   provisional→authoritative fold; additive migration + old-row `None`.
 - `xtask gate` green (fmt/clippy/test, zero warnings). Add lens-client to the gate `-p` set
