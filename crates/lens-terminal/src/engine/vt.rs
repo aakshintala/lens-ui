@@ -18,7 +18,7 @@ use libghostty_vt::{Terminal, TerminalOptions};
 use thiserror::Error;
 
 use super::command::{
-    KeyInput, MouseButtonKind, MouseEventKind, MouseFormat, MouseReportEv, MouseTracking,
+    KeyInput, KeyMods, MouseButtonKind, MouseEventKind, MouseFormat, MouseReportEv, MouseTracking,
     ScrollDelta,
 };
 use super::frame::{CellStyle, CursorPos, Frame, FrameCell, FrameRow, Rgb, UnderlineStyle};
@@ -67,6 +67,12 @@ pub struct VtEngine {
     drag_event: libghostty_vt::selection::gesture::DragEvent<'static>,
     release_event: libghostty_vt::selection::gesture::ReleaseEvent<'static>,
     applied_mouse_opts: Option<(MouseTracking, MouseFormat)>,
+    /// Coalesce dedup identity of the last report event. When tracking, format, OR
+    /// mods change vs. the previous report, the encoder's last-cell dedup is reset so a
+    /// same-cell motion cannot inherit stale dedup across a mode/modifier transition
+    /// (Rev-2 I11/I15): e.g. Sgr→SgrPixels→Sgr same-cell must re-emit, and a
+    /// plain-Move→Ctrl-Move same-cell must re-emit.
+    mouse_coalesce_key: Option<(MouseTracking, MouseFormat, KeyMods)>,
     applied_encoder_size: Option<(u32, u32, u32, u32)>,
     reply_buffer: Rc<RefCell<Vec<u8>>>,
     #[expect(dead_code, reason = "worker invokes after take_replies in Task 4")]
@@ -227,6 +233,7 @@ impl VtEngine {
             drag_event: libghostty_vt::selection::gesture::DragEvent::new()?,
             release_event: libghostty_vt::selection::gesture::ReleaseEvent::new()?,
             applied_mouse_opts: None,
+            mouse_coalesce_key: None,
             applied_encoder_size: None,
             reply_buffer,
             on_reply: Box::new(on_reply) as OnReplyFn,
@@ -372,6 +379,15 @@ impl VtEngine {
         if self.applied_mouse_opts != Some(opts) {
             self.mouse_encoder.set_options_from_terminal(&self.terminal);
             self.applied_mouse_opts = Some(opts);
+        }
+        // Reset the encoder's last-cell dedup on ANY tracking/format/mods transition so a
+        // same-cell motion after the transition re-emits instead of coalescing against a
+        // stale cell (Rev-2 I11/I15). Press/Release never coalesce, so an incidental reset
+        // on those is harmless.
+        let coalesce_key = (tracking, format, ev.mods);
+        if self.mouse_coalesce_key != Some(coalesce_key) {
+            self.mouse_encoder.reset();
+            self.mouse_coalesce_key = Some(coalesce_key);
         }
         let size_tuple = (
             self.cell_w_px.saturating_mul(u32::from(self.cols)),
@@ -929,6 +945,73 @@ mod tests {
         assert!(!first.is_empty());
         let second = e.encode_mouse_report(&ev).expect("second");
         assert!(!second.is_empty(), "SgrPixels must emit on every motion");
+    }
+
+    #[test]
+    fn encode_mouse_report_mods_change_resets_coalesce() {
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        let mut e = VtEngine::new(&test_config(), |_| {}, tx).unwrap();
+        e.feed(b"\x1b[?1003h\x1b[?1006h"); // Any tracking + SGR
+        let ev = |mods| MouseReportEv {
+            action: MouseEventKind::Move,
+            button: None,
+            wheel: None,
+            mods,
+            px_x: 16.0,
+            px_y: 0.0,
+            any_button_pressed: false,
+        };
+        let none = KeyMods::default();
+        let ctrl = KeyMods {
+            ctrl: true,
+            ..KeyMods::default()
+        };
+        assert!(
+            !e.encode_mouse_report(&ev(none)).unwrap().is_empty(),
+            "first move emits"
+        );
+        assert!(
+            e.encode_mouse_report(&ev(none)).unwrap().is_empty(),
+            "same-cell same-mods motion coalesces"
+        );
+        assert!(
+            !e.encode_mouse_report(&ev(ctrl)).unwrap().is_empty(),
+            "same-cell mods change must re-emit (coalesce dedup reset)"
+        );
+    }
+
+    #[test]
+    fn encode_mouse_report_format_transition_resets_coalesce() {
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        let mut e = VtEngine::new(&test_config(), |_| {}, tx).unwrap();
+        e.feed(b"\x1b[?1003h\x1b[?1006h"); // Any tracking + SGR
+        let ev = MouseReportEv {
+            action: MouseEventKind::Move,
+            button: None,
+            wheel: None,
+            mods: KeyMods::default(),
+            px_x: 16.0,
+            px_y: 0.0,
+            any_button_pressed: false,
+        };
+        assert!(
+            !e.encode_mouse_report(&ev).unwrap().is_empty(),
+            "first SGR move emits"
+        );
+        assert!(
+            e.encode_mouse_report(&ev).unwrap().is_empty(),
+            "second SGR same-cell motion coalesces"
+        );
+        e.feed(b"\x1b[?1016h"); // switch to SgrPixels
+        assert!(
+            !e.encode_mouse_report(&ev).unwrap().is_empty(),
+            "SgrPixels move emits"
+        );
+        e.feed(b"\x1b[?1016l"); // back to SGR
+        assert!(
+            !e.encode_mouse_report(&ev).unwrap().is_empty(),
+            "same-cell SGR move after a format round-trip must re-emit (coalesce dedup reset)"
+        );
     }
 
     #[test]
