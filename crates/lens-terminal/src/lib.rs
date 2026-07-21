@@ -854,6 +854,11 @@ impl TerminalTab {
         self.clipboard_policy.paste_warn_suppressed()
     }
 
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn debug_mouse_local_for_test(&self) -> bool {
+        self.mouse_local
+    }
+
     fn lower_mouse_gesture(
         &mut self,
         kind: engine::command::MouseEventKind,
@@ -958,6 +963,15 @@ impl TerminalTab {
             &event.modifiers,
             true,
         );
+    }
+
+    /// Toggle mouse-local mode: forces local text selection instead of PTY mouse
+    /// reporting for the NEXT gesture (the engine arbiter reads the flag carried on
+    /// the command). Host UI/keybinding wiring lands with Slice 3.
+    #[cfg_attr(not(test), expect(dead_code, reason = "host toggle wiring; Slice 3"))]
+    pub(crate) fn toggle_mouse_local(&mut self, cx: &mut Context<Self>) {
+        self.mouse_local = !self.mouse_local;
+        cx.notify();
     }
 
     fn write_input_allowed(&self) -> bool {
@@ -2330,6 +2344,17 @@ mod tests {
         let tab = cx.new(|cx| TerminalTab::with_engine_for_test(Arc::clone(&engine), cx));
         tab.update(cx, |tab, cx| tab.teardown_transport_off_foreground(cx));
         assert_eq!(engine.access_epoch(), before + 1);
+    }
+
+    #[gpui::test]
+    async fn toggle_mouse_local_flips_carried_flag(cx: &mut gpui::TestAppContext) {
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let tab = cx.new(|cx| TerminalTab::with_engine_for_test(Arc::clone(&engine), cx));
+        tab.update(cx, |tab, _cx| assert!(!tab.debug_mouse_local_for_test()));
+        tab.update(cx, |tab, cx| tab.toggle_mouse_local(cx));
+        tab.update(cx, |tab, _cx| assert!(tab.debug_mouse_local_for_test()));
+        tab.update(cx, |tab, cx| tab.toggle_mouse_local(cx));
+        tab.update(cx, |tab, _cx| assert!(!tab.debug_mouse_local_for_test()));
     }
 
     // Regression (codex T5 review, CRITICAL): teardown must revoke report authority

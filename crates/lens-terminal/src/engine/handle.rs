@@ -782,6 +782,42 @@ mod tests {
     }
 
     #[test]
+    fn mouse_force_local_policy_under_tracking_selects_without_egress() {
+        let h = EngineHandle::spawn(test_config());
+        let rx = h.attach_test_egress();
+        h.feed(TRACKING_SGR.to_vec()).expect("feed tracking");
+        enqueue_set_access(&h, true);
+        let mut g = base_mouse_gesture(MouseEventKind::Down, Some(MouseButtonKind::Left));
+        g.policy = MouseReportPolicy::ForceLocal;
+        let ack = send_mouse(&h, g);
+        assert_eq!(ack.disposition, GestureDisposition::Selected);
+        assert!(ack.encoded.is_empty());
+        assert!(
+            rx.try_recv().is_err(),
+            "ForceLocal must not egress under tracking"
+        );
+        h.stop();
+    }
+
+    #[test]
+    fn mouse_local_toggle_under_tracking_selects_without_egress() {
+        let h = EngineHandle::spawn(test_config());
+        let rx = h.attach_test_egress();
+        h.feed(TRACKING_SGR.to_vec()).expect("feed tracking");
+        enqueue_set_access(&h, true);
+        let mut g = base_mouse_gesture(MouseEventKind::Down, Some(MouseButtonKind::Left));
+        g.mouse_local = true;
+        let ack = send_mouse(&h, g);
+        assert_eq!(ack.disposition, GestureDisposition::Selected);
+        assert!(ack.encoded.is_empty());
+        assert!(
+            rx.try_recv().is_err(),
+            "mouse_local must not egress under tracking"
+        );
+        h.stop();
+    }
+
+    #[test]
     fn mouse_latch_epoch_bump_suppresses_move_without_egress() {
         let h = EngineHandle::spawn(test_config());
         let rx = h.attach_test_egress();
