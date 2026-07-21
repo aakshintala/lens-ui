@@ -5,7 +5,7 @@ the current forward-looking state only. **Full dated session entries live in
 [`STATUS-ARCHIVE.md`](./STATUS-ARCHIVE.md)** — write each session's detail there
 and roll older "Recent" pointers off this page as they age.
 
-_Last curated 2026-07-21 (B-2 packing/scroll/culling SHIPPED + merged to main unpushed; B-3 group chrome next — planning deferred to next session)._
+_Last curated 2026-07-21 (turn-counter Ready-flash bug FIXED + live-verified + pushed to origin/main; B-2 packing/scroll/culling SHIPPED + pushed; B-3 group chrome next — planning deferred to next session)._
 
 ---
 
