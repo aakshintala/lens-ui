@@ -3391,6 +3391,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "async-channel 2.5.0",
+ "base64",
  "criterion",
  "crossbeam-channel",
  "futures",

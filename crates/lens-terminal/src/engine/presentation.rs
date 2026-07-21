@@ -4,6 +4,11 @@ pub const PRESENTATION_CHANNEL_CAP: usize = 64;
 pub const MAX_REPORTED_TITLE_CHARS: usize = 512;
 pub const MAX_HYPERLINK_URI_BYTES: usize = 8192;
 
+/// Max **decoded** clipboard bytes (summed across MIME parts) an OSC 52 write may
+/// carry before it is dropped. Applied BEFORE any owned allocation. 1 MiB is well
+/// above real copy sizes; the bound stops a hostile program forcing large owned copies.
+pub const MAX_OSC52_CLIPBOARD_BYTES: usize = 1 << 20;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClipboardLocation {
     Standard,

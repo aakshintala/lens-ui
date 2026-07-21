@@ -21,7 +21,8 @@ use super::command::{KeyInput, ScrollDelta};
 use super::frame::{CellStyle, CursorPos, Frame, FrameCell, FrameRow, Rgb, UnderlineStyle};
 use super::key_map::encode_key_pure;
 use super::presentation::{
-    EnginePresentationEvent, MAX_HYPERLINK_URI_BYTES, TitleUpdate, sanitize_reported_title,
+    ClipboardLocation, ClipboardMimePart, EnginePresentationEvent, MAX_HYPERLINK_URI_BYTES,
+    MAX_OSC52_CLIPBOARD_BYTES, TitleUpdate, sanitize_reported_title,
 };
 use super::worker::WakerSlot;
 use crate::engine::inspect::InspectShared;
@@ -101,6 +102,9 @@ impl VtEngine {
         // path may already hold one clone of that sender.
         let title_slot = Arc::clone(&latest_title_slot);
         let title_tx = presentation_tx;
+        let clip_tx = title_tx.clone();
+        let waker_for_clip = waker.clone();
+        let inspect_for_clip = inspect.clone();
         let waker_for_title = waker.clone();
         let inspect_for_title = inspect.clone();
         terminal.on_title_changed(move |term| {
@@ -149,6 +153,47 @@ impl VtEngine {
                     wake();
                 }
             }
+        })?;
+
+        // --- 2b: OSC 52 clipboard-write effect (result IGNORED by OSC 52; cap + forward only) ---
+        terminal.on_clipboard_write(move |_term, write| {
+            let location = map_clipboard_location(write.location());
+            // cap BEFORE clone: borrow (&mime,&data) refs (no data copy), sum decoded bytes.
+            let parts: Vec<(&str, &str)> = write.contents().map(|c| (c.mime, c.data)).collect();
+            let total: usize = parts.iter().map(|(_, d)| d.len()).sum();
+            if total > MAX_OSC52_CLIPBOARD_BYTES {
+                if let Some(insp) = inspect_for_clip.as_ref() {
+                    insp.record_osc52_over_cap_drop();
+                }
+                return Ok(()); // OSC 52 ignores the result; drop with no owned allocation
+            }
+            let contents: Vec<ClipboardMimePart> = parts
+                .into_iter()
+                .map(|(mime, data)| ClipboardMimePart {
+                    mime: mime.to_owned(),
+                    data: data.to_owned(),
+                })
+                .collect();
+            match clip_tx.try_send(EnginePresentationEvent::ClipboardWrite { location, contents }) {
+                Ok(()) => {
+                    if let Some(insp) = inspect_for_clip.as_ref() {
+                        insp.record_osc52_forwarded();
+                    }
+                }
+                Err(TrySendError::Full(_)) => {
+                    if let Some(insp) = inspect_for_clip.as_ref() {
+                        insp.record_presentation_channel_full_drop();
+                    }
+                }
+                Err(TrySendError::Disconnected(_)) => {}
+            }
+            if let Some(w) = waker_for_clip.as_ref()
+                && let Ok(guard) = w.lock()
+                && let Some(f) = guard.as_ref()
+            {
+                f();
+            }
+            Ok(())
         })?;
 
         Ok(Self {
@@ -408,6 +453,15 @@ fn underline_from_ghostty(u: Underline) -> UnderlineStyle {
     }
 }
 
+fn map_clipboard_location(loc: libghostty_vt::terminal::ClipboardLocation) -> ClipboardLocation {
+    use libghostty_vt::terminal::ClipboardLocation as L;
+    match loc {
+        L::Standard => ClipboardLocation::Standard,
+        L::Selection => ClipboardLocation::Selection,
+        L::Primary => ClipboardLocation::Primary,
+    }
+}
+
 #[cfg(test)]
 impl VtEngine {
     pub fn scrollback_rows_for_test(&self) -> usize {
@@ -541,6 +595,93 @@ mod tests {
             f.cursor.is_none(),
             "cursor must be None when scrolled out of viewport, got {:?}",
             f.cursor
+        );
+    }
+}
+
+#[cfg(test)]
+mod clipboard_tests {
+    use super::*;
+    use crate::engine::presentation::{
+        ClipboardLocation, EnginePresentationEvent, MAX_OSC52_CLIPBOARD_BYTES,
+    };
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+    fn osc52(pc: &str, decoded: &[u8]) -> Vec<u8> {
+        let mut v = Vec::from(format!("\x1b]52;{pc};").as_bytes());
+        v.extend_from_slice(STANDARD.encode(decoded).as_bytes());
+        v.push(0x07); // BEL terminator
+        v
+    }
+
+    fn engine_with_rx() -> (
+        VtEngine,
+        crossbeam_channel::Receiver<EnginePresentationEvent>,
+    ) {
+        let (tx, rx) =
+            crossbeam_channel::bounded(crate::engine::presentation::PRESENTATION_CHANNEL_CAP);
+        let cfg = EngineConfig {
+            cols: 40,
+            rows: 8,
+            max_scrollback: 0,
+            cell_w_px: 8,
+            cell_h_px: 16,
+        };
+        let engine = VtEngine::new(&cfg, |_| {}, tx).expect("engine");
+        (engine, rx)
+    }
+
+    #[test]
+    fn osc52_write_under_cap_emits_clipboard_event_with_location_and_data() {
+        let (mut engine, rx) = engine_with_rx();
+        engine.feed(&osc52("c", b"hello-copy"));
+        match rx.try_recv().expect("clipboard event") {
+            EnginePresentationEvent::ClipboardWrite { location, contents } => {
+                assert_eq!(location, ClipboardLocation::Standard);
+                assert_eq!(contents.len(), 1);
+                assert_eq!(contents[0].data, "hello-copy");
+            }
+            other => panic!("expected ClipboardWrite, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn osc52_write_over_cap_drops_before_clone_no_event() {
+        let (mut engine, rx) = engine_with_rx();
+        let big = vec![b'x'; MAX_OSC52_CLIPBOARD_BYTES + 1];
+        engine.feed(&osc52("c", &big));
+        assert!(rx.try_recv().is_err(), "over-cap OSC 52 must emit no event");
+    }
+
+    #[test]
+    fn osc52_write_cap_minus_one_emits() {
+        let (mut engine, rx) = engine_with_rx();
+        let below = vec![b'z'; MAX_OSC52_CLIPBOARD_BYTES - 1];
+        engine.feed(&osc52("c", &below));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(EnginePresentationEvent::ClipboardWrite { .. })
+        ));
+    }
+
+    #[test]
+    fn osc52_write_at_cap_emits() {
+        let (mut engine, rx) = engine_with_rx();
+        let at = vec![b'y'; MAX_OSC52_CLIPBOARD_BYTES];
+        engine.feed(&osc52("c", &at));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(EnginePresentationEvent::ClipboardWrite { .. })
+        ));
+    }
+
+    #[test]
+    fn osc52_read_query_emits_no_event() {
+        let (mut engine, rx) = engine_with_rx();
+        engine.feed(b"\x1b]52;c;?\x07"); // read request — binding never delivers reads
+        assert!(
+            rx.try_recv().is_err(),
+            "OSC 52 read must not produce a host event"
         );
     }
 }
