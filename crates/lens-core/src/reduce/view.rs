@@ -74,6 +74,46 @@ pub fn pair_tool_spans<'a>(items: &[&'a Item]) -> Vec<ViewBlock<'a>> {
     out
 }
 
+/// Stage 2: pair tool spans over the (already Stage-1-filtered) item view, then splice the
+/// live streaming tail (reasoning, then message). `active_response` is reserved for Stage 3.
+pub fn project<'a>(
+    items: &[&'a Item],
+    scratch: &'a StreamScratch,
+    active_response: Option<&'a ResponseId>,
+) -> Vec<ViewBlock<'a>> {
+    project_filtered(items, scratch, active_response, true)
+}
+
+/// `project` with explicit control over whether the reasoning tail is spliced — the caller
+/// sets `splice_reasoning = false` when it applied `hide_reasoning` in Stage 1 (§5.2).
+pub fn project_filtered<'a>(
+    items: &[&'a Item],
+    scratch: &'a StreamScratch,
+    _active_response: Option<&'a ResponseId>,
+    splice_reasoning: bool,
+) -> Vec<ViewBlock<'a>> {
+    let mut blocks = pair_tool_spans(items);
+    if splice_reasoning
+        && let Some(r) = &scratch.open_reasoning
+    {
+        blocks.push(ViewBlock::StreamingReasoning(r));
+    }
+    if let Some(m) = &scratch.open_message {
+        blocks.push(ViewBlock::StreamingMessage(m));
+    }
+    blocks
+}
+
+/// No-filter convenience: project the full canonical slice.
+pub fn project_all<'a>(
+    items: &'a [Item],
+    scratch: &'a StreamScratch,
+    active_response: Option<&'a ResponseId>,
+) -> Vec<ViewBlock<'a>> {
+    let refs: Vec<&Item> = items.iter().collect();
+    project(&refs, scratch, active_response)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,6 +199,30 @@ mod tests {
         }
     }
 
+    fn scratch_with(reasoning: Option<ReasoningAcc>, message: Option<MessageAcc>) -> StreamScratch {
+        StreamScratch {
+            open_message: message,
+            open_reasoning: reasoning,
+            ..Default::default()
+        }
+    }
+
+    fn r_acc() -> ReasoningAcc {
+        ReasoningAcc {
+            full_text: "thinking".into(),
+            summary_text: String::new(),
+            encrypted: false,
+        }
+    }
+
+    fn m_acc() -> MessageAcc {
+        MessageAcc {
+            message_id: Some("msg_live".into()),
+            text: "partial".into(),
+            block_index: 0,
+        }
+    }
+
     #[test]
     fn pairs_call_with_following_output() {
         let items = vec![call("c1", None, "call_1", "completed"), output("o1", None, "call_1")];
@@ -166,6 +230,53 @@ mod tests {
         let out = pair_tool_spans(&refs);
         assert_eq!(out.len(), 1);
         assert_span(&out[0], "c1", Some("o1"));
+    }
+
+    #[test]
+    fn splices_reasoning_then_message_after_finalized() {
+        let items = vec![msg("m1", Some("resp_a"), Role::Assistant, "done")];
+        let refs: Vec<&Item> = items.iter().collect();
+        let scratch = scratch_with(Some(r_acc()), Some(m_acc()));
+        let resp_a = ResponseId::new("resp_a");
+        let out = project(&refs, &scratch, Some(&resp_a));
+        assert_eq!(out.len(), 3);
+        assert_item(&out[0], "m1");
+        assert!(matches!(out[1], ViewBlock::StreamingReasoning(_)));
+        assert!(matches!(out[2], ViewBlock::StreamingMessage(_)));
+    }
+
+    #[test]
+    fn no_tail_when_scratch_empty() {
+        let items = vec![msg("m1", Some("resp_a"), Role::Assistant, "done")];
+        let refs: Vec<&Item> = items.iter().collect();
+        let scratch = scratch_with(None, None);
+        let out = project(&refs, &scratch, None);
+        assert_eq!(out.len(), 1);
+        assert_item(&out[0], "m1");
+    }
+
+    #[test]
+    fn message_only_tail() {
+        let items: Vec<Item> = vec![];
+        let refs: Vec<&Item> = items.iter().collect();
+        let scratch = scratch_with(None, Some(m_acc()));
+        let out = project(&refs, &scratch, None);
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0], ViewBlock::StreamingMessage(_)));
+    }
+
+    #[test]
+    fn filter_consistency_hide_reasoning_suppresses_streaming_reasoning() {
+        // When the caller applies hide_reasoning (Stage 1), it must also suppress the
+        // reasoning tail. project() honors this by taking a `splice_reasoning` decision
+        // from the caller — modeled here by the caller pre-filtering + passing the flag.
+        let items: Vec<Item> = vec![];
+        let refs: Vec<&Item> = items.iter().collect();
+        let scratch = scratch_with(Some(r_acc()), Some(m_acc()));
+        // hide_reasoning path: project_filtered suppresses the reasoning tail.
+        let out = project_filtered(&refs, &scratch, None, false);
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0], ViewBlock::StreamingMessage(_)));
     }
 
     #[test]
