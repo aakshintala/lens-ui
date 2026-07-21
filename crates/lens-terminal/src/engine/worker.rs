@@ -605,13 +605,8 @@ fn handle_command(
                 // worker for billions of iterations (codex whole-slice F3).
                 let notches = w.lines.unsigned_abs().min(MAX_WHEEL_NOTCHES);
                 let mut encoded = Vec::new();
+                let mut emitted = 0u32;
                 for _ in 0..notches {
-                    // Re-check the LIVE access epoch before every notch: a downgrade on the
-                    // foreground can bump the epoch mid-loop, and the remaining notches must
-                    // not leak onto the PTY (parity with emit_mouse_report; codex F1).
-                    if w.access_epoch != access_epoch.load(Ordering::Acquire) {
-                        break;
-                    }
                     match engine.encode_mouse_report(&MouseReportEv {
                         action: MouseEventKind::Down,
                         button: None,
@@ -622,8 +617,15 @@ fn handle_command(
                         any_button_pressed: false,
                     }) {
                         Ok(bytes) => {
+                            // Re-check the LIVE epoch AFTER encoding, IMMEDIATELY before
+                            // egress: a downgrade during encode must not leak this notch
+                            // (parity with emit_mouse_report; codex F1 + re-review).
+                            if w.access_epoch != access_epoch.load(Ordering::Acquire) {
+                                break;
+                            }
                             let _ = try_emit_user_input(egress.as_ref(), EgressKind::Input, &bytes);
                             encoded = bytes;
+                            emitted += 1;
                         }
                         Err(e) => {
                             eprintln!(
@@ -633,8 +635,15 @@ fn handle_command(
                         }
                     }
                 }
-                inspect.record_wheel_reported();
-                (encoded, GestureDisposition::Reported)
+                // If every notch was revoked before egress, report honestly as Suppressed
+                // rather than a phantom Reported (codex re-review).
+                if emitted > 0 {
+                    inspect.record_wheel_reported();
+                    (encoded, GestureDisposition::Reported)
+                } else {
+                    inspect.record_mouse_suppressed();
+                    (Vec::new(), GestureDisposition::Suppressed)
+                }
             } else {
                 engine.local_scroll(ScrollDelta::Lines(w.lines));
                 *dirty = true;
@@ -1171,7 +1180,10 @@ fn handle_mouse_move(
     let write_allowed = mouse_state.write_allowed;
     let tracking = engine.read_live_tracking();
     // Tracking turned off invalidates the motion-dedup scope: reset so a later re-enable at
-    // the same cell re-emits instead of coalescing against a stale cell (codex F6).
+    // the same cell re-emits instead of coalescing against a stale cell (codex F6). RESIDUAL
+    // (documented): if a program toggles tracking off->on with NO mouse event during the off
+    // window and the very next hover lands on the exact same cell, the report coalesces once.
+    // Fully closing that needs a vendored mouse-mode generation hook (deferred).
     if tracking == MouseTracking::None {
         engine.reset_mouse_coalesce();
     }

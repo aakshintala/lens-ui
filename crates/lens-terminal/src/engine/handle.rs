@@ -1094,7 +1094,9 @@ mod tests {
     #[test]
     fn mouse_coalesce_resets_when_tracking_toggles_off_on() {
         // codex whole-slice F6: a tracking off->on transition invalidates the motion-dedup
-        // scope, so a same-cell hover after re-enable re-emits instead of coalescing.
+        // scope, so a same-cell hover after re-enable re-emits instead of coalescing. This
+        // covers the case where a Move arrives WHILE tracking is off (the realistic path);
+        // the no-intervening-Move toggle is a documented residual (see the F6 fix comment).
         let h = EngineHandle::spawn(test_config());
         let rx = h.attach_test_egress();
         h.feed(TRACKING_ANY_SGR.to_vec()).expect("feed tracking");

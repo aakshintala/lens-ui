@@ -461,7 +461,10 @@ pub struct TerminalTab {
     /// Frame captured at the most recent Left mouse-down. A `LocalClick` (hyperlink open)
     /// resolves its cell against THIS click-time frame, not the current frame, so
     /// intervening terminal output cannot repaint the cell and open an unclicked URL
-    /// (codex whole-slice F2 — TOCTOU).
+    /// (codex whole-slice F2 — TOCTOU). RESIDUAL (documented): a single slot correlates
+    /// correctly for one click in flight (the dominant case); two Left-downs within one
+    /// drain cycle share the latest frame. A per-click token round-tripped through the
+    /// engine's `LocalClick` would fully correlate them (deferred).
     pending_click_frame: Option<Arc<Frame>>,
 }
 
