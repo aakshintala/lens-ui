@@ -5,7 +5,7 @@ the current forward-looking state only. **Full dated session entries live in
 [`STATUS-ARCHIVE.md`](./STATUS-ARCHIVE.md)** — write each session's detail there
 and roll older "Recent" pointers off this page as they age.
 
-_Last curated 2026-07-21 (turn-counter Ready-flash bug FIXED + live-verified + pushed to origin/main; B-2 packing/scroll/culling SHIPPED + pushed; B-3 group chrome next — planning deferred to next session)._
+_Last curated 2026-07-21 (B-3 group chrome & rollups SHIPPED — merged to main UNPUSHED; B-4 drag/move + write-path next. Earlier same day: turn-counter Ready-flash bug FIXED+pushed; B-2 packing/scroll/culling SHIPPED+pushed)._
 
 ---
 
@@ -29,13 +29,29 @@ _Last curated 2026-07-21 (turn-counter Ready-flash bug FIXED + live-verified + p
     release demo launches clean (live gate confirmed: animating cards tick, Slept frozen). Memory
     [[board-b2-executed]]; plan `docs/plans/2026-07-21-board-b2-packing-scroll-culling.md`; handoff
     `docs/handoffs/2026-07-21-board-b2-executed.md`.
-  - **B-3 — group chrome & rollups — NEXT (planning deferred to next session).** Ring color/tint +
-    header-lane (`● dot · name · [spend · age] · ✓N · ⌄`) + aggregation rollups (spend/age/✓N-completed)
-    + the `group_of(&SessionCard)` seam. B-2 renders a group only as a **bare neutral placeholder box**;
-    B-3 fills that arm with chrome. **Runtime-dormant until B-4** (no group is creatable until B-4), so
-    B-3 is fixture-tested. Residual owed into B-3/B-4: a group RENDER-geometry test (path not runtime-
-    reachable under basis B), and two B-2 test-strength nits (archive `nodes.len()`, in-group ordinal sort).
-  - **B-4 — drag/move + context-menu grouping** — drives B-1's `move_item`/`ungroup`/`create_group`.
+  - **B-3 — group chrome & rollups SHIPPED 2026-07-21** (`3045590..75b78bb`, 7 commits, merged to main
+    **UNPUSHED**). Filled the B-2 placeholder arm with real chrome: `board/rollup.rs` pure `GroupRollup`
+    fold (Σspend / oldest-`created_at` age / `completed_count`) + formatters; `group_accent` token→color
+    resolver (4 SSOT accents + neutral); `absolute_group` renders ring+accent+7%-tint + header-lane
+    (`● dot · name · spend·age · ✓N · ⌄`) folded from member cards; `created_at` plumbed onto `SessionCard`
+    (Detailed/Rebased); `test_layout` injection seam + `group_chrome_for_test` hook drive a fixture
+    integration test (the group path is not runtime-reachable under basis B). Subagent-driven (composer-2.5
+    implementers, codex gpt-5.6 cross-family review of board logic = clean + 1 Minor age-overflow fixed,
+    Opus whole-branch review = **SHIP**). `xtask gate` green. **Design deviations from the spec bullet:**
+    (a) the `group_of(&SessionCard)` seam was NOT built — group membership is threaded as `GroupMeta`
+    through `pack_and_render` from the `board_tree` walk, so a card-keyed reverse lookup is unnecessary;
+    (b) `✓N` renders `completed_count: 0` — the real Archive-side count wires in **B-6**. Plan
+    `docs/plans/2026-07-21-board-b3-group-chrome-rollups.md`. **3 Minors carried into B-4** (Opus review):
+    the render-dead `group_header_text`/inline-header duplication (add a live rendered-chrome assertion,
+    render from one source); the integration test proves data-wiring not pixels (correct under
+    NoopTextSystem — B-4 adds the live check); spec §3 fidelity nits (`.border_1()` 1px vs 1.5px; flat
+    wash vs glow/vignette — gpui 0.2.2 has no radial gradient, [[wave-card-body-wash]]).
+  - **B-4 — drag/move + context-menu grouping — NEXT.** Drives B-1's `move_item`/`ungroup`/`create_group`;
+    lands the store→replica **write** path that deletes the ephemeral `build_ephemeral_layout` stub and
+    makes groups runtime-reachable (retiring the B-3 `test_layout` seam); collapse toggle + §7 collapsed-tile
+    render. Also owed here: verify the B-3 `absolute_group` member-card read-during-render does not re-trip
+    the `.cached()` freeze ([[viewport-reentry-freeze]]) once groups go live; if it does, hoist the rollup
+    fold into `sync_card_views`.
   - **B-5 — multiple boards + rail switcher** — board CRUD (B-1 seeds only the default board), the
     externally-discovered-session landing policy, and `FleetStore` connection-scoping.
   - **B-6 — archive-as-board surface.**
@@ -114,6 +130,14 @@ _Last curated 2026-07-21 (turn-counter Ready-flash bug FIXED + live-verified + p
 
 ## Recently shipped (all on `main` unless noted)
 
+- **Board B-3 — group chrome & rollups (2026-07-21):** filled the B-2 group placeholder with real chrome —
+  `board/rollup.rs` pure `GroupRollup` fold (Σspend / oldest-`created_at` age / `completed_count`) +
+  formatters; `group_accent` token→color resolver; `absolute_group` ring+accent+7%-tint + header-lane folded
+  from member cards; `created_at` plumbed onto `SessionCard`; `test_layout` injection seam + `group_chrome_for_test`
+  hook + fixture integration test (path runtime-dormant under basis B). `group_of` seam dropped (membership
+  threaded as `GroupMeta` via `board_tree`); `✓N`=0 until B-6 Archive source. Subagent-driven (composer-2.5,
+  codex gpt-5.6 board-logic review clean+1-Minor-fixed, Opus whole-branch SHIP). `xtask gate` green. **`3045590..75b78bb`,
+  merged to main (UNPUSHED)**. Plan `docs/plans/2026-07-21-board-b3-group-chrome-rollups.md`.
 - **Board B-2 — packing/scroll/culling (2026-07-21):** `lens-core::pack` pure packer + `board_tree`
   walk + `lens-ui` absolute-masonry `overflow_scroll` container (board N-col + rail 1-col via one
   `pack_and_render`) with band-culling + container-driven visibility gate that retired the paint-time
