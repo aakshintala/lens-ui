@@ -217,6 +217,25 @@ card-summary feed** (§9 `SummaryUpdate`) already exists.
   separate reload path. Owner: whoever lands the terminal-integration slice;
   flagged to the terminal agent so they don't assume observation is free.
 
+- **Polymorphic `ContentTab` mount protocol deferred — owned by terminal-UI-integration**
+  (decided 2026-07-21, transcript T-2 brainstorm). The shell mounts any surface into a
+  slot via the concrete `TabHandle` (`AnyView` + title + focus, `crates/lens-ui/src/slot/mod.rs:8`)
+  built by a per-surface `*_tab` factory. The sibling `ContentTab` trait
+  (`slot/mod.rs:6`) is an **inert marker** — no methods, nothing bounds on it, and the
+  mount boundary erases the concrete type to `AnyView` anyway, so it does zero work.
+  A *real* polymorphic protocol (shared surface lifecycle: on_close / on_blur, command
+  routing, save-state) is **intentionally not built yet**: it needs a *second* concrete
+  UI surface to design against, and `terminal-ws` ships `lens-terminal::open` (an engine)
+  **without** UI integration. Building it now would bind a cross-layer seam against one
+  concrete side — the [[premature-layer-boundary-binding]] failure. T-2 (the first real
+  surface) standardized on `TabHandle` + `focused_transcript_tab(...)` and left the marker
+  untouched. **Promotion** (add methods to `ContentTab`; stop erasing to bare `AnyView`,
+  or hang closures on `TabHandle`) is a **small refactor** — impl the new trait for the
+  two existing factories — owned by **whoever lands terminal UI integration**, with
+  transcript + terminal as the two implementors. If terminal UI integration never lands,
+  no protocol is ever needed. Design note also annotated at
+  `application-shell-and-layout.md` §7.2. Owner: terminal-UI-integration slice.
+
 - **Permissions spec — mode-change elicitations are TUI-only for native harnesses**
   (found 2026-07-14 spike, `docs/spikes/2026-07-14-tui-native-elicitation.md`).
   For `claude-native`, generic tool permissions round-trip fine from Lens's

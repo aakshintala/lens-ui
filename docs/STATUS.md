@@ -5,7 +5,7 @@ the current forward-looking state only. **Full dated session entries live in
 [`STATUS-ARCHIVE.md`](./STATUS-ARCHIVE.md)** — write each session's detail there
 and roll older "Recent" pointers off this page as they age.
 
-_Last curated 2026-07-21 (transcript **T-0 + T-1 executed** on `lens-transript`; T-1 ViewBlock projection landed w/ 21 tests + cross-family review; **T-2 next** — focused view scaffold + virtualized disk-sourced surface)._
+_Last curated 2026-07-21 (transcript **T-0 + T-1 executed** on `lens-transript`; **T-2 spec written** — focused view scaffold + live disk-sourced surface, first real `Vec<ViewBlock>` consumer. **Reorg:** disk-scale split out to **T-2b** (next-not-deferred); live in-progress tool-tail moved to **T-4**; polymorphic `ContentTab` protocol deferred to terminal-UI-integration, SPEC-GAPS)._
 
 ---
 
@@ -85,12 +85,27 @@ _Last curated 2026-07-21 (transcript **T-0 + T-1 executed** on `lens-transript`;
     per-turn data → **T-6**); streaming variants carry `&MessageAcc`/`&ReasoningAcc` (stable identity);
     **`OptimisticUser` dropped** (pending is composer-owned → T-7); **`SubAgentSpan` dropped**
     (child-session model → T-5); `ReconnectBreak` emission → T-2.
-  - **T-2 — Focused view scaffold + virtualized disk-sourced surface.** §16/§17. Mount focused `ContentTab`
-    in `#chat-slot`; lift `RowSource` (id-keyed retained store) from spike to production; native
-    `list()`/`ListState`/`ListAlignment::Bottom`; D23 disk-paint (finalized from `TranscriptStore`, live
-    tail from actor scratch, id-keyed upsert, no below-watermark invalidation); wake/reconnect reconcile;
-    scroll contracts (anchoring/windowing/jump-to-bottom) + "N new" pill. **Bucket-C dep** (`GET /items`
-    tail pagination) is flagged here — small/medium sessions work without it.
+  - **T-2 — Focused view scaffold + live disk-sourced surface. ▶ SPEC WRITTEN 2026-07-21**
+    (`docs/specs/2026-07-21-transcript-t2-focused-view-scaffold-design.md`; brainstormed → design-locked,
+    awaiting plan). §16/§17. **First real consumer of `Vec<ViewBlock>`.** Mount focused view in `#chat-slot`
+    via a `focused_transcript_tab(replica) -> TabHandle` factory (`ContentTab` left an inert marker — protocol
+    deferred, SPEC-GAPS); a **store-side `FocusedTranscript` replica** created on `Promote`/dropped on `Demote`,
+    fed the detailed frames by the **existing single poller fanning out** (no channel tee — the feed is
+    single-consumer); replica opens a **2nd read conn** to `{session_id}.db` (WAL), baseline = full `load_items`,
+    steady-state = **forward-delta ranged read** `(last_rendered, committed_ordinal]` on `TranscriptAdvanced`
+    (one small new `TranscriptStore` primitive); live tail from `ScratchChanged`; liveness from
+    `ActiveResponseChanged`; `Rebased`(scalars-only) refreshes scalars, **never** clear-reloads items; lift
+    `RowSource`/`RowStore` from spike (id-keyed upsert, flash-free finalize — the two-id-space hazard is
+    handled, mandatory EntityId-stable test); native `list()`/`ListAlignment::Bottom`; four §16 scroll
+    contracts + "↓ N new" pill; `ReconnectBreak` = replica-injected synthetic marker on `Reconnected`-with-gap.
+    Renders every `ViewBlock` variant as **stubs** for T-3/T-4 content. **Bucket-C dep already satisfied**
+    (`GET /items` pagination ships in lens-client). **Descoped → T-2b.**
+  - **T-2b — Disk windowing, scroll-back paging & bounded-tail reconcile. (next after T-2, NOT deferred).**
+    The [[large-transcript-latency-spike-2026-07]] scale primitives on `TranscriptStore`: swap T-2's full
+    `load_items` baseline for a **byte-budgeted tail window**; add **backward** page-load (`WHERE ordinal < ?
+    ORDER BY ordinal DESC LIMIT ?`) for scroll-back; scope reconcile to the **resident tail** (full-history
+    reconcile is a >1s stall on multi-day sessions). Only needs T-2's RowSource; makes multi-day sessions
+    correct. Independent of content rendering (T-3/T-4).
   - **T-3 — Message & reasoning content.** §5/§6/§7. Vendor+patch gpui-component markdown (3 spots:
     debounce reset, `clear_selection` on reparse, `list_state.reset` scroll-jump); markdown-vs-verbatim
     channels + user backtick-gating; sanitization pre-pass; streaming safe-prefix / stable identity;
@@ -98,7 +113,11 @@ _Last curated 2026-07-21 (transcript **T-0 + T-1 executed** on `lens-transript`;
   - **T-4 — Tool spans, native tools, resource markers.** §8/§9/§12. Tool-span render (archetypes,
     truncation tiers, inline edit diff); native tools; §12 inline resource markers. **Bucket-B stubs
     live here** — "show full → editor/Review", "dock to Canvas", "open terminal" render **inert/disabled**;
-    **no invented inline fallbacks** (they'd be ripped out by the real surfaces).
+    **no invented inline fallbacks** (they'd be ripped out by the real surfaces). **+ live in-progress
+    tool-tail feed extension** (moved here from T-2 2026-07-21): in-flight `FunctionCall`s sit in the actor's
+    above-watermark working set and are **not** carried by today's feed (scratch has only
+    `open_message`/`open_reasoning`); shipping them so a running tool renders live before its output is a
+    lens-core actor/feed change, and it belongs where tool-span render lives — not T-2.
   - **T-5 — Sub-agent spans (child-session model).** §8.6. Sub-agents are child *sessions*
     (`session.child_session.created/updated`, linked by `parent_session_id`), **not** `ctx.depth` items —
     so this is a real feature, not a T-1 transform. Reducer folding of `child_session.*` into a

@@ -351,6 +351,15 @@ recursive splits). Several tiles allowed; resizable. Content tabs are **peer
 tabs** — a file beside a terminal beside a diff beside a Canvas beside a web
 view. See §8 for the launcher taxonomy.
 
+> **Implementation note (mount seam).** The code seam for mounting any surface
+> into a slot is the concrete `TabHandle` (`AnyView` + title + focus) built by a
+> per-surface `*_tab` factory; the `ContentTab` trait is an **inert marker**
+> today. A *polymorphic* content-tab protocol (shared lifecycle: on_close/on_blur,
+> command routing) is **deliberately deferred** until a second real UI surface
+> exists to design against — owned by the terminal-UI-integration slice. Tracked
+> in `docs/SPEC-GAPS.md` → "Cross-spec risks discovered during design." (Transcript
+> **T-2** standardized on `TabHandle` + factory as the first real surface.)
+
 ### 7.3 Persistence extends to content
 
 The state model's persistence covers not just *which* tabs/tiles are open but
