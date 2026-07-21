@@ -133,6 +133,122 @@ Ordering below is by "blocks shipping Lens to a second human" (roughly).
   event history, and treats an observed duplicate creation as a replacement,
   but cannot prove the remaining race away. Omnigent should expose an immutable
   generation/resource ID (or an equivalent durable replacement discriminator).
+10. **Keyboard shortcuts + macOS app menu** — *surfaced 2026-07-16 during the
+    theming demo (Cmd+Q dead; ⌘. was silently focus-dependent).* gpui apps get
+    **no standard macOS menu/shortcuts for free**: `Cmd+Q` (quit), `Cmd+W`,
+    `Cmd+H`, `Cmd+M`, About, etc. are all dead until an app menu is wired via
+    gpui's menu API. Today only two app-specific globals exist
+    (`crates/lens-ui/src/shortcuts.rs`: `cmd-.` BackToBoard, `cmd-shift-t`
+    ReloadTheme — the seed of this module). Needs: (a) the standard macOS app menu
+    (Quit/Close/Hide/Minimize/About), (b) a coherent app-wide shortcut map (new
+    session, switch/cycle session, focus composer/terminal, back, reload, maybe a
+    command palette), (c) a single owner for keybinding + handler registration.
+    **Hard rule** (learned the hard way — memory `gpui-global-vs-element-actions`):
+    app-global commands MUST be `cx.on_action` globals, never element-level
+    `.on_action`, which silently drop the keystroke when nothing in their subtree
+    is focused. Small, self-contained; no omnigent dependency.
+
+11. **Lens-owned MCP producer layer** — *surfaced 2026-07-16 designing the two new
+    wave states (`docs/specs/2026-07-16-wave-states-scheduled-awaitingreview-design.md`).*
+    Lens exposes its own MCP server to agents: `await_review` (ask a human to review
+    a Canvas artifact), `schedule_wake` (park-until-T) + the wake-firing **scheduler**
+    (Lens sends a message at T; also drives the `Ready`-style repaint timer in the
+    poller so the `Scheduled` wave self-clears), **board control**, **messaging**, and
+    **knowledge-base** tools. This layer is the **producer** for the `Scheduled` and
+    `AwaitingReview` waves — the wave-side presentation contract is already locked (the
+    spec above), but nothing sets the `scheduled_wake_at` / `awaiting_review` card
+    fields outside `--demo` until this ships.
+    - **`await_review` mechanics (decided):** **non-blocking** — a blocking MCP call
+      would time out. The tool posts the review request to Lens and **returns control
+      to the agent, who ends its turn** (session settles into the `AwaitingReview`
+      wave). The human reviews the Canvas and submits comments, which flow back as a
+      prompt message via **MessageCenter** (a SessionStart hook *or* a second MCP tool
+      — Lens posts a "You've got Mail" message), and that return path **clears**
+      `awaiting_review`.
+    - **⚠ OPEN RISK (load-bearing):** a **remote** agent (managed host / omnigent
+      server) must reach an MCP server running on the **user's local Mac**. If that
+      transport doesn't work, the whole Lens-owned-signal model (both new waves +
+      board/messaging/KB tools) needs a different shape. Resolve this **first** — it
+      gates the layer. (The wave-side contract does not depend on it; `--demo` sets
+      the fields directly, so that slice proceeds regardless.)
+    - **Scheduling ownership:** built **Lens-owned** ("A"); a future omnigent
+      `scheduled_until` forward ("B", sibling to the `client-message-id` ask) would
+      populate the same source-agnostic `scheduled_wake_at` field with no
+      `derive_wave` change. Native harness `/loop`/`ScheduleWakeup` are **invisible**
+      (not forwarded) and out of scope until B.
+
+## Board (§4) implementation specs
+
+The board's **behavior** is resolved in `application-shell-and-layout.md` §4
+(ordinal slots, recursive Card|Group tree, adaptive count-aware packing,
+Lens-local persistence, movement, multiple boards, archive) — but the
+**implementation** is un-designed: `BoardLayout` is a named placeholder in the
+state model (`app-architecture-and-state-model.md:1067`), never a concrete type,
+and the current `crates/lens-ui/src/board/mod.rs` is a flat `session_id`-sorted
+flex-wrap grid with no groups, scroll, or persistence. Card chrome (§5) shipped
+(waves B1–B5); these gaps are the remaining **board-level** (§4) work.
+
+Decomposed 2026-07-18 (brainstorm) into six cohesive specs, each its own
+brainstorm→spec→plan→build cycle. **This supersedes the old "B6/B7/B8" framing**
+in STATUS — B7 "stable ordinal ordering" dissolves into B-1's ordinal slots (no
+separate sort task). Order below is dependency order.
+
+- **B-1 — Board data model & persistence (`BoardLayout`)** — ✅ **SPEC WRITTEN
+  2026-07-18** ([`docs/specs/2026-07-18-board-data-model-persistence-design.md`](specs/2026-07-18-board-data-model-persistence-design.md),
+  user-approved). *keystone; lens-core.*
+  The concrete recursive **Board→(Card | Group)** tree; **ordinal-slot**
+  representation (§4.1, index-within-parent, never pixels); Lens-local **SQLite
+  schema + migration** (§4.2 — persisted in the state-model store, not a server
+  entity); mutation ops (create/rename/archive board & group, move item to slot,
+  reparent, ungroup); **where a new/polled session lands** (placement policy for
+  sessions appearing via the §10 list-poll or created outside Lens); and the
+  **auto-seed grouping rule** (session `workspace` project-dir → default Group,
+  since group membership is Lens-owned, not `card.workspace`). Foundation every
+  other B-spec reads/writes. Consumes the existing coarse `SummaryUpdate` feed
+  (FleetStore/ActorFeed, already shipped) via a `group_of(&SessionCard)` seam.
+
+- **B-2 — Adaptive packing & scroll (the layout engine)** — *lens-ui/gpui;
+  §20's "one real spike."* The §4.3 **count-aware balanced packing** algorithm
+  (pure, deterministic: 1→centered, 3→row, 4→2×2, 6→3×2 …, **never a lonely
+  stretched row** — this is the fix for the mockup's rigid auto-fill grid, which
+  is **not** faithful to §4.3); the gpui board element; the **scroll container**;
+  off-screen **viewport culling** + **the anim-gate-on-scroll fix** (the STATUS
+  hazard: today's `recover_viewport_gates_on_reentry` is edge-triggered on the
+  focus↔board mode switch, so a card scrolling into view — no mode change —
+  never resets its gate → frozen spinner; memory `viewport-reentry-freeze`).
+  Partly rewrites the current `board/mod.rs` flat grid. Depends on B-1's tree.
+
+- **B-3 — Group rendering & aggregation** — *lens-ui.* The group visual
+  (colored border + faint color-matched body tint + header: name · aggregate
+  spend · card count · age · collapse · ⋯ · ＋ quick-add); the **rollups**
+  (spend from `cumulative_cost`, count, age, "N done" peek); persisted **collapse**
+  state (via B-1). The mockup (`board-home.html` `.gwrap`) is the pixel ref for
+  group chrome. Depends on B-1, B-2.
+
+- **B-4 — Movement & grouping interaction** — *lens-ui.* §4.5 drag-to-reorder
+  (ordinal snap), drag in/out of groups & nested groups, create-group gestures
+  (drag card onto card · "New group" · right-click "New group from selection"),
+  context-menu moves (Move-to-group ▸, Move-to-board ▸, New-group, Pin, ungroup,
+  archive group), ⌘1–⌘9 card-jump. Mutates B-1. Depends on B-1, B-2.
+
+- **B-5 — Multiple boards + rail switcher** — *lens-ui + state.* §4.4 board-as-
+  bounded + spin-up-new; nav-rail board entries (§6); ⌘⇧1–⌘⇧9 / ⌘K board switch;
+  move-across-boards (drag onto a rail board / Move-to-board ▸); board CRUD.
+  Depends on B-1, B-4.
+
+- **B-6 — Archive-as-board** — *lens-ui + state.* §4.6 nav-rail Archive
+  destination rendered with the **same recursive board UI** (archived groups
+  represent themselves for free); scope filter (this board / all) + search +
+  **restore-to-origin**; the group inline "Completed (N)" peek deep-links here.
+  Mirrors the server `archived` flag (distinct from Sleep — state model §3).
+  Depends on B-1, B-3.
+
+**Seams (referenced, not folded in):** group **default new-session config**
+(§4.2 / §7.6 quick-add) belongs to the new-session-dialog surface (agent-
+definition seam), cross-referenced from B-1/B-3, not absorbed. The **coarse
+card-summary feed** (§9 `SummaryUpdate`) already exists.
+
+## Parked contract dependencies (omnigent-side asks)
 
 - **LSP-proxy endpoint — gates any IDE-grade (band-3) file editing** (recorded
   2026-07-14, framework §4.4). The File-tab editor is scoped to a "comfortable

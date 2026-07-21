@@ -5,13 +5,14 @@
 pub mod actor;
 pub mod clock;
 pub mod domain;
+pub mod pack;
 pub mod persist;
 pub mod reduce;
 
 pub use clock::{Clock, ManualClock};
 pub use domain::*;
 pub use persist::{
-    ControlStore, LiveKey, Loaded, PersistError, ReconcileOutcome, SkippedRow, StoreMode,
-    TranscriptStore,
+    BoardStore, ControlStore, LiveKey, Loaded, PersistError, ReconcileOutcome, SkippedRow,
+    SqliteBoardStore, SqliteControlStore, StoreMode, TranscriptStore,
 };
 pub use reduce::{StreamUpdate, Updates, reduce};

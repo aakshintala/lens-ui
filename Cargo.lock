@@ -3419,6 +3419,7 @@ dependencies = [
 name = "lens-ui"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-channel 2.5.0",
  "crossbeam-channel",
  "futures",
@@ -3426,6 +3427,8 @@ dependencies = [
  "gpui-component",
  "lens-client",
  "lens-core",
+ "serde",
+ "serde_json",
  "smallvec",
 ]
 

@@ -256,14 +256,14 @@ Reference render: `docs/design/renders/board-home.html`.
 
 | Wave | Treatment | Urgency | Derived from |
 |--------|-----------|---------|---------|
-| **Needs-input** | fast pulse, red | highest | `pending_elicitations` non-empty (own or mirrored from a child; the wire field is a list / `pending_elicitations_count`). **Sticky** until acted on; **overrides Slept dimming** (the poll still carries the count, so a slept card with a pending approval still glows red) |
+| **Needs-input** | fast pulse, orange | highest | `pending_elicitations` non-empty (own or mirrored from a child; the wire field is a list / `pending_elicitations_count`). **Sticky** until acted on; **overrides Slept dimming** (the poll still carries the count, so a slept card with a pending approval still glows orange). *(Orange, not red — the reference render `board-home.html` is the pixel SSOT and uses orange here; it keeps Needs-input distinct from Failed-red.)* |
 | **Ready** | steady, blue | high | `status == idle` **and an unacknowledged turn completion** — there's a result to look at. Sticky until you focus/view it, then neutral |
 | **Working** | calm shimmer, green | medium | `status ∈ {running, launching, waiting}` with no pending elicitation (`launching` shows "starting…"; `waiting` = parked on its own async/sub-agent work — busy, doesn't need you) |
 | **Slept** | dimmed card + **Resume** | lowest | Lens lifecycle: local observation closed and best-effort `stop_session` sent after quiescence (§ state model 3); card stays visible, dimmed |
 | **Failed** | steady, red + **Retry** | ≈ Ready (rare) | `status == failed` / `last_task_error` |
 
 > **"Scheduled" is reserved but not in v1** — there is no scheduled/cron session
-> status in omnigent `0.3.0.dev0` (`queued` turns are momentary). The `status.scheduled`
+> status in omnigent `0.5.1` (`queued` turns are momentary). The `status.scheduled`
 > token stays reserved in the theme for a future "agent on a loop" state; the v1
 > ladder is the five rows above.
 

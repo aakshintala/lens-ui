@@ -522,7 +522,7 @@ CREATE TABLE IF NOT EXISTS items (
         .unwrap();
         assert_eq!(
             read_schema_version(&s.conn).unwrap(),
-            VersionState::Known(2)
+            VersionState::Known(SCHEMA_VERSION)
         );
 
         let columns: Vec<String> = s

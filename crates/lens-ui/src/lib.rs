@@ -1,9 +1,12 @@
 pub mod actions;
+pub mod assets;
 pub mod board;
 pub mod card;
 pub mod clock;
 pub mod fleet;
+pub mod shortcuts;
 pub mod slot;
+pub mod theme;
 
 pub use board::{BoardView, ShellMode};
 pub use clock::{ManualUiClock, UiClock, WallUiClock};
@@ -11,6 +14,7 @@ pub use fleet::fake::{FEED_CAPACITY, FakeFleet, FakeSessionHandles};
 pub use fleet::poller::spawn_session_poller;
 pub use fleet::store::FleetStore;
 pub use slot::{ContentTab, PlaceholderTab, TabHandle, placeholder_tab};
+pub use theme::{ActiveLensTheme, LensTheme};
 
 use std::cell::Cell;
 use std::rc::Rc;

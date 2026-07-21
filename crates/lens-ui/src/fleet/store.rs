@@ -65,6 +65,20 @@ impl FleetStore {
         self.send_command(id, cmd);
     }
 
+    /// Wake a Slept session. SEAM: real behavior = respawn the actor from the
+    /// persisted connection context (state-model wake=respawn), which FleetStore
+    /// does not yet retain. TODO(state-model P3+): re-run `spawn_live_session`.
+    pub fn wake_session(&self, _id: &SessionId) {
+        // Intentional no-op until the wake=respawn plumbing lands. The button is a
+        // real affordance wired to this seam, not a dead element.
+    }
+
+    /// Retry a Failed session. SEAM: real behavior = re-poke / respawn the session.
+    /// TODO(state-model P3+): route to the actual retry path once it exists.
+    pub fn retry_session(&self, _id: &SessionId) {
+        // Intentional no-op — see `wake_session`.
+    }
+
     pub fn card(&self, id: &SessionId) -> Option<Entity<SessionCard>> {
         self.cards.get(id).cloned()
     }

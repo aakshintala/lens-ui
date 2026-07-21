@@ -213,9 +213,6 @@ pub(crate) fn fold_response_marker(
         ResponseEvent::InProgress => {
             smallvec![StreamUpdate::StatusChanged(state.status)]
         } // P1-DECISION: liveness marker
-        ResponseEvent::Failed | ResponseEvent::Incomplete | ResponseEvent::Cancelled => {
-            smallvec![]
-        }
         ResponseEvent::CompactionInProgress | ResponseEvent::CompactionFailed => smallvec![],
         // 0.5.0 addition: a native policy DENY was surfaced. Observational, no state-model
         // field home yet — marker-only until the store designs a surface.
@@ -262,9 +259,14 @@ pub(crate) fn fold_response_marker(
                 state.pending_elicitations.clone()
             )]
         }
-        // item-producing / scratch-finalizing arms handled in Task 7/8:
+        // item-producing / scratch-routing arms handled in `reduce`. The terminal
+        // completions discard open scratch there; Incomplete/Cancelled also bump the Ready
+        // counter, Failed does not (surfaced via Wave::Failed) — see the match arms.
         ResponseEvent::OutputItemDone { .. }
         | ResponseEvent::Completed
+        | ResponseEvent::Failed
+        | ResponseEvent::Incomplete
+        | ResponseEvent::Cancelled
         | ResponseEvent::ReasoningClosed { .. }
         | ResponseEvent::CompactionCompleted { .. }
         | ResponseEvent::OutputTextDelta { .. }

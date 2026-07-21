@@ -5,14 +5,19 @@ use gpui::{
 use lens_core::actor::SessionCommand;
 use lens_core::domain::ids::SessionId;
 use std::cell::Cell;
+#[cfg(feature = "demo")]
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::clock::UiClock;
 use crate::fleet::store::FleetStore;
+use crate::theme::ActiveLensTheme as _;
 
 use super::chrome::render_card_chrome;
 use super::model::{CARD_HEIGHT_PX, CARD_WIDTH_PX, SessionCard};
+use super::motion::{anim_tick_for, render_expanding_ring, ring_phase, sweep_phase};
 use super::wave::derive_wave;
 
 /// §4.4: skeleton card chrome uses gpui `div`/text only — no gpui-component widget
@@ -23,6 +28,17 @@ pub struct SessionCardView {
     fleet: Entity<FleetStore>,
     session_id: SessionId,
     kebab_open: bool,
+    /// Per-wave self-notify driver (20fps sweep/spinner, 1Hz Scheduled), live only while
+    /// the card's wave animates and is on-screen (approach ②).
+    anim_task: Option<gpui::Task<()>>,
+    /// Last-started driver interval; respawn when the wave's cadence class changes.
+    anim_interval: Option<Duration>,
+    /// Container-driven visibility gate (replaces the paint-time `last_bounds`
+    /// gate). Init HIDDEN — the board container is the sole visibility authority
+    /// and flips truly-visible cards on via `set_visible` (spec §4 unknown 3). If
+    /// this init'd `true`, the first `set_visible(true)` would early-return and the
+    /// anim timer would never spawn.
+    visible: bool,
     pub render_count: Rc<Cell<usize>>,
     pub paint_count: Rc<Cell<usize>>,
     pub last_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
@@ -44,10 +60,40 @@ impl SessionCardView {
             fleet,
             session_id,
             kebab_open: false,
+            anim_task: None,
+            anim_interval: None,
+            visible: false,
             render_count: Rc::new(Cell::new(0)),
             paint_count: Rc::new(Cell::new(0)),
             last_bounds: Rc::new(Cell::new(None)),
         }
+    }
+
+    /// Container calls this (via `cx.defer`, off its own render path) when a tile
+    /// enters/leaves the visible band. On HIDE we drop the anim driver directly —
+    /// a culled card is absent from the element tree and its `render` won't run to
+    /// drop it, and `anim_interval` must reset so the render guard re-spawns on
+    /// return. On SHOW we just notify; the card is now in the tree, so its render
+    /// runs and spawns the driver if the wave animates.
+    pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if visible == self.visible {
+            return;
+        }
+        self.visible = visible;
+        if !visible {
+            self.anim_task = None;
+            self.anim_interval = None;
+        }
+        cx.notify();
+    }
+
+    pub fn is_visible(&self) -> bool {
+        self.visible
+    }
+
+    /// Test hook: is the anim driver live?
+    pub fn timer_running_for_test(&self) -> bool {
+        self.anim_task.is_some()
     }
 
     fn send_command(&self, cmd: SessionCommand, cx: &mut Context<Self>) {
@@ -66,53 +112,83 @@ impl Render for SessionCardView {
         let kebab_open = self.kebab_open;
         let paint_count = self.paint_count.clone();
         let last_bounds = self.last_bounds.clone();
+        // Visibility is container-driven (spec §4 unknown 3), not paint-time.
+        let visible = self.visible;
+        let desired = anim_tick_for(wave).filter(|_| visible);
+        if desired != self.anim_interval {
+            self.anim_task = None; // drop cancels the old timer
+            self.anim_interval = desired;
+            if let Some(interval) = desired {
+                self.anim_task = Some(cx.spawn(async move |this, cx| {
+                    loop {
+                        cx.background_executor().timer(interval).await;
+                        if this.update(cx, |_, cx| cx.notify()).is_err() {
+                            break;
+                        }
+                    }
+                }));
+            }
+        }
+        let sweep = sweep_phase(wave, now_ms);
+        let ring_color = wave.status_color(cx.lens_theme());
+        let ring = ring_phase(now_ms);
 
         div()
             .id(("session-card", self.card.entity_id()))
+            .relative()
             .w(px(CARD_WIDTH_PX))
             .h(px(CARD_HEIGHT_PX))
-            .child(render_card_chrome(
-                card,
-                wave,
-                kebab_open,
-                cx.listener(|view, _, _, cx| {
-                    view.kebab_open = !view.kebab_open;
-                    cx.notify();
-                }),
-                cx.listener(|view, _, _, cx| {
-                    view.kebab_open = false;
-                    view.send_command(SessionCommand::Sleep, cx);
-                }),
-                cx.listener(|view, _, _, cx| {
-                    view.kebab_open = false;
-                    view.send_command(
-                        SessionCommand::Send {
-                            text: String::new(),
-                            model_override: None,
-                        },
-                        cx,
-                    );
-                }),
-                cx.listener(|view, _, _, cx| {
-                    view.send_command(
-                        SessionCommand::Send {
-                            text: String::new(),
-                            model_override: None,
-                        },
-                        cx,
-                    );
-                }),
-            ))
+            .child(render_expanding_ring(wave, ring_color, ring))
             .child(
-                canvas(
-                    |_, _, _| (),
-                    move |bounds, _, _, _| {
-                        paint_count.set(paint_count.get() + 1);
-                        last_bounds.set(Some(bounds));
-                    },
-                )
-                .absolute()
-                .size_full(),
+                div()
+                    .size_full()
+                    .child(render_card_chrome(
+                        card,
+                        wave,
+                        kebab_open,
+                        sweep,
+                        now_ms,
+                        cx,
+                        cx.listener(|view, _, _, cx| {
+                            view.kebab_open = !view.kebab_open;
+                            cx.notify();
+                        }),
+                        cx.listener(|view, _, _, cx| {
+                            let fleet = view.fleet.clone();
+                            let sid = view.session_id.clone();
+                            fleet.update(cx, |f, _| f.wake_session(&sid));
+                        }),
+                        cx.listener(|view, _, _, cx| {
+                            view.kebab_open = false;
+                            view.send_command(SessionCommand::Sleep, cx);
+                        }),
+                        cx.listener(|view, _, _, cx| {
+                            view.kebab_open = false;
+                            view.send_command(
+                                SessionCommand::Send {
+                                    text: String::new(),
+                                    model_override: None,
+                                },
+                                cx,
+                            );
+                        }),
+                        cx.listener(|view, _, _, cx| {
+                            let fleet = view.fleet.clone();
+                            let sid = view.session_id.clone();
+                            fleet.update(cx, |f, _| f.retry_session(&sid));
+                        }),
+                    ))
+                    .child(
+                        canvas(
+                            |_, _, _| (),
+                            move |bounds, _, _, _| {
+                                paint_count.set(paint_count.get() + 1);
+                                last_bounds.set(Some(bounds));
+                            },
+                        )
+                        .absolute()
+                        .size_full(),
+                    ),
             )
     }
 }
@@ -126,6 +202,31 @@ pub fn mount_cached_card(view: Entity<SessionCardView>) -> AnyView {
         .w(px(CARD_WIDTH_PX))
         .h(px(CARD_HEIGHT_PX));
     AnyView::from(view).cached(style)
+}
+
+/// Demo spike: stderr dump of per-card render/paint counters every ~2s.
+#[cfg(feature = "demo")]
+pub fn spawn_demo_paint_instrumentation(
+    card_views: &HashMap<SessionId, Entity<SessionCardView>>,
+    cx: &mut gpui::App,
+) {
+    let views: Vec<_> = card_views.values().cloned().collect();
+    cx.spawn(async move |cx| {
+        loop {
+            cx.background_executor().timer(Duration::from_secs(2)).await;
+            for view in &views {
+                let _ = view.update(cx, |v, _| {
+                    eprintln!(
+                        "paint-instr session={} render={} paint={}",
+                        v.session_id.as_str(),
+                        v.render_count.get(),
+                        v.paint_count.get(),
+                    );
+                });
+            }
+        }
+    })
+    .detach();
 }
 
 #[cfg(test)]
@@ -148,6 +249,16 @@ mod tests {
         }
     }
 
+    struct SingleCardBoard {
+        view: Entity<SessionCardView>,
+    }
+
+    impl Render for SingleCardBoard {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().child(mount_cached_card(self.view.clone()))
+        }
+    }
+
     #[gpui::test]
     async fn session_card_view_observes_own_card_only(cx: &mut gpui::TestAppContext) {
         let clock = Arc::new(crate::clock::ManualUiClock::new(0));
@@ -155,6 +266,8 @@ mod tests {
         let sid_b = SessionId::new("b");
 
         let (fleet, card_a, card_b, view_a, view_b, rc_a, rc_b) = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::install_at_startup(cx);
             let fleet = FleetStore::new(clock, cx);
             let card_a = fleet.update(cx, |f, cx| f.spawn_fake_session(sid_a.clone(), cx));
             let card_b = fleet.update(cx, |f, cx| f.spawn_fake_session(sid_b.clone(), cx));
@@ -223,5 +336,140 @@ mod tests {
             a_after_notify,
             "card A view count unchanged after card B notify"
         );
+    }
+
+    #[gpui::test]
+    async fn animating_card_does_not_render_a_static_sibling(cx: &mut gpui::TestAppContext) {
+        use lens_core::domain::scalars::SessionStatusValue;
+
+        let clock = Arc::new(crate::clock::ManualUiClock::new(0));
+        let sid_a = SessionId::new("anim");
+        let sid_b = SessionId::new("static");
+
+        let (fleet, view_a, view_b, rc_a, rc_b) = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::install_at_startup(cx);
+            let fleet = FleetStore::new(clock, cx);
+            let card_a = fleet.update(cx, |f, cx| f.spawn_fake_session(sid_a.clone(), cx));
+            let card_b = fleet.update(cx, |f, cx| f.spawn_fake_session(sid_b.clone(), cx));
+            card_a.update(cx, |c, _| c.status = SessionStatusValue::Running);
+            let ui_clock = fleet.read(cx).clock();
+            let view_a = cx.new(|cx| {
+                SessionCardView::new(
+                    card_a.clone(),
+                    ui_clock.clone(),
+                    fleet.clone(),
+                    sid_a.clone(),
+                    cx,
+                )
+            });
+            let view_b = cx.new(|cx| {
+                SessionCardView::new(card_b.clone(), ui_clock, fleet.clone(), sid_b.clone(), cx)
+            });
+            let rc_a = view_a.read(cx).render_count.clone();
+            let rc_b = view_b.read(cx).render_count.clone();
+            (fleet, view_a, view_b, rc_a, rc_b)
+        });
+
+        let (_board, vcx) = cx.add_window_view(|_, _| DualCardBoard {
+            view_a: view_a.clone(),
+            view_b: view_b.clone(),
+        });
+
+        vcx.run_until_parked();
+        let after_first = (rc_a.get(), rc_b.get());
+        assert_eq!(after_first, (1, 1), "initial mount renders both tiles once");
+
+        vcx.update(|_, cx| {
+            view_a.update(cx, |v, cx| v.set_visible(true, cx));
+        });
+        vcx.run_until_parked();
+        let baseline_a = rc_a.get();
+        let baseline_b = rc_b.get();
+
+        for _ in 0..5 {
+            vcx.executor().advance_clock(Duration::from_millis(40));
+            vcx.run_until_parked();
+        }
+
+        let count_a = view_a.read_with(cx, |v, _| v.render_count.get());
+        assert!(
+            count_a > baseline_a,
+            "animating card A must have re-rendered (baseline={baseline_a}, now={count_a})"
+        );
+        assert_eq!(
+            rc_b.get(),
+            baseline_b,
+            "static sibling B must NOT re-render when A animates (§4.4)"
+        );
+        let _ = fleet;
+    }
+
+    #[gpui::test]
+    async fn anim_driver_respawns_on_cadence_class_change(cx: &mut gpui::TestAppContext) {
+        use lens_core::domain::scalars::{SessionLifecycle, SessionStatusValue};
+
+        let clock = Arc::new(crate::clock::ManualUiClock::new(0));
+        let sid = SessionId::new("cadence");
+
+        let (card, view, rc) = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::install_at_startup(cx);
+            let fleet = FleetStore::new(clock, cx);
+            let card = fleet.update(cx, |f, cx| f.spawn_fake_session(sid.clone(), cx));
+            card.update(cx, |c, _| {
+                c.status = SessionStatusValue::Idle;
+                c.lifecycle = SessionLifecycle::Active;
+                c.scheduled_wake_at = Some(60_000);
+                c.scheduled_started_at = Some(0);
+            });
+            let ui_clock = fleet.read(cx).clock();
+            let view =
+                cx.new(|cx| SessionCardView::new(card.clone(), ui_clock, fleet, sid.clone(), cx));
+            let rc = view.read(cx).render_count.clone();
+            (card, view, rc)
+        });
+
+        let (_board, vcx) = cx.add_window_view(|_, _| SingleCardBoard { view: view.clone() });
+
+        vcx.run_until_parked();
+        assert_eq!(rc.get(), 1, "initial mount");
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| v.set_visible(true, cx));
+        });
+        vcx.run_until_parked();
+
+        // 1 Hz Scheduled driver: one extra render per second.
+        vcx.executor().advance_clock(Duration::from_millis(1000));
+        vcx.run_until_parked();
+        let after_1hz = rc.get();
+        assert!(
+            after_1hz > 1,
+            "Scheduled 1Hz driver should tick at least once (now={after_1hz})"
+        );
+
+        // Direct Scheduled → Working: driver must respawn at ~50ms (20fps), not keep 1Hz.
+        vcx.update(|_, cx| {
+            card.update(cx, |c, cx| {
+                c.status = SessionStatusValue::Running;
+                cx.notify();
+            });
+        });
+        vcx.run_until_parked();
+        let after_transition = rc.get();
+
+        for _ in 0..5 {
+            vcx.executor().advance_clock(Duration::from_millis(50));
+            vcx.run_until_parked();
+        }
+
+        let after_fast = rc.get();
+        let fast_delta = after_fast - after_transition;
+        assert!(
+            fast_delta > 3,
+            "Working ~20fps driver should produce >3 renders in 250ms (got {fast_delta}; \
+             after_1hz={after_1hz}, after_transition={after_transition}, after_fast={after_fast})"
+        );
+        let _ = view;
     }
 }

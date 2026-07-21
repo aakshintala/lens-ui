@@ -2,17 +2,20 @@
 //! (D-P2-1) over a portable, Bridge-readable SQLite schema (§6.1). Storage
 //! primitives only — the wake/actor wiring that calls them is P3.
 
+pub mod board;
 pub mod control;
 pub mod db;
 pub mod map;
 pub mod schema;
 pub mod transcript;
 
+use crate::domain::board::BoardError;
 use crate::domain::ids::{CallId, ConnectionId, ItemId, SessionId};
 use crate::domain::item::Item;
 use crate::domain::session::SessionState;
 use thiserror::Error;
 
+pub use board::{BoardStore, SqliteBoardStore};
 pub use control::SqliteControlStore;
 pub use transcript::SqliteTranscriptStore;
 
@@ -31,6 +34,9 @@ pub enum PersistError {
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("board error: {0}")]
+    Board(#[from] BoardError),
 }
 
 /// How a file was opened after the schema-version gate (§6.3).

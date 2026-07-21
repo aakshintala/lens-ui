@@ -33,7 +33,7 @@ macro_rules! branded_id {
 
 // Engine-local ids not present in lens-client (§2.1). BridgeItemId is Bridge
 // scope (§11) — out of this spec.
-branded_id!(ItemId, CallId, ResponseId, AgentId);
+branded_id!(ItemId, CallId, ResponseId, AgentId, BoardId, BoardItemId);
 
 #[cfg(test)]
 mod tests {

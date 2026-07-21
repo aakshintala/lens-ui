@@ -7,7 +7,7 @@ use lens_core::domain::usage::Cost;
 use lens_core::reduce::StreamUpdate;
 
 pub const CARD_WIDTH_PX: f32 = 280.0;
-pub const CARD_HEIGHT_PX: f32 = 148.0;
+pub const CARD_HEIGHT_PX: f32 = 160.0;
 pub const READY_DECAY_MS: i64 = 5 * 60 * 1000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -19,6 +19,10 @@ pub struct RepoRef {
 #[derive(Clone, Debug)]
 pub struct SessionCard {
     pub session_id: SessionId,
+    /// §3.1 rollup age source: epoch SECONDS of session creation. `None` until the
+    /// first `Detailed(Rebased)` fold (Summary frames don't carry it). Fed to
+    /// `board::rollup::group_rollup`.
+    pub created_at: Option<i64>,
     pub status: SessionStatusValue,
     pub title: Option<String>,
     pub activity_summary: String,
@@ -52,6 +56,16 @@ pub struct SessionCard {
     pub ready_reschedule: bool,
     /// §4.4: focus glow suppression — set by FleetStore on focus/blur only.
     pub is_focused: bool,
+    /// §2 waves: soft async attention — agent parked a Canvas review via the Lens
+    /// `await_review` MCP tool. Lens-owned; cleared when the human's comments return.
+    pub awaiting_review: bool,
+    /// §2 waves: epoch-ms of a Lens-owned scheduled wake (source-agnostic — a future
+    /// forwarded omnigent `scheduled_until` populates this same field). `Scheduled`
+    /// renders only while this is in the future.
+    pub scheduled_wake_at: Option<i64>,
+    /// §2 waves: epoch-ms when the current schedule began — the countdown-ring denominator
+    /// (`(wake − now) / (wake − started)`). Set alongside `scheduled_wake_at`.
+    pub scheduled_started_at: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -66,6 +80,7 @@ impl SessionCard {
     pub fn new(session_id: SessionId) -> Self {
         Self {
             session_id,
+            created_at: None,
             status: SessionStatusValue::Idle,
             title: None,
             activity_summary: String::new(),
@@ -95,6 +110,9 @@ impl SessionCard {
             seeded: false,
             ready_reschedule: false,
             is_focused: false,
+            awaiting_review: false,
+            scheduled_wake_at: None,
+            scheduled_started_at: None,
         }
     }
 
@@ -166,6 +184,7 @@ impl SessionCard {
                 self.reasoning_effort = state.reasoning_effort.clone();
                 self.harness = state.harness.clone();
                 self.lifecycle = state.lifecycle;
+                self.created_at = Some(state.created_at);
                 self.needs_attention = !state.pending_elicitations.is_empty()
                     || state.status == SessionStatusValue::Failed;
                 self.todos = state.todos.clone();
@@ -387,5 +406,23 @@ mod tests {
         card.fold_feed(ActorFeed::Summary(Box::new(base_summary())), &clock);
         card.fold_feed(ActorFeed::Detailed(StreamUpdate::ResourcesChanged), &clock);
         assert_eq!(card.git_branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn rebased_fold_plumbs_created_at() {
+        let mut card = SessionCard::new(SessionId::new("s"));
+        assert_eq!(card.created_at, None, "fresh card has no created_at");
+        let clock = crate::clock::ManualUiClock::new(0);
+        let mut baseline = SessionState::new(
+            ConnectionId::new("c"),
+            SessionId::new("s"),
+            AgentId::new("ag"),
+        );
+        baseline.created_at = 1_700_000_000; // epoch seconds
+        card.fold_feed(
+            ActorFeed::Detailed(StreamUpdate::Rebased(Box::new(baseline))),
+            &clock,
+        );
+        assert_eq!(card.created_at, Some(1_700_000_000));
     }
 }
