@@ -14,7 +14,7 @@ use super::inspect::{EngineInspect, InspectShared};
 use super::presentation::EnginePresentationEvent;
 use super::vt::EngineConfig;
 use super::worker::{self, EngineCommand, TestChunkBarrier, WakerSlot};
-use crate::engine::command::{MouseGesture, ScrollDelta};
+use crate::engine::command::{CopyResult, MouseGesture, ScrollDelta, WheelInput};
 
 /// Backpressure / lifecycle error when sending to a stopped or saturated engine.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -136,13 +136,14 @@ impl EngineHandle {
     /// Enqueue a user-input command via the off-fg forwarder (never blocks the caller).
     ///
     /// Stamps the current [`access_epoch`](Self::bump_access_epoch) onto `Key` / `Paste` /
-    /// `Focus` / `MouseGesture` at enqueue time.
+    /// `Focus` / `MouseGesture` / `Wheel` at enqueue time.
     pub(crate) fn enqueue_input(&self, mut cmd: EngineCommand) -> Result<(), FeedError> {
         let epoch = self.access_epoch.load(Ordering::Acquire);
         match &mut cmd {
             EngineCommand::Key(input) => input.access_epoch = epoch,
             EngineCommand::Paste(input) => input.access_epoch = epoch,
             EngineCommand::MouseGesture(gesture) => gesture.access_epoch = epoch,
+            EngineCommand::Wheel(wheel) => wheel.access_epoch = epoch,
             EngineCommand::Focus {
                 access_epoch: cmd_epoch,
                 ..
@@ -165,6 +166,26 @@ impl EngineHandle {
     #[allow(dead_code, reason = "foreground access wiring lands in Task 5")]
     pub(crate) fn enqueue_set_access(&self, writable: bool) -> Result<(), FeedError> {
         self.enqueue_input(EngineCommand::SetAccess(writable))
+    }
+
+    /// Enqueue a wheel event via the off-fg forwarder (never blocks the caller).
+    #[allow(dead_code, reason = "foreground lowering lands in Task 5")]
+    pub(crate) fn enqueue_wheel(&self, wheel: WheelInput) -> Result<(), FeedError> {
+        self.enqueue_input(EngineCommand::Wheel(wheel))
+    }
+
+    /// Enqueue select-all via the off-fg forwarder (never blocks the caller).
+    #[allow(dead_code, reason = "foreground lowering lands in Task 5")]
+    pub(crate) fn select_all(&self) -> Result<(), FeedError> {
+        self.enqueue_input(EngineCommand::SelectAll)
+    }
+
+    /// Request async copy extraction; returns a capacity-1 receiver for the result.
+    #[allow(dead_code, reason = "foreground copy wiring lands in Task 5")]
+    pub(crate) fn request_copy(&self) -> Result<Receiver<CopyResult>, FeedError> {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        self.enqueue_input(EngineCommand::Copy(tx))?;
+        Ok(rx)
     }
 
     /// Bump the access epoch (read-only downgrade). Stale `Key`/`Focus` commands still
@@ -433,7 +454,7 @@ mod tests {
     use super::*;
     use crate::engine::command::{
         GestureDisposition, KeyAction, KeyInput, KeyMods, LensKey, MouseAck, MouseButtonKind,
-        MouseEventKind, MouseGesture, MouseReportPolicy, PasteInput,
+        MouseEventKind, MouseGesture, MouseReportPolicy, PasteInput, WheelInput,
     };
     use crate::engine::forwarder::InputForwarder;
     use crate::engine::inspect::InspectEventKind;
@@ -452,6 +473,189 @@ mod tests {
     const TRACKING_SGR: &[u8] = b"\x1b[?1000h\x1b[?1006h";
     const TRACKING_BUTTON_SGR: &[u8] = b"\x1b[?1002h\x1b[?1006h";
     const TRACKING_ANY_SGR: &[u8] = b"\x1b[?1003h\x1b[?1006h";
+
+    fn base_wheel(lines: i32) -> WheelInput {
+        WheelInput {
+            lines,
+            cell: Some((0, 0)),
+            px_x: 0.0,
+            px_y: 0.0,
+            mods: KeyMods::default(),
+            access_epoch: 0,
+            ack: None,
+        }
+    }
+
+    fn send_wheel(h: &EngineHandle, mut wheel: WheelInput) -> MouseAck {
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+        wheel.ack = Some(ack_tx);
+        h.enqueue_wheel(wheel).expect("enqueue wheel");
+        ack_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("wheel ack timeout")
+    }
+
+    #[test]
+    fn wheel_report_under_tracking_emits_sgr_wheel_up() {
+        let h = EngineHandle::spawn(test_config());
+        h.set_inspect_enabled(true);
+        let rx = h.attach_test_egress();
+        h.feed(TRACKING_BUTTON_SGR.to_vec()).expect("feed tracking");
+        enqueue_set_access(&h, true);
+        let ack = send_wheel(&h, base_wheel(1));
+        assert_eq!(ack.disposition, GestureDisposition::Reported);
+        let frame = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("wheel egress timeout");
+        assert_eq!(frame.kind, EgressKind::Input);
+        assert_eq!(frame.bytes, b"\x1b[<64;1;1M");
+        assert_eq!(h.inspect().wheel_reported, 1);
+        h.stop();
+    }
+
+    #[test]
+    fn wheel_no_tracking_local_scrolls_without_egress() {
+        let h = EngineHandle::spawn(test_config());
+        let rx = h.attach_test_egress();
+        for i in 0..30 {
+            h.feed(format!("L{i:02}\r\n").into_bytes()).expect("feed");
+        }
+        h.build_now().expect("build");
+        h.enqueue_local_scroll(ScrollDelta::Top).expect("top");
+        let built_top = h.inspect().frames_built;
+        h.build_now().expect("build");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while h.inspect().frames_built <= built_top {
+            if Instant::now() >= deadline {
+                panic!("timeout waiting for top frame");
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        let before = h.latest_frame().expect("top frame");
+        assert!(
+            grid_text(&before).contains("L00"),
+            "viewport should be pinned to the top before wheel"
+        );
+
+        let ack = send_wheel(&h, base_wheel(1));
+        assert_eq!(ack.disposition, GestureDisposition::ScrolledLocal);
+        assert!(ack.encoded.is_empty());
+        assert!(rx.try_recv().is_err(), "no-tracking wheel must not egress");
+
+        let built_before = h.inspect().frames_built;
+        h.build_now().expect("build");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while h.inspect().frames_built <= built_before {
+            if Instant::now() >= deadline {
+                panic!("timeout waiting for post-wheel frame");
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        let after = h.latest_frame().expect("frame after wheel");
+        assert_ne!(
+            grid_text(&before),
+            grid_text(&after),
+            "wheel must local-scroll the viewport"
+        );
+        h.stop();
+    }
+
+    #[test]
+    fn wheel_read_only_under_tracking_local_scrolls_without_egress() {
+        let h = EngineHandle::spawn(test_config());
+        let rx = h.attach_test_egress();
+        h.feed(TRACKING_BUTTON_SGR.to_vec()).expect("feed tracking");
+        for i in 0..30 {
+            h.feed(format!("L{i:02}\r\n").into_bytes()).expect("feed");
+        }
+        h.build_now().expect("build");
+        h.enqueue_local_scroll(ScrollDelta::Top).expect("top");
+        let built_top = h.inspect().frames_built;
+        h.build_now().expect("build");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while h.inspect().frames_built <= built_top {
+            if Instant::now() >= deadline {
+                panic!("timeout waiting for top frame");
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        let before = h.latest_frame().expect("top frame");
+        enqueue_set_access(&h, false);
+
+        let ack = send_wheel(&h, base_wheel(1));
+        assert_eq!(ack.disposition, GestureDisposition::ScrolledLocal);
+        assert!(rx.try_recv().is_err(), "read-only wheel must not egress");
+
+        let built_before = h.inspect().frames_built;
+        h.build_now().expect("build");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while h.inspect().frames_built <= built_before {
+            if Instant::now() >= deadline {
+                panic!("timeout waiting for post-wheel frame");
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        let after = h.latest_frame().expect("frame after wheel");
+        assert_ne!(
+            grid_text(&before),
+            grid_text(&after),
+            "read-only wheel under tracking must local-scroll"
+        );
+        h.stop();
+    }
+
+    #[test]
+    fn request_copy_returns_selection_text() {
+        let h = EngineHandle::spawn(test_config());
+        h.set_inspect_enabled(true);
+        h.feed(b"copyme".to_vec()).expect("feed");
+        let _ = send_mouse(
+            &h,
+            base_mouse_gesture(MouseEventKind::Down, Some(MouseButtonKind::Left)),
+        );
+        let mut drag = base_mouse_gesture(MouseEventKind::Move, Some(MouseButtonKind::Left));
+        drag.cell = Some((3, 0));
+        drag.px_x = 31.0;
+        let _ = send_mouse(&h, drag);
+        let _ = send_mouse(
+            &h,
+            base_mouse_gesture(MouseEventKind::Up, Some(MouseButtonKind::Left)),
+        );
+
+        let rx = h.request_copy().expect("request copy");
+        let result = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("copy result timeout");
+        assert_eq!(result.text.as_deref(), Some("copy"));
+        assert_eq!(h.inspect().copy_started, 1);
+        assert_eq!(h.inspect().copy_completed, 1);
+        assert_eq!(h.inspect().copy_empty, 0);
+        h.stop();
+    }
+
+    #[test]
+    fn request_copy_empty_selection_returns_none() {
+        let h = EngineHandle::spawn(test_config());
+        h.set_inspect_enabled(true);
+        let rx = h.request_copy().expect("request copy");
+        let result = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("copy result timeout");
+        assert_eq!(result.text, None);
+        assert_eq!(h.inspect().copy_started, 1);
+        assert_eq!(h.inspect().copy_completed, 0);
+        assert_eq!(h.inspect().copy_empty, 1);
+        h.stop();
+    }
+
+    #[test]
+    fn request_copy_dropped_rx_does_not_panic() {
+        let h = EngineHandle::spawn(test_config());
+        let rx = h.request_copy().expect("request copy");
+        drop(rx);
+        h.build_now().expect("barrier");
+        h.stop();
+    }
 
     fn base_mouse_gesture(kind: MouseEventKind, button: Option<MouseButtonKind>) -> MouseGesture {
         MouseGesture {

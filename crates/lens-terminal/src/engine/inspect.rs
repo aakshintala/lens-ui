@@ -56,6 +56,10 @@ pub struct EngineInspect {
     pub mouse_encoded: u64,
     pub mouse_reports_coalesced: u64,
     pub mouse_suppressed: u64,
+    pub wheel_reported: u64,
+    pub copy_started: u64,
+    pub copy_completed: u64,
+    pub copy_empty: u64,
     pub recent: Vec<InspectEvent>,
 }
 
@@ -90,6 +94,10 @@ pub(crate) struct InspectShared {
     mouse_encoded: AtomicU64,
     mouse_reports_coalesced: AtomicU64,
     mouse_suppressed: AtomicU64,
+    wheel_reported: AtomicU64,
+    copy_started: AtomicU64,
+    copy_completed: AtomicU64,
+    copy_empty: AtomicU64,
     ring: Mutex<VecDeque<InspectEvent>>,
 }
 
@@ -124,6 +132,10 @@ impl InspectShared {
             mouse_encoded: AtomicU64::new(0),
             mouse_reports_coalesced: AtomicU64::new(0),
             mouse_suppressed: AtomicU64::new(0),
+            wheel_reported: AtomicU64::new(0),
+            copy_started: AtomicU64::new(0),
+            copy_completed: AtomicU64::new(0),
+            copy_empty: AtomicU64::new(0),
             ring: Mutex::new(VecDeque::with_capacity(RING_CAP)),
         }
     }
@@ -310,6 +322,34 @@ impl InspectShared {
         self.mouse_suppressed.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_wheel_reported(&self) {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        self.wheel_reported.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_copy_started(&self) {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        self.copy_started.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_copy_completed(&self) {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        self.copy_completed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_copy_empty(&self) {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        self.copy_empty.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn set_visible(&self, visible: bool) {
         self.visible.store(visible, Ordering::Relaxed);
     }
@@ -366,6 +406,10 @@ impl InspectShared {
             mouse_encoded: self.mouse_encoded.load(Ordering::Relaxed),
             mouse_reports_coalesced: self.mouse_reports_coalesced.load(Ordering::Relaxed),
             mouse_suppressed: self.mouse_suppressed.load(Ordering::Relaxed),
+            wheel_reported: self.wheel_reported.load(Ordering::Relaxed),
+            copy_started: self.copy_started.load(Ordering::Relaxed),
+            copy_completed: self.copy_completed.load(Ordering::Relaxed),
+            copy_empty: self.copy_empty.load(Ordering::Relaxed),
             recent,
         }
     }

@@ -10,8 +10,9 @@ use arc_swap::ArcSwapOption;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError};
 
 use super::command::{
-    GestureDisposition, GestureOwner, InputAck, KeyInput, MouseAck, MouseButtonKind,
-    MouseEventKind, MouseGesture, MouseReportEv, MouseReportPolicy, MouseTracking, PasteInput,
+    CopyResponder, CopyResult, GestureDisposition, GestureOwner, InputAck, KeyInput, MouseAck,
+    MouseButtonKind, MouseEventKind, MouseGesture, MouseReportEv, MouseReportPolicy, MouseTracking,
+    PasteInput, ScrollDelta, WheelInput,
 };
 use super::frame::Frame;
 use super::inspect::InspectShared;
@@ -121,6 +122,10 @@ pub(crate) enum EngineCommand {
     Paste(PasteInput),
     #[allow(dead_code, reason = "foreground lowering lands in Task 5")]
     MouseGesture(MouseGesture),
+    #[allow(dead_code, reason = "foreground lowering lands in Task 5")]
+    Wheel(WheelInput),
+    SelectAll,
+    Copy(CopyResponder),
     Focus {
         focused: bool,
         report: bool,
@@ -576,6 +581,67 @@ fn handle_command(
             presentation_tx,
             mouse_state,
         ),
+        EngineCommand::Wheel(mut w) => {
+            let ack_tx = w.ack.take();
+            let write_allowed = mouse_state.write_allowed;
+            let report = write_allowed
+                && engine.read_live_tracking() != MouseTracking::None
+                && w.access_epoch == current_epoch;
+            let (encoded, disposition) = if report {
+                let up = w.lines > 0;
+                let notches = w.lines.unsigned_abs();
+                let mut encoded = Vec::new();
+                for _ in 0..notches {
+                    match engine.encode_mouse_report(&MouseReportEv {
+                        action: MouseEventKind::Down,
+                        button: None,
+                        wheel: Some(up),
+                        mods: w.mods,
+                        px_x: w.px_x,
+                        px_y: w.px_y,
+                        any_button_pressed: false,
+                    }) {
+                        Ok(bytes) => {
+                            let _ = try_emit_user_input(egress.as_ref(), EgressKind::Input, &bytes);
+                            encoded = bytes;
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "lens-terminal engine: encode_mouse_report (wheel) failed: {e}"
+                            );
+                            break;
+                        }
+                    }
+                }
+                inspect.record_wheel_reported();
+                (encoded, GestureDisposition::Reported)
+            } else {
+                engine.local_scroll(ScrollDelta::Lines(w.lines));
+                *dirty = true;
+                *force_build = true;
+                (Vec::new(), GestureDisposition::ScrolledLocal)
+            };
+            send_mouse_ack(ack_tx, encoded, disposition);
+        }
+        EngineCommand::SelectAll => match engine.select_all() {
+            Ok(true) => {
+                *dirty = true;
+                *force_build = true;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                eprintln!("lens-terminal engine: select_all failed: {e}");
+            }
+        },
+        EngineCommand::Copy(responder) => {
+            inspect.record_copy_started();
+            let text = engine.extract_selection_text();
+            match &text {
+                Some(_) => inspect.record_copy_completed(),
+                None => inspect.record_copy_empty(),
+            }
+            let _ = responder.try_send(CopyResult { text });
+        }
         EngineCommand::Key(mut input) => {
             let cmd_epoch = input.access_epoch;
             let ack_tx = input.ack.take();
