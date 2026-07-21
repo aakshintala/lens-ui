@@ -1,35 +1,34 @@
 # Handoff — Terminal Slice 2: EXECUTION (2026-07-17, SERIAL re-cut)
 
-> **UPDATE 2026-07-21 — 2b PLANNED + grok-reviewed + fixes folded → EXECUTE NEXT. A fresh
-> session's first job is now to EXECUTE the 2b plan subagent-driven (NOT re-plan it).**
-> Plan: `docs/superpowers/plans/2026-07-20-terminal-slice-2b-clipboard-paste.md` (commit `c045d11`,
-> 5 tasks). Design was brainstormed 2026-07-20 → two user-approved decisions folded into the spec
-> (`c9d2465`): **(1) RE-CUT** 2b = **OSC-52 write policy + Cmd+V paste ONLY**; **selection + Cmd+C copy
-> MOVED to 2c** (they share 2c's mouse-capture stack + XTSHIFTESCAPE arbitration). **(2)** clipboard/paste
-> policy is **session-scoped behind an injectable `ClipboardPolicy` trait** (persistence deferred to
-> lens-ui). grok-4.5 plan review = **SHIP-WITH-FIXES**; all 1 Critical + 7 Important folded (C1 clone
-> ordering, I1 paste-cap-before-pending, I2 copy-notice event, I3 cap−1, I4 real Cmd+V test, I5 test
-> boilerplate, I6 always-warn deviation, I7 mapper layering) — full review `.superpowers/sdd/grok-2b-plan-review.md`.
-> **Execute per the "Execution flow for 2b/2c" block**: composer-2.5 per task, grok-4.5 per-task cross-family
-> reviews, gate after each (incl. lens-terminal `--features test-util,live-tests`), Opus whole-slice at end.
-> Note: gpt-5.6 endpoints stall AND cursor-delegate truncates grok's long chat replies — have review
-> agents **write findings to a scratch file** (gated non-empty) rather than return them as text. Then 2c.
-
-> **UPDATE 2026-07-20 — 2a + C2 + 2d ALL DONE. NEXT = 2b (then 2c). Both 2b/2c still need PLANS.**
-> Slice **2a** (input) DONE (2026-07-17). Critical **C2** (egress-replay) CLOSED via per-transport
-> egress channels + T4 (`fd79d54..2921da8`). Slice **2d** (presentation) EXECUTED + DONE (2026-07-20):
-> titles/OSC-8 hyperlinks/click→OpenUrlRequest/inspect+benches, 6 tasks composer-2.5 + grok-4.5
-> per-task reviews + fix waves + **Opus whole-slice = SHIP**. Opus caught a title-clear-vs-full-channel
-> invariant divergence (per-task reviews couldn't see it) → FIXED via a **tri-state latest-title slot**
-> (`Set|Clear` authoritative; drain never falls back to the droppable channel). The **end-of-slice
-> real-window gate PASSED** on a real macOS display and caught 3 latent bugs in the never-executed
-> Task-4 harness (frame-clobber-by-sampler / sync-read-of-async-`cx.emit` / dropped `Subscription`) —
-> all fixed; production click path was correct. Full 2d slice `bdd8695..5e6f28b`. **`terminal-ws`
-> PUSHED to `origin/terminal-ws` through 2d** (backup; **no `main` merge — user's standing call**).
-> Cross-family reviews used **grok-4.5** (`cursor-grok-4.5-high`) — gpt-5.6 endpoints stall; grok is the
-> proven 2d/C2 reviewer. Memories [[terminal-slice-2d-executed]], [[terminal-realwindow-harness-pitfalls]]
-> (READ THIS before any 2b/2c real-window test). **A fresh session's first job: WRITE THE 2b PLAN**
-> (see "Then 2b" below), then execute it subagent-driven, then plan+execute 2c.
+> **UPDATE 2026-07-21 — 2b DONE. NEXT = PLAN then execute 2c (mouse). A fresh session's first
+> job is to WRITE THE 2c PLAN (2c is NOT yet planned), then execute it subagent-driven.**
+> Slice **2b** (OSC-52 clipboard-write policy + Cmd+V paste) EXECUTED + DONE (2026-07-21) — 5 tasks,
+> commits `018820b..df53fa3` (11 code/test + 1 STATUS doc). composer-2.5 per task + **codex `gpt-5.6-sol`
+> high-effort** cross-family per-task reviews + fix waves + **Opus whole-slice = SHIP-WITH-FIXES → fixed**.
+> Opus caught a cross-task **read-only-gate bypass** no single-task review could see: `dispatch_paste`
+> didn't re-check `write_input_allowed()`, so a deferred multiline-warn paste Allowed AFTER a
+> Write→ReadOnly downgrade egressed write bytes to a read-only terminal (the epoch layer doesn't cover a
+> paste minted from the foreground `pending_pastes` queue post-downgrade) → FIXED (gate in `dispatch_paste`
+> + regression test `deferred_paste_allow_after_readonly_downgrade_is_suppressed`, commit `57bccde`).
+> Final full gate GREEN (fmt + workspace clippy + lens-terminal `test-util,live-tests` clippy + 132 lib
+> tests + benches `--features bench` + demo build). Memory [[terminal-slice-2b-planned-reviewed]] (now the
+> EXECUTED record). No live real-window rider run (paste round-trip is an env-gated manual leg; the Cmd+V
+> intercept is hermetically proven by `real_cmd_v_keystroke_routes_to_paste_not_key_encoder` via a FIFO
+> sentinel) — running it live is the user's call.
+>
+> **⚠ REVIEWER ROUTING CHANGED (user rule 2026-07-21, in CLAUDE.md):** cross-family reviews default to
+> **`gpt-5.6`** and gpt-5.6 must **ALWAYS run via `codex exec -s read-only`, NEVER via `cursor-delegate`**
+> ("Never use gpt-5.6 via Cursor — we have Codex for that"). On this box `codex` resolves to `gpt-5.6-sol`
+> high-effort; capture stdout to a file (codex does NOT truncate the way cursor-delegate truncates long
+> chat replies), the verdict is the last block from the `### Spec Compliance` header — `awk` from there.
+> `cursor-delegate` gpt-5.6-sol-high is FORBIDDEN (also hit its monthly usage cap mid-2b; resets 7/25).
+> Other diversity families (grok-4.5, gemini-3.5) still go via `cursor-delegate`. See [[codex-as-reviewer]],
+> [[review-spend-policy]].
+>
+> _Prior state (for provenance): 2a (input) DONE 2026-07-17; Critical C2 (egress-replay) CLOSED via
+> per-transport egress channels (`fd79d54..2921da8`); 2d (presentation) DONE 2026-07-20
+> (`bdd8695..5e6f28b`), Opus whole-slice=SHIP + real-window gate PASSED. `terminal-ws` pushed to
+> `origin/terminal-ws` through 2d; 2b commits are LOCAL/unpushed. No `main` merge — user's standing call._
 
 **Self-contained driver for a fresh session** whose job is to **execute** Slice 2. Planning is
 DONE and gpt-5.6-reviewed; do NOT re-plan or re-review the plan bodies — execute them.
@@ -162,9 +161,31 @@ click→OpenUrlRequest e2e + `render_realwindow` perf all in-budget) and caught 
 (fixed, `5e6f28b`; production correct). Memories [[terminal-slice-2d-executed]] (full record) +
 [[terminal-realwindow-harness-pitfalls]].
 
-## ▶ NEXT: PLAN then execute **2b** (clipboard/OSC-52), then plan+execute **2c** (mouse)
+## ✅ 2b (clipboard/OSC-52 write + Cmd+V paste) — EXECUTED + DONE (2026-07-21). See header.
 
-Neither is planned. See **Execution order item 3 (2b)** and **item 4 (2c)** above for the surface each
-owns + binding facts. **First action for a fresh session: write the 2b plan** (superpowers:writing-plans;
-plans→`docs/superpowers/plans/`), cross-family review it (grok-4.5), then execute subagent-driven per the
-**"Execution flow for 2b/2c"** block above. Merge `terminal-ws`→`main` remains the **user's standing call**.
+Full slice `018820b..df53fa3` (11 code/test commits + 1 STATUS doc). 5 tasks (OSC-52 `on_clipboard_write`
+cap-before-clone → foreground `ClipboardPolicy` seam + `ClipboardWriteRequest`/`ClipboardWriteNotice` +
+`on_host_event` → `EngineCommand::Paste` bracketed engine-side never-drop/epoch → Cmd+V intercept
+read-only-gated/multiline-warn/capped → demo Deny-default + benches + inspect + live rider). composer-2.5
+per task + codex `gpt-5.6-sol` per-task reviews + fix waves + **Opus whole-slice = SHIP-WITH-FIXES → fixed**
+(read-only-gate bypass on the deferred-warn paste; see header). Three documented deferrals carried in
+`docs/STATUS.md`: always-warn-on-multiline (no foreground mode-2004 snapshot until 2c), menu Edit→Paste
+not wired (only the keystroke path), empty-OSC-52 mints a prompt (intentional — could be a legit "clear
+clipboard"). Memory [[terminal-slice-2b-planned-reviewed]] = full EXECUTED record; ledger has per-task detail.
+
+## ▶ NEXT: PLAN then execute **2c** (mouse) — the LAST Slice-2 phase
+
+**2c is NOT yet planned.** First action for a fresh session: **write the 2c plan** (superpowers:writing-plans;
+plans→`docs/superpowers/plans/`; NOT `docs/superpowers` default — see [[spec-plan-location-convention]]),
+cross-family review it (**gpt-5.6 via `codex`** — see the reviewer-routing note in the header), then execute
+subagent-driven per the **"Execution flow for 2b/2c"** block above (composer-2.5 per task, codex per-task
+reviews, gate after each incl. lens-terminal `--features test-util,live-tests`, Opus whole-slice at end).
+
+**2c owns (surface + binding facts):** mouse capture built ONCE → {local selection + Cmd+C copy (moved here
+from 2b), mouse-report to the PTY} + **XTSHIFTESCAPE arbitration** (selection-vs-report). It opens with the
+**XTSHIFTESCAPE `mouse_shift_capture` safe-FFI spike** (the one still-open Slice-2 unknown). 2c builds the
+first **foreground mouse-/terminal-mode snapshot** — which also unblocks 2b's deferred always-warn nuance
+(suppress the multiline paste warn when bracketed paste / mode-2004 is active). Pixel→cell hit-testing +
+motion coalescing live here too. See the design spec §2c + the parent completion matrix; read
+[[terminal-realwindow-harness-pitfalls]] BEFORE any 2c real-window test. Merge `terminal-ws`→`main` and a
+backup push of the local 2b commits both remain the **user's standing call**.
