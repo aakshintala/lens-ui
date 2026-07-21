@@ -1,3 +1,5 @@
+mod layout_adapter;
+
 use crate::PtyProbe;
 use crate::card::view::{SessionCardView, mount_cached_card};
 use crate::fleet::store::FleetStore;
