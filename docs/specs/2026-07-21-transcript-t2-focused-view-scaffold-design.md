@@ -602,6 +602,21 @@ now **settled** and folded into §5/§6/§11. Recorded here for the plan.
   keeps it** for streaming-tail attribution. Chosen over B (remount-latest) and C (flat, defer
   to T-6) because grouping-at-finalize is the defining transcript behavior and A′ makes the
   flash-free handoff *structural*.
+  - **D-3 refinement (2026-07-22, user-approved during planning) — sections are per contiguous
+    RUN, not merged per `response_id`.** The round-3 "one section per `response_id`, merge
+    non-consecutive runs" framing was reconsidered when planning surfaced its cost on interleaved
+    turns (real shape: `claude-native-todos.sse` — assistant messages between tool-call runs of one
+    response): merging + hoisting the messages below the collapsed work **reorders mid-turn
+    narration**, decoupling it from the work it describes. Resolution: keep **per contiguous run**
+    grouping (as original T-1), so interleaved turns render **multiple chips in chronological order**
+    with the messages visible between them. A′'s flash-free core is unchanged — the retained section
+    entity is keyed by **`(response_id, run_index)`** (`run_index` = count of prior runs of the same
+    response; finalize-stable, re-keys only on the rare coarse reconcile), and the **collapse flag is
+    derived per `response_id`** so §4 timing folds a whole turn's runs together. Cost: per-run chips
+    (a `WorkSectionMeta` per-run-vs-per-turn question deferred to **T-6**). The T-1 amendment
+    (§4/§11) therefore drops the "merge non-consecutive runs" clause and instead removes the
+    flat-when-live special case + stamps `run_index`. See plan
+    `docs/plans/2026-07-22-transcript-t2-focused-view-scaffold.md` Task 1.
 - **D-1 → z (cache settled sections).** A settled `WorkSection`'s presentation is cached;
   only the **live section** re-projects per `ScratchChanged` — via a **per-`response_id`
   projection**, not `project_all` over the whole slice (round-3 correction) — so steady state
