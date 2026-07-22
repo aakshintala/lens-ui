@@ -1,9 +1,15 @@
 # T-2 — Focused view scaffold + live disk-sourced surface (design)
 
 **Date:** 2026-07-21
-**Status:** rev 3 — **design-locked 2026-07-22** (two GPT-5.6/codex review rounds; mechanical
-findings fixed; the three design decisions D-1/D-2/D-3 resolved with the user, §13). Pending
-a confirming re-review, then `writing-plans`.
+**Status:** rev 4 — **architecture-locked 2026-07-22**, proceeding to `writing-plans`
+(path B). Three GPT-5.6/codex review rounds; all mechanical + plumbing findings closed; the
+three design decisions **D-1/D-2/D-3 resolved** with the user (§13) and their round-3 contract
+refinements folded in (response-keyed sections + streaming-reasoning attribution;
+`Finalizing { item_id }` + terminal-path discard; coarse cache invalidation + per-response
+live projection; collapse honors §4). Remaining open items are **mechanism/contract detail
+deliberately deferred to the plan** (the `response_id`-vs-`(response_id,run)` confirmation,
+exact `Retired` payload, per-response projection index, silent re-fire signal §3.4) — to be
+nailed task-by-task with TDD, not more spec prose. **Not review-green by design; plan-ready.**
 **Owner:** Lens design effort
 **Type:** Implementation slice (build), transcript workstream T-2 of T-0..T-7 (+ T-2b).
 
@@ -221,8 +227,13 @@ a `Box<dyn TranscriptReader + Send>`:
   **completion of any epoch that overlapped the replica's baseline forces a re-read.** The
   re-read is a **full resident-range re-read** + **id-keyed reconcile** against the
   RowStore (changed ids update in place, folded-away provisional rows removed, new ids
-  inserted). O(resident), only on the (rare) reconcile episode; **T-2b** bounds it to the
-  tail. Upsert-by-id keeps it flash-free.
+  inserted) **and invalidates *all* settled-section caches** (D-1). Coarse-on-purpose
+  (round-3 New-Imp-3): reconcile can delete one ordinal and rewrite another, change ids/
+  payloads/`response_id`, and tool-span pairing is cross-ordinal — so "invalidate only
+  touched ordinals" is neither well-defined nor safe here. Blowing every settled cache is
+  correct and cheap because reconcile is rare (the live-path per-response projection, §5, is
+  what stays hot). O(resident), only on the reconcile episode; **T-2b** adds dependency-aware
+  changed-ordinal invalidation + bounds it to the tail. Upsert-by-id keeps it flash-free.
 - **Known gap — silent in-place updates (re-fire):** a re-fire of an already-persisted id
   updates an existing ordinal and emits **no** `TranscriptAdvanced` (`runloop.rs:2234`
   test); the scaffold emits two `output_item.done` for one `fc_*` id (D23). These are
@@ -282,14 +293,28 @@ reasoning identity (mirroring `finalize_message`'s `message_id`); a new **`Retir
 { acc_id, disposition }`** signal (`Finalizing`/`Discarded`, D-2 §13) from the
 finalize/discard paths; and the **T-1 amendment** (below). Each cross-family reviewed.
 
-**T-1 amendment (D-3 → A′, first task of T-2's build order).** `group_work_section` today
-skips the live response (`view.rs:148`, T-1 spec §5.3). Change it to **group every response
-uniformly** (drop the `active_response` special-case — the param is no longer needed) and to
-splice the live `StreamingReasoning` **under** the live section; `StreamingMessage`/`Message`
-stay top-level siblings. Update T-1's affected tests + annotate the T-1 spec §5.3 (its
-"leave live flat" rationale is superseded — structure is uniform; live-vs-settled is a
-render flag). Small and local, but it *is* a revision to an already-executed (unmerged)
-slice, so it carries the same cross-family review bar.
+**T-1 amendment (D-3 → A′, first task of T-2's build order).** Three coupled changes to
+`group_work_section` / the projector (`view.rs`), corrected per round-3 review:
+
+1. **Group every response uniformly**, including the live one — `group_work_section` no
+   longer uses `active_response` to decide *flat-vs-grouped*. **But `active_response` is
+   still an input to projection** (round-3 correction — my earlier "drop the param" was
+   wrong): it is needed to attribute the live streaming tail to its section (see #2).
+2. **Stamp the live `StreamingReasoning` with its `response_id`** so Stage 3 can place it
+   under the live section. Today `StreamingReasoning(&ReasoningAcc)` carries no `response_id`
+   (`ReasoningAcc` has none; it lives in scratch, `item.rs:118`). Fix: thread `active_response`
+   into the streaming-tail splice and emit `StreamingReasoning { response_id, acc }` (or add
+   `response_id` to the accumulator). `StreamingMessage`/`Message` stay top-level siblings.
+3. **Section identity = `response_id`, merging non-consecutive runs** (round-3 New-Crit-1):
+   today grouping is **run-based** — a sibling (`ResourceEvent`, etc.) mid-turn splits one
+   response into two runs → two sections with the same key, which breaks "one Level-1 entity
+   per `response_id`." Decide **one section per `response_id`** (merge runs; the section
+   renders at its first block's ordinal). *(The plan confirms `response_id` vs
+   `(response_id, run)` against real transcripts; `response_id` is the recommendation.)*
+
+Update T-1's affected tests (≥4 of the 21 contract live-flat/tail behavior) + annotate the
+T-1 spec §5.3 (done). A revision to an already-executed (unmerged) slice → same cross-family
+review bar.
 
 ---
 
@@ -308,25 +333,28 @@ anchor) · `focus_generation: u64` · the reader worker handle + `session_id`.
 |---|---|
 | `Rebased(scalars)` | Update status/title/active-response scalars **only**. Never clear `items` (append-only would remount every row). Baseline read was enqueued at **create** (§2). |
 | `ScratchChanged(s)` | `self.scratch = s`. Re-project the **live section only** (§6, D-1). |
-| `Retired{ acc_id, disposition }` (new reducer signal, D-2) | `Finalizing` → stage the child's last presentation in `pending_finalize` under its section (keep the row); `Discarded` → drop the streaming child (no ghost). §6. |
+| `Retired{ acc_id, disposition }` (new reducer signal, D-2) | `Finalizing { item_id }` → stage the child's last presentation keyed by **`item_id`** (the durable target — not `acc_id`, which differs for unkeyed messages) under its section; swap when the disk row for `item_id` arrives. `Discarded` → drop the streaming child (no ghost). Emitted on ordinary finalize **and** on Failed/Incomplete/Cancelled **and** reconnect discontinuity (all of which must retire scratch — `folds.rs:221` currently does not). §6. |
 | `TranscriptAdvanced{ord}` | If `ord > last_rendered`: enqueue forward-delta `(last_rendered, ord]` read (gen G). On arrival, swap any matching staged child in place. |
 | `ActiveResponseChanged(r)` | `self.active_response = r`. The now-settled section's flag flips expanded→collapsed (cached thereafter); the new live section begins. |
 | `Reconnected{gap}` | If `gap != Some(0)`, inject a `ReconnectBreak` marker anchored at the current tail ordinal (§3.5). |
 | `TransportChanged{reconcile_in_flight}` | Drive the debounced `syncing…` indicator (§9); on the reconcile-epoch edge, enqueue the reconcile re-read (§3.4). |
 
-**Projection** runs **on input change**, not per frame — the full staged pipeline (a bare
-`project_all` never groups). Per D-1, **settled sections are cached** and only the **live
-section** re-projects on a `ScratchChanged`:
+**Projection** runs **on input change**, not per frame. Per D-1 the two paths differ in
+cost (round-3 correction — calling `project_all` over the whole slice every delta is
+O(resident), defeating the point):
 
-```
-chat:    group_work_section( project_all(&items, &scratch) )
-history: group_work_section( project_filtered(hide_reasoning(&items), &scratch, false) )
-```
+- **Baseline / reconcile (rare):** the full staged pipeline over the resident set —
+  `group_work_section( project_all(&items, &scratch) )` (chat) / with `hide_reasoning` +
+  `project_filtered(.., false)` (history). Cache each settled section's owned presentation.
+- **`ScratchChanged` (frequent):** re-project **only the live section** — a
+  **per-`response_id` projection** over just that response's items + scratch tail, **not**
+  `project_all` over everything. Steady state is O(live turn).
 
-`group_work_section` (Stage 3, amended per §11 to group **every** response uniformly) emits
-the `WorkSection`s; `project_*` alone is Stage 2 only (`view.rs:93,110`). The live/expanded
-decision is the renderer's (`response_id == active_response`), so `group_work_section` no
-longer takes `active_response`. Then materialize owned presentations → upsert (§6).
+`group_work_section` (Stage 3, amended §11 for uniform response-keyed grouping) emits the
+`WorkSection`s. `active_response` remains a projection input (streaming-tail attribution,
+§11); the **collapse** decision is the renderer's — see §6 (and it must honor §4's "latest
+settled stays expanded until the next user message", not merely "collapsed if not live").
+Materialize owned presentations → upsert (§6).
 
 ---
 
@@ -354,8 +382,12 @@ Tested while scrolled up (contract 1).
 **from birth** — live or settled — so nothing changes shape at finalize:
 
 - **Level 1 — a `WorkSection` entity keyed by `response_id`.** Renders **expanded** (a rail
-  + its children) when `response_id == active_response` (the live turn), **collapsed** (a
-  chip) otherwise. Live-vs-settled is a **derived flag**, not a structural difference.
+  + its children) when it is the live turn (`response_id == active_response`) **or** the
+  **latest settled turn with no user message after it** (§4: "the latest turn's work stays
+  expanded until the next user message" — round-3 New-Imp-4; *not* merely "collapsed if not
+  live"). **Collapsed** (a chip) otherwise. Expanded-vs-collapsed is a **derived render
+  flag** (the renderer tracks the latest-settled/next-user boundary), not a structural
+  difference — the entity and its children are identical either way.
 - **Level 2 — a work-child entity keyed by its own id** (reasoning id, tool `call_id`)
   under the section.
 - **Top-level siblings** — messages (`message_id`), user messages, `ResourceEvent`,
@@ -389,11 +421,17 @@ So the **reducer emits an explicit retirement disposition** keyed by accumulator
 **`Finalizing`** (a disk row is coming) vs **`Discarded`** (abandoned) — instead of the
 replica inferring intent:
 
-- **`Finalizing`:** keep rendering the child's last presentation (`pending_finalize`) under
-  its section until the forward-delta read delivers the committed row for that RowId, then
-  **swap in place** (same `Entity`). Never absent, never remounts.
+- **`Finalizing { item_id }`:** keep rendering the child's last presentation
+  (`pending_finalize`, keyed by the durable **`item_id`** the signal carries — this bridges
+  the unkeyed-message case where the finalized `local_id` ≠ the streaming `acc_id`) under its
+  section until the forward-delta read delivers the committed row for `item_id`, then **swap
+  in place** (same `Entity`). Never absent, never remounts. If the persistence write **fails**
+  after the reducer emitted `Finalizing` (`runloop.rs:1195`), the staged row is recovered via
+  the reader's Fatal-state path (§3.3) — retried or surfaced, never orphaned.
 - **`Discarded`:** drop the streaming child immediately — **no** staging, so **no ghost
-  row**. The section reflects whatever actually persisted (via the reconcile re-read).
+  row**. Emitted for reconnect discontinuity **and** the terminal Failed/Incomplete/Cancelled
+  paths (which must also retire scratch — `folds.rs:221` currently clears only
+  `active_response`). The section reflects whatever actually persisted (reconcile re-read).
 
 **Test (MANDATORY, real-window harness — `#[gpui::test]` fakes the text system and
 false-greens paint/identity, per [[gpui-test-noop-text-system]]/[[terminal-realwindow-harness-pitfalls]]):**
@@ -479,8 +517,14 @@ Beyond the §6 mandatory finalize test:
   D-of-§3.4 fix lands); assert no stale row survives a reconcile.
 - **Unkeyed finalize** (D-3) — a `None`-`message_id` streaming message finalizes to a
   `local_id` row with no absent frame / no remount (once D-3 fixes the correlation).
-- **Reconnect-discard, no ghost** (D-2) — a reconnect discontinuity that clears scratch
-  **without** committing must **not** leave a permanent staged `pending_finalize` row.
+- **Discard paths, no ghost** (D-2) — a reconnect discontinuity **and** each terminal
+  Failed/Incomplete/Cancelled turn emits `Discarded`, clears scratch, and leaves **no**
+  permanent staged `pending_finalize` row.
+- **Collapse timing** (New-Imp-4) — the **latest settled** turn stays **expanded** until the
+  **next user message**, then collapses; older settled turns are collapsed; the live turn is
+  expanded. Asserts against §4, not "collapsed iff not active".
+- **Write-failure recovery** (D-2) — a persistence failure after `Finalizing` does not
+  orphan the staged row (retried/surfaced via the reader Fatal path, §3.3).
 - **Marker position persistence** (Imp-5) — a `ReconnectBreak` survives N full reprojections
   at its `after_ordinal` anchor; it neither floats to the tail nor vanishes.
 - **Paused-scroll not yanked** (New-Crit-3) — a live change while scrolled up uses `splice`
@@ -549,21 +593,28 @@ The mechanical review findings are folded into §§3–10; these three coupled d
 now **settled** and folded into §5/§6/§11. Recorded here for the plan.
 
 - **D-3 → A′ (two-level, group-from-birth).** Every turn's work is a `WorkSection` from
-  birth — a Level-1 entity per `response_id` owning Level-2 child entities; live = rendered
-  expanded, settled = rendered collapsed; **finalize flips a derived flag, nothing
-  remounts** (§6). Requires the T-1 amendment (uniform grouping incl. the live response;
-  `StreamingReasoning` spliced under the live section; `group_work_section` drops its
-  `active_response` param — §11). Chosen over B (remount-latest-turn) and C (flat in T-2,
-  defer grouping to T-6) because grouping-at-finalize is the defining transcript behavior
-  and A′ makes the flash-free handoff *structural* rather than race-dependent.
-- **D-1 → z (cache settled sections).** A settled `WorkSection` is immutable, so it is
-  projected once and cached; only the **live section** re-projects per `ScratchChanged`
-  (O(live turn), not O(resident)); a cached section is invalidated only when a reconcile
-  re-read touches its ordinals. Clears the frame budget without depending on T-2b. The
+  birth — a Level-1 entity **per `response_id`** owning Level-2 child entities; expanded when
+  live **or** latest-settled-until-next-user (§4/§6), collapsed otherwise; **finalize flips a
+  derived render flag, nothing remounts** (§6). Requires the T-1 amendment (§11), refined by
+  round-3: uniform **response-keyed** grouping merging non-consecutive runs; the live
+  `StreamingReasoning` stamped with its `response_id` and spliced under the live section;
+  `group_work_section` stops using `active_response` for flat-vs-grouped **but projection
+  keeps it** for streaming-tail attribution. Chosen over B (remount-latest) and C (flat, defer
+  to T-6) because grouping-at-finalize is the defining transcript behavior and A′ makes the
+  flash-free handoff *structural*.
+- **D-1 → z (cache settled sections).** A settled `WorkSection`'s presentation is cached;
+  only the **live section** re-projects per `ScratchChanged` — via a **per-`response_id`
+  projection**, not `project_all` over the whole slice (round-3 correction) — so steady state
+  is O(live turn). Invalidation is **coarse**: after any (rare) reconcile re-read, blow **all**
+  settled caches (per-ordinal invalidation is unsafe under cross-ordinal tool pairing +
+  delete/rewrite; round-3 New-Imp-3). Clears the frame budget without depending on T-2b; the
   `list()` order vec is maintained incrementally and read through the entity handle (no
-  per-render clone).
+  per-render clone). *(T-2b adds dependency-aware fine-grained invalidation.)*
 - **D-2 → ii (explicit reducer retirement).** The reducer emits `Retired { acc_id,
-  disposition }` — `Finalizing` vs `Discarded` — so the replica never infers intent from
-  batch shape (which fails on deferred commits). `Finalizing` stages until the disk row
-  swaps in place; `Discarded` drops immediately (no ghost). §6. Chosen over (i) batch
-  inference because T-2 already touches the reducer, so "UI-only" was not a real benefit.
+  disposition }` where `disposition = Finalizing { item_id } | Discarded` (round-3: the
+  durable `item_id` is required — the unkeyed-message `local_id` ≠ the streaming `acc_id`).
+  `Finalizing` stages by `item_id` until the disk row swaps in place (with write-failure
+  recovery via §3.3); `Discarded` drops immediately (no ghost) and is emitted on reconnect
+  **and** the terminal Failed/Incomplete/Cancelled paths (which must now also retire scratch —
+  `folds.rs:221`). Chosen over (i) batch inference (fails on deferred commits); T-2 already
+  touches the reducer, so "UI-only" was not a real benefit.
