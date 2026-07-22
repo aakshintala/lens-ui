@@ -14,11 +14,13 @@
   - Why missed: the Task-12 finalize probe drove `Retired`-before-`Scratch` AND manually spliced the harness list count; all finalize unit tests held `active_response=Some`. Extended the probe with the canonical `active→None`-before-disk run (no manual splice) — PASSES on real pixels.
 - **Reviews otherwise: everything else HOLDS** — §12 criteria, disk-signal completeness, scope discipline (no T-2b/T-3/T-4 leak, ContentTab inert), scroll/O(visible)/marker, fleet seams. See `.superpowers/sdd/task-final-opus-synthesis.md` + `task-final-codex-review.md`.
 
-## OPEN — resume here (in order)
-1. **Flaky Task-7 test not fully deterministic (PARTIAL fix 52dbf94).** Keep-alive mock rewrite killed the `IncompleteMessage` class but ~1/120 residual remains (`error sending request /api/version` — reqwest pool-reuse vs hand-rolled TCP). **Finish with a proper HTTP-mock dev-dep (wiremock/httptest) or a Client no-handshake test seam**, loop-verify 100+/100. Last blocker to a trustworthy gate.
-2. **Run the final FULL `cargo run -p xtask -- gate`** on tip (not run after the last 2 commits; composer gates were focused-only + fmt). Expect green.
-3. **Merge:** solo workflow → merge `lens-transript`→main + push once gate is trustworthy ([[integration-workflow]]).
-4. **Write memory:** the false-green-probe lesson (see ledger RESUME item 4).
+## CLOSED — 2026-07-22 (all four items resolved)
+1. **Flaky Task-7 — DETERMINISTIC (e7a9ee8).** No HTTP-mock crate exists (lens-client only talks to real live servers); the residual was a benign transient reqwest pool handshake drop (~1/120), not a product bug. Both fallible net ops fail before any store state is inserted, so a bounded 5-attempt retry is clean and masks nothing. **Verified 0/200.**
+2. **Final FULL gate — GREEN on tip 5790203.** Caught 3 clippy `-D warnings` in the crux fix + Task-15 tests (collapsible_if, 2× len_zero) that focused/composer gates skipped → fixed 5790203. fmt+clippy+all-crates+tests+drift+benches pass.
+3. **Merge — user chose KEEP-AS-IS.** Branch stays UNMERGED (76 commits); worktree preserved. Merge deferred to the user.
+4. **Memory WRITTEN:** `false-green-probe-drives-production-path.md`.
+
+**Tip is now `5790203`** (was `52dbf94`): `+e7a9ee8` (flaky) `+5790203` (clippy).
 
 ## Process notes
 - Per-task reviews: grok-4.5 (via cursor-delegate); codex reserved for end-of-workstream (user directive, credit conservation). Implementers: composer-2.5.
