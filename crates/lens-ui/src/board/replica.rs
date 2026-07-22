@@ -135,6 +135,19 @@ impl BoardReplica {
         this
     }
 
+    /// Production ctor. `store` is the bootstrap-opened handle (Task 8), or `None` if that
+    /// open failed; `path` lets `ensure_open`/recovery (re)open. `None` + a bad path →
+    /// `LoadFailed` with the real `conn` (not a test ctor).
+    pub fn new(
+        store: Option<Box<dyn BoardStore + Send>>,
+        path: PathBuf,
+        conn: ConnectionId,
+        fleet: Entity<FleetStore>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::build(store, path, conn, None, fleet, cx)
+    }
+
     pub fn for_test(fleet: Entity<FleetStore>, cx: &mut Context<Self>) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("board.db");
@@ -976,6 +989,28 @@ mod tests {
             );
         });
         drop(dir);
+    }
+
+    // Production new(None, bad path) → LoadFailed with the REAL conn (not a test ctor).
+    #[gpui::test]
+    async fn new_with_none_store_and_bad_path_is_load_failed(cx: &mut gpui::TestAppContext) {
+        let fleet = cx.update(|cx| test_fleet(cx));
+        let replica = cx.update(|cx| {
+            cx.new(|cx| {
+                BoardReplica::new(
+                    None,
+                    "/dev/null/nope.db".into(),
+                    ConnectionId::new("lens-app"),
+                    fleet.clone(),
+                    cx,
+                )
+            })
+        });
+        cx.run_until_parked();
+        replica.read_with(cx, |r, _| {
+            assert_eq!(r.state(), ReplicaState::LoadFailed);
+            assert_eq!(r.conn.as_str(), "lens-app");
+        });
     }
 
     // A card arriving WHILE a reconcile place is in-flight coalesces; the reply's re-diff
