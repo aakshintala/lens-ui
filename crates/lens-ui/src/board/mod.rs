@@ -844,22 +844,23 @@ fn group_accent(token: Option<&str>) -> gpui::Hsla {
     gpui::rgb(hex).into()
 }
 
+/// The prune set for a single **top-level** `board_tree` node: if it is a collapsed
+/// group, every leaf session under it (those hide behind the 1×1 rollup tile). An
+/// expanded group renders its members as cards (they need views), so nothing is
+/// pruned — and we do NOT recurse into it. Recursing would prune a *nested* collapsed
+/// group's members while `pack`/`absolute_group` (top-level tiles only) still render
+/// them as cards → orphaned `visible` ids with no view (Grok T5 review Important #2).
+/// Nested groups are unreachable until B-5; B-5 owns nested collapse rendering + prune
+/// together. Keeping prune scope == pack scope (top-level tiles) makes B-4b consistent.
 fn collect_collapsed_group_members(node: &BoardNode<'_>, out: &mut HashSet<SessionId>) {
-    match node {
-        BoardNode::Card(_) => {}
-        BoardNode::Group { item, members } => {
-            let collapsed = match &item.kind {
-                lens_core::domain::board::BoardItemKind::Group { collapsed, .. } => *collapsed,
-                _ => false,
-            };
-            if collapsed {
-                for sid in node.leaf_sessions() {
-                    out.insert(sid.clone());
-                }
-            } else {
-                for m in members {
-                    collect_collapsed_group_members(m, out);
-                }
+    if let BoardNode::Group { item, .. } = node {
+        let collapsed = matches!(
+            &item.kind,
+            lens_core::domain::board::BoardItemKind::Group { collapsed: true, .. }
+        );
+        if collapsed {
+            for sid in node.leaf_sessions() {
+                out.insert(sid.clone());
             }
         }
     }
