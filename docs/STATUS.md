@@ -5,7 +5,7 @@ the current forward-looking state only. **Full dated session entries live in
 [`STATUS-ARCHIVE.md`](./STATUS-ARCHIVE.md)** — write each session's detail there
 and roll older "Recent" pointers off this page as they age.
 
-_Last curated 2026-07-22 (transcript **T-0 + T-1 executed**, **T-2 EXECUTING 13/15 tasks** on `lens-transript` c53179f..2886508 UNMERGED — subagent-driven; Phase A done, Phase B 7–13 done (Task-13 scroll contracts RESOLVED + Task-12 collapse nuance validated non-defect); resume ledger `.superpowers/sdd/progress.md`, handoff `docs/handoffs/2026-07-22-transcript-t2-executing.md`. Open: Tasks 14–15, flaky Task-7 test. **Reorg:** disk-scale → **T-2b** (next-not-deferred); live tool-tail → **T-4**; polymorphic `ContentTab` → terminal-UI-integration, SPEC-GAPS)._
+_Last curated 2026-07-22 (transcript **T-0 + T-1 executed**, **T-2 ALL 15 tasks DONE** on `lens-transript` c53179f..52dbf94 UNMERGED — subagent-driven. **End-of-workstream review (codex + Opus synthesis) found 3 Criticals — the Task-12 finalize "crux" was FALSELY validated (probe drove wrong update order + manually spliced; tests held `active_response=Some`)** — all source-verified, FIXED (55ea529), grok re-review + real-pixel probe CONFIRM CLOSED. lens-store DELETED (vestigial). **OPEN before merge:** flaky Task-7 test only PARTIALLY deterministic (52dbf94 killed the IncompleteMessage class, ~1/120 residual — finish w/ http-mock dev-dep); run final full gate; then merge→main. Resume ledger `.superpowers/sdd/progress.md` (RESUME HERE block), handoff `docs/handoffs/2026-07-22-transcript-t2-complete-1critical-flaky-open.md`. **Reorg:** disk-scale → **T-2b**; live tool-tail → **T-4**; polymorphic `ContentTab` → terminal-UI-integration, SPEC-GAPS)._
 
 ---
 
