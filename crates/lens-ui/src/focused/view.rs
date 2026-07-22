@@ -30,9 +30,10 @@ impl FocusedTranscriptView {
             r.list_state_mut().reset(row_count);
         });
         let focus_handle = cx.focus_handle();
-        let weak = cx.weak_entity();
+        // The observe callback is already invoked with the view leased (&mut Context<Self>);
+        // notify directly. A nested weak.update() here re-enters the same lease → panic.
         cx.observe(&replica, move |_, _, cx| {
-            weak.update(cx, |_, cx| cx.notify()).ok();
+            cx.notify();
         })
         .detach();
         Self {
@@ -146,22 +147,20 @@ impl Render for FocusedTranscriptView {
 
         let list_state = self.list_state(cx);
         let weak = cx.weak_entity();
+        // Scroll events fire from input, outside the render/update pass, so a direct weak.update
+        // is not re-entrant (the re-entrancy panic was the replica observer, fixed in `new`).
         list_state.set_scroll_handler(move |event: &ListScrollEvent, _, app| {
-            let visible_end = event.visible_range.end;
-            let is_scrolled = event.is_scrolled;
-            let weak = weak.clone();
-            app.defer(move |app| {
-                weak.update(app, |view, _| {
-                    let count = view.last_row_count;
-                    let at_bottom = visible_end >= count.saturating_sub(1) && !is_scrolled;
-                    if at_bottom {
-                        view.set_follow_mode(FollowMode::Following, count);
-                    } else if is_scrolled {
-                        view.set_follow_mode(FollowMode::Paused, count);
-                    }
-                })
-                .ok();
-            });
+            weak.update(app, |view, _| {
+                let count = view.last_row_count;
+                let at_bottom =
+                    event.visible_range.end >= count.saturating_sub(1) && !event.is_scrolled;
+                if at_bottom {
+                    view.set_follow_mode(FollowMode::Following, count);
+                } else if event.is_scrolled {
+                    view.set_follow_mode(FollowMode::Paused, count);
+                }
+            })
+            .ok();
         });
 
         let replica = self.replica.clone();
