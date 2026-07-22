@@ -19,7 +19,7 @@ app-wide ripple.
 
 - The HTTP client — typed requests + responses for every endpoint in `openapi.json`.
 - The SSE stream parser — `GET /v1/sessions/{id}/stream`, the full event taxonomy, `sequence_number` dedup.
-- The WS terminal attach client — `WS /v1/sessions/{id}/resources/terminals/{id}/attach` (the `/v1` prefix IS required — the router is mounted with `prefix="/v1"` at `app.py:1635-1642`; the bare `terminal_attach.py:130` path is router-relative. Not in openapi, read from source).
+- The WS terminal attach client — `WS /v1/sessions/{id}/resources/terminals/{id}/attach` (the `/v1` prefix IS required — the router is mounted with `prefix="/v1"` at `app.py:2041-2046`; the bare `terminal_attach.py:145` path is router-relative. Not in openapi, read from source).
 - The no-replay reconnect protocol — snapshot + history + reopen + dedup.
 - The contract-version gate — `GET /api/version` (the semver source), refuse-to-start on mismatch. (`GET /v1/info` is the unauthenticated capability/auth probe; `GET /health` is liveness — neither carries a version.)
 - Per-connection auth — the credential the HTTP/WS clients present for this connection.
@@ -114,13 +114,13 @@ endpoints are now environment-scoped):
 | `GET` | `/v1/sessions/{id}/resources/files/{file_id}` | file metadata |
 | `GET` | `/v1/sessions/{id}/resources/files/{file_id}/content` | file content |
 | `GET/POST` | `/v1/sessions/{id}/resources/terminals` | list / create terminals |
+| `GET` | `/v1/sessions/{id}/resources/terminals/{terminal_id}` | fetch one terminal and verify liveness |
 | `DELETE` | `/v1/sessions/{id}/resources/terminals/{terminal_id}` | destroy a terminal |
-| `POST` | `/v1/sessions/{id}/resources/terminals/{terminal_id}/transfer` | transfer a terminal to a different session (live `/clear` rotation) |
 
 **Terminal WS attach IS under `/v1/`** — it lives at
 `ws://{host}/v1/sessions/{session_id}/resources/terminals/{terminal_id}/attach`.
-The router defines the bare `/sessions/.../attach` path (`terminal_attach.py:103-130`)
-but `create_app` mounts that router with `prefix="/v1"` (`app.py:1635-1642`), so the
+The router defines the bare `/sessions/.../attach` path (`terminal_attach.py:104-145`)
+but `create_app` mounts that router with `prefix="/v1"` (`app.py:2041-2046`), so the
 external URL carries `/v1`. Runner proxy + the `web` client both use the `/v1`-prefixed URL.
 Section 5 covers it.
 
@@ -218,20 +218,50 @@ reconnaissance (framework §2.1).
 
 ## 5. The terminal WS attach
 
+REST/resource-event facts in this section cite
+`vendor/omnigent-0.5.1/openapi.json` paths
+`/v1/sessions/{session_id}/resources/terminals` and
+`/v1/sessions/{session_id}/resources/terminals/{terminal_id}`, and schemas
+`SessionResourceObject`, `ResourceEventData`, and `SessionSupersededEvent`.
+Attach framing, authorization, transport, and close meanings are absent from
+OpenAPI and were audited at omnigent `08285468` in
+`server/routes/terminal_attach.py`, `server/app.py`,
+`terminals/{ws_bridge,control_bridge}.py`, and `server/routes/sessions.py`.
+
 Live terminal I/O is **not** over HTTP — it's a WebSocket at
 `ws://{host}/v1/sessions/{id}/resources/terminals/{terminal_id}/attach` (the
-`/v1` prefix comes from the router mount at `app.py:1635-1642`; the bare path in
-`terminal_attach.py:103-130` is router-relative). Frames are binary PTY bytes
+`/v1` prefix comes from the router mount at `app.py:2041-2046`; the bare path in
+`terminal_attach.py:104-145` is router-relative). Frames are binary PTY bytes
 inbound/outbound; control is text JSON (`{"type":"resize", ...}`). A `read_only`
-query param controls write access.
+query param controls write access, and Lens explicitly sends `transport=pty`
+because its retained Ghostty engine owns terminal state. Omnigent's default
+`control` transport captures tmux history for xterm.js and is not suitable for
+replay into an existing native emulator.
 
-- **Read-only by default** — the server attaches via `tmux attach -r` (read-only
-  tmux mode). Write attach requires `LEVEL_OWNER` (the session owner).
-- **Transferable** — `POST …/terminals/{id}/transfer` moves a terminal to a new
-  session without closing it.
-- **No replay buffer** — live attach only. Reconnect loses scrollback;
-  `workspace-and-terminals.md` decision §0.7-C pins the Lens-side ring buffer
-  for reconnect scrollback.
+- **Server-authoritative access** — `read_only=true` requires read access,
+  drops binary input, retains resize, and attaches via `tmux attach -r`.
+  Interactive attach requires `LEVEL_OWNER` (the session owner). Authorization
+  rejection uses WebSocket close `1008`.
+- **Typed close meanings** — `4404` is missing/dead terminal, `4405` is a
+  detached tmux client whose terminal remains alive, and `4500` is an internal
+  attach failure. The attachment maps these values; callers never parse close
+  reasons.
+- **No replay proof** — there are no terminal sequence numbers. After every
+  established reconnect, `lens-terminal` inserts an output-gap marker while
+  retaining its existing Ghostty engine; it does not maintain a second raw-byte
+  ring.
+- **No public transfer capability** — the pinned 0.5.1 OpenAPI has no transfer
+  path. Native `/clear` uses a server-internal transfer and publishes public
+  `session.superseded`; lens-ui follows that session event and passes the
+  rebind to the terminal tab. Lens never calls the internal route.
+- **Generation limitation** — terminal IDs are currently deterministic from
+  `(terminal_name, session_key)`, and a few server-owned roles can be recreated
+  with the same ID. A duplicate `session.resource.created` is treated as a new
+  observed generation. Resource lifecycle events are normally persisted as
+  `ResourceEventData` items for reconnect discovery, so reconnect consults that
+  history as well as preflight GET. Persistence is best-effort, however, and
+  0.5.1 exposes no immutable generation token, so those checks narrow rather
+  than eliminate the ambiguity.
 - `session.terminal.activity` is delivered on the **SSE stream** (byte-verified
   2026-06-26 — `docs/spikes/2026-06-26-live-event-recapture.md`), not via the WS
   terminal attach; it signals which terminal is active so the workspace drawer can
@@ -239,9 +269,18 @@ query param controls write access.
   WS-only (above). `session.terminal_pending` (0.2.0 net-new) also drives the
   workspace drawer.
 
-The crate's WS client uses `tungstenite` (the same crate the recon's Arbor
-reference uses) wrapped in the same thread → channel → UI-poller bridge as the
-SSE parser.
+The crate's WS client uses `tungstenite` on background work and bounded typed
+channels. It applies backpressure to PTY bytes; if saturation persists, it
+deliberately disconnects rather than drop arbitrary chunks and corrupt an
+escape sequence. Render snapshots may be coalesced because obsolete snapshots
+are safe to replace.
+
+The terminal protocol layer carries Criterion benchmarks for WS frame
+classification, resize/control codec throughput, and bounded-queue behavior. Its
+gated `Inspect` implementation returns a typed serializable transport snapshot
+on demand and, while locally enabled, records typed connection/queue/access
+transitions in a fixed-capacity diagnostic ring. Disabled inspection performs
+no hot-path recording or snapshot work.
 
 ---
 

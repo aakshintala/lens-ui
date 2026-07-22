@@ -436,9 +436,10 @@ resource events render inline:
 - **Env lifecycle** → **rail only** (infrastructure — `default` env,
   terminal-scoped envs; rarely actionable).
 
-tmux scrollback is the only record — there is no client REST endpoint for
-captured stdout. Scrollback fidelity is whatever Lens captured while attached
-(the terminal ring-buffer decision, workspace doc / capability map §0.7-C).
+tmux scrollback is the only server-side record — there is no client REST endpoint
+for captured stdout. Lens keeps one bounded emulator while attached and across
+brief reconnects, but deliberately does not persist terminal contents (workspace
+doc / capability map §0.7-C).
 
 ---
 

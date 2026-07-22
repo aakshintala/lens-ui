@@ -5,11 +5,239 @@ the current forward-looking state only. **Full dated session entries live in
 [`STATUS-ARCHIVE.md`](./STATUS-ARCHIVE.md)** — write each session's detail there
 and roll older "Recent" pointers off this page as they age.
 
-_Last curated 2026-07-22 (**B-4a cull-at-scale residual CLOSED** — `5de3b93`, two sabotage-verified regression tests proving off-screen animating cards drop their anim timers at scale; gate green; on `main`. Earlier: B-4a store→replica write-path MERGED+PUSHED; B-3/B-2/B-1 shipped)._
+_Last curated 2026-07-22 (**terminal workstream LANDED ON `main`** — `terminal-ws`→`main` merged: Slices 0–4 (VT foundation → render → input → clipboard/mouse → byte-accounting/perf → lifecycle mechanisms), foreground gate GREEN pre- and post-merge, first terminal on main. In parallel on `main`: **B-4a cull-at-scale residual CLOSED** (`5de3b93`, sabotage-verified regression tests) + B-4b collapse-toggle design LOCKED/planned. Next: terminal Slice 5 (lens-ui `FleetStore`) + board B-4b.)_
 
 ---
 
 ## Next up
+
+- **▶ ACTIVE: shared terminal workstream — Slices 0/1a/1b merged; 1c DONE; 1d COMPLETE (live-proven); Slice 2 SERIAL: 2a (input) DONE + C2 CLOSED, 2d (presentation) DONE + real-window-gated, ▶▶ 2b (clipboard/OSC-52 + Cmd+V paste) EXECUTED + DONE (2026-07-21): all 5 tasks (OSC-52 on_clipboard_write cap-before-clone → foreground ClipboardPolicy seam + ClipboardWriteRequest/Notice + on_host_event → EngineCommand::Paste bracketed engine-side never-drop/epoch → Cmd+V intercept read-only-gated/multiline-warn/capped → demo Deny-default + benches + inspect + live rider), each codex-gpt5.6-reviewed + fix waves, Opus whole-slice = SHIP-WITH-FIXES (caught a cross-task read-only-gate bypass on the deferred-warn paste path — dispatch_paste now gates, regression-tested) → fixed. Full 2b slice `018820b..57bccde` (11 commits). FINAL FULL GATE GREEN (fmt + workspace clippy + lens-terminal test-util,live-tests clippy + 132 lib tests + benches + demo). `terminal-ws` unpushed (backup push + `main` merge = user's call). ▶▶ 2c (mouse) **DONE (2026-07-21)** — full slice `f1922c5..c924fd9`. T5 fg lowering (thin, zero mode logic; immediate forward; `SetAccess`-wired on open AND teardown) → T6 mouse-local toggle + arbitration goldens → T7 coalesce-reset + per-mode motion + benches. **Whole-slice codex review = 9 findings, ALL folded** (F1 wheel epoch-recheck, F2 LocalClick click-time-frame **token correlation**, F3 notch-cap/overflow, F4 Any-motion local-policy, F5 Button-mode latched-button, F6 coalesce tracking-toggle reset, F7 multi-button latch guard, F8 jitter-click via `gesture_dragged`, F9 honest LocalClick-drop). **Re-review = 3 more** (Re-1 pre-egress epoch recheck FIXED; Re-2 F2-token FIXED per user; Re-3 F6-no-move-toggle documented residual). Also root-caused a suite flake (test-only worker stall gate busy-spun → starved build workers → now sleeps). **T8 DONE:** `mouse_realwindow` real-window proof (4 phases: localclick/select+copy/report/read-only PASS) + live **P6** mouse-report round-trip vs omnigent 0.5.1 (`LENS_LIVE_MOUSE_REPORT=1`, PASS) + both specs updated (DP3 engine-side; XTSHIFTESCAPE RESOLVED-DEFERRED). **DP3 AMENDED:** arbitration/latching/coalescing engine-side at ordered-stream position; `Frame` mode hint rejected. **176 lib tests, workspace+test-util clippy clean, fmt, benches compile, stable 8/8.** Plan `docs/superpowers/plans/2026-07-21-terminal-slice-2c-mouse.md`. **NEXT — remaining slices RESHAPED 2026-07-21 (design/grilling pass; design spec Build-sequence revised, memory [[terminal-slice-3plus-replan]]):** old 2-slice tail (Slice 3 lifecycle&fleet → Slice 4 perf) is superseded by **3 → 4 → 5 → 6**: **Slice 3** byte-accounting (thin per-tab retained-bytes *estimate*) + perf acceptance (demo-hosted, thin multi-tab spawner); **Slice 4** lifecycle *mechanisms* (full generation guard, Sleep/wake teardown, `ReplacementWaiting`; `Ended` **inert** — no 0.5.1/**0.6.0** termination signal, verified; module/demo, host-agnostic); **merge `terminal-ws`→`main`** after 3+4 (pure `lens-terminal`+demo, low-risk — first terminal landing on main); then on a fresh branch off main: **Slice 5** lens-ui **minimal** `FleetStore` membership + fleet policy (memory-pressure LRV trim/disconnect, when-to-sleep, `session.superseded` as sub-slice **5-super** lens-core-first) + **Slice 6** full production terminal surface + **E2E-in-app** (old "lens-ui integration out of scope" deliberately expired). Byte-*accurate* FFI = fail-closed conditional (no C-ABI accessor + compressed scrollback; escalate only if the estimate is ordinally unreliable — RSS covers absolute budget). Demo = permanent module isolation/perf rig. **▶▶ SLICE 3 (byte-accounting + perf) DONE (2026-07-22)** — full slice `af0b605..f30f894` on `terminal-ws`, `xtask gate` GREEN. `EngineInspect.total_rows`+`retained_bytes_estimate` (sampled per build; `PER_CELL_BYTES` provisional 4, ordinal-only). **Job A** `stream_perf_realwindow` real-GPUI (in macOS gate): paint_p95 3.1 ms / build_p95 0.57 ms under sustained 4-tab streaming, hidden-tab suppression asserted. **Job B** `rss_probe` bin + `xtask terminal-rss-sweep` (out-of-gate acceptance): 1k–50k rows × {compressible,incompressible} → **estimate ordinally reliable, NO flips → byte-accurate FFI conditional NOT triggered.** **Two real bugs found by Job B + fixed:** (1) 64 MiB worker stack (`67e8192`) — libghostty scrollback overflowed the ~2 MiB default at ~2000+ rows (real product crash); (2) `max_scrollback` is a BYTE budget, not lines (vendored doc wrong). Memory [[terminal-max-scrollback-bytes-and-worker-stack]]. Plan `docs/plans/2026-07-22-terminal-slice-3-byte-accounting-perf.md`; handoff `docs/handoffs/2026-07-22-terminal-slice-3-executed.md`. **Slice-3 codex follow-ups TRIAGED + CLOSED (2026-07-22, `59b3b06`):** filter = carry only genuine dep limits. FIXED (all perf-gate correctness) — I6 Job-A false-green (sustained post-flip build floor), I7 build-p95 aliasing (per-distinct-build sampling; second half already fixed by I1), a torn read + empty-samples panic caught by the review-of-the-fixes, `retained_bytes_estimate` doc (ordinal score NOT bytes), `render_realwindow` 400×100 budget 8→10 (load-flake re-baseline), 64 MiB stack comment tied to the byte cap. DECIDED — I5 keep the spec's flip-not-scale ordinal criterion (no code). CARRIED (honest C-ABI/dep limits) — I2 alt-screen `total_rows` under-count + uncharacterised libghostty stack shape. DEFERRED to Slice 4 — Minor worker `.expect()` (belongs with engine-spawn lifecycle). One codex High (I7 Δ>1 build-miss) ACCEPTED-with-doc: clean fix impossible (event ring is `BytesFed`-flooded), residual small at 2.5× budget margin. Verified: clippy clean, `inspect` lib 16/16, `render_realwindow` 4.779<10, `stream_perf` foreground `all budgets OK` (paint 3.494, build 0.559). **So Slice 3 is fully closed — no open follow-ups into Slice 4.** **▶▶ SLICE 4 (lifecycle mechanisms) EXECUTED (2026-07-22)** — full slice `8ff7cc8..f5ced39` on `terminal-ws` (14 commits), subagent-driven (composer-2.5 authors + **Grok-4.5** per-task cross-family reviews + fix waves; Codex reserved for workstream end per user, low credits). Pure `lens-terminal`+demo+xtask (merge-safe). Delivered: pure `GenerationGuard` reducer (`generation.rs`); resource-signal correlation → `ReplacementWaiting`/`Detached`/adopt + `reconnect_epoch` cancellation (bound to real reconnect exit arms); exact-key successor adoption (fresh engine) + bounded 30s `ReplacementWaiting` timeout; Sleep/Wake (apply-time `is_dirty` re-check) / Reattach (4405) host actions; fallible `EngineHandle::spawn`→`Detached(EngineSpawnFailed)` (folds Slice-3 Minor); demo `ctrl-alt-{s,w,r,x,d}` chords + opt-in P7/P8 live riders. `Ended` stays inert. **Whole-branch Grok review caught 1 Critical the per-task reviews structurally couldn't see** (`f5ced39`): `apply_bridge_event` had no lifecycle gate → a late bridge close (common `4404` on reset) clobbered `ReplacementWaiting`/`Sleeping` → fixed (gate frozen states + unify detach teardown/epoch). **Headless gate GREEN** (fmt, clippy `--all-targets` ×2 configs + demo, `--lib` 206/206 at `--test-threads=4`, benches). Plan `docs/plans/2026-07-22-terminal-slice-4-lifecycle-mechanisms.md`; handoff `docs/handoffs/2026-07-22-terminal-slice-4-executed.md`; memory [[terminal-slice-4-executed]]. **Deferrals (documented, SPEC-GAPS):** reconnect-path full guard (upstream generation token), `4404`-first adoption ordering (Slice-5 bridge↔host event model), inspect correlation state (Slice-6). **⏳ OPEN before merge:** run the **foreground gate** `! cargo run -p xtask -- gate` (real-window harnesses frame-starve headless) + optional demo smoke / live riders. **Immediate action:** foreground gate → then **merge `terminal-ws`→`main`** (first terminal landing; user's call) → then Slice 5.
+    - **▶ SLICE 2b (clipboard/OSC-52 write + Cmd+V paste) — DONE (2026-07-21).** RE-CUT per the
+      2026-07-20 spec amendment to **OSC-52 output-clipboard write policy + Cmd+V paste ONLY**
+      (selection + Cmd+C copy MOVED to 2c — they share 2c's mouse-capture stack + XTSHIFTESCAPE
+      arbitration). Policy state is session-scoped behind an injectable **`ClipboardPolicy`** trait
+      (in-memory `SessionClipboardPolicy` now; `lens-ui` injects a persisted impl later). Executed
+      subagent-driven: composer-2.5 per task + **codex `gpt-5.6-sol` high-effort** cross-family
+      per-task reviews (user rule 2026-07-21: gpt-5.6 always via codex, never Cursor) + fix waves +
+      Opus whole-slice. Security-critical ordering all in place: cap-before-clone (1 MiB, before any
+      owned alloc), post-encode epoch-recheck (covers empty output), reject-not-truncate paste (1 MiB),
+      OSC-52 reads never reach the callback, read-only gate on BOTH the immediate and deferred-warn
+      paste paths. Plan `docs/superpowers/plans/2026-07-20-terminal-slice-2b-clipboard-paste.md`.
+      **Documented deferrals (carried, not bugs):** (1) **always-warn-on-multiline** — the foreground
+      has no live mode-2004 (bracketed-paste) snapshot until 2c, so 2b uses the safe over-approximation
+      (warn on any multiline, suppressible via "don't warn again"); suppressing the warn while bracketed
+      paste is active is deferred to 2c. (2) **Menu Edit→Paste (`OsAction::Paste`) not wired** — only the
+      Cmd+V keystroke path is intercepted (`handle_key_down`); the app-menu paste command is a distinct
+      gpui path deferred to `lens-ui` menu integration (the standalone demo has no app menu). (3) **empty
+      OSC-52 write still mints a host prompt** (writes empty string on Allow) — left intentionally, since
+      suppressing could drop a legitimate "clear clipboard" intent; the bounded pending map rate-limits nag.
+      **Live paste rider PASSED (2026-07-21)** — `terminal_live` P5 round-trip against a live omnigent
+      0.5.1 shell (ephemeral rider-shell bundle, zero LLM cost): real clipboard→bracketed-encode→PTY→shell
+      echo→frame paint on a real macOS display (`terminal_live: P5 paste round-trip OK` / `PASS`). P5 drives
+      the production `handle_paste` path; the Cmd+V OS-keystroke intercept stays hermetically proven by
+      `real_cmd_v_keystroke_routes_to_paste_not_key_encoder` (FIFO sentinel). 2b is now hermetically + live-proven.
+  - **▶ SLICE 2 (interaction) — RE-CUT TO SERIAL; 2a + C2 + 2d DONE (2026-07-20).** 2d (presentation)
+    executed subagent-driven (composer-2.5 per task + grok-4.5 cross-family per-task reviews + fix waves +
+    Opus whole-slice = SHIP); the Opus review caught a title-clear-vs-full-channel invariant divergence
+    (per-task reviews structurally couldn't see it) → FIXED via tri-state latest-title slot. The end-of-slice
+    real-window gate (run on a real macOS display) caught 3 latent bugs in the never-executed Task-4 harness
+    (frame-clobber-by-sampler, sync-read-of-async-emit, dropped Subscription) → all fixed; production click path
+    was correct. Both `presentation_realwindow` (click→OpenUrlRequest e2e) and `render_realwindow` (perf all
+    in-budget; C2-era over-budget flag confirmed environmental) green. 2d slice `bdd8695..5e6f28b`. Design spec
+    [`docs/specs/2026-07-17-terminal-slice-2-interaction-design.md`](./specs/2026-07-17-terminal-slice-2-interaction-design.md).
+    **Task 0 DELETED — dissolved into 2a/2d** (serial removes the parallel merge hazard at the root; 2d edits 2a's
+    committed code). Plans: `docs/superpowers/plans/2026-07-17-terminal-slice-2-{2a-input,2d-presentation}.md`.
+    Phases **2a input/IME/focus/read-only → 2d OSC-output → 2b clipboard/OSC52 → 2c mouse**, serial on `terminal-ws`.
+    **2a DONE**: all 6 tasks via composer-2.5 + per-task gpt-5.6 review + fix waves + broad-slice review; gate-green
+    (both clippy configs, 77 lens-terminal + 162 lens-client tests, real-window keystroke validated). Reviews caught
+    real bugs each task (macOS option-as-alt clobber, reversed epoch-revoke, Tab/Enter/Shift double-emit, worker
+    epoch TOCTOU, reply-evicts-user-egress). **✅ Critical C2 CLOSED (2026-07-20)** via **per-transport egress
+    channels** (`fd79d54..2921da8`; plan `docs/superpowers/plans/2026-07-18-terminal-c2-per-transport-egress.md`):
+    the shared untyped `Vec<u8>` egress became a swappable typed `Sender<EgressFrame>` owned by the worker
+    (in-order `SetEgress`), each bridge owning its own receiver → emitted residue stays on the OLD channel
+    (drain-dropped on stop); + `access_epoch` bump on every teardown revokes un-encoded upstream input.
+    **T4 hardening (option A):** grok/Opus reviews diverged → source-verified adjudication (Opus GO correct;
+    grok's Criticals need a live old bridge, unreachable today since every teardown = bridge self-stop). C1
+    (false EngineStopped) closed BY-CONSTRUCTION (`signal_stop` synchronous-before-swap + Disconnected-arm
+    suppression); C2 (reply-source) NARROWED (inbound-arm re-checks `stop` before feeding) + **join-before-attach
+    documented residual** (only needed if a live-bridge teardown path is ever added, e.g. `on_host_event` →
+    server downgrade). Reconnecting-input-semantics decision resolved in 1d. Ledger `.superpowers/sdd/progress.md`.
+    Architecture = Option A (single-owner engine + ONE ordered command stream). **Progress+notifications spike-resolved
+    bucket-C (absent from pinned C ABI) → DEFERRED + parent matrix amended.** Plans: grok authored → Opus review →
+    consolidated **gpt-5.6-sol-high** review ($1.67; 8 Critical + 11 Important) → folded + verified. **Merge-seam
+    finding resolved via Task 0** (single-writer foundation; both plans collide on `VtEngine::new`/`WorkerChannels`/
+    `build_frame`/`render` — see [[terminal-parallel-worktree-task0-foundation]]). **XTSHIFTESCAPE (2c) still open.**
+    Memory [[terminal-slice-2-design-ghostty-precedent]]. **Execution handoff (self-contained):
+    [`docs/handoffs/2026-07-17-terminal-slice-2-execution.md`](./handoffs/2026-07-17-terminal-slice-2-execution.md).**
+  - **✅ SLICE 1d (convergence) — ALL CODE DONE (T1–T9), gate GREEN, AND live rider PASSED, subagent-driven (composer-2.5 build +
+    cross-family review: Opus inline per-task + codex on T4 reconnect machine + codex whole-branch). 17 commits
+    `f4d3080..39ee7b3` on `terminal-ws` (unpushed). Ledger `.superpowers/sdd/progress.md`.**
+    - **Shipped:** bridge thread (Select multiplex attach↔engine, OutboundSaturated/AttachDisconnected/
+      EngineStopped policy events); `TerminalRuntime` off-foreground teardown (panic-free unique-Arc stop);
+      `open()` C2 background discover/attach + foreground `cx.spawn` wake sampler (durable policy_tx survives
+      reconnect); close-code policy + single 30s `RetryWindow` + reconnect state machine (read-only downgrade
+      → read-only reconnect; preflight GET; transient-retryable); resize-before-input on connect+reconnect;
+      retained-engine reconnect-seed acceptance (viewport Frame equality + fail-closed scrollback delta);
+      `TerminalInspect`; standalone GPUI demo (handshake-before-GPUI); live rider harness (real-window,
+      4-phase: attach→painted-marker→abort→Reconnecting→reattach+output_gap).
+    - **Reviews earned their keep:** codex T4 caught 2 Critical (reconnect race + foreground-block) + 4
+      Important → hardened (foreground bridge-spawn eliminates the race; single window; read-only reconnect).
+      codex whole-branch caught 6 Important integration issues (engine-death stuck-Live; initial resize
+      skipped; rider false-green; abort machinery leaking into production; inspect not durable across
+      reconnect) → all folded.
+    - **✅ LIVE RUN DONE (2026-07-17) — rider PASSED all 4 phases vs omnigent 0.5.1** (`tests/terminal_live.rs`,
+      `--features live-tests,test-util`, real GPUI window): P1 attach→Live · P2 `echo LENSMARK_<pid>\r` to a
+      real **zsh** PTY + proved a PAINTED frame carried the marker · P3 abort-attach→Reconnecting · P4
+      reattach→Live+`output_gap`. **Both OMNIGENT-OPERATIONAL blockers from the prior attempt resolved (never
+      rider bugs):** (1) the design Q is ANSWERED — a declared `terminals:` entry spawns a real tmux-backed
+      bare shell (default `command`) SEPARATE from the agent TUI (`runner/app.py:16228`), gated server-side on
+      the agent spec's `terminals:` block (`sessions.py:17565`); no billable turn; (2) the recipe = an ephemeral
+      `rider-shell` agent bundle declaring `terminals.shell.command: zsh`, launched `omnigent run <bundle>
+      --server` (spawns its own runner, `sleep`-held stdin keeps the REPL alive), rider `open()` open-or-creates
+      the declared PTY. Full recipe + yaml-shape gotchas in memory [[omnigent-terminal-attach-live-run]]; the
+      throwaway session was torn down, server+host daemon left online for future riders. Handoff
+      [`docs/handoffs/2026-07-17-terminal-slice-1d-live-run.md`](./handoffs/2026-07-17-terminal-slice-1d-live-run.md).
+      Merge `terminal-ws` → user's call (staying on branch through the rest of the workstream).
+    - **Deferred (roll-up in ledger):** 1b engine flake `hidden_tab_suppresses_publish_until_visible`
+      (pre-existing, timing under parallel load); EngineHandle::spawn readiness result (1b); thread-exhaustion
+      foreground-panic extreme edge; per-task lens-terminal clippy should include `--features test-util`
+      (missed T3's render_realwindow break for ~6 tasks).
+  - **✅ SLICE 1c (render) — DONE, `xtask gate` GREEN on `terminal-ws` (unpushed).** T1–T7 correctness
+    (`874c817`→`ae12b8b`) + perf-block resolution (`63f490f`→`f4f0d15`). Real-window harness
+    (`tests/render_realwindow.rs`, `harness=false`, `test-util`-gated, xtask executes on macOS **in
+    `--release`**): **Menlo gate PASSES**; `Frame` paint (PerRow/PerCell routing + debug-guard that
+    PerRow never gets a wide cell), full SGR + `underline_quad_color` (I10a) + invisible-width (I10b),
+    render Inspect ring; `TerminalTab` renders via shared `TabRenderState::render_element` (I6). Clippy
+    clean `-D warnings` (normal + `test-util`).
+    **2 plan deviations (both user-approved, in commit msgs):** (1) `render_test_api` gated on
+    `test-util` not `cfg(test)`; (2) Menlo gate drops the emoji's-own-left-edge probe (real hardware:
+    ASCII grid/box-drawing/CJK/post-emoji-resync all exact; emoji left edge drifts 2.857px under
+    per-row shaping, which the renderer never uses for emoji — wide rows → per-cell).
+    **⛔→✅ The "per-cell perf block" was a DEBUG-BUILD ARTIFACT.** The gate measured the harness in
+    **debug** (~5.4× slower per-cell than release, from unoptimised `Font` clones). The 8.3ms budget is
+    a 120fps *product* target; in **release** (what ships) every workload meets it: dense-wide 200×50
+    **2.5–3.7ms**, 400×100 **4.8–6.2ms** (beats the *absolute* 8.3, not just the 20ms interim),
+    pathological **2.4–3.3ms**. Shaping is ~0.06ms — the recommended per-glyph shape cache / **C-a
+    reopen is RETIRED** (never the bottleneck). Fixes: gate now runs `--release` (`b1cc3e2`);
+    resolve-once-per-row cleanup (`ad7e049`; **codex/gpt-5.5 review caught a per-cell decoration
+    paint-order flip → fixed `730fc83`**); release-calibrated per-phase budgets (ascii 3.0 / wide-200
+    5.5 / wide-400 8.0 / pathological 6.0ms — carry ~30% gate-load margin so no flap). Plan:
+    `docs/plans/2026-07-16-terminal-slice-1c-perf-resolution.md`.
+    **✅ Engine gate flake FIXED.** Both `engine::handle` flakes
+    (`build_failure_retries_on_next_pump` + `stop_publishes_final_frame_before_join`) shared ONE root
+    cause: a process-global `static TEST_BUILD_FAILURES` the fault-injection test set, which any
+    concurrent test's worker consumed (its own build then wrongly succeeded; bystanders lost a frame).
+    Moved injection to a per-handle `Arc<AtomicUsize>` shared only with that handle's worker — no
+    cross-test contamination, zero-cost in production. 120/120 clean stress runs.
+  - **✅ SLICE 0 (surface freeze) DONE + merged** (`fdba839`→`635eaa7`): froze the opaque public
+    names/seam invariants `lens-ui` binds to (`open`/`TerminalTarget`/`AccessIntent`/`TerminalKey`/
+    `TerminalOpenOptions`, 7-variant `Lifecycle`, `TerminalHostEvent`/`TerminalEvent`, opaque `Frame`,
+    `focus_handle`/`presentation`) + `lens-terminal` & `lens-terminal-demo` crate skeletons. **codex
+    (gpt-5.5) review** caught 3 evolvability issues, folded: `Lifecycle` = permanent payload-free
+    `Copy` tag (detail rides `Presentation`); `TerminalOpenOptions` `#[non_exhaustive]`+`with_*`
+    setters; `Frame` dropped `Clone`/`Default` (shared as `Arc<Frame>`).
+  - **✅ SLICE 1a (`lens-client` transport) DONE + merged** (branch `terminal-1a`, 8 commits
+    `0f7f23a`→`9e7b16f`): typed REST CRUD (`Terminals` subservice — **superseded** the dead
+    Value-leaking `create_terminal`/`delete_terminal`/`transfer_terminal` wrappers, no callers), WS
+    attach on a **contained tokio current-thread runtime + tokio-tungstenite** bridged to sync via
+    bounded crossbeam queues (NO `transport=`), typed frame codec, close-code **classification**
+    (4404/4405/4500/1008; policy deferred to 1d), gated `AttachInspect` ring, benches, feature-gated
+    live rider (create/attach/input/resize/delete + 4404). **gpt-5.6-sol review** caught 6 real
+    issues, all fixed (`9e7b16f`): `close()` deadlock on outbound saturation, unbounded connect/close,
+    **inbound-saturation `Closed` signal lost** (now drops the Sender → guaranteed `Disconnected`),
+    **queue bench deadlock**, `bench_api` `Message` leak (now typed), silent runtime-build failure.
+    162 lib tests. Plan `docs/plans/2026-07-16-terminal-slice-1a-lens-client-transport.md`.
+  Original design ([`specs/2026-07-14-terminal-workstream-design.md`](./specs/2026-07-14-terminal-workstream-design.md))
+  assumed **porting Ghostty VT source** via the gpui-ghostty wrapper (adopt/adapt/exclude inventory,
+  WP0 provenance gate). **That model is now superseded.** This session:
+  - **WP0 plan revised** through Opus review (B1–B7) + **5 rounds of gpt-5.6-sol** review, committed
+    (`73738d5`); then **executed Tasks 1–4** subagent-driven (composer-2.5 + cross-family):
+    xtask verifier + CLI (17 tests, `db5a0b4`→`354d405`), archive hashes (`d9b2194`), adoption
+    inventory 45+742 (`5bb16ec`). **These are now built on the obsolete model — repurpose/discard.**
+  - **Task 5 (Zig build probe) hit a macOS-26 wall → resolved:** vanilla ziglang.org Zig ≤0.15.2 can't
+    link natively on macOS 26 (Xcode 26 bug, ziglang/zig#31658); the **Homebrew/Nix patched `zig@0.15`
+    (0.15.2)** works. Ghostty **v1.3.1** `lib-vt` builds natively with it. Memory
+    [[zig-ghostty-macos26-scissor]].
+  - **DECIDED MODEL (memory [[terminal-vt-adoption-model]]), PROVEN on hardware:** the terminal C API
+    (`terminal.h`/`screen.h`/`render.h`/`grid_ref*.h`) lives ONLY on Ghostty **dev** (release v1.3.1
+    `vt.h`=7 parser headers; dev `a887df42`=29 incl. the full terminal surface). **[libghostty-rs]**
+    (Uzaaft, MIT/Apache) already binds it — `libghostty-vt-sys` (checked-in bindings) + `libghostty-vt`
+    (safe `Terminal`/`vt_write`/`RenderState`/`Cell`/scrollback), pinning Ghostty dev in `build.rs`.
+    **VERIFIED:** builds on macOS 26.6 w/ patched `zig@0.15` in 33s, 29 tests pass, example drives a
+    real terminal. **Model = VENDOR libghostty-rs + BUILD FROM SOURCE** (patched zig prereq;
+    ~25-33s cached build) — NOT a shim, NOT a source port, NOT prebuilt (no CI yet; prebuilt =
+    flip-a-switch later). gpui-ghostty = reference only. WP0's provenance apparatus collapses to
+    **dependency vetting** (pin libghostty-rs + Ghostty commit + license closure).
+  - **✅ MECHANICAL EXECUTION DONE (2026-07-15, this session)** — commits `ae1f385`/`014f9a9`/`e155230`
+    on `terminal-ws` (unpushed):
+    - **Task 2 — vendored + wired + link-proven.** `vendor/libghostty-rs/` (2 crates @ `46a9d2ac`,
+      684K); the Ghostty source is **crates-only, NOT vendored** — reversed the "pinned vendored
+      Ghostty source tree" plan: its ~57-152M tree is the same large-artifact-before-CI anti-pattern
+      we reject for a prebuilt `.a`, so the pin stays in `build.rs` (`a887df42`, blobless fetch,
+      cached) and a `GHOSTTY_SOURCE_DIR` vendor is deferred to the **same CI trigger** as prebuilt.
+      Wiring: crates **EXCLUDED** (not member) → Cargo cap-lints them (clippy `--workspace -D warnings`
+      stays clean); `.cargo/config.toml` `ZIG`→keg-only `zig@0.15` + a 1-line `build.rs` patch. Proof:
+      `spikes/libghostty-link` (bytes→cell); from-source build re-verified post-`cargo clean` (24.94s).
+      Provenance + patch list: `vendor/libghostty-rs/README.md`. Memory [[terminal-vt-vendored-executed]].
+    - **Task 1 — dead WP0 apparatus removed.** xtask terminal-provenance CLI/lib/tests/fixtures +
+      toml/thiserror/sha2 deps; `vendor/gpui-ghostty-e3025981/`; generate-terminal-adoption.sh; WP0
+      plan+review docs. codegen/drift/gate intact (`cargo test -p xtask` 2/2).
+    - **Docs superseded** — banners on the source-port design + roadmap (VT-adoption + `--workspace`
+      gate lines flagged dead; model-independent parts still hold).
+  - **✅ DESIGN-PASS SPIKES DONE (2026-07-16, this session)** — both design questions answered;
+    merged to `terminal-ws` (unpushed). Spec `docs/specs/2026-07-15-terminal-spikes-design.md`,
+    plans `docs/plans/2026-07-15-terminal-spike-{a,b}-*.md`. Memory
+    [[terminal-render-ptyattach-spikes-executed]].
+    - **Spike A — render viability → VERDICT: full-snapshot repaint contract.** Standalone GPUI
+      probe (grok-built, Opus+codex reviewed). S1 (reshape every row every frame, no cache) full-redraw
+      p95 = **2.77 ms @ 200×50** ≤ 8.3 ms budget → Ghostty dirty-row tracking is **not** load-bearing;
+      per-row `ShapedLine` cache (S2) barely helps (2.45 ms) → shaping isn't the bottleneck. Wide/emoji
+      need per-cell glyph placement (per-row `shape_line` drifts). Liftable `paint.rs` kept +
+      codex 3-item punch-list (findings `docs/spikes/2026-07-15-terminal-render-viability.md`).
+      ⚠ p95 is paint-closure CPU only (no vsync/present) — re-measure end-to-end when building real.
+    - **Spike B — PTY-attach contract → DOCUMENTED + LIVE-VERIFIED** vs omnigent 0.5.1
+      (`docs/spikes/2026-07-15-pty-attach-contract.md`, corpus in `captures/2026-07-15-pty-attach/`).
+      **Wire is transport-independent** (control=default & pty both deliver **raw VT binary**; tmux
+      control-mode consumed server-side → **NO tmux parser in the client**). Attach `ws:// /v1/…/attach`,
+      101 before terminal lookup, no auth on dev; input=binary bytes (also the `on_pty_write` back-channel),
+      resize=JSON text; reconnect to same `terminal_id` = current-screen redraw, **no byte-replay**
+      (transient gap); typed close codes 4404(stop, live-confirmed)/4405(detach)/4500(retry).
+  - **✅ SLICE 1b (`lens-terminal` engine core) DONE + merged** (branch `terminal-1b`, 8 commits
+    `376dd1c`→`8de30f7`): non-`Send` `VtEngine` on a pinned `std::thread`, Lens-owned `Frame` seam
+    (no Ghostty types escape `engine/vt.rs`; full SGR carried for 1c), throttled publish-and-wake
+    (`ArcSwapOption` + coalesced waker + `recv_timeout` throttle wake), DA/DSR reverse channel,
+    hidden-tab suppression, gated `EngineInspect` ring, offline replay tests (`attach`/`resize`
+    captures), Criterion benches (parse ~12µs / frame-build ~590µs @ 200×50). Composer self-ran
+    cursor Bugbot (3 concurrency fixes). **grok-4.5 review** caught 4 publish/lifecycle edges, all
+    fixed (`8de30f7`): `build_frame` `Err` dropped the dirty bit, `SetVisible(true)` no-force,
+    `Stop` abandoned a dirty frame, `Drop` joined on the dropping thread (now detach; join via
+    `stop()` only, off-foreground). 16 tests. Plan
+    `docs/plans/2026-07-16-terminal-slice-1b-lens-terminal-engine.md`.
+  - **Process (this session):** Slice 0 authored + reviewed inline (Opus); 1a∥1b built **in parallel
+    isolated git worktrees** by **composer-2.5** (subagent-driven, per-task TDD commits), each
+    cross-family reviewed by a **different family** (gpt-5.6-sol on 1a, grok-4.5 on 1b), fixes
+    delegated back to composer, then merged to `terminal-ws`. **Full gate green:** `cargo fmt`,
+    `clippy --workspace --all-targets -D warnings`, `cargo test --workspace` (lens-client 162 /
+    lens-core 202 / lens-terminal 14+2 / all crates). `xtask gate` lists updated for the 2 new crates.
+    ⚠ **unpushed** on `terminal-ws`.
+  - **✅ 1c + 1d PLANS DONE (2026-07-16, this session)** — authored by **grok-4.5**, cross-family
+    reviewed (**codex/gpt-5.6 + Opus** source-verification, **15 findings / 5 Criticals** folded),
+    revised, Opus diff-verified, committed `f12a933` (**unpushed**).
+    `docs/plans/2026-07-16-terminal-slice-1{c,d}-*.md`. Criticals fixed: `#[gpui::test]` NoopTextSystem
+    false-green → real-window `harness=false` gate (memory [[gpui-test-noop-text-system]]);
+    off-thread→entity wake impossible → `cx.spawn` sampler + `async_channel`; `TerminalRuntime`
+    teardown-ownership; reconnect-seed acceptance (leg-2 seed + scrollback probe); fail-closed perf
+    gate xtask-executed on macOS. **NEXT = BUILD 1c → 1d (sequential, 1d needs 1c)** — see
+    **[`docs/handoffs/2026-07-16-terminal-slice-1c-1d-build.md`](./handoffs/2026-07-16-terminal-slice-1c-1d-build.md)**
+    (self-contained driver for a fresh session).
+  - **Plan detail (build):** **1c** full-snapshot render layer (lift `spikes/terminal-render/src/paint.rs`
+    split at the `collect_rows`/paint seam — engine already produces the owned `Frame`; apply the 3
+    codex fixes + per-cell wide/emoji + **full SGR** the `Frame` now carries + **gate system `Menlo`**
+    live-GPUI resolution/alignment, bundle-font fallback) → **1d** convergence (wire `open()`/
+    `TerminalTab`/`presentation()`, transport↔engine bridge, `cx.notify` waker, close-code **policy**,
+    lifecycle subset + gap marker, retained-engine-seed acceptance test, standalone GPUI demo, live
+    proof vs omnigent 0.5.1). 1c needs 1b (done); plan 1c/1d against the now-landed APIs.
+    GPUI 0.2.2 + omnigent 0.5.1 pins unchanged.
 
 - **▶ Board B-2..B-6 (board-home)** — §4 board is now decomposed into **six specs B-1..B-6**
   (`docs/SPEC-GAPS.md` → "Board (§4) implementation specs"; supersedes the old B6/B7/B8 framing — B7
@@ -102,10 +330,6 @@ _Last curated 2026-07-22 (**B-4a cull-at-scale residual CLOSED** — `5de3b93`, 
     §3.5 Ready *policy* (seen_turn detector / `last_completed_at` stamp / per-card decay one-shot /
     focus-suppress) is lens-ui work over §3.4's `last_completed_turn`. Design spec REVIEW-CLOSED:
     `docs/specs/2026-07-14-lens-ui-shell-skeleton-design.md` — settled, don't re-litigate.
-
-- **⏳ Terminal Slice 2 (interaction)** — planned + execution-ready on branch `terminal-ws`;
-  **being executed by a separate agent.** Don't double-drive. Design = single-owner engine + one
-  ordered command stream (memory [[terminal-slice-2-design-ghostty-precedent]]).
 
 - **✅ Fixed 2026-07-21 — turn counter only bumped on `response.completed`.** Cancel/incomplete turns
   now bump `state.stream.turn` so the card flashes `Wave::Ready` ("just finished"). As-built (differs

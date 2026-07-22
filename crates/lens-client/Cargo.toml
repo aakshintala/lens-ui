@@ -20,9 +20,13 @@ url = { version = "2", features = ["serde"] }
 # 0.3.0 mcp-servers schemas. Pinned to typify's own regress major.
 regress = "0.10"
 crossbeam-channel = "0.5"
+tokio = { version = "1", default-features = false, features = ["rt", "net", "io-util", "sync", "time", "macros"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+crossbeam-channel = "0.5"
 url = "2"
 
 [features]
@@ -30,9 +34,14 @@ url = "2"
 # neither implies the other, so a live-tests build never pulls in the bench harness).
 bench = []
 live-tests = []
-test-util = [] # exposes byte-decode helpers for downstream reducer tests
+test-util = [] # byte-decode helpers + offline Client stub for downstream tests
 
 [[bench]]
 name = "sse_pipeline"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "terminal_transport"
 harness = false
 required-features = ["bench"]

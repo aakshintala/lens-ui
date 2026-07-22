@@ -1,0 +1,17 @@
+[package]
+name = "libghostty-link"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Deliberately NO `[lints] workspace = true` — spikes live outside the
+# production lint wall (see root Cargo.toml).
+#
+# Purpose: prove the vendored `libghostty-vt` (build-from-source via zig@0.15)
+# compiles AND links from inside the Lens workspace, and that the safe API
+# actually drives a terminal (feed bytes -> read a cell). This is the task-2
+# link smoke-test; it is superseded when the real `lens-terminal` crate lands.
+# Requires `$(brew --prefix zig@0.15)/bin` on PATH (see .cargo/config.toml).
+
+[dependencies]
+libghostty-vt = { path = "../../vendor/libghostty-rs/libghostty-vt" }

@@ -13,6 +13,7 @@ mod reconnect;
 pub mod registries;
 pub mod sessions;
 pub mod stream;
+pub mod terminal;
 
 /// The omnigent contract version this crate is pinned to (ADR-0001).
 pub const PINNED_OMNIGENT_VERSION: &str = "0.5.1";
@@ -31,4 +32,8 @@ pub use sessions::{
     FilesystemList, HostType, OwnerInfo, PermissionsInfo, ResourceList, ResourceObject,
     SearchQuery, SendEventAck, SessionEventInput, SessionFilter, SessionKind, SessionList,
     SessionSnapshot, SessionStatus, SessionSummary, Sessions, ShellResult,
+};
+pub use terminal::{
+    AttachHandle, AttachInspect, AttachOptions, Backoff, CloseCause, TerminalCreate,
+    TerminalMetadata, TerminalResource, Terminals, WsInbound, WsOutbound, attach,
 };
