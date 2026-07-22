@@ -5,14 +5,16 @@ pub use replica::{BoardReplica, ReplicaState, WriteDisposition};
 
 use crate::PtyProbe;
 use crate::card::view::{SessionCardView, mount_cached_card};
+use crate::card::wave::{Wave, derive_wave};
 use crate::fleet::store::FleetStore;
 use crate::slot::TabHandle;
+use crate::theme::ActiveLensTheme as _;
 use gpui::{
     AnyElement, AnyView, App, AppContext, Bounds, ClickEvent, Context, Entity, IntoElement,
     ParentElement, Pixels, Render, ScrollHandle, Styled, Window, div, prelude::*, px,
 };
 use lens_core::domain::board::BoardNode;
-use lens_core::domain::ids::SessionId;
+use lens_core::domain::ids::{BoardItemId, SessionId};
 use lens_core::pack::{self, CARD_H, CARD_W, CELL_H, CELL_W, GAP, HEADER, INSET, Item};
 use std::collections::{HashMap, HashSet};
 
@@ -42,8 +44,10 @@ impl ShellMode {
 /// Per-tile group metadata threaded from `board_tree` into the renderer (B-3).
 /// `completed_count` is Archive-side (B-6); B-3 passes 0.
 struct GroupMeta {
+    id: BoardItemId,
     name: String,
     color_token: Option<String>,
+    collapsed: bool,
     completed_count: u32,
 }
 
@@ -59,6 +63,8 @@ pub struct GroupChromeSnapshot {
     pub spend_age: String,
     /// Whether the `✓N` element is rendered (⇔ `rollup.completed_count > 0`).
     pub shows_completed: bool,
+    pub collapsed: bool,
+    pub status_rows: Vec<(Wave, u32)>,
 }
 
 pub struct BoardView {
@@ -175,12 +181,21 @@ impl BoardView {
     }
 
     fn sync_card_views(&mut self, cx: &mut Context<Self>) {
+        // Collapsed-group members feed the status rollup (fleet card read) but must
+        // not hold a SessionCardView entity — prune any that slipped in at mount.
+        let collapsed_members = self.collapsed_group_member_ids(cx);
+        self.card_views
+            .retain(|id, _| !collapsed_members.contains(id));
+        self.cached_tiles
+            .retain(|id, _| !collapsed_members.contains(id));
+
         let missing: Vec<_> = {
             let fleet = self.fleet.read(cx);
             fleet
                 .cards
                 .iter()
                 .filter(|(id, _)| !self.card_views.contains_key(*id))
+                .filter(|(id, _)| !collapsed_members.contains(*id))
                 .map(|(id, card)| (id.clone(), card.clone()))
                 .collect()
         };
@@ -188,6 +203,22 @@ impl BoardView {
             let view = self.make_card_view(id.clone(), card, cx);
             self.insert_card_view(id, view);
         }
+    }
+
+    /// Session ids placed under a collapsed group on the default board — excluded
+    /// from card-view entities (§3.1 visibility fork).
+    fn collapsed_group_member_ids(&self, cx: &App) -> HashSet<SessionId> {
+        let layout = self.replica.read(cx).layout();
+        let board_id = match layout.default_board_id() {
+            Ok(id) => id.clone(),
+            Err(_) => return HashSet::new(),
+        };
+        let nodes = layout.board_tree(&board_id).unwrap_or_default();
+        let mut out = HashSet::new();
+        for node in &nodes {
+            collect_collapsed_group_members(node, &mut out);
+        }
+        out
     }
 
     fn card_click(
@@ -237,21 +268,28 @@ impl BoardView {
             let (item, meta) = match node {
                 BoardNode::Card(_) => (Item::card(), None),
                 BoardNode::Group { item, .. } => {
-                    let meta = match &item.kind {
+                    let (name, color_token, collapsed) = match &item.kind {
                         lens_core::domain::board::BoardItemKind::Group {
                             name,
                             color_token,
+                            collapsed,
                             ..
-                        } => Some(GroupMeta {
-                            name: name.clone(),
-                            color_token: color_token.clone(),
-                            // ✓N is Archive-side (B-6); B-3 has no source → 0.
-                            completed_count: 0,
-                        }),
-                        // A Group node always carries a Group kind; defensively None.
-                        _ => None,
+                        } => (name.clone(), color_token.clone(), *collapsed),
+                        _ => (String::new(), None, false),
                     };
-                    (Item::group(sessions.len()), meta)
+                    let meta = GroupMeta {
+                        id: item.id.clone(),
+                        name,
+                        color_token,
+                        collapsed,
+                        completed_count: 0, // Archive-side (B-6)
+                    };
+                    let item = if collapsed {
+                        Item::group_collapsed(sessions.len())
+                    } else {
+                        Item::group(sessions.len())
+                    };
+                    (item, Some(meta))
                 }
             };
             items.push(item);
@@ -282,11 +320,9 @@ impl BoardView {
                 continue; // culled → absent from child vec → gpui never builds it
             }
             let sessions = &tile_sessions[placed.item_index];
-            for s in sessions {
-                visible.push(s.clone());
-            }
             match placed.item.kind {
                 pack::Kind::Card => {
+                    visible.push(sessions[0].clone());
                     if let Some(tile) = self.absolute_card(
                         &sessions[0],
                         placed.cell_left(),
@@ -298,11 +334,24 @@ impl BoardView {
                 }
                 pack::Kind::Group { .. } => {
                     let meta = tile_groups[placed.item_index].as_ref();
-                    let (els, snap) = self.absolute_group(placed, sessions, meta, now_ms, cx);
-                    for el in els {
+                    let collapsed = meta.map(|m| m.collapsed).unwrap_or(false);
+                    if collapsed {
+                        // FORK: members feed the rollup (read inside), but are NOT visible —
+                        // no card views spawn for a collapsed group's members.
+                        let (el, snap) =
+                            self.absolute_collapsed_group(placed, sessions, meta, now_ms, cx);
                         content = content.child(el);
+                        group_chrome.push(snap);
+                    } else {
+                        for s in sessions {
+                            visible.push(s.clone());
+                        }
+                        let (els, snap) = self.absolute_group(placed, sessions, meta, now_ms, cx);
+                        for el in els {
+                            content = content.child(el);
+                        }
+                        group_chrome.push(snap);
                     }
-                    group_chrome.push(snap);
                 }
             }
         }
@@ -408,6 +457,8 @@ impl BoardView {
             rollup: rollup.clone(),
             spend_age: spend_age.clone(),
             shows_completed,
+            collapsed: false,
+            status_rows: Vec::new(),
         };
 
         let mut out: Vec<AnyElement> = Vec::with_capacity(sessions.len() + 2);
@@ -469,6 +520,134 @@ impl BoardView {
         }
 
         (out, snapshot)
+    }
+
+    /// A collapsed group (§7): a 1×1 tile reusing the group ring/accent/tint, with a
+    /// header `● name · [spend · age] · ▸` and a body of status-rollup rows
+    /// (`● N <label>` per non-empty wave), plus a `✓N done` footer rendered iff N>0.
+    /// Members feed the rollup (read here) but are not rendered as cards.
+    fn absolute_collapsed_group(
+        &self,
+        placed: &pack::Placed,
+        sessions: &[SessionId],
+        meta: Option<&GroupMeta>,
+        now_ms: i64,
+        cx: &mut Context<Self>,
+    ) -> (AnyElement, GroupChromeSnapshot) {
+        let x = placed.cell_left();
+        let y = placed.cell_top();
+        let block_w = CELL_W - GAP;
+        let block_h = CELL_H - GAP;
+
+        let name = meta.map(|m| m.name.clone()).unwrap_or_default();
+        let completed = meta.map(|m| m.completed_count).unwrap_or(0);
+        let accent = group_accent(meta.and_then(|m| m.color_token.as_deref()));
+
+        // Narrow projections read from member cards: cost/age (spend·age) + Wave (rollup).
+        let (member_costs, member_waves): (Vec<rollup::MemberCost>, Vec<Wave>) = {
+            let fleet = self.fleet.read(cx);
+            let mut costs = Vec::with_capacity(sessions.len());
+            let mut waves = Vec::with_capacity(sessions.len());
+            for s in sessions {
+                if let Some(e) = fleet.cards.get(s) {
+                    let card = e.read(cx);
+                    costs.push(rollup::MemberCost::from_card(card));
+                    waves.push(derive_wave(card, now_ms, false));
+                }
+            }
+            (costs, waves)
+        };
+        let rollup = rollup::group_rollup(&member_costs, completed);
+        let status = rollup::status_rollup(&member_waves);
+        let spend_age = format!(
+            "{} · {}",
+            rollup::format_group_spend(rollup.spend_usd),
+            rollup::format_age(rollup.oldest_created_at, now_ms),
+        );
+        let shows_completed = rollup.completed_count > 0;
+
+        let snapshot = GroupChromeSnapshot {
+            session_ids: sessions.to_vec(),
+            name: name.clone(),
+            accent,
+            rollup: rollup.clone(),
+            spend_age: spend_age.clone(),
+            shows_completed,
+            collapsed: true,
+            status_rows: status.rows.clone(),
+        };
+
+        let theme = cx.lens_theme();
+        let mut body = div()
+            .absolute()
+            .left(px(x))
+            .top(px(y + HEADER))
+            .w(px(block_w))
+            .h(px(block_h - HEADER))
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .px_1p5();
+        for (w, n) in &status.rows {
+            body = body.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1p5()
+                    .child(div().size(px(8.0)).rounded_full().bg(w.status_color(theme)))
+                    .child(
+                        div()
+                            .text_color(gpui::rgb(0xc4c4cc))
+                            .child(format!("{n} {}", wave_rollup_label(*w))),
+                    ),
+            );
+        }
+        body = body.children(shows_completed.then(|| {
+            div()
+                .text_color(gpui::rgb(0x8a8a94))
+                .child(format!("✓ {} done →", rollup.completed_count))
+        }));
+
+        // Ring/tint + header. The `▸` caret renders as a static glyph here (mirrors
+        // B-3's static expanded `⌄`); Task 6 makes both carets interactive.
+        let ring = div()
+            .absolute()
+            .left(px(x - INSET))
+            .top(px(y - INSET))
+            .w(px(block_w + 2.0 * INSET))
+            .h(px(block_h + 2.0 * INSET))
+            .rounded(px(12.0))
+            .border_1()
+            .border_color(accent)
+            .bg(accent.opacity(0.07));
+        let header = div()
+            .absolute()
+            .left(px(x))
+            .top(px(y))
+            .w(px(block_w))
+            .h(px(HEADER))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1p5()
+            .px_1p5()
+            .child(div().size(px(8.0)).rounded_full().bg(accent))
+            .child(div().text_color(gpui::rgb(0xd6d6de)).child(name.clone()))
+            .child(
+                div()
+                    .flex_grow()
+                    .text_color(gpui::rgb(0x8a8a94))
+                    .child(spend_age.clone()),
+            )
+            .child(div().text_color(gpui::rgb(0x8a8a94)).child("▸"));
+
+        let tile = div()
+            .child(ring)
+            .child(header)
+            .child(body)
+            .into_any_element();
+        (tile, snapshot)
     }
 
     /// Test hook: the session ids whose tiles were built (in the visible band) at
@@ -663,6 +842,42 @@ fn group_accent(token: Option<&str>) -> gpui::Hsla {
         _ => 0x6b7280, // neutral slate
     };
     gpui::rgb(hex).into()
+}
+
+fn collect_collapsed_group_members(node: &BoardNode<'_>, out: &mut HashSet<SessionId>) {
+    match node {
+        BoardNode::Card(_) => {}
+        BoardNode::Group { item, members } => {
+            let collapsed = match &item.kind {
+                lens_core::domain::board::BoardItemKind::Group { collapsed, .. } => *collapsed,
+                _ => false,
+            };
+            if collapsed {
+                for sid in node.leaf_sessions() {
+                    out.insert(sid.clone());
+                }
+            } else {
+                for m in members {
+                    collect_collapsed_group_members(m, out);
+                }
+            }
+        }
+    }
+}
+
+/// Title-case label for a status-rollup row (§7). `Neutral` is never in a rollup
+/// (excluded by `status_rollup`), so it maps to an empty label.
+fn wave_rollup_label(w: Wave) -> &'static str {
+    match w {
+        Wave::NeedsInput => "Needs input",
+        Wave::Failed => "Failed",
+        Wave::Working => "Working",
+        Wave::AwaitingReview => "Awaiting review",
+        Wave::Scheduled => "Scheduled",
+        Wave::Ready => "Ready",
+        Wave::Slept => "Slept",
+        Wave::Neutral => "",
+    }
 }
 
 #[cfg(test)]
@@ -900,5 +1115,87 @@ mod tests {
         let neutral: gpui::Hsla = gpui::rgb(0x6b7280).into();
         assert_eq!(group_accent(None), neutral);
         assert_eq!(group_accent(Some("chartreuse")), neutral);
+    }
+
+    #[gpui::test]
+    async fn collapsed_group_renders_1x1_and_excludes_members_from_visible(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use lens_core::domain::board::{DEFAULT_BOARD_ID, PlacementTarget};
+        use lens_core::domain::ids::{BoardId, ConnectionId};
+        use lens_core::domain::scalars::SessionStatusValue;
+        use lens_core::persist::{BoardStore, SqliteBoardStore};
+
+        let clock = Arc::new(ManualUiClock::new(10_000)) as Arc<dyn UiClock>;
+        let conn = ConnectionId::new("conn_test");
+        let (s1, s2) = (SessionId::new("s1"), SessionId::new("s2"));
+        let fleet = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::install_at_startup(cx);
+            let fleet = FleetStore::new(clock, cx);
+            fleet.update(cx, |f, cx| {
+                for s in [&s1, &s2] {
+                    let card = f.spawn_fake_session(s.clone(), cx);
+                    card.update(cx, |c, _| c.status = SessionStatusValue::Running); // → Wave::Working
+                }
+            });
+            fleet
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.db");
+        let store = SqliteBoardStore::open(&path).unwrap();
+        let board = BoardId::new(DEFAULT_BOARD_ID);
+        let g1 = store.create_group(&board, None, 0, "G").unwrap();
+        for (i, s) in [&s1, &s2].into_iter().enumerate() {
+            store
+                .place_session(
+                    &conn,
+                    s,
+                    &PlacementTarget {
+                        board_id: Some(board.clone()),
+                        parent_item_id: Some(g1.clone()),
+                        ordinal: Some(i as i32),
+                    },
+                )
+                .unwrap();
+        }
+        store.set_collapsed(&g1, true).unwrap(); // collapsed on disk
+        let boxed: Box<dyn BoardStore + Send> = Box::new(store);
+        let replica = cx.update(|cx| {
+            cx.new(|cx| BoardReplica::new(Some(boxed), path, conn, fleet.clone(), cx))
+        });
+        cx.run_until_parked();
+
+        let (board_view, vcx) = cx.add_window_view(|_, cx| {
+            BoardView::mount(fleet, replica, placeholder_tab(cx), None, cx)
+        });
+        vcx.run_until_parked();
+
+        board_view.read_with(vcx, |b, _| {
+            let chrome = b.group_chrome_for_test();
+            assert_eq!(chrome.len(), 1);
+            assert!(chrome[0].collapsed, "group renders collapsed");
+            // 2 Running members → one Working row, count 2.
+            assert_eq!(
+                chrome[0].status_rows,
+                vec![(crate::card::wave::Wave::Working, 2)]
+            );
+            // THE FORK: collapsed members are NOT in the visible (card-view) set.
+            let visible: HashSet<SessionId> =
+                b.visible_session_ids_for_test().into_iter().collect();
+            assert!(
+                !visible.contains(&SessionId::new("s1"))
+                    && !visible.contains(&SessionId::new("s2")),
+                "collapsed members must be excluded from the visibility gate"
+            );
+            // and no card view is instantiated for them (no hidden-entity leak).
+            let views = b.card_views_for_test();
+            assert!(
+                !views.contains_key(&SessionId::new("s1"))
+                    && !views.contains_key(&SessionId::new("s2")),
+                "no card view spawned for a collapsed member"
+            );
+        });
     }
 }
