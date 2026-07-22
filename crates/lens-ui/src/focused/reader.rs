@@ -108,7 +108,7 @@ impl ReaderWorkerHandle {
     }
 
     /// Test-only: observe exactly what the replica enqueues (no worker).
-    #[cfg(test)]
+    #[doc(hidden)]
     pub fn new_test() -> (Self, Receiver<ReadTarget>) {
         let (tx, rx) = async_channel::unbounded();
         (
@@ -471,7 +471,7 @@ mod tests {
                         cx,
                     )
                 } else {
-                    FocusedTranscript::new_with_reader_no_baseline(
+                    FocusedTranscript::new_test_no_baseline(
                         reader,
                         session_id,
                         ReconcileEpoch::default(),

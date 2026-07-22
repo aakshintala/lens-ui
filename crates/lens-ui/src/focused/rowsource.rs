@@ -1,6 +1,5 @@
 //! Id-keyed retained row store — owned `RowPresentation` per projected block (T-2 §6).
-//! Lifted from `spikes/transcript-virtual/src/rowsource.rs`; projection stays borrow-only
-//! in lens-core, materialization happens here for the `'static` `list()` closure.
+//! Two-level nesting: `Section` owns child rows; flattening is derived from the collapse flag.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -28,12 +27,29 @@ pub enum RowId {
     Marker(u64),
 }
 
+/// Section identity — finalize-stable `(response_id, run_index)`.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct SectionKey {
+    pub response_id: ResponseId,
+    pub run_index: u32,
+}
+
+impl SectionKey {
+    pub fn chip_id(&self) -> RowId {
+        RowId::Section(self.response_id.clone(), self.run_index)
+    }
+
+    pub fn rail_id(&self) -> RowId {
+        RowId::SectionRail(self.response_id.clone(), self.run_index)
+    }
+}
+
 /// Minimal owned presentation the stub renderer needs — not the whole `Item`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RowPresentation {
     pub kind: RowKind,
     pub text: String,
-    /// Derived collapse flag (Task 12); materialize seeds `false` (expanded).
+    /// Derived collapse flag (Task 12); `false` = expanded.
     pub collapsed: bool,
     /// Optional height hint for the stub renderer (pixels).
     pub height_hint: Option<f32>,
@@ -67,11 +83,29 @@ pub enum UpsertEffect {
     UpdatedInPlace { entity_id_stable: bool },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum StructureEntry {
+    Section(SectionKey),
+    Sibling(RowId),
+    #[allow(dead_code)] // constructed in Task 14 (ReconnectBreak markers)
+    Marker(RowId),
+}
+
+/// Owned child list for a work section (Level 2).
+#[derive(Clone, Debug, Default)]
+struct SectionNode {
+    children: Vec<RowId>,
+}
+
 /// Retained `Entity`-per-row store keyed by `RowId`. Order is separate from identity
 /// so virtualization recycle never remounts row state.
 pub struct RowStore {
     pub(crate) order: Vec<RowId>,
     entities: HashMap<RowId, Entity<RowState>>,
+    sections: HashMap<SectionKey, SectionNode>,
+    structure: Vec<StructureEntry>,
+    /// Per-`response_id` derived expand flag (all runs of a turn fold together).
+    response_expanded: HashMap<ResponseId, bool>,
 }
 
 impl RowStore {
@@ -79,6 +113,9 @@ impl RowStore {
         Self {
             order: Vec::new(),
             entities: HashMap::new(),
+            sections: HashMap::new(),
+            structure: Vec::new(),
+            response_expanded: HashMap::new(),
         }
     }
 
@@ -116,10 +153,64 @@ impl RowStore {
         self.entities.get(id).map(|entity| entity.entity_id())
     }
 
+    pub fn entity_id_at(&self, index: usize, cx: &App) -> Option<EntityId> {
+        let id = self.order.get(index)?;
+        self.entity_id(id, cx)
+    }
+
+    pub fn section_expanded(&self, response_id: &ResponseId) -> bool {
+        self.response_expanded
+            .get(response_id)
+            .copied()
+            .unwrap_or(true)
+    }
+
+    pub fn set_response_expanded(
+        &mut self,
+        response_id: &ResponseId,
+        expanded: bool,
+        list: Option<&ListState>,
+    ) {
+        let prev = self.section_expanded(response_id);
+        if prev == expanded {
+            return;
+        }
+        self.response_expanded.insert(response_id.clone(), expanded);
+        let prev_len = self.order.len();
+        self.rebuild_flat_order();
+        if let Some(list) = list {
+            self.sync_list_count(list, prev_len);
+        }
+    }
+
+    pub fn set_all_response_expansion(
+        &mut self,
+        flags: &HashMap<ResponseId, bool>,
+        list: Option<&ListState>,
+    ) {
+        let changed = flags
+            .iter()
+            .any(|(r, &exp)| self.section_expanded(r) != exp);
+        if !changed {
+            return;
+        }
+        for (r, &exp) in flags {
+            self.response_expanded.insert(r.clone(), exp);
+        }
+        let prev_len = self.order.len();
+        self.rebuild_flat_order();
+        if let Some(list) = list {
+            self.sync_list_count(list, prev_len);
+        }
+    }
+
     /// Id-keyed upsert: reuse the existing `Entity` when the `RowId` is present.
     pub fn upsert(&mut self, id: RowId, pres: RowPresentation, cx: &mut App) -> UpsertEffect {
         if let Some(entity) = self.entities.get_mut(&id) {
-            entity.update(cx, |state, _| state.presentation = pres);
+            entity.update(cx, |state, _| {
+                state.id = id.clone();
+                state.presentation = pres;
+            });
             UpsertEffect::UpdatedInPlace {
                 entity_id_stable: true,
             }
@@ -138,21 +229,182 @@ impl RowStore {
         list.splice(effect_range, count);
     }
 
+    pub fn sync_list_count(&self, list: &ListState, prev_len: usize) {
+        let new_len = self.order.len();
+        if prev_len != new_len {
+            self.splice_into(list, 0..prev_len, new_len);
+        }
+    }
+
     /// Height-invalidate a content-mutated row (spike `invalidate_row_height`).
     pub fn invalidate_row_height(&self, list: &ListState, index: usize) {
         self.splice_into(list, index..index + 1, 1);
     }
 
-    /// Owned copy of each projected block into retained entities + flat order.
-    pub fn materialize(blocks: &[ViewBlock<'_>], into: &mut RowStore, cx: &mut App) {
-        into.order.clear();
+    /// Replace the full projection from grouped `ViewBlock`s (baseline / reconcile path).
+    pub fn materialize_full(blocks: &[ViewBlock<'_>], into: &mut RowStore, cx: &mut App) {
+        into.structure.clear();
+        into.sections.clear();
         for block in blocks {
-            materialize_block(block, into, cx);
+            materialize_top_level(block, into, cx);
+        }
+        into.rebuild_flat_order();
+    }
+
+    /// Re-project only the tail blocks (live-section path) onto an existing prefix.
+    pub fn materialize_live_tail(
+        prefix_len: usize,
+        blocks: &[ViewBlock<'_>],
+        into: &mut RowStore,
+        cx: &mut App,
+    ) {
+        into.structure.truncate(prefix_len);
+        into.sections.retain(|key, _| {
+            into.structure
+                .iter()
+                .any(|e| matches!(e, StructureEntry::Section(k) if k == key))
+        });
+        for block in blocks {
+            materialize_top_level(block, into, cx);
+        }
+        into.rebuild_flat_order();
+    }
+
+    /// Stage a streaming tail for finalize — keep rendering under its section.
+    pub fn stage_stream_finalize(
+        &mut self,
+        acc_id: &AccId,
+        pres: RowPresentation,
+        cx: &mut App,
+    ) -> Option<EntityId> {
+        self.ensure_stream_tail_visible(acc_id, pres, cx);
+        self.entity_id(&RowId::StreamTail(acc_id.clone()), cx)
+    }
+
+    /// Keep a pending-finalize tail visible after scratch clears (structure + entity).
+    pub fn ensure_stream_tail_visible(
+        &mut self,
+        acc_id: &AccId,
+        pres: RowPresentation,
+        cx: &mut App,
+    ) {
+        let id = RowId::StreamTail(acc_id.clone());
+        self.upsert(id.clone(), pres, cx);
+        if !self
+            .structure
+            .iter()
+            .any(|e| matches!(e, StructureEntry::Sibling(row) if row == &id))
+        {
+            self.structure.push(StructureEntry::Sibling(id));
+            self.rebuild_flat_order();
         }
     }
 
-    fn push_order(&mut self, id: RowId) {
-        self.order.push(id);
+    /// Drop a streaming tail immediately (`Discarded`).
+    pub fn discard_stream_tail(&mut self, acc_id: &AccId, list: Option<&ListState>, cx: &mut App) {
+        let id = RowId::StreamTail(acc_id.clone());
+        for section in self.sections.values_mut() {
+            section.children.retain(|c| c != &id);
+        }
+        self.entities.remove(&id);
+        let prev_len = self.order.len();
+        self.rebuild_flat_order();
+        if let Some(list) = list {
+            self.sync_list_count(list, prev_len);
+        }
+        let _ = cx;
+    }
+
+    /// Swap a staged stream tail to its durable row id in place (same `Entity`).
+    pub fn commit_stream_finalize(
+        &mut self,
+        acc_id: &AccId,
+        item_id: &ItemId,
+        pres: RowPresentation,
+        as_sibling: bool,
+        list: Option<&ListState>,
+        cx: &mut App,
+    ) -> Option<EntityId> {
+        let tail_id = RowId::StreamTail(acc_id.clone());
+        let durable_id = if as_sibling {
+            RowId::Sibling(item_id.clone())
+        } else {
+            RowId::Work(item_id.clone())
+        };
+        let entity = self.entities.remove(&tail_id)?;
+        entity.update(cx, |state, _| {
+            state.id = durable_id.clone();
+            state.presentation = pres;
+        });
+        self.entities.insert(durable_id.clone(), entity);
+        let entity_id = self.entity_id(&durable_id, cx);
+        for section in self.sections.values_mut() {
+            if let Some(pos) = section.children.iter().position(|c| c == &tail_id) {
+                section.children[pos] = durable_id.clone();
+            }
+        }
+        if let Some(pos) = self.order.iter().position(|c| c == &tail_id) {
+            self.order[pos] = durable_id;
+            if let Some(list) = list {
+                self.invalidate_row_height(list, pos);
+            }
+        } else {
+            let prev_len = self.order.len();
+            self.rebuild_flat_order();
+            if let Some(list) = list {
+                self.sync_list_count(list, prev_len);
+            }
+        }
+        entity_id
+    }
+
+    pub fn structure_len(&self) -> usize {
+        self.structure.len()
+    }
+
+    pub(crate) fn rebuild_flat_order(&mut self) {
+        self.order.clear();
+        for entry in &self.structure.clone() {
+            match entry {
+                StructureEntry::Section(key) => self.push_section_flat(key),
+                StructureEntry::Sibling(id) | StructureEntry::Marker(id) => {
+                    self.order.push(id.clone());
+                }
+            }
+        }
+    }
+
+    fn push_section_flat(&mut self, key: &SectionKey) {
+        let expanded = self.section_expanded(&key.response_id);
+        if expanded {
+            self.order.push(key.rail_id());
+            if let Some(node) = self.sections.get(key) {
+                self.order.extend(node.children.iter().cloned());
+            }
+        } else {
+            self.order.push(key.chip_id());
+        }
+    }
+
+    fn ensure_section_node(&mut self, key: &SectionKey, cx: &mut App) -> &mut SectionNode {
+        if !self.sections.contains_key(key) {
+            let chip = RowPresentation {
+                kind: RowKind::SectionChip,
+                text: format!("section {} run {}", key.response_id.as_str(), key.run_index),
+                collapsed: false,
+                height_hint: None,
+            };
+            let rail = RowPresentation {
+                kind: RowKind::SectionRail,
+                text: format!("rail {} run {}", key.response_id.as_str(), key.run_index),
+                collapsed: false,
+                height_hint: None,
+            };
+            self.upsert(key.chip_id(), chip, cx);
+            self.upsert(key.rail_id(), rail, cx);
+            self.sections.insert(key.clone(), SectionNode::default());
+        }
+        self.sections.get_mut(key).expect("just inserted")
     }
 }
 
@@ -162,7 +414,7 @@ impl Default for RowStore {
     }
 }
 
-fn materialize_block(block: &ViewBlock<'_>, into: &mut RowStore, cx: &mut App) {
+fn materialize_top_level(block: &ViewBlock<'_>, into: &mut RowStore, cx: &mut App) {
     match block {
         ViewBlock::Item(item) => materialize_sibling_item(item, into, cx),
         ViewBlock::ToolSpan { call, output } => materialize_tool_span(call, *output, into, cx),
@@ -174,7 +426,13 @@ fn materialize_block(block: &ViewBlock<'_>, into: &mut RowStore, cx: &mut App) {
         ViewBlock::StreamingReasoning { acc, .. } => {
             materialize_streaming_reasoning(acc, into, cx);
         }
-        ViewBlock::StreamingMessage(acc) => materialize_streaming_message(acc, into, cx),
+        ViewBlock::StreamingMessage(acc) => {
+            materialize_streaming_message(acc, into, cx);
+            into.structure
+                .push(StructureEntry::Sibling(RowId::StreamTail(
+                    acc.acc_id.clone(),
+                )));
+        }
     }
 }
 
@@ -185,44 +443,46 @@ fn materialize_work_section(
     into: &mut RowStore,
     cx: &mut App,
 ) {
-    let section_id = RowId::Section(response_id.clone(), run_index);
-    let chip = RowPresentation {
-        kind: RowKind::SectionChip,
-        text: format!("section {} run {run_index}", response_id.as_str()),
-        collapsed: false,
-        height_hint: None,
+    let key = SectionKey {
+        response_id: response_id.clone(),
+        run_index,
     };
-    into.upsert(section_id.clone(), chip, cx);
-    into.push_order(section_id);
-
-    let rail_id = RowId::SectionRail(response_id.clone(), run_index);
-    let rail = RowPresentation {
-        kind: RowKind::SectionRail,
-        text: format!("rail {} run {run_index}", response_id.as_str()),
-        collapsed: false,
-        height_hint: None,
-    };
-    into.upsert(rail_id.clone(), rail, cx);
-    into.push_order(rail_id);
-
+    into.structure.push(StructureEntry::Section(key.clone()));
+    into.ensure_section_node(&key, cx);
+    let mut child_ids = Vec::new();
     for child in blocks {
-        materialize_section_child(child, into, cx);
+        if let Some(id) = materialize_section_child_id(child, into, cx) {
+            child_ids.push(id);
+        }
+    }
+    if let Some(node) = into.sections.get_mut(&key) {
+        node.children = child_ids;
     }
 }
 
-fn materialize_section_child(block: &ViewBlock<'_>, into: &mut RowStore, cx: &mut App) {
+fn materialize_section_child_id(
+    block: &ViewBlock<'_>,
+    into: &mut RowStore,
+    cx: &mut App,
+) -> Option<RowId> {
     match block {
-        ViewBlock::Item(item) => materialize_work_item(item, into, cx),
+        ViewBlock::Item(item) => {
+            materialize_work_item(item, into, cx);
+            Some(RowId::Work(item.id.clone()))
+        }
         ViewBlock::ToolSpan { call, output } => {
             materialize_tool_span(call, *output, into, cx);
+            Some(RowId::Work(call.id.clone()))
         }
         ViewBlock::StreamingReasoning { acc, .. } => {
             materialize_streaming_reasoning(acc, into, cx);
+            Some(RowId::StreamTail(acc.acc_id.clone()))
         }
-        ViewBlock::WorkSection { .. } => {
-            // Nested sections are not produced by `group_work_section`; ignore if seen.
+        ViewBlock::WorkSection { .. } => None,
+        ViewBlock::StreamingMessage(acc) => {
+            materialize_streaming_message(acc, into, cx);
+            Some(RowId::StreamTail(acc.acc_id.clone()))
         }
-        ViewBlock::StreamingMessage(acc) => materialize_streaming_message(acc, into, cx),
     }
 }
 
@@ -235,7 +495,7 @@ fn materialize_sibling_item(item: &Item, into: &mut RowStore, cx: &mut App) {
         height_hint: None,
     };
     into.upsert(id.clone(), pres, cx);
-    into.push_order(id);
+    into.structure.push(StructureEntry::Sibling(id));
 }
 
 fn materialize_work_item(item: &Item, into: &mut RowStore, cx: &mut App) {
@@ -246,8 +506,7 @@ fn materialize_work_item(item: &Item, into: &mut RowStore, cx: &mut App) {
         collapsed: false,
         height_hint: None,
     };
-    into.upsert(id.clone(), pres, cx);
-    into.push_order(id);
+    into.upsert(id, pres, cx);
 }
 
 fn materialize_tool_span(call: &Item, output: Option<&Item>, into: &mut RowStore, cx: &mut App) {
@@ -263,8 +522,7 @@ fn materialize_tool_span(call: &Item, output: Option<&Item>, into: &mut RowStore
         collapsed: false,
         height_hint: None,
     };
-    into.upsert(id.clone(), pres, cx);
-    into.push_order(id);
+    into.upsert(id, pres, cx);
 }
 
 fn materialize_streaming_reasoning(acc: &ReasoningAcc, into: &mut RowStore, cx: &mut App) {
@@ -275,8 +533,7 @@ fn materialize_streaming_reasoning(acc: &ReasoningAcc, into: &mut RowStore, cx: 
         collapsed: false,
         height_hint: None,
     };
-    into.upsert(id.clone(), pres, cx);
-    into.push_order(id);
+    into.upsert(id, pres, cx);
 }
 
 fn materialize_streaming_message(acc: &MessageAcc, into: &mut RowStore, cx: &mut App) {
@@ -287,8 +544,7 @@ fn materialize_streaming_message(acc: &MessageAcc, into: &mut RowStore, cx: &mut
         collapsed: false,
         height_hint: None,
     };
-    into.upsert(id.clone(), pres, cx);
-    into.push_order(id);
+    into.upsert(id, pres, cx);
 }
 
 fn sibling_row_kind(item: &Item) -> RowKind {
@@ -300,7 +556,7 @@ fn sibling_row_kind(item: &Item) -> RowKind {
     }
 }
 
-fn item_text_stub(item: &Item) -> String {
+pub(crate) fn item_text_stub(item: &Item) -> String {
     match &item.kind {
         ItemKind::Message { content, .. } => content
             .iter()
@@ -317,6 +573,24 @@ fn item_text_stub(item: &Item) -> String {
         ItemKind::TerminalCommand { command, .. } => command.clone(),
         ItemKind::NativeTool { tool_type, .. } => tool_type.clone(),
         ItemKind::AgentChanged { to, .. } => to.as_str().to_string(),
+    }
+}
+
+pub(crate) fn presentation_for_item(item: &Item) -> RowPresentation {
+    RowPresentation {
+        kind: sibling_row_kind(item),
+        text: item_text_stub(item),
+        collapsed: false,
+        height_hint: None,
+    }
+}
+
+pub(crate) fn presentation_for_work_item(item: &Item) -> RowPresentation {
+    RowPresentation {
+        kind: RowKind::WorkChild,
+        text: item_text_stub(item),
+        collapsed: false,
+        height_hint: None,
     }
 }
 
@@ -426,7 +700,7 @@ mod tests {
         let blocks = group_work_section(projected, Some(&resp_a));
 
         let mut store = RowStore::new();
-        cx.update(|cx| RowStore::materialize(&blocks, &mut store, cx));
+        cx.update(|cx| RowStore::materialize_full(&blocks, &mut store, cx));
 
         let kinds: Vec<RowKind> = cx.read(|cx| {
             (0..store.len())
@@ -436,7 +710,6 @@ mod tests {
         assert_eq!(
             kinds,
             vec![
-                RowKind::SectionChip,
                 RowKind::SectionRail,
                 RowKind::WorkChild,
                 RowKind::WorkChild,
@@ -453,12 +726,40 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(section_ids, vec![("resp_a", 0)]);
+        assert!(
+            section_ids.is_empty(),
+            "expanded section shows rail not chip"
+        );
 
         assert!(matches!(
             store.order().last(),
             Some(RowId::StreamTail(acc)) if acc.as_str() == "acc_stream_m"
         ));
+    }
+
+    #[gpui::test]
+    fn collapse_splices_rail_to_chip(cx: &mut gpui::TestAppContext) {
+        let resp_a = ResponseId::new("resp_a");
+        let items = [reasoning("r1", Some("resp_a"))];
+        let refs: Vec<&Item> = items.iter().collect();
+        let scratch = lens_core::domain::item::StreamScratch::default();
+        let projected = project(&refs, &scratch, Some(&resp_a));
+        let blocks = group_work_section(projected, Some(&resp_a));
+
+        let mut store = RowStore::new();
+        let list = ListState::new(0, gpui::ListAlignment::Bottom, gpui::px(0.));
+        cx.update(|cx| RowStore::materialize_full(&blocks, &mut store, cx));
+        list.reset(store.len());
+        assert_eq!(store.len(), 2);
+
+        store.set_response_expanded(&resp_a, false, Some(&list));
+        assert_eq!(store.len(), 1);
+        cx.read(|cx| {
+            assert_eq!(store.kind_at(0, cx), Some(RowKind::SectionChip));
+        });
+
+        store.set_response_expanded(&resp_a, true, Some(&list));
+        assert_eq!(store.len(), 2);
     }
 
     /// Pre-fix rail keys used `RowId::Marker(0x8000… | hash)`; reconnect markers share that namespace.
@@ -481,7 +782,7 @@ mod tests {
         let blocks = group_work_section(projected, Some(&resp_a));
 
         let mut store = RowStore::new();
-        cx.update(|cx| RowStore::materialize(&blocks, &mut store, cx));
+        cx.update(|cx| RowStore::materialize_full(&blocks, &mut store, cx));
 
         let legacy_seq = legacy_section_rail_marker_seq(&resp_a, 0);
         let marker_id = RowId::Marker(legacy_seq);
@@ -502,7 +803,10 @@ mod tests {
                 },
                 cx,
             );
-            store.push_order(marker_id.clone());
+            store
+                .structure
+                .push(StructureEntry::Marker(marker_id.clone()));
+            store.rebuild_flat_order();
         });
 
         let rail_in_order = store.order().iter().filter(|id| **id == rail_id).count();
@@ -526,17 +830,6 @@ mod tests {
             rail_entity, marker_entity,
             "distinct RowIds must map to distinct entities (no HashMap aliasing)"
         );
-
-        cx.read(|cx| {
-            assert_eq!(
-                store.entity(&rail_id).unwrap().read(cx).presentation.kind,
-                RowKind::SectionRail
-            );
-            assert_eq!(
-                store.entity(&marker_id).unwrap().read(cx).presentation.kind,
-                RowKind::ReconnectBreak
-            );
-        });
     }
 
     #[gpui::test]
@@ -582,9 +875,47 @@ mod tests {
                 first_entity, second,
                 "same RowId must keep the same EntityId"
             );
+        });
+    }
+
+    #[gpui::test]
+    fn commit_finalize_preserves_entity_id(cx: &mut gpui::TestAppContext) {
+        let acc = AccId::new("acc_1");
+        let item_id = ItemId::new("msg_local_0");
+        let mut store = RowStore::new();
+        let before = cx.update(|cx| {
+            store.stage_stream_finalize(
+                &acc,
+                RowPresentation {
+                    kind: RowKind::StreamingMessage,
+                    text: "streaming".into(),
+                    collapsed: false,
+                    height_hint: None,
+                },
+                cx,
+            )
+        });
+        let after = cx.update(|cx| {
+            store.commit_stream_finalize(
+                &acc,
+                &item_id,
+                RowPresentation {
+                    kind: RowKind::Message,
+                    text: "final".into(),
+                    collapsed: false,
+                    height_hint: None,
+                },
+                true,
+                None,
+                cx,
+            )
+        });
+        assert_eq!(before, after, "finalize must not recreate entity");
+        cx.read(|cx| {
+            let id = RowId::Sibling(item_id);
             assert_eq!(
-                store.entity(&row_id).unwrap().read(cx).presentation.text,
-                "v2"
+                store.entity(&id).unwrap().read(cx).presentation.text,
+                "final"
             );
         });
     }
