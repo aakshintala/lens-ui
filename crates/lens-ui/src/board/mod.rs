@@ -393,8 +393,14 @@ impl BoardView {
         let now_ms = self.fleet.read(cx).clock().now_millis();
         let mut group_chrome: Vec<GroupChromeSnapshot> = Vec::new();
 
+        // Grid offset by INSET inside `padded` (below): group rings/tints overhang their
+        // tile by INSET on every side, so a group at cell (0,0) would paint at (-INSET,
+        // -INSET) and clip against the scroll viewport (on-device: "Group card clipped on
+        // the left and top"). `content` stays a positioning context for its absolute tiles.
         let mut content = div()
-            .relative()
+            .absolute()
+            .left(px(INSET))
+            .top(px(INSET))
             .w(px(cols as f32 * CELL_W))
             .h(px(packing.content_height));
 
@@ -443,12 +449,19 @@ impl BoardView {
         self.last_built = visible.clone();
         self.last_group_chrome = group_chrome;
 
+        // Reserve the INSET margin the offset grid needs (2×INSET total: the grid sits at
+        // +INSET, and its rings overhang +INSET past the bottom-right tile).
+        let padded = div()
+            .relative()
+            .w(px(cols as f32 * CELL_W + 2.0 * INSET))
+            .h(px(packing.content_height + 2.0 * INSET))
+            .child(content);
         let el = div()
             .id("board-scroll")
             .size_full()
             .overflow_scroll()
             .track_scroll(&scroll)
-            .child(content)
+            .child(padded)
             .into_any_element();
         (el, visible)
     }
