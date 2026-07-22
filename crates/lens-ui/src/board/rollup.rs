@@ -4,6 +4,7 @@
 //! it as an input defaulting to 0.
 
 use crate::card::model::SessionCard;
+use crate::card::wave::Wave;
 
 /// Pure fold over a group's member cards (spec §3.1). `completed_count` is supplied
 /// by the caller (Archive-side; B-6 wires the real source, B-3 passes 0).
@@ -52,6 +53,38 @@ pub fn group_rollup(members: &[MemberCost], completed_count: u32) -> GroupRollup
         oldest_created_at,
         completed_count,
     }
+}
+
+/// The status-rollup body of a collapsed group (spec §7 / §4.1): one row per
+/// non-empty wave, in `derive_wave` priority-ladder order. `Neutral` is excluded
+/// (no meaningful status). Pure — the caller projects each member card to a `Wave`
+/// via `derive_wave` and passes the slice; label + dot color are resolved at render.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StatusRollup {
+    pub rows: Vec<(Wave, u32)>,
+}
+
+/// Priority ladder (matches `derive_wave`'s resolution order; `Neutral` omitted).
+/// New waves inherit their ladder position here — no separate list to keep in sync.
+const WAVE_LADDER: [Wave; 7] = [
+    Wave::NeedsInput,
+    Wave::Failed,
+    Wave::Working,
+    Wave::AwaitingReview,
+    Wave::Scheduled,
+    Wave::Ready,
+    Wave::Slept,
+];
+
+pub fn status_rollup(member_waves: &[Wave]) -> StatusRollup {
+    let rows = WAVE_LADDER
+        .into_iter()
+        .filter_map(|w| {
+            let n = member_waves.iter().filter(|&&m| m == w).count() as u32;
+            (n > 0).then_some((w, n))
+        })
+        .collect();
+    StatusRollup { rows }
 }
 
 /// `~$X.XX`, or `—` when unknown. Mirrors `card::chrome::format_spend`.
@@ -171,6 +204,36 @@ mod tests {
         assert_eq!(
             group_header_text("Refactor", &r, 7_200_000),
             "Refactor · ~$3.50 · 2h · ✓2"
+        );
+    }
+
+    #[test]
+    fn status_rollup_counts_orders_and_drops_empties() {
+        use crate::card::wave::Wave;
+        // 2 Working, 1 Failed, 1 Ready, 1 Neutral (excluded).
+        let waves = [
+            Wave::Working,
+            Wave::Ready,
+            Wave::Working,
+            Wave::Failed,
+            Wave::Neutral,
+        ];
+        let r = status_rollup(&waves);
+        // Ladder order: Failed before Working before Ready; Neutral absent; no zero rows.
+        assert_eq!(
+            r.rows,
+            vec![(Wave::Failed, 1), (Wave::Working, 2), (Wave::Ready, 1)]
+        );
+    }
+
+    #[test]
+    fn status_rollup_empty_and_all_neutral_are_empty() {
+        use crate::card::wave::Wave;
+        assert!(status_rollup(&[]).rows.is_empty());
+        assert!(
+            status_rollup(&[Wave::Neutral, Wave::Neutral])
+                .rows
+                .is_empty()
         );
     }
 }
