@@ -3,8 +3,10 @@
 **Written:** 2026-07-21 · **Status:** LOCKED — grilled, gpt-5.6 codex spec-review folded,
 §3 re-grilled and settled, **residual pass 2026-07-22 folded** (write-failure contract §5:
 busy-timeout-on-writes + drop-queued + pump re-gate + optimistic-drag seam→B-4c; reconcile
-re-diffs on reply §2/§3.3/§7; perf E2E scope-labeled as B-2/B-3 debt §7). Ready for
-writing-plans. ·
+re-diffs on reply §2/§3.3/§7; perf E2E scope-labeled as B-2/B-3 debt §7), **plan authored +
+codex-reviewed 2026-07-22** (fixes folded back into design: §3.3 suppress-stuck guard for the
+tombstone re-diff loop; §5 typed BUSY retry; §6 demo-seed-before-`run`). Plan v2 at
+`docs/plans/2026-07-22-board-b4a-store-replica-write-path.md`. Ready to execute. ·
 **Depends on:** B-1 (`SqliteBoardStore` + `BoardStore` trait, `8100cc8`),
 B-2 (packer + container, `14b474c`), B-3 (group chrome, `ac9d5ae`) ·
 **Feeds:** B-4b (collapse), B-4c (drag/move), B-4d (grouping menus), B-5
@@ -178,6 +180,13 @@ On each `FleetStore` change (and once at construction), `reconcile`:
   reply it would linger unplaced until the next unrelated notify — a silently-missing card,
   the UX §5 forbids. The reply-triggered re-diff shrinks the missing set monotonically and
   stops at quiescence (empty diff → no op).
+  - **Suppress-stuck guard (codex C1, 2026-07-22).** Re-diff-on-reply would *not* terminate for
+    a **tombstoned session still present in `fleet.cards`** (`FleetStore` is add-only, never
+    removes it; `place_sessions` skips tombstoned keys — verified `fleet/store.rs` has no
+    `cards.remove`). That key is permanently "missing" → reply re-enqueues it forever. Fix: a
+    replica-side `suppressed` set — any attempted key **still missing** after its place is
+    marked stuck and excluded from future diffs. Guarantees the re-diff terminates. (The earlier
+    "repeated cheap no-op skips" claim held only *before* re-diff-on-reply; the guard restores it.)
 
 **Convergence (review #6, narrowed).** Two placement sources exist: this loop (from
 `fleet`, pinned conn) and `load_layout`'s built-in reconcile (from the `sessions` table,
@@ -251,13 +260,18 @@ write in a transaction; an `Err` on commit has exactly one *transient* source �
 `SQLITE_BUSY` from the ~dozen `SqliteControlStore` connections on `lens.db`
 (`fleet/live.rs:71`) — and several *persistent* ones (disk-full, I/O, `SQLITE_CORRUPT`;
 schema-degraded is refused up front, so it never reaches a mid-write `Err`). So:
-- **Absorb the transient case in the op:** write transactions run under a **bounded busy
-  timeout** (the same one §6 adds to `open`, extended to writes), so SQLite retries internally.
-- **Therefore any `Err` that reaches the replica is *persistent* by definition** — a replay
-  or a user "redo" would just fail again. On persistent `Err`: transition state (below),
-  **drop queued write ops** from `pending`, and **`pump` re-gates write ops on
-  `is_writable()`** (belt-and-suspenders over the enqueue-time gate — an op queued *before*
-  the failure must not spawn against a broken store). Recovery `Load` is still always allowed.
+- **Absorb the common transient case in the driver:** the connection sets `busy_timeout`
+  (§6, set right after `open` so it also covers the `meta` create/version read), so SQLite
+  retries `SQLITE_BUSY` internally for up to 5s.
+- **Classify the residual at the replica (codex M6, 2026-07-22).** A 5s timeout is a *bound*,
+  not a guarantee — a lock freed at 5.1s still surfaces `DatabaseBusy`/`DatabaseLocked`. The
+  replica carries the typed `PersistError` (never stringified) and classifies: **transient**
+  (`DatabaseBusy`/`DatabaseLocked`) → keep the op, **bounded exponential-backoff retry**
+  (≤`MAX_RETRIES`, still single-in-flight); **persistent** (corruption/IO/`ReadOnly`, or
+  retries exhausted) → transition state (below), **drop queued write ops**, and **`pump`
+  re-gates write ops on `is_writable()`** (an op queued *before* the failure must not spawn
+  against a broken store; dropped writes are *counted* for the banner, never silent). Recovery
+  `Load` is always allowed.
 - **"Never drop a user write" is refined to "never *silently* drop":** the banner names the
   loss. B-4a itself ships no user writes (only `Load`/`PlaceSessions`/recovery — all
   idempotent/coalescable), so this contract is only *exercised* from B-4b onward; it is fixed
@@ -282,10 +296,13 @@ area (never a modal; the rest of Lens stays usable), driven by `ReplicaState`, w
   applies to write transactions** (§5 write-failure contract) — it is what makes every `Err`
   reaching the replica persistent. conn = `"lens-app"`. Wire
   `BoardReplica` into the `BoardView::mount` sites (`main.rs:110,165`).
-- **Demo (fake):** in-memory store (`:memory:`; `CONTROL_DDL` still makes the empty
-  `sessions` table) + `"conn_demo"`. **Seed a group at construction** (before the first
-  fleet reconcile, so its members aren't re-placed loose), with members also spawned as
-  fake fleet sessions — rendering B-3 group chrome live for the first time.
+- **Demo (`run_demo`, codex C4 2026-07-22):** the repo has no `:memory:` path and `run_demo`
+  uses `FleetStore::new_live` (so `spawn_fake_session` would panic). **Open + seed the demo
+  board store BEFORE `Application::run`** (a temp file, compliant — no `cx.new` SQLite), grouping
+  a couple of `run_demo`'s existing `demo_preset_cards` session-ids; pin the replica conn to
+  match those cards' placement conn. `run_demo` already inserts its cards straight into
+  `fleet.cards`, so reconcile places the rest loose and the seeded pair render under B-3 group
+  chrome — live, for the first time. (Perf E2E rides this same real path at `LENS_DEMO_N` scale, §7.)
 - **Tests:** `BoardReplica::in_memory_for_test(fleet, cx)`.
 
 `BoardView::mount` gains a `replica: Entity<BoardReplica>` parameter; call sites are the
