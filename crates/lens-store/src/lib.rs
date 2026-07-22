@@ -43,12 +43,13 @@ pub fn apply(state: &mut SessionState, update: StreamUpdate) {
         ContextWindowChanged(v) => state.context_window = v,
         ActiveResponseChanged(v) => state.active_response = v,
         Rebased(baseline) => *state = *baseline,
-        // markers with no replica-visible payload in P3-1
+        // markers with no replica-visible payload in P3-1 (scratch clears arrive via ScratchChanged)
         ChildSessionChanged
         | ResourcesChanged
         | SnapshotRestored(_)
         | Reconnecting { .. }
-        | Reconnected
+        | Reconnected { .. }
+        | Retired { .. }
         | TranscriptAdvanced { .. } => {}
         Disconnected(_) => {}
     }
