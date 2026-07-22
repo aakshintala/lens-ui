@@ -1,5 +1,8 @@
 mod layout_adapter;
+pub mod replica;
 mod rollup;
+
+pub use replica::{BoardReplica, ReplicaState, WriteDisposition};
 
 use crate::PtyProbe;
 use crate::card::model::SessionCard;
