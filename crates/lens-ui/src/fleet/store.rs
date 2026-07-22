@@ -3,6 +3,7 @@ use crate::clock::UiClock;
 use crate::fleet::fake::{FEED_CAPACITY, FakeFleet};
 use crate::fleet::live::{self, StreamBridge, WallClock};
 use crate::fleet::poller::spawn_session_poller;
+use crate::focused::FocusedTranscript;
 use gpui::{App, AppContext, Context, Entity, Task};
 use lens_client::{Client, Connection};
 use lens_core::actor::{
@@ -33,6 +34,10 @@ pub struct ReaderFactory {
 }
 
 impl ReaderFactory {
+    pub fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
     pub fn open(&self, busy_timeout: Duration) -> Result<SqliteTranscriptReader, PersistError> {
         SqliteTranscriptReader::open_read_only(
             &self.data_dir.join(format!("{}.db", self.session_id)),
@@ -53,8 +58,8 @@ pub struct FleetStore {
     stream_bridges: HashMap<SessionId, StreamBridge>,
     reader_factories: HashMap<SessionId, ReaderFactory>,
     reconcile_epochs: HashMap<SessionId, ReconcileEpoch>,
-    // Task 9: `focused_replica: Option<(SessionId, Entity<FocusedTranscript>)>` — installed
-    // on focus before Promote, dropped on Demote.
+    focused_replica: Option<(SessionId, Entity<FocusedTranscript>)>,
+    focus_generation: u64,
     #[cfg(test)]
     focused_detailed_fanout_count: Cell<u64>,
 }
@@ -73,6 +78,8 @@ impl FleetStore {
             stream_bridges: HashMap::new(),
             reader_factories: HashMap::new(),
             reconcile_epochs: HashMap::new(),
+            focused_replica: None,
+            focus_generation: 0,
             #[cfg(test)]
             focused_detailed_fanout_count: Cell::new(0),
         })
@@ -91,6 +98,8 @@ impl FleetStore {
             stream_bridges: HashMap::new(),
             reader_factories: HashMap::new(),
             reconcile_epochs: HashMap::new(),
+            focused_replica: None,
+            focus_generation: 0,
             #[cfg(test)]
             focused_detailed_fanout_count: Cell::new(0),
         })
@@ -175,9 +184,19 @@ impl FleetStore {
                 }
             }
         });
-        if route_replica && !detailed_for_replica.is_empty() {
-            // Task 9: when `focused_replica` is installed, forward the whole batch atomically:
-            // `replica.update(cx, |r, cx| r.fold_detailed_batch(detailed_for_replica, cx))`
+        let route_focused_detailed = route_replica && !detailed_for_replica.is_empty();
+        if route_focused_detailed
+            && let Some(replica) = self
+                .focused_replica
+                .as_ref()
+                .filter(|(focused_id, _)| focused_id == id)
+                .map(|(_, replica)| replica.clone())
+        {
+            for u in detailed_for_replica {
+                replica.update(cx, |r, cx| r.fold_detailed(u, cx));
+            }
+        }
+        if route_focused_detailed {
             #[cfg(test)]
             self.focused_detailed_fanout_count
                 .set(self.focused_detailed_fanout_count.get().saturating_add(1));
@@ -208,8 +227,13 @@ impl FleetStore {
             entry.in_flight = true;
         } else if !reconcile_in_flight && was_in_flight {
             entry.in_flight = false;
-            let _epoch = entry.epoch;
-            // Task 9: `replica.update(cx, |r, cx| r.on_reconcile_epoch_settled(_epoch, cx))`
+            let epoch = entry.epoch;
+            if let Some((focused_id, replica)) = &self.focused_replica
+                && focused_id == id
+            {
+                let replica = replica.clone();
+                replica.update(cx, |r, cx| r.on_reconcile_epoch_settled(epoch, cx));
+            }
         } else if reconcile_in_flight {
             entry.in_flight = true;
         }
@@ -223,6 +247,14 @@ impl FleetStore {
         if let Some(prev) = self.focused.clone() {
             self.send_command(&prev, SessionCommand::Demote);
             self.set_card_focused(&prev, false, cx);
+            self.focused_replica = None;
+        }
+        self.focus_generation = self.focus_generation.saturating_add(1);
+        let generation = self.focus_generation;
+        if let Some(factory) = self.reader_factories.get(&id).cloned() {
+            let epoch = self.reconcile_epochs.get(&id).cloned().unwrap_or_default();
+            let replica = cx.new(|cx| FocusedTranscript::new(factory, epoch, generation, cx));
+            self.focused_replica = Some((id.clone(), replica));
         }
         self.send_command(&id, SessionCommand::Promote);
         self.set_card_focused(&id, true, cx);
@@ -236,6 +268,7 @@ impl FleetStore {
         if let Some(prev) = self.focused.take() {
             self.send_command(&prev, SessionCommand::Demote);
             self.set_card_focused(&prev, false, cx);
+            self.focused_replica = None;
             self.store_notify_count
                 .set(self.store_notify_count.get().saturating_add(1));
             cx.notify();
