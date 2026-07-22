@@ -260,9 +260,11 @@ write in a transaction; an `Err` on commit has exactly one *transient* source �
 `SQLITE_BUSY` from the ~dozen `SqliteControlStore` connections on `lens.db`
 (`fleet/live.rs:71`) — and several *persistent* ones (disk-full, I/O, `SQLITE_CORRUPT`;
 schema-degraded is refused up front, so it never reaches a mid-write `Err`). So:
-- **Absorb the common transient case in the driver:** the connection sets `busy_timeout`
-  (§6, set right after `open` so it also covers the `meta` create/version read), so SQLite
-  retries `SQLITE_BUSY` internally for up to 5s.
+- **Absorb the common transient case in the driver:** the connection already carries a 5s
+  `busy_timeout` — **rusqlite 0.32.1 sets `busy_timeout=5000` on every open** (verified
+  `inner_connection.rs:119`; raw SQLite defaults to 0), covering the `meta` create/version
+  read and every write txn — so SQLite retries `SQLITE_BUSY` internally for up to 5s. (No
+  explicit PRAGMA needed; a regression test guards this relied-upon default — Task 1.)
 - **Classify the residual at the replica (codex M6, 2026-07-22).** A 5s timeout is a *bound*,
   not a guarantee — a lock freed at 5.1s still surfaces `DatabaseBusy`/`DatabaseLocked`. The
   replica carries the typed `PersistError` (never stringified) and classifies: **transient**
@@ -291,10 +293,10 @@ area (never a modal; the rest of Lens stays usable), driven by `ReplicaState`, w
 ## 6. Construction & startup order
 
 - **App (live):** open the board store on `data_dir/lens.db` **before the session
-  actors start** (review #7 — minimizes `SQLITE_BUSY`), and give `open_db` a bounded
-  **busy timeout** so a transient lock retries rather than fails. The **same busy timeout
-  applies to write transactions** (§5 write-failure contract) — it is what makes every `Err`
-  reaching the replica persistent. conn = `"lens-app"`. Wire
+  actors start** (review #7 — minimizes `SQLITE_BUSY`). The **busy timeout is already
+  present** (rusqlite defaults `busy_timeout=5000` at open — §5), covering open-time queries
+  and write transactions; a transient lock retries in-driver rather than failing. conn =
+  `"lens-app"`. Wire
   `BoardReplica` into the `BoardView::mount` sites (`main.rs:110,165`).
 - **Demo (`run_demo`, codex C4 2026-07-22):** the repo has no `:memory:` path and `run_demo`
   uses `FleetStore::new_live` (so `spawn_fake_session` would panic). **Open + seed the demo
