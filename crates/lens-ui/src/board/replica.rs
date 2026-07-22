@@ -448,7 +448,6 @@ impl BoardReplica {
 
     /// The B-4b/c/d write seam: B-4a exercises it only in tests (no user interactions yet),
     /// so it's dead in the non-test build until the interaction slices call it.
-    #[allow(dead_code)]
     pub(crate) fn write(&mut self, op: Op, cx: &mut Context<Self>) -> WriteDisposition {
         if !self.is_writable() {
             self.banner_dismissed = false; // re-surface the banner on a rejected gesture

@@ -232,6 +232,32 @@ impl BoardView {
             .update(cx, |fleet, cx| fleet.focus_session(session_id, cx));
     }
 
+    /// The caret toggle entry point (both ⌄ expanded and ▸ collapsed call this).
+    /// Reads the current flag from the replica's committed layout, issues the flipped
+    /// `SetCollapsed` write (commit-gated; a non-writable replica refuses + banners).
+    fn toggle_group_collapsed(&mut self, group_id: BoardItemId, cx: &mut Context<Self>) {
+        let current = matches!(
+            self.replica
+                .read(cx)
+                .layout()
+                .item(&group_id)
+                .map(|it| &it.kind),
+            Some(lens_core::domain::board::BoardItemKind::Group {
+                collapsed: true,
+                ..
+            })
+        );
+        self.replica.update(cx, |r, cx| {
+            r.write(
+                replica::Op::SetCollapsed {
+                    group_id,
+                    collapsed: !current,
+                },
+                cx,
+            );
+        });
+    }
+
     fn render_nav_rail(&self) -> impl IntoElement {
         div()
             .id("nav-rail")
@@ -424,6 +450,7 @@ impl BoardView {
         let name = meta.map(|m| m.name.clone()).unwrap_or_default();
         let completed = meta.map(|m| m.completed_count).unwrap_or(0);
         let accent = group_accent(meta.and_then(|m| m.color_token.as_deref()));
+        let group_id = meta.map(|m| m.id.clone());
 
         // Fold the rollup from member cards via a NARROW projection (cost + created_at
         // only) — no full SessionCard clone per member per frame (codex final-review I2).
@@ -504,7 +531,20 @@ impl BoardView {
                         .clone()
                         .map(|t| div().text_color(gpui::rgb(0x8a8a94)).child(t)),
                 )
-                .child(div().text_color(gpui::rgb(0x8a8a94)).child("⌄"))
+                .child({
+                    let gid = group_id.clone();
+                    div()
+                        .id(("group-caret", placed.item_index))
+                        .cursor_pointer()
+                        .text_color(gpui::rgb(0x8a8a94))
+                        .child("⌄")
+                        .on_click(cx.listener(move |board, _ev, _win, cx| {
+                            cx.stop_propagation();
+                            if let Some(gid) = gid.clone() {
+                                board.toggle_group_collapsed(gid, cx);
+                            }
+                        }))
+                })
                 .into_any_element(),
         );
 
@@ -542,6 +582,7 @@ impl BoardView {
         let name = meta.map(|m| m.name.clone()).unwrap_or_default();
         let completed = meta.map(|m| m.completed_count).unwrap_or(0);
         let accent = group_accent(meta.and_then(|m| m.color_token.as_deref()));
+        let group_id = meta.map(|m| m.id.clone());
 
         // Narrow projections read from member cards: cost/age (spend·age) + Wave (rollup).
         let (member_costs, member_waves): (Vec<rollup::MemberCost>, Vec<Wave>) = {
@@ -609,8 +650,7 @@ impl BoardView {
                 .child(format!("✓ {} done →", rollup.completed_count))
         }));
 
-        // Ring/tint + header. The `▸` caret renders as a static glyph here (mirrors
-        // B-3's static expanded `⌄`); Task 6 makes both carets interactive.
+        // Ring/tint + header. The `▸` caret is interactive (Task 6); mirrors expanded `⌄`.
         let ring = div()
             .absolute()
             .left(px(x - INSET))
@@ -640,7 +680,20 @@ impl BoardView {
                     .text_color(gpui::rgb(0x8a8a94))
                     .child(spend_age.clone()),
             )
-            .child(div().text_color(gpui::rgb(0x8a8a94)).child("▸"));
+            .child({
+                let gid = group_id.clone();
+                div()
+                    .id(("group-caret", placed.item_index))
+                    .cursor_pointer()
+                    .text_color(gpui::rgb(0x8a8a94))
+                    .child("▸")
+                    .on_click(cx.listener(move |board, _ev, _win, cx| {
+                        cx.stop_propagation();
+                        if let Some(gid) = gid.clone() {
+                            board.toggle_group_collapsed(gid, cx);
+                        }
+                    }))
+            });
 
         let tile = div()
             .child(ring)
@@ -856,7 +909,10 @@ fn collect_collapsed_group_members(node: &BoardNode<'_>, out: &mut HashSet<Sessi
     if let BoardNode::Group { item, .. } = node {
         let collapsed = matches!(
             &item.kind,
-            lens_core::domain::board::BoardItemKind::Group { collapsed: true, .. }
+            lens_core::domain::board::BoardItemKind::Group {
+                collapsed: true,
+                ..
+            }
         );
         if collapsed {
             for sid in node.leaf_sessions() {
@@ -1196,6 +1252,98 @@ mod tests {
                 !views.contains_key(&SessionId::new("s1"))
                     && !views.contains_key(&SessionId::new("s2")),
                 "no card view spawned for a collapsed member"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn toggle_group_collapsed_flips_render_and_visibility(cx: &mut gpui::TestAppContext) {
+        use lens_core::domain::board::{DEFAULT_BOARD_ID, PlacementTarget};
+        use lens_core::domain::ids::{BoardId, ConnectionId};
+        use lens_core::domain::scalars::SessionStatusValue;
+        use lens_core::persist::{BoardStore, SqliteBoardStore};
+
+        let clock = Arc::new(ManualUiClock::new(10_000)) as Arc<dyn UiClock>;
+        let conn = ConnectionId::new("conn_test");
+        let (s1, s2) = (SessionId::new("s1"), SessionId::new("s2"));
+        let fleet = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::install_at_startup(cx);
+            let fleet = FleetStore::new(clock, cx);
+            fleet.update(cx, |f, cx| {
+                for s in [&s1, &s2] {
+                    let card = f.spawn_fake_session(s.clone(), cx);
+                    card.update(cx, |c, _| c.status = SessionStatusValue::Running);
+                }
+            });
+            fleet
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.db");
+        let store = SqliteBoardStore::open(&path).unwrap();
+        let board = BoardId::new(DEFAULT_BOARD_ID);
+        let g1 = store.create_group(&board, None, 0, "G").unwrap();
+        for (i, s) in [&s1, &s2].into_iter().enumerate() {
+            store
+                .place_session(
+                    &conn,
+                    s,
+                    &PlacementTarget {
+                        board_id: Some(board.clone()),
+                        parent_item_id: Some(g1.clone()),
+                        ordinal: Some(i as i32),
+                    },
+                )
+                .unwrap();
+        }
+        let boxed: Box<dyn BoardStore + Send> = Box::new(store);
+        let replica = cx.update(|cx| {
+            cx.new(|cx| BoardReplica::new(Some(boxed), path, conn, fleet.clone(), cx))
+        });
+        cx.run_until_parked();
+        let (board_view, vcx) = cx.add_window_view(|_, cx| {
+            BoardView::mount(fleet, replica, placeholder_tab(cx), None, cx)
+        });
+        vcx.run_until_parked();
+
+        let collapsed = |b: &BoardView| b.group_chrome_for_test()[0].collapsed;
+        board_view.read_with(vcx, |b, _| assert!(!collapsed(b), "starts expanded"));
+
+        // Toggle → collapse (the caret closure calls exactly this).
+        let gid = g1.clone();
+        vcx.update(|_, cx| {
+            board_view.update(cx, |b, cx| b.toggle_group_collapsed(gid.clone(), cx));
+        });
+        vcx.run_until_parked();
+        board_view.read_with(vcx, |b, _| {
+            assert!(collapsed(b), "collapsed after toggle");
+            let visible: HashSet<SessionId> =
+                b.visible_session_ids_for_test().into_iter().collect();
+            assert!(
+                visible.is_empty(),
+                "collapsed members leave the visible set"
+            );
+            let views = b.card_views_for_test();
+            assert!(
+                !views.contains_key(&s1) && !views.contains_key(&s2),
+                "collapse drops member card views (cancels anim timers)"
+            );
+        });
+
+        // Toggle again → expand.
+        vcx.update(|_, cx| {
+            board_view.update(cx, |b, cx| b.toggle_group_collapsed(g1.clone(), cx));
+        });
+        vcx.run_until_parked();
+        board_view.read_with(vcx, |b, _| {
+            assert!(!collapsed(b), "expanded after second toggle");
+            let visible: HashSet<SessionId> =
+                b.visible_session_ids_for_test().into_iter().collect();
+            assert_eq!(visible.len(), 2, "members visible again");
+            let views = b.card_views_for_test();
+            assert!(
+                views.contains_key(&s1) && views.contains_key(&s2),
+                "expand recreates member card views via sync_card_views"
             );
         });
     }
