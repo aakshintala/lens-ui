@@ -225,6 +225,14 @@ impl FleetStore {
         reconcile_in_flight: bool,
         cx: &mut Context<Self>,
     ) {
+        if let Some((focused_id, replica)) = &self.focused_replica
+            && focused_id == id
+        {
+            let replica = replica.clone();
+            replica.update(cx, |r, cx| {
+                r.set_reconcile_in_flight(reconcile_in_flight, cx)
+            });
+        }
         if let Some(card) = self.cards.get(id) {
             card.update(cx, |card, cx| {
                 card.connection_overlay = match transport {

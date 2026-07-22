@@ -14,6 +14,7 @@ use lens_core::persist::{RangeRead, ReadRange};
 use lens_core::reduce::{RetireDisposition, StreamUpdate, group_work_section, project};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 pub use reader::{Priority, ReadTarget, ReaderWorkerHandle};
 pub use rowsource::{
@@ -21,6 +22,7 @@ pub use rowsource::{
 };
 
 const LIST_OVERDRAW: Pixels = gpui::px(200.);
+const SYNC_DEBOUNCE_MS: u64 = 150;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MarkerKind {
@@ -54,6 +56,9 @@ pub struct FocusedTranscript {
     session_id: SessionId,
     baseline_epoch: u64,
     baseline_reconcile_in_flight: bool,
+    reconcile_in_flight: bool,
+    syncing: bool,
+    sync_debounce_task: Option<gpui::Task<()>>,
     live_section_projection_count: usize,
     /// Top-level structure entries materialized from settled prefix (D-1 cache index).
     settled_structure_len: usize,
@@ -98,6 +103,9 @@ impl FocusedTranscript {
             session_id,
             baseline_epoch: seed_epoch.epoch,
             baseline_reconcile_in_flight: seed_epoch.in_flight,
+            reconcile_in_flight: false,
+            syncing: false,
+            sync_debounce_task: None,
             live_section_projection_count: 0,
             settled_structure_len: 0,
         };
@@ -133,11 +141,56 @@ impl FocusedTranscript {
             session_id,
             baseline_epoch: seed_epoch.epoch,
             baseline_reconcile_in_flight: seed_epoch.in_flight,
+            reconcile_in_flight: false,
+            syncing: false,
+            sync_debounce_task: None,
             live_section_projection_count: 0,
             settled_structure_len: 0,
         };
         cx.notify();
         replica
+    }
+
+    pub fn set_reconcile_in_flight(&mut self, in_flight: bool, cx: &mut Context<Self>) {
+        if in_flight == self.reconcile_in_flight {
+            return;
+        }
+        self.reconcile_in_flight = in_flight;
+        if in_flight {
+            self.sync_debounce_task = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(SYNC_DEBOUNCE_MS))
+                    .await;
+                let _ = this.update(cx, |r, cx| {
+                    if r.reconcile_in_flight && !r.syncing {
+                        r.syncing = true;
+                        cx.notify();
+                    }
+                });
+            }));
+        } else {
+            self.sync_debounce_task = None;
+            if self.syncing {
+                self.syncing = false;
+                cx.notify();
+            }
+        }
+    }
+
+    pub fn syncing(&self) -> bool {
+        self.syncing
+    }
+
+    #[doc(hidden)]
+    pub fn live_section_projection_count(&self) -> usize {
+        self.live_section_projection_count
+    }
+
+    #[cfg(test)]
+    pub(crate) fn live_section_block_count_for_test(&self) -> usize {
+        let slice = &self.items[self.live_section_start..];
+        let refs: Vec<&Item> = slice.iter().collect();
+        project(&refs, self.scratch.as_ref(), self.active_response.as_ref()).len()
     }
 
     pub fn fold_detailed(&mut self, u: StreamUpdate, cx: &mut Context<Self>) {
@@ -589,7 +642,7 @@ fn is_user_message(item: &Item) -> bool {
 mod tests {
     use super::*;
     use async_channel::Receiver;
-    use gpui::AppContext;
+    use gpui::{AppContext, Entity};
     use lens_core::domain::ids::{AgentId, ConnectionId, SessionId as Sid};
     use lens_core::domain::item::{BlockContext, ContentBlock, ItemKind};
     use lens_core::domain::scalars::{Role, SessionStatusValue};
@@ -2432,6 +2485,169 @@ mod tests {
                 "markers must only be injected via Reconnected fold arm"
             );
             assert_eq!(count_markers_in_order(r.rows().order()), 0);
+        });
+    }
+
+    struct ReplicaBoard {
+        _replica: Entity<FocusedTranscript>,
+    }
+
+    impl gpui::Render for ReplicaBoard {
+        fn render(
+            &mut self,
+            _: &mut gpui::Window,
+            _: &mut Context<Self>,
+        ) -> impl gpui::IntoElement {
+            gpui::div()
+        }
+    }
+
+    #[gpui::test]
+    async fn syncing_does_not_show_before_debounce(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        {
+            let (_board, vcx) = cx.add_window_view(|_, _| ReplicaBoard {
+                _replica: replica.clone(),
+            });
+            vcx.run_until_parked();
+
+            vcx.update(|_, cx| {
+                replica.update(cx, |r, cx| r.set_reconcile_in_flight(true, cx));
+            });
+            vcx.executor().advance_clock(Duration::from_millis(100));
+            vcx.update(|_, cx| {
+                replica.update(cx, |r, cx| r.set_reconcile_in_flight(false, cx));
+            });
+            vcx.run_until_parked();
+        }
+
+        assert!(
+            !replica.read_with(cx, |r, _| r.syncing()),
+            "syncing must not show when reconcile finishes before 150 ms debounce"
+        );
+    }
+
+    #[gpui::test]
+    async fn syncing_shows_after_debounce_then_clears(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        {
+            let (_board, vcx) = cx.add_window_view(|_, _| ReplicaBoard {
+                _replica: replica.clone(),
+            });
+            vcx.run_until_parked();
+
+            vcx.update(|_, cx| {
+                replica.update(cx, |r, cx| r.set_reconcile_in_flight(true, cx));
+            });
+            vcx.executor().advance_clock(Duration::from_millis(200));
+            vcx.run_until_parked();
+        }
+
+        assert!(
+            replica.read_with(cx, |r, _| r.syncing()),
+            "syncing must show after 150 ms debounce while reconcile is in flight"
+        );
+
+        {
+            let (_board, vcx) = cx.add_window_view(|_, _| ReplicaBoard {
+                _replica: replica.clone(),
+            });
+            vcx.run_until_parked();
+            vcx.update(|_, cx| {
+                replica.update(cx, |r, cx| r.set_reconcile_in_flight(false, cx));
+            });
+            vcx.run_until_parked();
+        }
+
+        assert!(
+            !replica.read_with(cx, |r, _| r.syncing()),
+            "syncing must clear on reconcile falling edge"
+        );
+    }
+
+    fn settled_turn_rows(turns: usize) -> Vec<(i64, Item)> {
+        let mut rows = Vec::with_capacity(turns * 2 + 1);
+        for i in 0..turns {
+            let ord = (i * 2) as i64;
+            rows.push((ord, user_item(&format!("u{i}"), "hi")));
+            rows.push((
+                ord + 1,
+                reasoning_item(&format!("r{i}"), &format!("resp_settled_{i}")),
+            ));
+        }
+        let live_ord = (turns * 2) as i64;
+        rows.push((live_ord, reasoning_item("live_seed", "resp_live")));
+        rows
+    }
+
+    fn seed_resident_replica(
+        replica: &Entity<FocusedTranscript>,
+        turns: usize,
+        cx: &mut gpui::App,
+    ) {
+        let rows = settled_turn_rows(turns);
+        let watermark = rows.last().map(|(o, _)| *o).unwrap_or(0);
+        let resp_live = ResponseId::new("resp_live");
+        replica.update(cx, |r, cx| {
+            r.apply_read(1, ReadRange::All, range_read(rows, watermark), cx);
+            r.active_response = Some(resp_live);
+        });
+    }
+
+    fn drive_live_scratch_delta(replica: &Entity<FocusedTranscript>, cx: &mut gpui::App) {
+        let scratch = StreamScratch {
+            open_message: Some(lens_core::domain::item::MessageAcc {
+                acc_id: AccId::new("acc_live_delta"),
+                message_id: None,
+                text: "live delta".into(),
+                block_index: 0,
+            }),
+            ..StreamScratch::default()
+        };
+        replica.update(cx, |r, cx| {
+            r.fold_detailed(StreamUpdate::ScratchChanged(Arc::new(scratch)), cx);
+        });
+    }
+
+    #[gpui::test]
+    async fn scratch_delta_projection_is_o_visible_not_o_resident(cx: &mut gpui::TestAppContext) {
+        let (small, rx_small) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx_small.try_recv().expect("baseline small");
+        let (large, rx_large) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx_large.try_recv().expect("baseline large");
+
+        cx.update(|cx| {
+            seed_resident_replica(&small, 4, cx);
+            seed_resident_replica(&large, 400, cx);
+        });
+
+        cx.update(|cx| {
+            drive_live_scratch_delta(&small, cx);
+            drive_live_scratch_delta(&large, cx);
+        });
+
+        cx.read(|cx| {
+            let small_r = small.read(cx);
+            let large_r = large.read(cx);
+            let small_count = small_r.live_section_projection_count();
+            let large_count = large_r.live_section_projection_count();
+            let expected = small_r.live_section_block_count_for_test();
+            assert_eq!(
+                small_count, large_count,
+                "live delta projection must not scale with resident size (small={small_count}, large={large_count})"
+            );
+            assert_eq!(
+                small_count, expected,
+                "projection count must equal live-section block count (got {small_count}, expected {expected})"
+            );
+            assert!(
+                small_r.items.len() < large_r.items.len(),
+                "precondition: large resident has more items than small"
+            );
         });
     }
 }

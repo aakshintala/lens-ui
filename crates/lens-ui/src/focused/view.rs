@@ -218,6 +218,25 @@ impl Render for FocusedTranscriptView {
             None
         };
 
+        let syncing = if self.replica.read(cx).syncing() {
+            Some(
+                div()
+                    .id("syncing-indicator")
+                    .absolute()
+                    .top(px(12.))
+                    .right(px(12.))
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .bg(gpui::rgb(0x374151))
+                    .text_color(gpui::rgb(0xe5e7eb))
+                    .text_sm()
+                    .child("syncing…"),
+            )
+        } else {
+            None
+        };
+
         div()
             .id("focused-transcript-view")
             .track_focus(&self.focus_handle)
@@ -225,6 +244,7 @@ impl Render for FocusedTranscriptView {
             .size_full()
             .child(list_el)
             .children(pill)
+            .children(syncing)
     }
 }
 
