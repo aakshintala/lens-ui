@@ -251,7 +251,8 @@ impl Render for StreamView {
             // Baseline for the exit-time sustained-progress check (codex I6):
             // record the shown tab's build count now so we can require it to
             // climb by MIN_POST_FLIP_BUILDS before measurement ends.
-            *self.flip_progress_baseline.borrow_mut() = Some(self.engines[1].inspect().frames_built);
+            *self.flip_progress_baseline.borrow_mut() =
+                Some(self.engines[1].inspect().frames_built);
             *self.flipped.borrow_mut() = true;
         }
 
