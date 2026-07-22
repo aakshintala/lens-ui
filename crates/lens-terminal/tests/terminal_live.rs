@@ -567,12 +567,7 @@ fn resolve_terminal_ids(
                         && t.metadata.session_key.as_deref() == Some(key.session_key.as_str())
                 })
                 .map(|t| (session_id.clone(), t.id))
-                .ok_or_else(|| {
-                    format!(
-                        "no terminal for {}:{}",
-                        key.terminal_name, key.session_key
-                    )
-                })
+                .ok_or_else(|| format!("no terminal for {}:{}", key.terminal_name, key.session_key))
         }
     }
 }
