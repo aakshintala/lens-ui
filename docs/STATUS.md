@@ -5,7 +5,7 @@ the current forward-looking state only. **Full dated session entries live in
 [`STATUS-ARCHIVE.md`](./STATUS-ARCHIVE.md)** — write each session's detail there
 and roll older "Recent" pointers off this page as they age.
 
-_Last curated 2026-07-21 (B-3 SHIPPED — merged to main UNPUSHED; **B-4 decomposed → B-4a foundation design LOCKED** (grilled + codex-reviewed + §3 re-grilled), ready for writing-plans in a fresh session. Earlier same day: turn-counter fix + B-2 shipped)._
+_Last curated 2026-07-22 (**B-4a store→replica write-path EXECUTED** on branch `board-b4a` — 10 TDD tasks, subagent-driven (composer implementers + codex per-task + final whole-branch review); gate green; on-device FPS confirmation owed to user; awaiting merge decision. Earlier: B-3 SHIPPED merged-unpushed; B-4a design LOCKED then planned+codex-reviewed)._
 
 ---
 
@@ -49,7 +49,23 @@ _Last curated 2026-07-21 (B-3 SHIPPED — merged to main UNPUSHED; **B-4 decompo
   - **B-4 — drag/move + context-menu grouping — decomposed into B-4a…B-4d.** At design time B-4 was split
     into a **foundation slice B-4a** (store→replica write-path; NO interactions) + interaction follow-ons
     B-4b (collapse + §7 collapsed-tile) / B-4c (drag/move) / B-4d (context-menu grouping).
-    - **B-4a — store→replica write-path foundation — DESIGN LOCKED, ready to plan (NEXT).** Spec
+    - **B-4a — store→replica write-path foundation — EXECUTED 2026-07-22** on branch `board-b4a`
+      (base `0f18ea7`, 20 commits). Plan `docs/plans/2026-07-22-board-b4a-store-replica-write-path.md`
+      (v2, codex-reviewed REWORK folded). Subagent-driven: composer-2.5 implementers + codex gpt-5.6
+      per-task cross-family review + final whole-branch review + Opus controller adjudication. `BoardReplica`
+      (`board/replica.rs`, ~930 lines) = in-memory `BoardLayout` + serialized single-in-flight off-thread
+      `run_op` pump (`cx.spawn`→`background_executor().spawn`→`WeakEntity::update`), typed BUSY-retry w/
+      backoff, recovery force-reopen, suppress-stuck reconcile (no tombstone loop), deterministic
+      session-sorted placement; retired `build_ephemeral_layout` + `test_layout` seam; non-blocking
+      `ReplicaState` banner; demo seeds a "Demo group" (B-3 chrome live). **Reviews caught (all fixed):**
+      ~10 false-green tests (composer blind spot → controller load-bearing rewrites w/ sabotage-verify),
+      the C1 tombstone infinite-loop (self-introduced by re-diff-on-reply), a buggy `gate_epoch` composer
+      over-reach for a non-existent race, and non-deterministic HashMap placement (flaky acceptance).
+      **Perf:** `board_tree` bench 11.8µs @ 1000+group; at-scale demo (`LENS_DEMO_N=125`) launches stable;
+      **MANDATORY on-device FPS-at-120 confirmation OWED (headless can't measure — run
+      `LENS_DEMO_N=125 ./target/release/lens-app --demo` on a display).** Gate green (clippy -D warnings,
+      fmt, lens-core 254 / lens-client 150 / lens-ui 83 lib + 5 acceptance). Memory [[board-b4a-plan-executed]].
+      **NEXT: merge `board-b4a`→main (solo workflow) after final review clears — user's merge call.** Original design spec:
       `docs/specs/2026-07-21-board-b4a-store-replica-write-path-design.md` — grilled + gpt-5.6 codex
       spec-review folded + §3 re-grilled. Replaces `build_ephemeral_layout` with a persisted `BoardLayout`
       via a new `BoardReplica` gpui entity; **off-thread store access** (`Arc<Mutex>` + `cx.background_spawn`
