@@ -1539,6 +1539,247 @@ mod tests {
         });
     }
 
+    // ── Task-12 residual nuance: collapse vs a pending finalize tail (validated
+    // NON-DEFECT). §4 keeps the just-completed latest-settled turn EXPANDED until
+    // the next user message, so the finalize handoff (§6, "never absent") happens
+    // while the turn is shown. When a later user message DOES collapse the turn,
+    // its children — including a still-staged reasoning tail — are correctly
+    // hidden inside the chip, never leaked as loose rows and never orphaned out
+    // of staging. In practice ordinal-ordered disk delivery lands the tail's row
+    // before any later user message, so the "collapse-before-disk" state is
+    // barely reachable; the first test forces it anyway to prove robustness.
+
+    #[gpui::test]
+    async fn pending_tail_hidden_not_orphaned_when_turn_collapses_before_disk_row(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        let acc = AccId::new("acc_collapse_pending");
+        let item_id = ItemId::new("r_collapse_pending");
+        let resp_a = ResponseId::new("resp_a");
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::All,
+                    range_read(vec![(0, reasoning_item("r_a0", "resp_a"))], 0),
+                    cx,
+                );
+                r.fold_detailed(
+                    StreamUpdate::ActiveResponseChanged(Some(resp_a.clone())),
+                    cx,
+                );
+                // Stream a reasoning tail, finalize it, clear scratch, complete turn.
+                r.fold_detailed(
+                    StreamUpdate::ScratchChanged(Arc::new(StreamScratch {
+                        open_reasoning: Some(lens_core::domain::item::ReasoningAcc {
+                            acc_id: acc.clone(),
+                            full_text: "streaming tail".into(),
+                            summary_text: String::new(),
+                            encrypted: false,
+                        }),
+                        ..Default::default()
+                    })),
+                    cx,
+                );
+                r.fold_detailed(
+                    StreamUpdate::Retired {
+                        acc_id: acc.clone(),
+                        disposition: RetireDisposition::Finalizing {
+                            item_id: item_id.clone(),
+                        },
+                    },
+                    cx,
+                );
+                r.fold_detailed(
+                    StreamUpdate::ScratchChanged(Arc::new(StreamScratch::default())),
+                    cx,
+                );
+                r.fold_detailed(StreamUpdate::ActiveResponseChanged(None), cx);
+            });
+        });
+
+        let tail = RowId::StreamTail(acc.clone());
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert!(
+                r.section_expanded(&resp_a),
+                "§4: completed latest-settled turn stays expanded — the tail is visible for a flash-free handoff"
+            );
+            assert_eq!(r.pending_finalize_len(), 1, "tail staged, awaiting disk row");
+            assert_eq!(
+                count_in_order(r.rows().order(), &tail),
+                1,
+                "staged tail visible while the turn is expanded"
+            );
+        });
+
+        // Force the flagged state: a next user message collapses resp_a BEFORE
+        // the finalize disk row arrives.
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Delta {
+                        after: 0,
+                        through: 1,
+                    },
+                    range_read(vec![(1, user_item("u_next", "next"))], 1),
+                    cx,
+                );
+            });
+        });
+
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert!(
+                !r.section_expanded(&resp_a),
+                "§4: the next user message collapses the turn"
+            );
+            assert_eq!(
+                count_in_order(r.rows().order(), &tail),
+                0,
+                "collapsed: the pending tail is hidden inside the chip, not leaked into the flat order"
+            );
+            assert_eq!(
+                r.pending_finalize_len(),
+                1,
+                "collapse must not orphan the staged tail — still pending its disk row"
+            );
+            assert_eq!(
+                r.rows().section_containing_child(&tail).map(|k| &k.response_id),
+                Some(&resp_a),
+                "tail still belongs to resp_a's section (hidden, not lost)"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn finalized_child_hidden_by_later_collapse_after_disk_commit(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // Realistic ordering: the finalize disk row lands (ordinal before any
+        // later user message) → commits in place while the turn is still
+        // expanded (§4, no absent frame) → a subsequent user message collapses
+        // the turn, hiding the now-durable work row inside the chip.
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        let acc = AccId::new("acc_commit_collapse");
+        let item_id = ItemId::new("r_commit_disk");
+        let resp_a = ResponseId::new("resp_a");
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::All,
+                    range_read(vec![(0, reasoning_item("r_a0", "resp_a"))], 0),
+                    cx,
+                );
+                r.fold_detailed(
+                    StreamUpdate::ActiveResponseChanged(Some(resp_a.clone())),
+                    cx,
+                );
+                r.fold_detailed(
+                    StreamUpdate::ScratchChanged(Arc::new(StreamScratch {
+                        open_reasoning: Some(lens_core::domain::item::ReasoningAcc {
+                            acc_id: acc.clone(),
+                            full_text: "streaming tail".into(),
+                            summary_text: String::new(),
+                            encrypted: false,
+                        }),
+                        ..Default::default()
+                    })),
+                    cx,
+                );
+                r.fold_detailed(
+                    StreamUpdate::Retired {
+                        acc_id: acc.clone(),
+                        disposition: RetireDisposition::Finalizing {
+                            item_id: item_id.clone(),
+                        },
+                    },
+                    cx,
+                );
+                r.fold_detailed(
+                    StreamUpdate::ScratchChanged(Arc::new(StreamScratch::default())),
+                    cx,
+                );
+                r.fold_detailed(StreamUpdate::ActiveResponseChanged(None), cx);
+            });
+        });
+
+        // Disk row for the tail arrives (ordinal 1) → commit in place; resp_a is
+        // still the latest settled with no user after it, so it stays expanded.
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Delta {
+                        after: 0,
+                        through: 1,
+                    },
+                    range_read(vec![(1, reasoning_item("r_commit_disk", "resp_a"))], 1),
+                    cx,
+                );
+            });
+        });
+
+        let work = RowId::Work(item_id.clone());
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert_eq!(r.pending_finalize_len(), 0, "disk row committed");
+            assert!(
+                r.section_expanded(&resp_a),
+                "still latest-settled → expanded after commit (no premature collapse)"
+            );
+            assert_eq!(
+                count_in_order(r.rows().order(), &work),
+                1,
+                "durable work row visible while expanded"
+            );
+        });
+
+        // A later user message collapses resp_a → the durable work row hides.
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Delta {
+                        after: 1,
+                        through: 2,
+                    },
+                    range_read(vec![(2, user_item("u_next", "next"))], 2),
+                    cx,
+                );
+            });
+        });
+
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert!(
+                !r.section_expanded(&resp_a),
+                "the next user message collapses the turn"
+            );
+            assert_eq!(
+                count_in_order(r.rows().order(), &work),
+                0,
+                "durable child hidden inside the collapsed chip"
+            );
+            assert_eq!(
+                r.rows()
+                    .section_containing_child(&work)
+                    .map(|k| &k.response_id),
+                Some(&resp_a),
+                "work row still under resp_a (hidden, not lost)"
+            );
+        });
+    }
+
     #[gpui::test]
     async fn staged_reasoning_finalize_recreates_vanished_reasoning_only_section(
         cx: &mut gpui::TestAppContext,
