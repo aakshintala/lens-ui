@@ -529,6 +529,23 @@ per-slice, never deferred.
 > on a fresh branch off `main` (lens-ui/lens-core integration). Memory
 > `terminal-slice-3plus-replan`.
 
+- **Slice 3 — Byte-accounting + perf acceptance — DONE (2026-07-22).** Executed on
+  `terminal-ws` (`af0b605`..`f30f894`), full `xtask gate` GREEN. `EngineInspect` now
+  carries `total_rows` + `retained_bytes_estimate` (`= total_rows × cols ×
+  PER_CELL_BYTES`, provisional 4, ordinal-only), sampled once per build. **Job A**
+  (`stream_perf_realwindow`, real-GPUI, wired into the macOS gate): 4 engines under
+  sustained dense wide/emoji streaming — paint_p95 **3.1 ms** (budget 5.5), build_p95
+  **0.57 ms** (budget 3), ΔRSS recorded, hidden-tab build-suppression asserted.
+  **Job B** (`rss_probe` bin + `xtask terminal-rss-sweep`, out-of-gate acceptance):
+  RSS sweep 1k–50k rows × {compressible, incompressible} → **estimate is ordinally
+  reliable, no RSS/estimate ordering flips → byte-accurate FFI conditional NOT
+  triggered.** Two real bugs surfaced + fixed: **(1)** the engine worker thread needed
+  a 64 MiB stack (libghostty scrollback ops overflowed the ~2 MiB default at ~2000+
+  rows — a real product crash); **(2)** `max_scrollback` is a **BYTE budget, not a
+  line count** (the vendored doc comment is wrong; the "10,000,000-byte" figure below
+  is correct). Handoff `docs/handoffs/2026-07-22-terminal-slice-3-executed.md`; plan
+  `docs/plans/2026-07-22-terminal-slice-3-byte-accounting-perf.md`. Original scope
+  bullet retained below for the record.
 - **Slice 3 — Byte-accounting + perf acceptance** (demo-hosted): a **thin per-tab
   retained-bytes *estimate*** = `total_rows × cols × per_cell` (task 1 — surface
   `TOTAL_ROWS`/`SCROLLBACK_ROWS` via `ghostty_terminal_get` through `EngineInspect`;
@@ -596,11 +613,11 @@ Every requirement maps to a slice; deferral is explicit, never forgotten.
 | Lifecycle mechanisms: `ReplacementWaiting` + Sleep/wake (confirmed-exit teardown/recreate), generation guard (full) | 4 (module); `Sleeping` reachable via host `Sleep`; **`Ended` inert** — no 0.5.1/0.6.0 positive-termination signal (verified 2026-07-21) |
 | `session.superseded` redirect (retained engine follows `TerminalId`) | 5 — sub-slice **5-super**, lens-core reducer surface first (`reduce/folds.rs` drops `target_conversation_id`; collides with T-0 on `lens-transript`) |
 | Fleet memory-pressure trim/disconnect (LRV) | 5 (fleet policy in `FleetStore`, consumes Slice-4 module primitives) |
-| Byte accounting: thin per-tab **estimate** (`total_rows × cols × per_cell`) + real process RSS | 3 — estimate via `EngineInspect` (`TOTAL_ROWS`/`SCROLLBACK_ROWS` accessors **exist today**, no re-vendor) recorded with RSS; ordinal-fidelity gate = the (B) one-tab-per-process sweep w/ adversarial compression pair. byte-**accurate** FFI = **fail-closed conditional** (`GHOSTTY_TERMINAL_DATA_*` byte selector + re-vendor — no *byte* accessor today, scrollback is compressed; escalate only if the row estimate is *ordinally* unreliable) |
+| Byte accounting: thin per-tab **estimate** (`total_rows × cols × per_cell`) + real process RSS | **3 — DONE (2026-07-22).** estimate via `EngineInspect.retained_bytes_estimate` (sampled once per build); Job B sweep (`xtask terminal-rss-sweep`) = **ordinally reliable, no flips** → byte-**accurate** FFI conditional **NOT triggered** (stays parked). Found `max_scrollback` is a BYTE budget + fixed a worker-stack overflow. `per_cell` provisional 4 (ordinal-only) |
 | Inspect + diagnostic rings (disabled-path proof) | per-slice (1a/1b/1c/1d **+ 2/4 extensions**), integrated 6 |
 | Benchmarks (client codec/queue, engine parse/frame/scroll/reflow, GPUI frame incl. dense wide/emoji) | per-slice, full harness 3 |
 | Verification gates: deterministic + GPUI + live tests, `rustfmt`, workspace clippy | per-slice, full E2E 6 |
-| Perf acceptance (numeric budgets, real RSS, PerCell fail-closed gate, workloads) | 3 (demo-hosted authority); integrated sanity check 6 |
+| Perf acceptance (numeric budgets, real RSS, PerCell fail-closed gate, workloads) | **3 — DONE (2026-07-22)** (demo-hosted authority: Job A `stream_perf_realwindow` in the macOS gate, paint_p95 3.1 / build_p95 0.57 ms; Job B RSS sweep); integrated sanity check 6 |
 | lens-ui integration: terminal as `FleetStore` member (minimal), production surface, E2E-in-app | 5 (minimal membership), 6 (full surface + E2E) — **scope expansion** (old "lens-ui integration out of scope" deliberately expired 2026-07-21) |
 | Build acceptance: offline-after-cache; full clean-build offline (vendored Ghostty tree) | 6 / CI trigger |
 | Font registry / bundled defaults / Nerd-Font symbols | deferred → settings workstream (SPEC-GAPS §7) |
