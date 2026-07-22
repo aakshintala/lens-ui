@@ -19,6 +19,10 @@ pub struct RepoRef {
 #[derive(Clone, Debug)]
 pub struct SessionCard {
     pub session_id: SessionId,
+    /// §3.1 rollup age source: epoch SECONDS of session creation. `None` until the
+    /// first `Detailed(Rebased)` fold (Summary frames don't carry it). Fed to
+    /// `board::rollup::group_rollup`.
+    pub created_at: Option<i64>,
     pub status: SessionStatusValue,
     pub title: Option<String>,
     pub activity_summary: String,
@@ -76,6 +80,7 @@ impl SessionCard {
     pub fn new(session_id: SessionId) -> Self {
         Self {
             session_id,
+            created_at: None,
             status: SessionStatusValue::Idle,
             title: None,
             activity_summary: String::new(),
@@ -179,6 +184,7 @@ impl SessionCard {
                 self.reasoning_effort = state.reasoning_effort.clone();
                 self.harness = state.harness.clone();
                 self.lifecycle = state.lifecycle;
+                self.created_at = Some(state.created_at);
                 self.needs_attention = !state.pending_elicitations.is_empty()
                     || state.status == SessionStatusValue::Failed;
                 self.todos = state.todos.clone();
@@ -404,5 +410,23 @@ mod tests {
         card.fold_feed(ActorFeed::Summary(Box::new(base_summary())), &clock);
         card.fold_feed(ActorFeed::Detailed(StreamUpdate::ResourcesChanged), &clock);
         assert_eq!(card.git_branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn rebased_fold_plumbs_created_at() {
+        let mut card = SessionCard::new(SessionId::new("s"));
+        assert_eq!(card.created_at, None, "fresh card has no created_at");
+        let clock = crate::clock::ManualUiClock::new(0);
+        let mut baseline = SessionState::new(
+            ConnectionId::new("c"),
+            SessionId::new("s"),
+            AgentId::new("ag"),
+        );
+        baseline.created_at = 1_700_000_000; // epoch seconds
+        card.fold_feed(
+            ActorFeed::Detailed(StreamUpdate::Rebased(Box::new(baseline))),
+            &clock,
+        );
+        assert_eq!(card.created_at, Some(1_700_000_000));
     }
 }

@@ -1,4 +1,5 @@
 use gpui::Action;
+use gpui::AppContext;
 use lens_core::actor::{ActorFeed, SessionCommand, SummaryUpdate};
 use lens_core::domain::ids::SessionId;
 use lens_core::domain::scalars::SessionStatusValue;
@@ -6,7 +7,7 @@ use lens_core::domain::usage::Cost;
 use lens_core::reduce::StreamUpdate;
 use lens_ui::PtyProbe;
 use lens_ui::actions::BackToBoard;
-use lens_ui::board::BoardView;
+use lens_ui::board::{BoardReplica, BoardView};
 use lens_ui::card::model::{READY_DECAY_MS, RepoRef, SessionCard};
 use lens_ui::card::wave::{Wave, derive_wave};
 use lens_ui::clock::{ManualUiClock, UiClock};
@@ -55,9 +56,9 @@ fn summary(
 async fn card_offscreen_in_focus_rail_resumes_animating_on_return(cx: &mut gpui::TestAppContext) {
     use gpui::{Size, px};
 
-    const N: usize = 8;
+    const N: usize = 12; // enough rail cards to overflow a short window at 1 col
     let clock = Arc::new(ManualUiClock::new(10_000));
-    let ids: Vec<SessionId> = (0..N).map(|i| SessionId::new(format!("s{i}"))).collect();
+    let ids: Vec<SessionId> = (0..N).map(|i| SessionId::new(format!("s{i:02}"))).collect();
 
     let fleet = cx.update(|cx| {
         gpui_component::init(cx);
@@ -68,38 +69,36 @@ async fn card_offscreen_in_focus_rail_resumes_animating_on_return(cx: &mut gpui:
                 f.spawn_fake_session(id.clone(), cx);
             }
         });
-        // All cards Working (Running → Wave::Working → animating tick).
         for id in &ids {
             let card = fleet.read(cx).card(id).unwrap();
-            card.update(cx, |c, _| c.status = SessionStatusValue::Running);
+            card.update(cx, |c, _| c.status = SessionStatusValue::Running); // Working → animates
         }
         fleet
     });
 
     let fleet_for_window = fleet.clone();
+    let replica = cx.update(|cx| cx.new(|cx| BoardReplica::for_test(fleet_for_window.clone(), cx)));
+    cx.run_until_parked();
     let (board_handle, vcx) = cx.add_window_view(|_, cx| {
-        let working_tab = placeholder_tab(cx);
-        BoardView::mount(fleet_for_window, working_tab, None, cx)
+        BoardView::mount(
+            fleet_for_window,
+            replica.clone(),
+            placeholder_tab(cx),
+            None,
+            cx,
+        )
     });
-
-    // Wide + short: board grid (horizontal wrap) keeps ALL cards on-screen; the focus
-    // rail (280px vertical column, ~152px/card) overflows so bottom cards go off-screen.
+    // Wide + short: board (multi-col) keeps all cards on-screen; the 1-col focus
+    // rail overflows so the bottom cards cull.
     vcx.simulate_resize(Size {
         width: px(3000.0),
         height: px(700.0),
     });
-    for id in &ids {
-        vcx.update(|_, cx| {
-            let card = fleet.read(cx).card(id).unwrap();
-            card.update(cx, |_, cx| cx.notify());
-        });
-    }
     vcx.run_until_parked();
 
-    let top = ids[1].clone(); // on-screen in the rail (healthy control)
-    let bottom = ids[N - 1].clone(); // off-screen in the rail (freeze suspect)
+    let top = ids[0].clone(); // on-screen control
+    let bottom = ids[N - 1].clone(); // off-screen in the rail
 
-    // Capture the per-card render_count handles once (no borrow of cx afterwards).
     let (rc_top, rc_bottom) = vcx.read(|cx| {
         let views = board_handle.read(cx).card_views_for_test();
         (
@@ -107,94 +106,77 @@ async fn card_offscreen_in_focus_rail_resumes_animating_on_return(cx: &mut gpui:
             views[&bottom].read(cx).render_count.clone(),
         )
     });
-    let bottom_for_bounds = bottom.clone();
-    let top_for_bounds = top.clone();
-    let bounds = |vcx: &mut gpui::VisualTestContext, id: SessionId| {
-        vcx.read(|cx| board_handle.read(cx).card_bounds_for_test(&id, cx))
-    };
 
-    // Sanity: on the board every Working card animates.
-    let board_base_top = rc_top.get();
-    let board_base_bottom = rc_bottom.get();
+    // Sanity: on the wide board every Working card is visible and animating.
+    let base_top = rc_top.get();
+    let base_bottom = rc_bottom.get();
     for _ in 0..5 {
         vcx.executor().advance_clock(Duration::from_millis(50));
         vcx.run_until_parked();
     }
     assert!(
-        rc_top.get() > board_base_top && rc_bottom.get() > board_base_bottom,
+        rc_top.get() > base_top && rc_bottom.get() > base_bottom,
         "sanity: all Working cards animate on the board"
     );
 
-    // Enter focus mode; let the off-screen card's timer fire and self-drop.
+    // Enter focus mode; the bottom rail card culls → hidden → timer drops.
     vcx.update(|_, cx| fleet.update(cx, |f, cx| f.focus_session(ids[0].clone(), cx)));
     vcx.run_until_parked();
     for _ in 0..5 {
         vcx.executor().advance_clock(Duration::from_millis(50));
         vcx.run_until_parked();
     }
-    // Precondition: the suspect really did land off-screen in the rail (else the repro is
-    // vacuous — it would pass without exercising the freeze path).
-    let bottom_rail = bounds(vcx, bottom_for_bounds.clone()).expect("bottom card painted in rail");
-    let vp = vcx.update(|window, _| window.viewport_size());
+    let (bottom_visible, bottom_timer) = vcx.read(|cx| {
+        let v = &board_handle.read(cx).card_views_for_test()[&bottom];
+        (v.read(cx).is_visible(), v.read(cx).timer_running_for_test())
+    });
+    assert!(!bottom_visible, "off-screen rail card must be gated hidden");
+    assert!(!bottom_timer, "hidden card's anim timer must be dropped");
+    let (top_visible, top_timer) = vcx.read(|cx| {
+        let v = &board_handle.read(cx).card_views_for_test()[&top];
+        (v.read(cx).is_visible(), v.read(cx).timer_running_for_test())
+    });
     assert!(
-        bottom_rail.origin.y >= vp.height,
-        "repro precondition: suspect must be off-screen in the focus rail \
-         (y={:?}, viewport height={:?})",
-        bottom_rail.origin.y,
-        vp.height
+        top_visible,
+        "on-screen rail control must stay visible in focus mode (gate must not blanket-hide)"
     );
-    // The viewport gate must actually CULL the off-screen card (driver dropped → no more
-    // re-renders). Without this, a fix that simply deleted the gate would pass the recovery
-    // assertion while silently reintroducing the off-screen-CPU regression.
-    let bottom_settled = rc_bottom.get();
+    assert!(
+        top_timer,
+        "on-screen rail control must keep animating in focus mode"
+    );
+    let settled = rc_bottom.get();
     for _ in 0..5 {
         vcx.executor().advance_clock(Duration::from_millis(50));
         vcx.run_until_parked();
     }
     assert_eq!(
         rc_bottom.get(),
-        bottom_settled,
-        "gate must cull the off-screen rail card (render_count frozen while hidden)"
+        settled,
+        "culled card must not re-render (no off-screen CPU)"
     );
 
-    // Return to the board.
+    // Return to the board — bottom card re-enters the visible band → timer respawns.
     vcx.update(|_, cx| fleet.update(cx, |f, cx| f.blur_to_board(cx)));
     vcx.run_until_parked();
-
-    let top_after_blur = rc_top.get();
-    let bottom_after_blur = rc_bottom.get();
-
-    // Advance the animation clock; a Working card that is animating keeps re-rendering.
+    let after_blur = rc_bottom.get();
     for _ in 0..6 {
         vcx.executor().advance_clock(Duration::from_millis(50));
         vcx.run_until_parked();
     }
-    let top_delta = rc_top.get() - top_after_blur;
-    let bottom_delta = rc_bottom.get() - bottom_after_blur;
-    let _ = top_for_bounds;
-
     assert!(
-        top_delta > 0,
-        "control: on-screen card must keep animating on the board (delta={top_delta})"
-    );
-    assert!(
-        bottom_delta > 0,
-        "FREEZE BUG: card that was off-screen in the focus rail is frozen after return \
-         (delta={bottom_delta}) — anim driver never respawned"
+        rc_bottom.get() > after_blur,
+        "FREEZE BUG: card off-screen in the rail is frozen after return — timer never respawned"
     );
 }
 
 /// Same freeze, but the board *mounts already focused* (deep-link / session-restore shape).
-/// The recovery must not depend on a fleet notification having established the focused mode
-/// before the first blur — it tracks the last *rendered* mode, so the first render (focused)
-/// records it and the blur recovers. Guards against the observer-only regression.
 #[gpui::test]
 async fn card_offscreen_resumes_when_board_mounts_focused(cx: &mut gpui::TestAppContext) {
     use gpui::{Size, px};
 
-    const N: usize = 8;
+    const N: usize = 12; // enough rail cards to overflow a short window at 1 col
     let clock = Arc::new(ManualUiClock::new(10_000));
-    let ids: Vec<SessionId> = (0..N).map(|i| SessionId::new(format!("s{i}"))).collect();
+    let ids: Vec<SessionId> = (0..N).map(|i| SessionId::new(format!("s{i:02}"))).collect();
 
     let fleet = cx.update(|cx| {
         gpui_component::init(cx);
@@ -209,16 +191,22 @@ async fn card_offscreen_resumes_when_board_mounts_focused(cx: &mut gpui::TestApp
             let card = fleet.read(cx).card(id).unwrap();
             card.update(cx, |c, _| c.status = SessionStatusValue::Running);
         }
-        // Focus BEFORE the board window exists — the board will mount already in focus mode,
-        // and this notify predates the board's fleet observer (so it never sees the edge).
+        // Focus BEFORE the board window exists — mounts already in focus mode.
         fleet.update(cx, |f, cx| f.focus_session(ids[0].clone(), cx));
         fleet
     });
 
     let fleet_for_window = fleet.clone();
+    let replica = cx.update(|cx| cx.new(|cx| BoardReplica::for_test(fleet_for_window.clone(), cx)));
+    cx.run_until_parked();
     let (board_handle, vcx) = cx.add_window_view(|_, cx| {
-        let working_tab = placeholder_tab(cx);
-        BoardView::mount(fleet_for_window, working_tab, None, cx)
+        BoardView::mount(
+            fleet_for_window,
+            replica.clone(),
+            placeholder_tab(cx),
+            None,
+            cx,
+        )
     });
     vcx.simulate_resize(Size {
         width: px(3000.0),
@@ -226,6 +214,7 @@ async fn card_offscreen_resumes_when_board_mounts_focused(cx: &mut gpui::TestApp
     });
     vcx.run_until_parked();
 
+    let top = ids[0].clone(); // on-screen control
     let bottom = ids[N - 1].clone();
     let rc_bottom = vcx.read(|cx| {
         board_handle.read(cx).card_views_for_test()[&bottom]
@@ -234,13 +223,41 @@ async fn card_offscreen_resumes_when_board_mounts_focused(cx: &mut gpui::TestApp
             .clone()
     });
 
-    // Settle in focus mode so the off-screen bottom card drops its driver.
+    // Settle in focus mode; bottom rail card culls → hidden → timer drops.
     for _ in 0..5 {
         vcx.executor().advance_clock(Duration::from_millis(50));
         vcx.run_until_parked();
     }
+    let (bottom_visible, bottom_timer) = vcx.read(|cx| {
+        let v = &board_handle.read(cx).card_views_for_test()[&bottom];
+        (v.read(cx).is_visible(), v.read(cx).timer_running_for_test())
+    });
+    assert!(!bottom_visible, "off-screen rail card must be gated hidden");
+    assert!(!bottom_timer, "hidden card's anim timer must be dropped");
+    let (top_visible, top_timer) = vcx.read(|cx| {
+        let v = &board_handle.read(cx).card_views_for_test()[&top];
+        (v.read(cx).is_visible(), v.read(cx).timer_running_for_test())
+    });
+    assert!(
+        top_visible,
+        "on-screen rail control must stay visible in focus mode (gate must not blanket-hide)"
+    );
+    assert!(
+        top_timer,
+        "on-screen rail control must keep animating in focus mode"
+    );
+    let settled = rc_bottom.get();
+    for _ in 0..5 {
+        vcx.executor().advance_clock(Duration::from_millis(50));
+        vcx.run_until_parked();
+    }
+    assert_eq!(
+        rc_bottom.get(),
+        settled,
+        "culled card must not re-render (no off-screen CPU)"
+    );
 
-    // Return to the board and confirm the previously-off-screen card resumes animating.
+    // Return to the board — bottom card re-enters the visible band → timer respawns.
     vcx.update(|_, cx| fleet.update(cx, |f, cx| f.blur_to_board(cx)));
     vcx.run_until_parked();
     let after_blur = rc_bottom.get();
@@ -285,9 +302,16 @@ async fn shell_skeleton_acceptance(cx: &mut gpui::TestAppContext) {
 
     let fleet_for_window = fleet.clone();
     let pty_for_window = pty.clone();
+    let replica = cx.update(|cx| cx.new(|cx| BoardReplica::for_test(fleet_for_window.clone(), cx)));
+    cx.run_until_parked();
     let (board_handle, vcx) = cx.add_window_view(|_, cx| {
-        let working_tab = placeholder_tab(cx);
-        BoardView::mount(fleet_for_window, working_tab, Some(pty_for_window), cx)
+        BoardView::mount(
+            fleet_for_window,
+            replica.clone(),
+            placeholder_tab(cx),
+            Some(pty_for_window),
+            cx,
+        )
     });
 
     // (1) Settle first frame — targeted notify only (never cx.refresh()).
@@ -611,4 +635,281 @@ async fn shell_skeleton_acceptance(cx: &mut gpui::TestAppContext) {
             "BackToBoard must Demote"
         );
     });
+}
+
+/// Culling (spec §4 unknown 2): on a board tall enough to overflow, tiles below
+/// the visible band + overdraw are NOT built (absent from the child vec).
+#[gpui::test]
+async fn board_culls_offscreen_tiles(cx: &mut gpui::TestAppContext) {
+    use gpui::{Size, px};
+
+    const N: usize = 40; // 40 loose cards @ 200px cell / ~3 cols ⇒ ~14 rows ⇒ tall
+    let clock = Arc::new(ManualUiClock::new(10_000));
+    let ids: Vec<SessionId> = (0..N).map(|i| SessionId::new(format!("s{i:02}"))).collect();
+
+    let fleet = cx.update(|cx| {
+        gpui_component::init(cx);
+        lens_ui::theme::install_at_startup(cx);
+        let fleet = FleetStore::new(Arc::clone(&clock) as Arc<dyn UiClock>, cx);
+        fleet.update(cx, |f, cx| {
+            for id in &ids {
+                f.spawn_fake_session(id.clone(), cx);
+            }
+        });
+        fleet
+    });
+
+    let fleet_for_window = fleet.clone();
+    let replica = cx.update(|cx| cx.new(|cx| BoardReplica::for_test(fleet_for_window.clone(), cx)));
+    cx.run_until_parked();
+    let (board_handle, vcx) = cx.add_window_view(|_, cx| {
+        BoardView::mount(
+            fleet_for_window,
+            replica.clone(),
+            placeholder_tab(cx),
+            None,
+            cx,
+        )
+    });
+    // Normal-size window: only the top few rows fit; the rest overflow the band.
+    vcx.simulate_resize(Size {
+        width: px(1000.0),
+        height: px(700.0),
+    });
+    vcx.run_until_parked();
+
+    let built = vcx.read(|cx| board_handle.read(cx).visible_session_ids_for_test());
+    assert!(!built.is_empty(), "some tiles must be built");
+    assert!(
+        built.len() < N,
+        "off-screen tiles must be culled (built {} of {N})",
+        built.len()
+    );
+    // The last card (bottom row) is far below the band → not built.
+    assert!(
+        !built.contains(&ids[N - 1]),
+        "bottom card must be culled while scrolled to top"
+    );
+}
+
+// B-4a migration of the retired B-3 `board_group_renders_chrome_and_rollup`: the group now
+// comes from a persisted store loaded through the real BoardReplica (not the test_layout
+// seam). Members are seeded under the group with the replica's conn so reconcile treats
+// them as already-placed. Proves the store→replica→group-render path end to end.
+#[gpui::test]
+async fn board_group_renders_chrome_and_rollup_via_replica(cx: &mut gpui::TestAppContext) {
+    use gpui::{Size, px};
+    use lens_core::domain::board::{DEFAULT_BOARD_ID, PlacementTarget};
+    use lens_core::domain::ids::{BoardId, ConnectionId};
+    use lens_core::persist::{BoardStore, SqliteBoardStore};
+
+    let clock = Arc::new(ManualUiClock::new(7_200_000)); // 2h past epoch → oldest member ages to "2h"
+    let s1 = SessionId::new("s1");
+    let s2 = SessionId::new("s2");
+    let conn = ConnectionId::new("c");
+
+    let (fleet, c1, c2) = cx.update(|cx| {
+        gpui_component::init(cx);
+        lens_ui::theme::install_at_startup(cx);
+        let fleet = FleetStore::new(Arc::clone(&clock) as Arc<dyn UiClock>, cx);
+        let (c1, c2) = fleet.update(cx, |f, cx| {
+            let c1 = f.spawn_fake_session(s1.clone(), cx);
+            let c2 = f.spawn_fake_session(s2.clone(), cx);
+            (c1, c2)
+        });
+        (fleet, c1, c2)
+    });
+    // Member card data: s1 = $1.50 @ 0s (oldest), s2 = $2.00 @ 100s.
+    cx.update(|cx| {
+        c1.update(cx, |card, _| {
+            card.cumulative_cost.total_cost_usd = Some(1.50);
+            card.created_at = Some(0);
+        });
+        c2.update(cx, |card, _| {
+            card.cumulative_cost.total_cost_usd = Some(2.00);
+            card.created_at = Some(100);
+        });
+    });
+
+    // Seed the "Refactor" (blue) group + members into a REAL store, then load via BoardReplica.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("board.db");
+    let store = SqliteBoardStore::open(&path).unwrap();
+    let board = BoardId::new(DEFAULT_BOARD_ID);
+    let g1 = store.create_group(&board, None, 0, "Refactor").unwrap();
+    store.set_color(&g1, "blue").unwrap();
+    for (i, s) in [&s1, &s2].into_iter().enumerate() {
+        store
+            .place_session(
+                &conn,
+                s,
+                &PlacementTarget {
+                    board_id: Some(board.clone()),
+                    parent_item_id: Some(g1.clone()),
+                    ordinal: Some(i as i32),
+                },
+            )
+            .unwrap();
+    }
+    let boxed: Box<dyn BoardStore + Send> = Box::new(store);
+
+    let fleet_for_window = fleet.clone();
+    let replica = cx.update(|cx| {
+        cx.new(|cx| {
+            BoardReplica::new(
+                Some(boxed),
+                path.clone(),
+                conn.clone(),
+                fleet_for_window.clone(),
+                cx,
+            )
+        })
+    });
+    cx.run_until_parked(); // load the seeded group + members
+
+    let (board_handle, vcx) = cx.add_window_view(|_, cx| {
+        BoardView::mount(
+            fleet_for_window,
+            replica.clone(),
+            placeholder_tab(cx),
+            None,
+            cx,
+        )
+    });
+    vcx.simulate_resize(Size {
+        width: px(1200.0),
+        height: px(900.0),
+    });
+    vcx.run_until_parked();
+
+    let chrome = vcx.read(|cx| board_handle.read(cx).group_chrome_for_test());
+    assert_eq!(
+        chrome.len(),
+        1,
+        "exactly one group tile rendered via the store→replica path"
+    );
+    let g = &chrome[0];
+    assert_eq!(g.name, "Refactor");
+    assert_eq!(
+        g.accent,
+        gpui::rgb(0x4c8dff).into(),
+        "blue token → SSOT blue"
+    );
+    assert_eq!(g.rollup.spend_usd, Some(3.50), "spend sums members");
+    assert_eq!(g.rollup.oldest_created_at, Some(0), "oldest member wins");
+    assert_eq!(g.rollup.completed_count, 0, "✓N is 0 until B-6");
+    assert_eq!(g.header, "Refactor · ~$3.50 · 2h · ✓0");
+    assert_eq!(g.session_ids, vec![s1.clone(), s2.clone()]);
+
+    let built = vcx.read(|cx| board_handle.read(cx).visible_session_ids_for_test());
+    assert!(built.contains(&s1) && built.contains(&s2), "members built");
+    drop(dir);
+}
+
+// I5 (design §7 freshness): after mount, a member's cost change must refresh the group
+// rollup. Also proves the I2 narrow projection reads LIVE member data (not a stale snapshot)
+// and that the member-notify → board re-render dependency is intact.
+#[gpui::test]
+async fn group_rollup_refreshes_on_member_cost_change(cx: &mut gpui::TestAppContext) {
+    use gpui::{Size, px};
+    use lens_core::domain::board::{DEFAULT_BOARD_ID, PlacementTarget};
+    use lens_core::domain::ids::{BoardId, ConnectionId};
+    use lens_core::persist::{BoardStore, SqliteBoardStore};
+
+    let clock = Arc::new(ManualUiClock::new(7_200_000));
+    let s1 = SessionId::new("s1");
+    let s2 = SessionId::new("s2");
+    let conn = ConnectionId::new("c");
+
+    let (fleet, c1, _c2) = cx.update(|cx| {
+        gpui_component::init(cx);
+        lens_ui::theme::install_at_startup(cx);
+        let fleet = FleetStore::new(Arc::clone(&clock) as Arc<dyn UiClock>, cx);
+        let (c1, c2) = fleet.update(cx, |f, cx| {
+            (
+                f.spawn_fake_session(s1.clone(), cx),
+                f.spawn_fake_session(s2.clone(), cx),
+            )
+        });
+        (fleet, c1, c2)
+    });
+    cx.update(|cx| {
+        c1.update(cx, |card, _| {
+            card.cumulative_cost.total_cost_usd = Some(1.50)
+        });
+        _c2.update(cx, |card, _| {
+            card.cumulative_cost.total_cost_usd = Some(2.00)
+        });
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("board.db");
+    let store = SqliteBoardStore::open(&path).unwrap();
+    let board = BoardId::new(DEFAULT_BOARD_ID);
+    let g1 = store.create_group(&board, None, 0, "G").unwrap();
+    for (i, s) in [&s1, &s2].into_iter().enumerate() {
+        store
+            .place_session(
+                &conn,
+                s,
+                &PlacementTarget {
+                    board_id: Some(board.clone()),
+                    parent_item_id: Some(g1.clone()),
+                    ordinal: Some(i as i32),
+                },
+            )
+            .unwrap();
+    }
+    let boxed: Box<dyn BoardStore + Send> = Box::new(store);
+
+    let fleet_for_window = fleet.clone();
+    let replica = cx.update(|cx| {
+        cx.new(|cx| {
+            BoardReplica::new(
+                Some(boxed),
+                path.clone(),
+                conn.clone(),
+                fleet_for_window.clone(),
+                cx,
+            )
+        })
+    });
+    cx.run_until_parked();
+
+    let (board_handle, vcx) = cx.add_window_view(|_, cx| {
+        BoardView::mount(
+            fleet_for_window,
+            replica.clone(),
+            placeholder_tab(cx),
+            None,
+            cx,
+        )
+    });
+    vcx.simulate_resize(Size {
+        width: px(1200.0),
+        height: px(900.0),
+    });
+    vcx.run_until_parked();
+
+    // Initial rollup = $1.50 + $2.00.
+    let before = vcx.read(|cx| board_handle.read(cx).group_chrome_for_test());
+    assert_eq!(before[0].rollup.spend_usd, Some(3.50), "initial rollup");
+
+    // Change a member's cost AFTER mount + notify → board (which reads the member in render)
+    // must re-render and re-fold a FRESH rollup.
+    vcx.update(|_, cx| {
+        c1.update(cx, |card, cx| {
+            card.cumulative_cost.total_cost_usd = Some(5.00);
+            cx.notify();
+        });
+    });
+    vcx.run_until_parked();
+
+    let after = vcx.read(|cx| board_handle.read(cx).group_chrome_for_test());
+    assert_eq!(
+        after[0].rollup.spend_usd,
+        Some(7.00),
+        "rollup refreshed after member cost change (5.00 + 2.00)"
+    );
+    drop(dir);
 }

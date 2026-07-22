@@ -14,9 +14,10 @@ use lens_core::domain::session::SessionState;
 #[cfg(feature = "demo")]
 use lens_core::domain::usage::Cost;
 use lens_core::persist::{
-    ConnectionRecord, ControlStore, SqliteControlStore, SqliteTranscriptStore,
+    BoardStore, ConnectionRecord, ControlStore, SqliteBoardStore, SqliteControlStore,
+    SqliteTranscriptStore,
 };
-use lens_ui::board::BoardView;
+use lens_ui::board::{BoardReplica, BoardView};
 #[cfg(feature = "demo")]
 use lens_ui::card::model::SessionCard;
 use lens_ui::clock::{UiClock, WallUiClock};
@@ -80,6 +81,12 @@ fn main() {
         }
     };
 
+    let board_db = config.data_dir.join("lens.db");
+    let mut board_store: Option<Box<dyn BoardStore + Send>> = SqliteBoardStore::open(&board_db)
+        .ok()
+        .map(|s| Box::new(s) as _);
+    let conn_id = ConnectionId::new("lens-app");
+
     Application::new()
         .with_assets(lens_ui::assets::LensAssets)
         .run(move |cx: &mut App| {
@@ -106,8 +113,24 @@ fn main() {
                         }
                     });
                 }
-                let board =
-                    cx.new(|cx| BoardView::mount(fleet.clone(), placeholder_tab(cx), None, cx));
+                let replica = cx.new(|cx| {
+                    BoardReplica::new(
+                        board_store.take(),
+                        board_db.clone(),
+                        conn_id.clone(),
+                        fleet.clone(),
+                        cx,
+                    )
+                });
+                let board = cx.new(|cx| {
+                    BoardView::mount(
+                        fleet.clone(),
+                        replica.clone(),
+                        placeholder_tab(cx),
+                        None,
+                        cx,
+                    )
+                });
                 let any: gpui::AnyView = board.into();
                 cx.new(|cx| Root::new(any, window, cx))
             })
@@ -116,14 +139,92 @@ fn main() {
         });
 }
 
+/// The preset demo session-id stems (one per wave state). MUST stay in sync with
+/// `demo_preset_cards`' ids — the group seed and the fleet cards key on the same values.
+#[cfg(feature = "demo")]
+const DEMO_BASE_IDS: [&str; 8] = [
+    "demo-needs-input",
+    "demo-ready",
+    "demo-working",
+    "demo-failed",
+    "demo-slept",
+    "demo-neutral",
+    "demo-scheduled",
+    "demo-awaiting-review",
+];
+
+/// Every demo session id that `demo_cards` will create (7 stems × `LENS_DEMO_N` replicas,
+/// same scheme: rep 0 = stem, rep>0 = `{stem}-r{rep}`).
+#[cfg(feature = "demo")]
+fn demo_session_ids() -> Vec<String> {
+    let n = std::env::var("LENS_DEMO_N")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(1);
+    let mut ids = Vec::with_capacity(DEMO_BASE_IDS.len() * n);
+    for rep in 0..n {
+        for stem in DEMO_BASE_IDS {
+            ids.push(if rep == 0 {
+                stem.to_string()
+            } else {
+                format!("{stem}-r{rep}")
+            });
+        }
+    }
+    ids
+}
+
+/// Open a temp board store and seed a "Demo group" over HALF the demo session ids (conn
+/// `lens-app`, matching the replica) so the loaded board renders B-3 group chrome — and,
+/// crucially, exercises group member-reads AT SCALE under `LENS_DEMO_N` (the other half
+/// reconciles loose; half-group/half-loose matches the criterion fixture — codex I3).
+/// Best-effort: any store failure just yields `None` → the demo board still renders loose.
+#[cfg(feature = "demo")]
+fn seed_demo_group(
+    db: &std::path::Path,
+    conn: &ConnectionId,
+) -> Option<Box<dyn BoardStore + Send>> {
+    use lens_core::domain::board::{DEFAULT_BOARD_ID, PlacementTarget};
+    use lens_core::domain::ids::{BoardId, SessionId};
+
+    let store = SqliteBoardStore::open(db).ok()?;
+    let board = BoardId::new(DEFAULT_BOARD_ID);
+    if let Ok(group) = store.create_group(&board, None, 0, "Demo group") {
+        let ids = demo_session_ids();
+        let half = (ids.len() / 2).max(1);
+        for (i, sid) in ids.iter().take(half).enumerate() {
+            let _ = store.place_session(
+                conn,
+                &SessionId::new(sid.clone()),
+                &PlacementTarget {
+                    board_id: Some(board.clone()),
+                    parent_item_id: Some(group.clone()),
+                    ordinal: Some(i as i32),
+                },
+            );
+        }
+    }
+    Some(Box::new(store) as _)
+}
+
 /// `--demo`: paint six cards in the six wave states (no live server needed) so the
 /// status language is visible at a glance. Cards carry no poller/commands — clicking
 /// one still toggles focus (and suppresses that card's glow while focused).
 #[cfg(feature = "demo")]
 fn run_demo() {
+    // A held TempDir (auto-cleaned on app exit; no PID-reuse stale data). Seed a group
+    // BEFORE Application::run (compliant — no cx.new SQLite) so B-3 group chrome renders
+    // live over two of the demo cards; the rest reconcile loose.
+    let demo_dir = tempfile::tempdir().expect("demo tempdir");
+    let demo_db = demo_dir.path().join("board.db");
+    let demo_conn = ConnectionId::new("lens-app");
+    let mut demo_store = seed_demo_group(&demo_db, &demo_conn);
+
     Application::new()
         .with_assets(lens_ui::assets::LensAssets)
-        .run(|cx: &mut App| {
+        .run(move |cx: &mut App| {
+            let _demo_dir = &demo_dir; // hold the TempDir for the app's lifetime
             gpui_component::init(cx);
             lens_ui::theme::install_at_startup(cx);
 
@@ -161,8 +262,24 @@ fn run_demo() {
                     }
                     cx.notify();
                 });
-                let board =
-                    cx.new(|cx| BoardView::mount(fleet.clone(), placeholder_tab(cx), None, cx));
+                let replica = cx.new(|cx| {
+                    BoardReplica::new(
+                        demo_store.take(),
+                        demo_db.clone(),
+                        demo_conn.clone(),
+                        fleet.clone(),
+                        cx,
+                    )
+                });
+                let board = cx.new(|cx| {
+                    BoardView::mount(
+                        fleet.clone(),
+                        replica.clone(),
+                        placeholder_tab(cx),
+                        None,
+                        cx,
+                    )
+                });
                 let card_views = board.read(cx).card_views_for_test().clone();
                 lens_ui::card::spawn_demo_paint_instrumentation(&card_views, cx);
                 let any: gpui::AnyView = board.into();

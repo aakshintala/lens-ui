@@ -33,6 +33,12 @@ pub struct SessionCardView {
     anim_task: Option<gpui::Task<()>>,
     /// Last-started driver interval; respawn when the wave's cadence class changes.
     anim_interval: Option<Duration>,
+    /// Container-driven visibility gate (replaces the paint-time `last_bounds`
+    /// gate). Init HIDDEN — the board container is the sole visibility authority
+    /// and flips truly-visible cards on via `set_visible` (spec §4 unknown 3). If
+    /// this init'd `true`, the first `set_visible(true)` would early-return and the
+    /// anim timer would never spawn.
+    visible: bool,
     pub render_count: Rc<Cell<usize>>,
     pub paint_count: Rc<Cell<usize>>,
     pub last_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
@@ -56,24 +62,38 @@ impl SessionCardView {
             kebab_open: false,
             anim_task: None,
             anim_interval: None,
+            visible: false,
             render_count: Rc::new(Cell::new(0)),
             paint_count: Rc::new(Cell::new(0)),
             last_bounds: Rc::new(Cell::new(None)),
         }
     }
 
-    /// Clear the paint-time viewport gate so the next render re-evaluates visibility as
-    /// first-frame (`visible = true`) and respawns the anim driver if the wave animates.
-    ///
-    /// The gate reads `last_bounds`, which is written at *paint* time (after render, with
-    /// no notify). When a card is re-shown after being off-screen — e.g. returning to the
-    /// board from focused mode, where it sat off-screen in the shrunk rail — its stale
-    /// off-screen `last_bounds` makes the single re-entry render read `visible = false` and
-    /// never respawn the dropped timer → frozen spinner/pulse. The board resets the gate on
-    /// the focus→board edge (see `board::mod`) so recovery is immediate and needs no
-    /// paint-time notify (which would break gpui's render/paint separation).
-    pub fn invalidate_viewport_gate(&self) {
-        self.last_bounds.set(None);
+    /// Container calls this (via `cx.defer`, off its own render path) when a tile
+    /// enters/leaves the visible band. On HIDE we drop the anim driver directly —
+    /// a culled card is absent from the element tree and its `render` won't run to
+    /// drop it, and `anim_interval` must reset so the render guard re-spawns on
+    /// return. On SHOW we just notify; the card is now in the tree, so its render
+    /// runs and spawns the driver if the wave animates.
+    pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if visible == self.visible {
+            return;
+        }
+        self.visible = visible;
+        if !visible {
+            self.anim_task = None;
+            self.anim_interval = None;
+        }
+        cx.notify();
+    }
+
+    pub fn is_visible(&self) -> bool {
+        self.visible
+    }
+
+    /// Test hook: is the anim driver live?
+    pub fn timer_running_for_test(&self) -> bool {
+        self.anim_task.is_some()
     }
 
     fn send_command(&self, cmd: SessionCommand, cx: &mut Context<Self>) {
@@ -84,7 +104,7 @@ impl SessionCardView {
 }
 
 impl Render for SessionCardView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.render_count.set(self.render_count.get() + 1);
         let card = self.card.read(cx);
         let now_ms = self.clock.now_millis();
@@ -92,16 +112,8 @@ impl Render for SessionCardView {
         let kebab_open = self.kebab_open;
         let paint_count = self.paint_count.clone();
         let last_bounds = self.last_bounds.clone();
-        // Viewport gate: gpui does not auto-cull off-screen Div children, so an off-screen
-        // card's timer would keep re-rendering it. Only animate while visible. First frame
-        // (no bounds yet) counts as visible; it self-corrects next frame.
-        let visible = match self.last_bounds.get() {
-            Some(b) => {
-                let viewport = gpui::Bounds::new(gpui::Point::default(), window.viewport_size());
-                b.intersects(&viewport)
-            }
-            None => true,
-        };
+        // Visibility is container-driven (spec §4 unknown 3), not paint-time.
+        let visible = self.visible;
         let desired = anim_tick_for(wave).filter(|_| visible);
         if desired != self.anim_interval {
             self.anim_task = None; // drop cancels the old timer
@@ -365,13 +377,15 @@ mod tests {
         });
 
         vcx.run_until_parked();
+        let after_first = (rc_a.get(), rc_b.get());
+        assert_eq!(after_first, (1, 1), "initial mount renders both tiles once");
+
+        vcx.update(|_, cx| {
+            view_a.update(cx, |v, cx| v.set_visible(true, cx));
+        });
+        vcx.run_until_parked();
         let baseline_a = rc_a.get();
         let baseline_b = rc_b.get();
-        assert_eq!(
-            (baseline_a, baseline_b),
-            (1, 1),
-            "initial mount renders both tiles once"
-        );
 
         for _ in 0..5 {
             vcx.executor().advance_clock(Duration::from_millis(40));
@@ -420,6 +434,10 @@ mod tests {
 
         vcx.run_until_parked();
         assert_eq!(rc.get(), 1, "initial mount");
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| v.set_visible(true, cx));
+        });
+        vcx.run_until_parked();
 
         // 1 Hz Scheduled driver: one extra render per second.
         vcx.executor().advance_clock(Duration::from_millis(1000));
@@ -453,5 +471,52 @@ mod tests {
              after_1hz={after_1hz}, after_transition={after_transition}, after_fast={after_fast})"
         );
         let _ = view;
+    }
+
+    /// The residual guard (B-4a): the container drops a culled tile from the child vec,
+    /// but the tile's self-notify timer is a *background task* that would keep firing
+    /// off-screen unless `set_visible(false)` cancels it. Prove the full transition —
+    /// hidden→no-timer, visible→timer, hidden-again→timer-dropped — for an animating card.
+    #[gpui::test]
+    async fn hidden_animating_card_holds_no_timer(cx: &mut gpui::TestAppContext) {
+        use lens_core::domain::scalars::SessionStatusValue;
+
+        let clock = Arc::new(crate::clock::ManualUiClock::new(0));
+        let sid = SessionId::new("animating");
+
+        let view = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::install_at_startup(cx);
+            let fleet = FleetStore::new(clock, cx);
+            let card = fleet.update(cx, |f, cx| f.spawn_fake_session(sid.clone(), cx));
+            card.update(cx, |c, _| c.status = SessionStatusValue::Running); // Working → animates
+            let ui_clock = fleet.read(cx).clock();
+            cx.new(|cx| SessionCardView::new(card, ui_clock, fleet.clone(), sid.clone(), cx))
+        });
+
+        let (_board, vcx) = cx.add_window_view(|_, _| SingleCardBoard { view: view.clone() });
+        vcx.run_until_parked();
+
+        // Cards init HIDDEN: an animating wave must NOT spawn a timer while off-screen.
+        assert!(
+            !view.read_with(vcx, |v, _| v.timer_running_for_test()),
+            "off-screen animating card must not run a timer"
+        );
+
+        // Enter the band → timer spawns.
+        vcx.update(|_, cx| view.update(cx, |v, cx| v.set_visible(true, cx)));
+        vcx.run_until_parked();
+        assert!(
+            view.read_with(vcx, |v, _| v.timer_running_for_test()),
+            "visible animating card must run its anim timer"
+        );
+
+        // Leave the band (culled) → timer dropped (no off-screen wakeups).
+        vcx.update(|_, cx| view.update(cx, |v, cx| v.set_visible(false, cx)));
+        vcx.run_until_parked();
+        assert!(
+            !view.read_with(vcx, |v, _| v.timer_running_for_test()),
+            "culled animating card must DROP its anim timer"
+        );
     }
 }

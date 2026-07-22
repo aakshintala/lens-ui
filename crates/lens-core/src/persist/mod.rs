@@ -39,6 +39,18 @@ pub enum PersistError {
     Board(#[from] BoardError),
 }
 
+impl PersistError {
+    pub fn is_transient(&self) -> bool {
+        match self {
+            PersistError::Sqlite(rusqlite::Error::SqliteFailure(e, _)) => matches!(
+                e.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            ),
+            _ => false,
+        }
+    }
+}
+
 /// How a file was opened after the schema-version gate (§6.3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StoreMode {
@@ -193,4 +205,19 @@ pub trait TranscriptStore {
         store_item: &Item,
         live_key: &LiveKey,
     ) -> Result<ReconcileOutcome>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PersistError;
+
+    #[test]
+    fn persist_error_is_transient_for_busy_locked() {
+        let busy = PersistError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(5 /* SQLITE_BUSY */),
+            None,
+        ));
+        assert!(busy.is_transient());
+        assert!(!PersistError::ReadOnly.is_transient());
+    }
 }

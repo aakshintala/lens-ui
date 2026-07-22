@@ -7,8 +7,7 @@ use crate::domain::{
 };
 use crate::reduce::items;
 use crate::reduce::reconcile::{ReconcileSignal, reconcile_pending_user};
-use crate::reduce::scratch::take_open_acc_ids;
-use crate::reduce::{RetireDisposition, StreamUpdate, Updates};
+use crate::reduce::{StreamUpdate, Updates};
 use lens_client::stream::event::TodoItemStatus;
 use lens_client::stream::{ResponseEvent, SessionEvent, SessionStatusValue as WireStatus};
 use smallvec::smallvec;
@@ -211,6 +210,9 @@ pub(crate) fn fold_response_marker(
     ev: &ResponseEvent,
 ) -> Option<Updates> {
     Some(match ev {
+        // T-0: liveness marker AND active-response tracking. The wire `response_id`
+        // (nullable) becomes `state.active_response`; terminal completions clear it in
+        // `reduce` (see the Completed/Incomplete/Cancelled/Failed arms).
         ResponseEvent::InProgress { response_id } => {
             let active = ResponseId::from_wire(response_id.as_deref());
             state.active_response = active.clone();
@@ -218,21 +220,6 @@ pub(crate) fn fold_response_marker(
                 StreamUpdate::StatusChanged(state.status),
                 StreamUpdate::ActiveResponseChanged(active),
             ]
-        }
-        ResponseEvent::Failed | ResponseEvent::Incomplete | ResponseEvent::Cancelled => {
-            state.active_response = None;
-            let mut u: Updates = smallvec![StreamUpdate::ActiveResponseChanged(None)];
-            for acc_id in take_open_acc_ids(&mut state.stream) {
-                u.push(StreamUpdate::Retired {
-                    acc_id,
-                    disposition: RetireDisposition::Discarded,
-                });
-            }
-            if !state.stream.unpaired_calls.is_empty() {
-                state.stream.unpaired_calls.clear();
-            }
-            u.push(StreamUpdate::ScratchChanged(Arc::new(state.stream.clone())));
-            u
         }
         ResponseEvent::CompactionInProgress | ResponseEvent::CompactionFailed => smallvec![],
         // 0.5.0 addition: a native policy DENY was surfaced. Observational, no state-model
@@ -280,9 +267,14 @@ pub(crate) fn fold_response_marker(
                 state.pending_elicitations.clone()
             )]
         }
-        // item-producing / scratch-finalizing arms handled in Task 7/8:
+        // item-producing / scratch-routing arms handled in `reduce`. The terminal
+        // completions discard open scratch there; Incomplete/Cancelled also bump the Ready
+        // counter, Failed does not (surfaced via Wave::Failed) — see the match arms.
         ResponseEvent::OutputItemDone { .. }
         | ResponseEvent::Completed
+        | ResponseEvent::Failed
+        | ResponseEvent::Incomplete
+        | ResponseEvent::Cancelled
         | ResponseEvent::ReasoningClosed { .. }
         | ResponseEvent::CompactionCompleted { .. }
         | ResponseEvent::OutputTextDelta { .. }

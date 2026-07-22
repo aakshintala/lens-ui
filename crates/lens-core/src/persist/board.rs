@@ -29,6 +29,16 @@ pub trait BoardStore {
 
     fn remove_session(&self, conn: &ConnectionId, session: &SessionId) -> Result<()>;
 
+    /// Batch placement (§3.3): place each non-tombstoned, not-already-present session,
+    /// persisting each touched board ONCE inside ONE transaction (one persist vs k).
+    /// Tombstoned/duplicate entries are skipped. Callers re-read via `load_layout` for
+    /// the reconciled view (read-time lazy-place + tombstone-prune).
+    fn place_sessions(
+        &self,
+        placements: &[(ConnectionId, SessionId)],
+        target: &PlacementTarget,
+    ) -> Result<()>;
+
     fn create_group(
         &self,
         board_id: &BoardId,
@@ -464,6 +474,57 @@ impl BoardStore for SqliteBoardStore {
         let tx = self.conn.unchecked_transaction()?;
         self.persist_board_items(&layout, &board_id)?;
         self.touch_board(&board_id)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn place_sessions(
+        &self,
+        placements: &[(ConnectionId, SessionId)],
+        target: &PlacementTarget,
+    ) -> Result<()> {
+        self.guard_write()?;
+        let mut loaded = self.load_layout_inner()?;
+        let mut layout = loaded.rows.pop().unwrap_or_default();
+        if layout.boards.is_empty() {
+            self.ensure_default_board()?;
+            layout.boards = self.load_boards()?.rows;
+        }
+        let mut touched: std::collections::HashSet<BoardId> = std::collections::HashSet::new();
+        for (conn, session) in placements {
+            if self.is_tombstoned(conn, session)? {
+                continue;
+            }
+            if layout.find_card(conn, session).is_some() {
+                continue;
+            }
+            let item_id = self.new_item_id("card");
+            let created_at = self.now_ms();
+            layout.place_session(
+                conn.clone(),
+                session.clone(),
+                target,
+                item_id.clone(),
+                created_at,
+            )?;
+            // Typed (not .expect): place_sessions runs on the board replica's async
+            // pump — a panic there never resolves its Task and wedges the pump forever
+            // (M10). A regression in place_session surfaces as Err → OpOutcome::Failed.
+            let board_id = layout
+                .item(&item_id)
+                .ok_or(BoardError::ItemNotFound)?
+                .board_id
+                .clone();
+            touched.insert(board_id);
+        }
+        if touched.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        for board_id in &touched {
+            self.persist_board_items(&layout, board_id)?;
+            self.touch_board(board_id)?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -1100,6 +1161,163 @@ CREATE TABLE IF NOT EXISTS cost_samples (
             .query_row("SELECT COUNT(*) FROM board_items", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0, "no card created for a tombstoned session");
+    }
+
+    fn tombstone_session(store: &SqliteBoardStore, conn: &ConnectionId, session: &SessionId) {
+        let path = store.conn.path().expect("db path");
+        let control = SqliteControlStore::open(Path::new(path)).unwrap();
+        seed_session(&control, conn.as_str(), session.as_str());
+        control
+            .conn
+            .execute(
+                &format!(
+                    "UPDATE sessions SET tombstoned_at = 1 WHERE connection_id = '{}' AND id = '{}'",
+                    conn.as_str(),
+                    session.as_str()
+                ),
+                [],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn place_sessions_batch_places_all_in_one_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteBoardStore::open(&dir.path().join("lens.db")).unwrap();
+        let conn = ConnectionId::new("c1");
+        let target = PlacementTarget {
+            board_id: None,
+            parent_item_id: None,
+            ordinal: None,
+        };
+        store
+            .place_sessions(
+                &[
+                    (conn.clone(), SessionId::new("s1")),
+                    (conn.clone(), SessionId::new("s2")),
+                    (conn.clone(), SessionId::new("s3")),
+                ],
+                &target,
+            )
+            .unwrap();
+
+        let layout = store
+            .load_layout()
+            .unwrap()
+            .rows
+            .into_iter()
+            .next()
+            .unwrap();
+        let cards: Vec<_> = layout
+            .items
+            .iter()
+            .filter_map(|i| match &i.kind {
+                BoardItemKind::Card { session, .. } => Some(session.as_str().to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cards.len(), 3);
+        assert!(
+            ["s1", "s2", "s3"]
+                .iter()
+                .all(|s| cards.iter().any(|c| c == s))
+        );
+    }
+
+    // Load-bearing for the batch's CENTRAL purpose (one persist per touched board vs k).
+    // `persist_board_items` upserts every item on the board, so ONE batched persist of k
+    // new cards writes k times; a naive per-session loop (k separate persists) re-writes the
+    // accumulating set 1+2+…+k times. A temp trigger counting board_items writes distinguishes
+    // them: this test FAILS if place_sessions regresses to a per-session persist loop.
+    #[test]
+    fn place_sessions_batch_persists_each_board_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteBoardStore::open(&dir.path().join("lens.db")).unwrap();
+        store
+            .conn
+            .execute_batch(
+                "CREATE TEMP TABLE _wc (n INTEGER NOT NULL);
+                 INSERT INTO _wc VALUES (0);
+                 CREATE TEMP TRIGGER _wc_ins AFTER INSERT ON board_items BEGIN UPDATE _wc SET n = n + 1; END;
+                 CREATE TEMP TRIGGER _wc_upd AFTER UPDATE ON board_items BEGIN UPDATE _wc SET n = n + 1; END;",
+            )
+            .unwrap();
+        let conn = ConnectionId::new("c1");
+        let target = PlacementTarget {
+            board_id: None,
+            parent_item_id: None,
+            ordinal: None,
+        };
+        store
+            .place_sessions(
+                &[
+                    (conn.clone(), SessionId::new("s1")),
+                    (conn.clone(), SessionId::new("s2")),
+                    (conn.clone(), SessionId::new("s3")),
+                ],
+                &target,
+            )
+            .unwrap();
+        let writes: i64 = store
+            .conn
+            .query_row("SELECT n FROM _wc", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            writes, 3,
+            "one persist of 3 new cards = 3 board_items writes; a per-session loop would be 1+2+3=6"
+        );
+    }
+
+    #[test]
+    fn place_sessions_skips_tombstoned_and_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteBoardStore::open(&dir.path().join("lens.db")).unwrap();
+        let conn = ConnectionId::new("c1");
+        let target = PlacementTarget {
+            board_id: None,
+            parent_item_id: None,
+            ordinal: None,
+        };
+        store
+            .place_session(&conn, &SessionId::new("s1"), &target)
+            .unwrap();
+        tombstone_session(&store, &conn, &SessionId::new("s2"));
+
+        store
+            .place_sessions(
+                &[
+                    (conn.clone(), SessionId::new("s1")),
+                    (conn.clone(), SessionId::new("s2")),
+                    (conn.clone(), SessionId::new("s3")),
+                ],
+                &target,
+            )
+            .unwrap();
+
+        // Read the RAW persisted rows (load_layout_inner does NOT reconcile). Reading via
+        // load_layout() would prune tombstoned cards itself, masking whether the BATCH
+        // skipped s2 — this asserts the batch's own tombstone check (board.rs place_sessions).
+        let layout = store
+            .load_layout_inner()
+            .unwrap()
+            .rows
+            .into_iter()
+            .next()
+            .unwrap();
+        let mut cards: Vec<String> = layout
+            .items
+            .iter()
+            .filter_map(|i| match &i.kind {
+                BoardItemKind::Card { session, .. } => Some(session.as_str().to_string()),
+                _ => None,
+            })
+            .collect();
+        cards.sort();
+        assert_eq!(
+            cards,
+            vec!["s1".to_string(), "s3".to_string()],
+            "batch places s1 (dup no-op) + s3; tombstoned s2 skipped by the batch, not by load reconcile"
+        );
     }
 
     // Regression for the high-water-mark seed: after delete+reopen, a freshly minted

@@ -90,13 +90,43 @@ executor is the implementation.
 
 ### 2.2 Terminal widget
 
-`alacritty_terminal` (Zed's fork) + `portable-pty`. Bytes → bump a
-`generation` counter → on render walk the grid → shape text (cached) → paint
-quads+runs in a `canvas()` element. Arbor's `arbor-terminal-emulator/` is
-the template (MIT — copyable into Lens with attribution).
+**Resolved 2026-07-14:** Ghostty VT, through a narrow audited port of the
+Apache-2.0 `gpui-ghostty` terminal implementation — **not**
+`alacritty_terminal`/`portable-pty`. Ghostty owns VT parsing, terminal state,
+input encoding, scrollback, and damage tracking; GPUI owns the native Canvas
+renderer. The omnigent server owns the PTY, so Lens needs an authenticated
+terminal WS attach client rather than a local PTY.
 
-Lens's terminal surface (workspace doc §9) uses this pattern. The ring
-buffer (workspace doc §9.2) is a Lens-local addition layered on top.
+The port is Lens-owned, deliberately narrow, and provenance-pinned; it is not
+a Git subtree or an independent terminal workspace. Before code enters Lens,
+the terminal adoption audit records the exact `gpui-ghostty`/Ghostty/GPUI/Zig
+inputs, licenses, FFI safety, version delta, and each module's
+adopt/adapt/exclude disposition. The GPUI tab renders only coalesced immutable
+engine updates: terminal byte processing, I/O, and lock waits never run on the
+foreground thread.
+
+**Audit result:** the candidate `gpui-ghostty` revision is
+`e3025981c6211dd7db2a825dc364ffb5d342f45e`, with Ghostty submodule
+`6d2dd585a5d87fa745d48188dd096ca6e63014d0`. Its bridge exposes no image state
+through the Zig/C/Rust seam and its GPUI renderer paints text/quads only, so
+inline graphics are deferred. Unsupported APC/DCS sequences are consumed with
+strict bounds and no per-byte log storm; unsupported Unicode image-placeholder
+clusters render blank. Kitty graphics/Unicode placement is the sole future
+parity candidate; Sixel and OSC 1337 remain excluded.
+
+The retained Lens-local state is one bounded Ghostty engine, not a separate raw
+byte ring. Lens requests omnigent `transport=pty`; the server's default control
+transport captures tmux history for xterm.js and could duplicate history if
+fed into the retained engine. The engine preserves screen, selection, cursor,
+and provisional 10 MB (10,000,000-byte) scrollback across brief reconnects, but
+cannot restore output the server did not replay. Deliberate Sleep releases the
+engine and full history, retaining only an immutable final viewport.
+
+The port ships layer-specific release benchmarks for terminal WS codec/queue,
+Ghostty parse/damage/reflow, and GPUI frame timing. Its transport, engine, and
+render layers each implement the gated typed `Inspect` snapshot plus a
+fixed-capacity state-transition diagnostic ring, with no hot-path recording or
+snapshot cost while inspection is disabled.
 
 ### 2.3 Diff widget
 
@@ -400,7 +430,7 @@ Each spec has a "framework divergence" section. What each one owns vs. here:
 | state model §14 | State primitive (gpui `Entity::observe` vs alternative store); the channel→UI crossing (`cx.spawn` + entity update) | gpui's per-entity notify + `cx.spawn` is the foreground replica implementation |
 | application shell §17 | The board (ordinal-slot responsive reflow vs a free-form canvas) | §2.4 of this doc — confirmed ordinal board is *simpler*, not harder, in gpui |
 | transcript §19 | Progressive re-render (stable-identity in-place diff); markdown library; virtualization | §4.1 markdown spike; **virtualization SPIKED 2026-07-08 → native gpui `list()`** (variable-height, `ListAlignment::Bottom`) satisfies all four §16 contracts — `uniform_list` was the wrong primitive, `list()` is the right one (§4.1c/d verdict) |
-| workspace §9 | Terminal widget | §2.2 — `alacritty_terminal` + `portable-pty`, Arbor template (MIT) |
+| workspace §9 | Terminal widget | §2.2 — audited narrow Ghostty-VT/GPUI port, omnigent WS attach, and Lens-owned reconnect state |
 | workspace §4 | Diff widget | §2.3 — `imara-diff` + `syntect` cached, Arbor template (MIT) |
 | workspace §3 / shell §8.5 | File-tab editing (data + container) | §4.4 — editable code surface, **top of band 2b** (highlight/find-replace/multi-cursor/fold; no LSP — blocked by omnigent's no-LSP-proxy contract); vendor-and-patch `gpui-component` code input, in-repo |
 | permissions | (form renderer uses gpui-component inputs; a bounded flat-primitive schema→inputs mapper + structured-payload cards) | §4.3 form spike **SPIKED 2026-07-08 → GO** (6/6) — runtime schema→`gpui-component` inputs → valid flat `ElicitationResult.content`; discriminated surface, not an arbitrary renderer |

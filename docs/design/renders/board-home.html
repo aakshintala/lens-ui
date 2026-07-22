@@ -13,18 +13,17 @@
   }
   *{box-sizing:border-box}
   html,body{margin:0}
-  body{background:var(--bg);color:var(--tx);font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,sans-serif;-webkit-font-smoothing:antialiased}
-  .app{display:flex;min-height:840px;width:1280px}
+  body{background:var(--bg);color:var(--tx);font:13px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,sans-serif;-webkit-font-smoothing:antialiased}
   .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  .app{display:flex;height:860px;width:1360px}
 
-  .rail{width:50px;background:var(--bg);border-right:1px solid var(--line);display:flex;flex-direction:column;align-items:center;padding:10px 0;gap:6px}
+  .rail{width:50px;background:var(--bg);border-right:1px solid var(--line);display:flex;flex-direction:column;align-items:center;padding:10px 0;gap:6px;flex:none}
   .logo{width:26px;height:26px;border-radius:7px;background:linear-gradient(135deg,#4c8dff,#b08cff);margin-bottom:8px}
   .ricon{width:34px;height:34px;border-radius:8px;display:flex;align-items:center;justify-content:center;color:var(--tx2);font-size:15px;position:relative}
   .ricon.on{background:var(--bg3);color:var(--tx)}
-  .ricon .dot{position:absolute;top:4px;right:4px;min-width:14px;height:14px;padding:0 3px;border-radius:8px;background:var(--red);color:#fff;font-size:9px;font-weight:700;display:flex;align-items:center;justify-content:center}
+  .ricon .dot{position:absolute;top:3px;right:3px;min-width:14px;height:14px;padding:0 3px;border-radius:8px;background:var(--red);color:#fff;font-size:9px;font-weight:700;display:flex;align-items:center;justify-content:center}
   .spacer{flex:1}
   .avatar{width:30px;height:30px;border-radius:50%;background:radial-gradient(circle at 30% 30%,#ffd479,#e0a042);display:flex;align-items:center;justify-content:center;font-size:14px;border:2px solid #2a2f3a}
-  .health{width:9px;height:9px;border-radius:50%;background:var(--green);box-shadow:0 0 0 3px rgba(54,201,138,.15);margin-top:6px}
 
   .main{flex:1;display:flex;flex-direction:column;min-width:0}
   .topbar{height:48px;flex:none;display:flex;align-items:center;gap:14px;padding:0 22px;border-bottom:1px solid var(--line)}
@@ -34,51 +33,59 @@
   .spend .lab{font-size:9px;letter-spacing:.07em;text-transform:uppercase;color:var(--tx3);display:block;line-height:1.1}
   .spend b{font-size:13px}
 
-  .canvas{flex:1;padding:20px 24px;display:flex;flex-direction:column;gap:20px}
+  .canvas{position:relative;flex:1;overflow:auto;padding:20px 22px}
+  .stage{position:relative}
+  .tile{position:absolute}
 
-  /* group */
-  .gwrap{border:1.5px solid var(--gborder);border-radius:15px;padding:14px;background:color-mix(in srgb, var(--gborder) 9%, var(--bg));box-shadow:0 0 22px -11px var(--gborder), inset 0 0 40px -20px color-mix(in srgb,var(--gborder) 60%,transparent)}
-  .gh{display:flex;align-items:center;gap:10px;margin:2px 4px 13px}
-  .gt{font-weight:700;font-size:15px;color:var(--gborder)}
-  .gmeta{margin-left:auto;font-size:12px;color:var(--tx2)}
-  .donepill{font-size:11px;color:var(--tx2);border:1px solid var(--line2);border-radius:7px;padding:1px 9px;margin-left:10px}
-  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:13px}
-
-  /* card */
-  .card{position:relative;border:1.5px solid var(--c);border-radius:13px;overflow:hidden;background:
+  /* 280x160 card — fills body-zone, identical loose or member */
+  .card{position:relative;width:100%;height:100%;border:1.5px solid var(--c);border-radius:12px;overflow:hidden;background:
       radial-gradient(120% 130% at 0% 0%, color-mix(in srgb, var(--c) 12%, transparent), transparent 58%), var(--bg1);
-    box-shadow:0 0 22px -12px var(--c)}
-  .ctop{display:flex;gap:13px;padding:13px 15px 8px}
-  .tile{width:44px;height:44px;flex:none;border-radius:11px;display:flex;align-items:center;justify-content:center;font-size:19px;color:var(--c);background:color-mix(in srgb, var(--c) 14%, var(--bg2));border:1px solid color-mix(in srgb, var(--c) 30%, transparent)}
+    box-shadow:0 0 20px -13px var(--c);display:flex;flex-direction:column}
+  .ctop{display:flex;gap:10px;padding:11px 13px 6px}
+  .itile{width:34px;height:34px;flex:none;border-radius:9px;display:flex;align-items:center;justify-content:center;font-size:16px;color:var(--c);background:color-mix(in srgb, var(--c) 14%, var(--bg2));border:1px solid color-mix(in srgb, var(--c) 30%, transparent)}
   .cmeta{min-width:0;flex:1}
-  .stat{font-size:10px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;color:var(--c)}
-  .ttl{font-size:16px;font-weight:700;color:var(--tx);margin:2px 0 1px;letter-spacing:-.01em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .model{font-size:12px;color:var(--tx2);display:flex;align-items:center;gap:6px}
-  .tuib{font-size:8px;font-weight:700;letter-spacing:.04em;border:1px solid var(--line2);border-radius:3px;padding:0 3px;color:var(--tx3)}
+  .stat{font-size:9px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;color:var(--c)}
+  .ttl{font-size:14px;font-weight:700;color:var(--tx);margin:1px 0 0;letter-spacing:-.01em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .model{font-size:11px;color:var(--tx2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .cact{margin-left:auto;align-self:flex-start}
-  .wake{font-size:11px;color:var(--tx);border:1px solid var(--line2);border-radius:8px;padding:4px 11px}
-
-  .actline{padding:0 15px 6px;font-size:12.5px;color:var(--tx);display:flex;align-items:center;gap:6px;min-height:14px}
-  .actline.attn{color:#ffc59a}
-  .actline.err{color:#ff9d9d}
-  .actline.sub{color:var(--blue)}
-
-  .rows{padding:0 15px 4px;display:flex;flex-direction:column;gap:2px}
-  .row{display:flex;align-items:center;gap:7px;font-size:12.5px;white-space:nowrap;overflow:hidden}
-  .ic{color:var(--tx3);flex:none}
-  .repo{color:var(--tx);flex:none}
-  .br{color:var(--brc,var(--purple));overflow:hidden;text-overflow:ellipsis}
-  .foot{display:flex;align-items:center;gap:9px;padding:8px 15px 11px}
-  .hostpill{font-size:11px;color:var(--tx);background:var(--bg3);border:1px solid var(--line2);border-radius:7px;padding:2px 8px}
-  .cost{color:var(--tx2);font-size:12px}
-  .pct{margin-left:auto;font-size:12px;color:var(--tx);font-weight:600}
-  .pbar{height:4px;background:rgba(255,255,255,.06)}
+  .wake{font-size:10px;color:var(--tx);border:1px solid var(--line2);border-radius:7px;padding:3px 9px}
+  .actline{padding:0 13px 4px;font-size:11.5px;color:var(--tx);display:flex;align-items:center;gap:6px;min-height:14px}
+  .actline.attn{color:#ffc59a} .actline.err{color:#ff9d9d} .actline.sub{color:var(--blue)}
+  .arow{padding:0 13px 4px;font-size:11.5px;color:var(--tx2);display:flex;align-items:center;gap:6px;white-space:nowrap;overflow:hidden}
+  .arow .br{color:var(--brc,var(--purple));overflow:hidden;text-overflow:ellipsis}
+  .foot{margin-top:auto;display:flex;align-items:center;gap:9px;padding:7px 13px 9px}
+  .hostpill{font-size:10px;color:var(--tx);background:var(--bg3);border:1px solid var(--line2);border-radius:6px;padding:2px 7px}
+  .cost{color:var(--tx2);font-size:11px} .pct{margin-left:auto;font-size:11px;color:var(--tx);font-weight:600}
+  .pbar{height:3px;background:rgba(255,255,255,.06);position:absolute;bottom:0;left:0;right:0}
   .pbar i{display:block;height:100%;background:var(--c)}
-  .dim{opacity:.5}
-  .dim.card{box-shadow:none}
+  .card.dim{opacity:.55;box-shadow:none}
+
+  /* group ring in the gap; header sits in the top cell's own lane (no bleed into neighbors) */
+  .grp{position:absolute;inset:0;border-radius:15px;border:1.5px solid var(--gc);
+    background:color-mix(in srgb, var(--gc) 7%, transparent);
+    box-shadow:0 0 24px -14px var(--gc), inset 0 0 55px -26px color-mix(in srgb,var(--gc) 50%,transparent)}
+  .gh{position:absolute;left:0;right:0;top:var(--inset);height:var(--ghead);display:flex;align-items:center;gap:8px;padding:0 13px}
+  .gdot{width:8px;height:8px;border-radius:50%;background:var(--gc)}
+  .gt{font-weight:700;font-size:12.5px;color:var(--gc)}
+  .gmeta{margin-left:auto;font-size:10.5px;color:var(--tx2)}
+  .gcount{font-size:9.5px;color:var(--tx2);border:1px solid var(--line2);border-radius:6px;padding:0 6px}
+  .gcaret{font-size:10px;color:var(--tx3);margin-left:2px}
+  .member{position:absolute}
 </style>
 </head>
 <body>
+<!--
+  Board / home — model B (groups-as-tiles) + grid-snap packing.
+  KEY GEOMETRY (see docs/specs board packing design):
+    - Uniform cell = [header-lane HEADER][card-body CARD_H][gap GAP]. CELL_H = CARD_H+HEADER+GAP.
+    - Every card (loose or group member) sits in its cell's BODY-ZONE -> everything aligns on one grid.
+    - A group's header fills only its TOP cell's lane; members occupy full cells below, so the
+      surplus header-allowance of lower rows becomes the inter-member gap == the loose-card row gap.
+      Result: zero dead space, no ring bleed into neighbors, one shared vertical rhythm.
+    - Footprint(n): n<=3 -> n x 1 (single row); n>=4 -> ceil(sqrt(n)) cols. Group ring lives in the
+      inter-tile gap (INSET) so members stay full 280x160. Packing is grid-snap first-fit (backfills holes).
+  This is a static layout mockup; the shipped card is the compact 280x160 (CARD_*_PX), not the older rich card.
+-->
 <div class="app">
   <div class="rail">
     <div class="logo"></div>
@@ -87,10 +94,8 @@
     <div class="ricon" title="Archive">🗄</div>
     <div class="ricon" title="Settings">⚙</div>
     <div class="spacer"></div>
-    <div class="avatar" title="Concierge">🎩</div>
-    <div class="health"></div>
+    <div class="avatar">🎩</div>
   </div>
-
   <div class="main">
     <div class="topbar">
       <span class="btab on">Polly</span>
@@ -101,141 +106,95 @@
         <span><span class="lab">today</span><b>$6.40</b></span>
         <span><span class="lab">7 days</span><b>$48.10</b></span>
         <span><span class="lab">30 days</span><b>$211</b></span>
-        <span class="health" style="margin:0 0 0 4px"></span>
       </div>
     </div>
-
-    <div class="canvas">
-
-      <!-- GROUP: Polly feature (blue) — 3-up grid -->
-      <div class="gwrap" style="--gborder:var(--blue)">
-        <div class="gh">
-          <span class="gt">Polly feature</span>
-          <span class="gmeta">$36.94 · 12d</span>
-          <span class="donepill">5 done</span>
-        </div>
-        <div class="grid">
-
-          <div class="card" style="--c:var(--green)">
-            <div class="ctop">
-              <div class="tile">↻</div>
-              <div class="cmeta">
-                <div class="stat">Working</div>
-                <div class="ttl">auth refactor</div>
-                <div class="model">claude-sdk · Opus 4.8</div>
-              </div>
-            </div>
-            <div class="actline">✎ Refactoring auth module</div>
-            <div class="rows"><div class="row"><span class="ic">📁</span><span class="repo">app</span><span class="ic">⑂</span><span class="br" style="--brc:var(--green)">feat/auth-refactor</span></div></div>
-            <div class="foot"><span class="hostpill mono">local</span><span class="cost">~$16.53</span><span class="pct">25%</span></div>
-            <div class="pbar"><i style="width:25%"></i></div>
-          </div>
-
-          <div class="card" style="--c:var(--orange)">
-            <div class="ctop">
-              <div class="tile">🔔</div>
-              <div class="cmeta">
-                <div class="stat">Needs input</div>
-                <div class="ttl">payments api</div>
-                <div class="model">codex-native <span class="tuib">TUI</span> · GPT-5</div>
-              </div>
-            </div>
-            <div class="actline attn">⏸ approve: prod migration</div>
-            <div class="rows">
-              <div class="row"><span class="ic">📁</span><span class="repo">payments</span><span class="ic">⑂</span><span class="br" style="--brc:var(--orange)">feat/pay</span></div>
-              <div class="row"><span class="ic">📁</span><span class="repo">payments@infra</span><span class="ic">⑂</span><span class="br" style="--brc:var(--orange)">feat/pay</span></div>
-            </div>
-            <div class="foot"><span class="hostpill mono">sandbox</span><span class="cost">~$11.10</span><span class="pct">61%</span></div>
-            <div class="pbar"><i style="width:61%"></i></div>
-          </div>
-
-          <div class="card" style="--c:var(--blue)">
-            <div class="ctop">
-              <div class="tile">✓</div>
-              <div class="cmeta">
-                <div class="stat">Ready</div>
-                <div class="ttl">db migration</div>
-                <div class="model">claude-sdk · Sonnet 4.6</div>
-              </div>
-            </div>
-            <div class="actline sub">▸ 3 children · 1 busy</div>
-            <div class="rows"><div class="row"><span class="ic">📁</span><span class="repo">runtime</span><span class="ic">⑂</span><span class="br" style="--brc:var(--blue)">feat/migrate</span></div></div>
-            <div class="foot"><span class="hostpill mono">arca</span><span class="cost">~$9.31</span><span class="pct">37%</span></div>
-            <div class="pbar"><i style="width:37%"></i></div>
-          </div>
-
-        </div>
-      </div>
-
-      <!-- GROUP: infra (orange) — 2 cards -->
-      <div class="gwrap" style="--gborder:var(--orange)">
-        <div class="gh">
-          <span class="gt">infra</span>
-          <span class="gmeta">$2.70 · 6d</span>
-        </div>
-        <div class="grid">
-
-          <div class="card" style="--c:var(--green)">
-            <div class="ctop">
-              <div class="tile">↻</div>
-              <div class="cmeta">
-                <div class="stat">Working</div>
-                <div class="ttl">log pipeline</div>
-                <div class="model">goose-native <span class="tuib">TUI</span> · Llama-4</div>
-              </div>
-            </div>
-            <div class="actline">✎ wiring otel exporter</div>
-            <div class="rows"><div class="row"><span class="ic">📁</span><span class="repo">logs</span><span class="ic">⑂</span><span class="br" style="--brc:var(--green)">feat/logs</span></div></div>
-            <div class="foot"><span class="hostpill mono">internal-dev</span><span class="cost">~$1.90</span><span class="pct">14%</span></div>
-            <div class="pbar"><i style="width:14%"></i></div>
-          </div>
-
-          <div class="card" style="--c:var(--red)">
-            <div class="ctop">
-              <div class="tile">!</div>
-              <div class="cmeta">
-                <div class="stat">Failed</div>
-                <div class="ttl">flaky e2e fix</div>
-                <div class="model">cursor · Sonnet 4.6</div>
-              </div>
-              <div class="cact"><span class="wake">Retry</span></div>
-            </div>
-            <div class="actline err">✕ tool error: timeout</div>
-            <div class="rows"><div class="row"><span class="ic">📁</span><span class="repo">app</span><span class="ic">⑂</span><span class="br" style="--brc:var(--red)">fix/e2e</span></div></div>
-            <div class="foot"><span class="hostpill mono">local</span><span class="cost">~$0.80</span><span class="pct">—</span></div>
-            <div class="pbar"><i style="width:0%"></i></div>
-          </div>
-
-        </div>
-      </div>
-
-      <!-- GROUP: scratch (gray) — 1 card, slept -->
-      <div class="gwrap" style="--gborder:var(--gray)">
-        <div class="gh">
-          <span class="gt">scratch</span>
-          <span class="gmeta">$5.50 · 3d</span>
-        </div>
-        <div class="grid">
-          <div class="card dim" style="--c:var(--gray)">
-            <div class="ctop">
-              <div class="tile">☾</div>
-              <div class="cmeta">
-                <div class="stat">Slept</div>
-                <div class="ttl">docs cleanup</div>
-                <div class="model">claude-sdk · Haiku 4.5</div>
-              </div>
-              <div class="cact"><span class="wake">Resume</span></div>
-            </div>
-            <div class="actline" style="color:var(--tx3)">reclaimed · idle 22m</div>
-            <div class="rows"><div class="row"><span class="ic">📁</span><span class="repo">app</span><span class="ic">⑂</span><span class="br" style="--brc:var(--gray)">docs</span></div></div>
-            <div class="foot"><span class="hostpill mono">local</span><span class="cost">~$5.50</span><span class="pct">28%</span></div>
-            <div class="pbar"><i style="width:28%"></i></div>
-          </div>
-        </div>
-      </div>
-
-    </div>
+    <div class="canvas"><div class="stage" id="stage"></div></div>
   </div>
 </div>
+
+<script>
+const CARD_W=280, CARD_H=160, HEADER=24, GAP=16, INSET=5;
+const CELL_W=CARD_W+GAP, CELL_H=CARD_H+HEADER+GAP;   // every cell = [header-lane][card-body][gap]
+
+function foot(n){ if(n<=3)return[n,1]; const c=Math.ceil(Math.sqrt(n)); return [c,Math.ceil(n/c)]; }
+
+function card(d){
+  const dim=d.dim?' dim':'';
+  const act=d.act?`<div class="actline ${d.actcls||''}">${d.act}</div>`:`<div class="actline"></div>`;
+  const arow=d.repo?`<div class="arow">📁 <span>${d.repo}</span> ⑂ <span class="br" style="--brc:var(--${d.c})">${d.br}</span></div>`:'';
+  const action=d.action?`<div class="cact"><span class="wake">${d.action}</span></div>`:'';
+  return `<div class="card${dim}" style="--c:var(--${d.c})">
+    <div class="ctop"><div class="itile">${d.icon}</div>
+      <div class="cmeta"><div class="stat">${d.stat}</div><div class="ttl">${d.ttl}</div><div class="model">${d.model}</div></div>${action}</div>
+    ${act}${arow}
+    <div class="foot"><span class="hostpill mono">${d.host}</span><span class="cost">${d.cost}</span><span class="pct">${d.pct||''}</span></div>
+    <div class="pbar"><i style="width:${d.pbar||0}%"></i></div></div>`;
+}
+
+const M = {
+  orch:{c:'green',icon:'↻',stat:'Working',ttl:'orchestrator',model:'claude-sdk · Opus 4.8',act:'✎ planning migration steps',host:'local',cost:'~$16.53',pct:'25%',pbar:25,repo:'app',br:'feat/board'},
+  pay:{c:'orange',icon:'🔔',stat:'Needs input',ttl:'payments api',model:'codex · GPT-5',act:'⏸ approve: prod migration',actcls:'attn',host:'sandbox',cost:'~$11.10',pct:'61%',pbar:61,repo:'payments',br:'feat/pay'},
+  db:{c:'blue',icon:'✓',stat:'Ready',ttl:'db migration',model:'claude-sdk · Sonnet 4.6',act:'▸ 3 children · 1 busy',actcls:'sub',host:'arca',cost:'~$9.31',pct:'37%',pbar:37,repo:'runtime',br:'feat/migrate'},
+  e2e:{c:'red',icon:'!',stat:'Failed',ttl:'flaky e2e fix',model:'cursor · Sonnet 4.6',act:'✕ tool error: timeout',actcls:'err',action:'Retry',host:'local',cost:'~$0.80',repo:'app',br:'fix/e2e'},
+  docs:{c:'gray',icon:'☾',stat:'Slept',ttl:'docs cleanup',model:'claude-sdk · Haiku 4.5',act:'reclaimed · idle 22m',dim:true,action:'Resume',host:'local',cost:'~$5.50',pct:'28%',pbar:28,repo:'app',br:'docs'},
+  auth:{c:'green',icon:'↻',stat:'Working',ttl:'auth refactor',model:'claude-sdk · Opus 4.8',act:'✎ refactoring auth',host:'local',cost:'~$4.2',pct:'44%',pbar:44,repo:'app',br:'feat/auth'},
+  log:{c:'green',icon:'↻',stat:'Working',ttl:'log pipeline',model:'goose · Llama-4',act:'✎ wiring otel',host:'internal',cost:'~$1.9',pct:'14%',pbar:14,repo:'logs',br:'feat/logs'},
+  idx:{c:'blue',icon:'✓',stat:'Ready',ttl:'search index',model:'claude-sdk · Sonnet 4.6',act:'',host:'arca',cost:'~$3.1',pct:'80%',pbar:80,repo:'svc',br:'idx'},
+  tests:{c:'orange',icon:'🔔',stat:'Needs input',ttl:'test harness',model:'codex · GPT-5',act:'⏸ pick fixture set',actcls:'attn',host:'sandbox',cost:'~$2.2',pct:'50%',pbar:50,repo:'app',br:'test'},
+  notes:{c:'gray',icon:'☾',stat:'Slept',ttl:'scratch notes',model:'claude-sdk · Haiku 4.5',act:'idle 1h',dim:true,action:'Resume',host:'local',cost:'~$0.4',repo:'notes',br:'main'},
+};
+const ITEMS = [
+  {kind:'card', d:M.orch},
+  {kind:'group', g:{name:'Polly feature',color:'blue',spend:'$36.94',age:'12d',done:5,members:[M.auth,M.pay,M.db,M.idx]}},   // 4 -> 2x2
+  {kind:'card', d:M.e2e},
+  {kind:'card', d:M.docs},
+  {kind:'group', g:{name:'infra',color:'orange',spend:'$2.70',age:'6d',done:1,members:[M.log,M.tests]}},                     // 2 -> 2x1
+  {kind:'card', d:M.notes},
+  {kind:'group', g:{name:'QA',color:'green',spend:'$5.50',age:'3d',done:5,members:[M.auth,M.e2e,M.tests]}},                  // 3 -> 3x1
+];
+ITEMS.forEach(it=>{ if(it.kind==='group'){ const [c,r]=foot(it.g.members.length); it.fc=c; it.fr=r; } else { it.fc=1; it.fr=1; } });
+
+function pack(cols){
+  const occ=[];
+  const free=(r,c,w,h)=>{for(let i=0;i<h;i++)for(let j=0;j<w;j++){if(c+j>=cols)return false;if(occ[r+i]&&occ[r+i][c+j])return false;}return true;};
+  const mark=(r,c,w,h)=>{for(let i=0;i<h;i++){if(!occ[r+i])occ[r+i]=[];for(let j=0;j<w;j++)occ[r+i][c+j]=true;}};
+  const out=[]; let maxR=0;
+  for(const it of ITEMS){ let done=false;
+    for(let r=0;!done;r++)for(let c=0;c+it.fc<=cols;c++){ if(free(r,c,it.fc,it.fr)){ mark(r,c,it.fc,it.fr);
+      out.push({it,gx:c,gy:r}); maxR=Math.max(maxR,r+it.fr); done=true; break; } if(done)break; } }
+  return {tiles:out,height:maxR*CELL_H-GAP};
+}
+function render(){
+  const stage=document.getElementById('stage');
+  const avail=stage.parentElement.clientWidth - 44;
+  const cols=Math.max(1,Math.floor((avail+GAP)/CELL_W));
+  const res=pack(cols);
+  stage.style.height=res.height+'px'; stage.innerHTML='';
+  for(const p of res.tiles){
+    const X=p.gx*CELL_W, Y=p.gy*CELL_H;
+    if(p.it.kind==='group'){
+      const g=p.it.g, cN=p.it.fc;
+      const memBlockW=p.it.fc*CELL_W-GAP, memBlockH=p.it.fr*CELL_H-GAP;
+      const box=document.createElement('div'); box.className='tile';
+      box.style.left=(X-INSET)+'px'; box.style.top=(Y-INSET)+'px';
+      box.style.width=(memBlockW+2*INSET)+'px'; box.style.height=(memBlockH+2*INSET)+'px';
+      let html=`<div class="grp" style="--gc:var(--${g.color});--ghead:${HEADER}px;--inset:${INSET}px">
+        <div class="gh"><span class="gdot"></span><span class="gt">${g.name}</span>
+        <span class="gmeta">${g.spend} · ${g.age}</span><span class="gcount" title="Completed → Archive">✓ ${g.done}</span><span class="gcaret">⌄</span></div>`;
+      // members occupy full cells (header-lane on top of each) -> zero dead space, shared rhythm
+      g.members.forEach((m,i)=>{ const cc=i%cN, rr=Math.floor(i/cN);
+        const mx=INSET+cc*CELL_W, my=INSET+HEADER+rr*CELL_H;
+        html+=`<div class="member" style="left:${mx}px;top:${my}px;width:${CARD_W}px;height:${CARD_H}px">${card(m)}</div>`; });
+      box.innerHTML=html+`</div>`; stage.appendChild(box);
+    } else {
+      // loose card sits in its body-zone (header-lane above left empty) -> aligns with members
+      const d=document.createElement('div'); d.className='tile';
+      d.style.left=X+'px'; d.style.top=(Y+HEADER)+'px'; d.style.width=CARD_W+'px'; d.style.height=CARD_H+'px';
+      d.innerHTML=card(p.it.d); stage.appendChild(d);
+    }
+  }
+}
+render(); window.addEventListener('resize',render);
+</script>
 </body>
 </html>

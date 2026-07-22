@@ -5,6 +5,7 @@
 pub mod actor;
 pub mod clock;
 pub mod domain;
+pub mod pack;
 pub mod persist;
 pub mod reduce;
 

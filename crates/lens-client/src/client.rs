@@ -67,6 +67,28 @@ impl Client {
         &self.http
     }
 
+    /// Offline test stub — no network I/O. Hidden from the public API surface.
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    pub fn stub_for_test() -> Self {
+        Self {
+            conn: crate::connection::Connection::new(
+                crate::ids::ConnectionId::new("test"),
+                "http://127.0.0.1:1".parse().expect("valid test url"),
+                crate::connection::Auth::None,
+            ),
+            http: reqwest::blocking::Client::new(),
+            info: crate::info::ServerInfo {
+                accounts_enabled: false,
+                login_url: None,
+                needs_setup: false,
+                databricks_features: serde_json::Value::Null,
+                managed_sandboxes_enabled: false,
+                sandbox_provider: None,
+            },
+        }
+    }
+
     /// Issue a GET expecting a JSON body, mapping status → typed errors. Internal
     /// building block for the typed REST methods. `query` pairs are appended as-is.
     pub(crate) fn get_json<T: serde::de::DeserializeOwned>(

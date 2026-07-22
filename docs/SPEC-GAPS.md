@@ -52,7 +52,7 @@ Ordering below is by "blocks shipping Lens to a second human" (roughly).
    connect your first omnigent") is unspecified.
 
 7. **Settings / preferences surface** — the STATUS "Tunables" (auto-sleep
-   threshold, poll cadence, ring-buffer size, transcript truncation tiers,
+   threshold, poll cadence, terminal scrollback/fleet-memory budgets, transcript truncation tiers,
    `cost_samples` cadence) have no UI home. Where the user sees/changes them.
    - **Known requirement — TUI-by-default global** (from the TUI-native toggle
      spec, 2026-07-13): a global preference "prefer the raw TUI when a harness
@@ -62,6 +62,18 @@ Ordering below is by "blocks shipping Lens to a second human" (roughly).
      persistence. When honored, a fresh session materialization of a TUI-native
      harness initializes to TUI (riding the same `starting TUI…` pending state)
      instead of rendered.
+   - **Known requirement — font registry** (deferred here from the terminal
+     workstream, 2026-07-16). Monospace font *selection* (terminal + chat code
+     blocks) belongs to a runtime **font registry** owned by lens-app: enumerate
+     `{system-resolvable} ∪ {optional bundled defaults} ∪ {user-supplied file}`,
+     let the user pick, hand the chosen family name down (e.g. through
+     `TerminalOpenOptions`). Until this lands, consumers use a **system monospace
+     (`Menlo`)** referenced by name — zero bundling, guaranteed on macOS, grid-
+     aligns. A `lens-fonts` bundle crate is **not** built now: without a registry
+     it has nothing to do (system fonts resolve by name for free; the spike's
+     alignment failure was a *missing* font, not the lack of a good system one).
+     Bundling a brand default (e.g. JetBrains Mono, OFL) and Nerd-Font/powerline
+     symbol fallback are decided *inside* this registry work, not before it.
 
 8. **Data lifecycle / migration** — the two-tier SQLite store has a
    schema-version degrade path, but no app-level story for data location, backup,
@@ -71,6 +83,88 @@ Ordering below is by "blocks shipping Lens to a second human" (roughly).
    the same remote omnigent: independent replicas, or any Lens-side sync? Decide
    the posture even if the answer is "independent, no sync."
 
+---
+
+## Cross-repo seams (agreements to keep in sync, not backlog)
+
+- **lens-ui ↔ lens-terminal integration seam** *(agreed 2026-07-14 during a grill
+  of the lens-ui shell-skeleton design; recorded on both sides).* Direction is
+  **lens-ui depends on lens-terminal** and *hosts* its tab — lens-ui is
+  deliberately **not** a dependency of this workstream (§ this doc, "lens-ui is
+  not a dependency"). Consequences both docs commit to:
+  - **lens-terminal exports the constructor**
+    `open(TerminalTarget, Arc<Client>, TerminalOpenOptions, cx) -> Entity<TerminalTab>`
+    and public `TerminalTarget::{Existing { session_id, terminal_id },
+    OpenOrCreate { session_id, key }}` plus
+    `AccessIntent::{Automatic, ReadOnly}`. These values leak no Ghostty or
+    transport types. `open` returns immediately in `Starting` and builds its
+    own `TerminalAttachment` asynchronously.
+  - **lens-ui owns routing and policy**: it chooses the logical target, resolves
+    `ConnectionId → Arc<Client>`, supplies access intent/preferences, calls
+    `open(...)`, and **wraps** the returned `Entity<TerminalTab>` in a lens-ui
+    `ContentTab` adapter (lens-terminal cannot implement lens-ui's `ContentTab`
+    because there is no dependency edge that way). It performs no terminal
+    REST/WS work.
+  - The host seam is one typed inbound `TerminalHostEvent` stream and one typed
+    outbound `TerminalEvent` stream. Presentation updates atomically expose
+    identity/reported title, lifecycle, effective access, and progress. Host
+    requests cover user-gesture URL opens, permissioned OSC 52 clipboard writes,
+    and background notifications. `TerminalTab::focus_handle(cx)` is direct,
+    not a callback. There is no generic `RequestClose`.
+  - Native `/clear` has no public terminal-transfer operation. `lens-ui` handles
+    public `session.superseded`, then sends the typed supersession host event so
+    the tab reattaches the same terminal under the target session. Lens never
+    calls omnigent's schema-hidden internal transfer route.
+  - lens-ui does **not** publish any attach type. An earlier lens-ui
+    `SessionAttach { …, attach: TerminalAttachCapability }` sketch was **dropped**
+    (wrong shape: no such capability exists, and it omitted `TerminalId`/access
+    mode). If the `open(...)`/target shape changes here, update lens-ui §5.2.
+
+---
+
+## Upstream contract gaps (omnigent-side asks)
+
+- **Immutable terminal generation identity** — omnigent 0.5.1 derives terminal
+  IDs from `(terminal_name, session_key)` and may recreate a few server-owned
+  terminal roles on attach while reusing that ID. It emits another live
+  `session.resource.created` and normally persists a corresponding
+  `ResourceEventData` item for reconnect discovery, but supplies no generation
+  token and persistence is best-effort. Lens preflights GET and (via the
+  Slice-4 live-stream generation guard) treats an **observed** duplicate
+  creation / delete as a replacement, but cannot prove the remaining race away.
+  Omnigent should expose an immutable generation/resource ID (or an equivalent
+  durable replacement discriminator).
+  - **Slice-4 status (2026-07-22):** the module guard correlates all *observed*
+    `session.resource.created`/`.deleted` signals correctly (delete→create =
+    adopt fresh engine; delete-alone = `ReplacementWaiting`/`Detached`). The
+    **reconnect-path** "full" guard (resource-event-history consultation on
+    preflight) is **NOT implemented** — `preflight_reconnect` only GETs
+    existence. Residual bug: a *missed* live `deleted` + a *non-`4404`* retryable
+    WS close retains the old engine → stale scrollback (active viewport stays
+    correct; `output_gap` marker shown). Bounded because the common server-side
+    teardown closes **`4404`** (`ws_bridge.py:80-83`) → clean `Detached`, no mix.
+    **Practical narrowing at Slice 5** (the `FleetStore`'s persistent host
+    session-event subscription shrinks the missed-live-delete window); **true
+    closure needs this upstream token.** Do not claim reconnect recovers it.
+    (Memory `terminal-resource-event-granularity`.)
+  - **Slice-4 whole-branch review carry → Slice-5 integration (2026-07-22):**
+    the bridge close (WS `4404`) and the host resource-signal are two views of
+    the same agent reset arriving on **independent transports**, so their
+    ordering is a race. Slice 4 fixed the *clobber* direction (a late bridge
+    close can no longer overwrite `ReplacementWaiting`/`Sleeping` —
+    `apply_bridge_event` is gated in those states). The **unfixed** direction is
+    **`4404`-first**: on an `OpenOrCreate` reset where the WS `4404` lands
+    *before* the `resource.deleted`, the tab goes `Detached(TerminalGone)` and a
+    subsequent delete→create is ignored (no re-adopt from `Detached`) → the
+    successor is not adopted. Not resolvable at the module level (a `4404` alone
+    can't distinguish reset from genuine deletion, and speculatively waiting
+    would violate the spec's "unexplained disappearance → `Detached`" for real
+    deletions). Resolve when the **real bridge↔host event model** is designed in
+    Slice 5 (FleetStore forwards resource signals + owns the WS lifecycle) —
+    e.g. an `OpenOrCreate` tab that observes a positive reset while `Detached`
+    could re-arm adoption, or the host could order/serialize the two channels.
+    In Slice-4 (deterministic demo/tests) there is no real race, so demo
+    adoption works. Do NOT claim `4404`-first adoption works in production.
 10. **Keyboard shortcuts + macOS app menu** — *surfaced 2026-07-16 during the
     theming demo (Cmd+Q dead; ⌘. was silently focus-dependent).* gpui apps get
     **no standard macOS menu/shortcuts for free**: `Cmd+Q` (quit), `Cmd+W`,
