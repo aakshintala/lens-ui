@@ -173,7 +173,22 @@ pub(crate) fn theme_dir() -> Option<PathBuf> {
 /// Startup install (fg thread, pre-window — synchronous read is allowed here). Resolves mode +
 /// external dir, loads, applies. On Err (embedded default unparseable — a build bug), print + exit 1.
 pub fn install_at_startup(cx: &mut App) {
-    let mode = select_mode(cx);
+    install_mode(select_mode(cx), cx);
+}
+
+/// Like [`install_at_startup`], but uses `default` when `LENS_THEME` is unset (an explicit
+/// `LENS_THEME=light|dark` still wins). Lets a caller pick the startup palette without
+/// mutating process env (the demo defaults to dark this way — no `unsafe` `set_var`).
+pub fn install_at_startup_with_default(default: ThemeMode, cx: &mut App) {
+    let mode = match std::env::var("LENS_THEME").ok().as_deref() {
+        Some("light") => ThemeMode::Light,
+        Some("dark") => ThemeMode::Dark,
+        _ => default,
+    };
+    install_mode(mode, cx);
+}
+
+fn install_mode(mode: ThemeMode, cx: &mut App) {
     match load_or_embedded(mode, theme_dir().as_deref()) {
         Ok(lens) => apply(lens, cx),
         Err(e) => {
