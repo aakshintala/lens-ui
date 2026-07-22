@@ -145,17 +145,22 @@ impl Render for FocusedTranscriptView {
         self.note_row_count(row_count);
 
         let list_state = self.list_state(cx);
-        let view_entity = cx.entity().clone();
+        let weak = cx.weak_entity();
         list_state.set_scroll_handler(move |event: &ListScrollEvent, _, app| {
-            view_entity.update(app, |view, _| {
-                let count = view.last_row_count;
-                let at_bottom =
-                    event.visible_range.end >= count.saturating_sub(1) && !event.is_scrolled;
-                if at_bottom {
-                    view.set_follow_mode(FollowMode::Following, count);
-                } else if event.is_scrolled {
-                    view.set_follow_mode(FollowMode::Paused, count);
-                }
+            let visible_end = event.visible_range.end;
+            let is_scrolled = event.is_scrolled;
+            let weak = weak.clone();
+            app.defer(move |app| {
+                weak.update(app, |view, _| {
+                    let count = view.last_row_count;
+                    let at_bottom = visible_end >= count.saturating_sub(1) && !is_scrolled;
+                    if at_bottom {
+                        view.set_follow_mode(FollowMode::Following, count);
+                    } else if is_scrolled {
+                        view.set_follow_mode(FollowMode::Paused, count);
+                    }
+                })
+                .ok();
             });
         });
 
