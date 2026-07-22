@@ -472,4 +472,51 @@ mod tests {
         );
         let _ = view;
     }
+
+    /// The residual guard (B-4a): the container drops a culled tile from the child vec,
+    /// but the tile's self-notify timer is a *background task* that would keep firing
+    /// off-screen unless `set_visible(false)` cancels it. Prove the full transition —
+    /// hidden→no-timer, visible→timer, hidden-again→timer-dropped — for an animating card.
+    #[gpui::test]
+    async fn hidden_animating_card_holds_no_timer(cx: &mut gpui::TestAppContext) {
+        use lens_core::domain::scalars::SessionStatusValue;
+
+        let clock = Arc::new(crate::clock::ManualUiClock::new(0));
+        let sid = SessionId::new("animating");
+
+        let view = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::install_at_startup(cx);
+            let fleet = FleetStore::new(clock, cx);
+            let card = fleet.update(cx, |f, cx| f.spawn_fake_session(sid.clone(), cx));
+            card.update(cx, |c, _| c.status = SessionStatusValue::Running); // Working → animates
+            let ui_clock = fleet.read(cx).clock();
+            cx.new(|cx| SessionCardView::new(card, ui_clock, fleet.clone(), sid.clone(), cx))
+        });
+
+        let (_board, vcx) = cx.add_window_view(|_, _| SingleCardBoard { view: view.clone() });
+        vcx.run_until_parked();
+
+        // Cards init HIDDEN: an animating wave must NOT spawn a timer while off-screen.
+        assert!(
+            !view.read_with(vcx, |v, _| v.timer_running_for_test()),
+            "off-screen animating card must not run a timer"
+        );
+
+        // Enter the band → timer spawns.
+        vcx.update(|_, cx| view.update(cx, |v, cx| v.set_visible(true, cx)));
+        vcx.run_until_parked();
+        assert!(
+            view.read_with(vcx, |v, _| v.timer_running_for_test()),
+            "visible animating card must run its anim timer"
+        );
+
+        // Leave the band (culled) → timer dropped (no off-screen wakeups).
+        vcx.update(|_, cx| view.update(cx, |v, cx| v.set_visible(false, cx)));
+        vcx.run_until_parked();
+        assert!(
+            !view.read_with(vcx, |v, _| v.timer_running_for_test()),
+            "culled animating card must DROP its anim timer"
+        );
+    }
 }

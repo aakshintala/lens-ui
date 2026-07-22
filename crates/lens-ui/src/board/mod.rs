@@ -689,6 +689,126 @@ mod tests {
         board_ok.read_with(vcx_ok, |b, cx| assert!(b.banner_text(cx).is_none()));
     }
 
+    /// B-4a residual: prove off-screen animating cards hold NO anim timer *at scale*.
+    /// The drop mechanism (`set_visible(false)` cancels the task) is unit-tested in
+    /// `card::view`; this is the end-to-end container proof — that the band-culling gate
+    /// actually flips the culled tiles hidden, so the live-timer set equals the visible
+    /// band EXACTLY (no off-screen wakeups, no on-screen misses) across a scroll.
+    #[gpui::test]
+    async fn culled_animating_cards_hold_no_timer_at_scale(cx: &mut gpui::TestAppContext) {
+        use lens_core::domain::scalars::SessionStatusValue;
+
+        // ≫ one 1920×1080 test-window band (~7 rows × 6 cols ≈ 42 tiles) → most are culled.
+        const N: usize = 150;
+
+        let clock = Arc::new(ManualUiClock::new(10_000)) as Arc<dyn UiClock>;
+        let (fleet, replica) = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::install_at_startup(cx);
+            let fleet = FleetStore::new(clock, cx);
+            fleet.update(cx, |f, cx| {
+                for i in 0..N {
+                    // zero-padded id → deterministic sorted ordinals (row-major placement).
+                    let sid = SessionId::new(format!("s{i:03}"));
+                    let card = f.spawn_fake_session(sid, cx);
+                    card.update(cx, |c, _| c.status = SessionStatusValue::Running); // animates
+                }
+            });
+            let replica = cx.new(|cx| BoardReplica::for_test(fleet.clone(), cx));
+            (fleet, replica)
+        });
+        cx.run_until_parked(); // Load + reconcile places all N under conn_test.
+
+        let (board, vcx) = cx.add_window_view(|_, cx| {
+            BoardView::mount(
+                fleet.clone(),
+                replica.clone(),
+                placeholder_tab(cx),
+                None,
+                cx,
+            )
+        });
+        vcx.run_until_parked();
+
+        // (visible band, cards whose anim task is live) — one read of the settled frame.
+        fn snapshot(
+            board: &Entity<BoardView>,
+            cx: &mut gpui::VisualTestContext,
+        ) -> (HashSet<SessionId>, HashSet<SessionId>) {
+            board.read_with(cx, |b, app| {
+                let visible: HashSet<SessionId> =
+                    b.visible_session_ids_for_test().into_iter().collect();
+                let running: HashSet<SessionId> = b
+                    .card_views_for_test()
+                    .iter()
+                    .filter(|(_, v)| v.read(app).timer_running_for_test())
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                (visible, running)
+            })
+        }
+
+        let (v0, running0) = snapshot(&board, vcx);
+        assert!(!v0.is_empty(), "some tiles must be in the visible band");
+        assert!(
+            v0.len() < N,
+            "at scale most tiles must be culled (visible={} of {N})",
+            v0.len()
+        );
+        // THE RESIDUAL: every Running card animates, so the live-timer set must equal the
+        // visible set EXACTLY — no more (off-screen wakeups), no fewer (on-screen misses).
+        assert_eq!(
+            running0, v0,
+            "anim timers must be exactly the in-band cards; off-screen ones hold none"
+        );
+
+        // Scroll deep so a disjoint band shows: top rows cull (DROP path), new rows enter
+        // (SPAWN path). `set_offset` writes the shared scroll cell; notify re-renders.
+        vcx.update(|_, cx| {
+            board.update(cx, |b, cx| {
+                b.board_scroll
+                    .set_offset(gpui::point(gpui::px(0.0), gpui::px(-4000.0)));
+                cx.notify();
+            });
+        });
+        vcx.run_until_parked();
+
+        let (v1, running1) = snapshot(&board, vcx);
+        assert!(!v1.is_empty(), "band non-empty after scroll");
+        assert_ne!(v1, v0, "scrolling must move the visible band");
+        assert_eq!(
+            running1, v1,
+            "after scroll, live timers still track the band exactly"
+        );
+
+        let scrolled_off: Vec<&SessionId> = v0.difference(&v1).collect();
+        assert!(
+            !scrolled_off.is_empty(),
+            "some top cards must have scrolled off"
+        );
+        for id in &scrolled_off {
+            assert!(
+                !running1.contains(*id),
+                "card {} scrolled off-screen but kept its timer",
+                id.as_str()
+            );
+        }
+        let scrolled_in: Vec<&SessionId> = v1.difference(&v0).collect();
+        assert!(
+            !scrolled_in.is_empty(),
+            "new cards must have entered the band"
+        );
+        for id in &scrolled_in {
+            assert!(
+                running1.contains(*id),
+                "card {} entered the band but never spawned its timer",
+                id.as_str()
+            );
+        }
+
+        let _ = (fleet, replica);
+    }
+
     #[test]
     fn group_accent_maps_ssot_tokens() {
         assert_eq!(group_accent(Some("blue")), gpui::rgb(0x4c8dff).into());
