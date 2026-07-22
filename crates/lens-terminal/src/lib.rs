@@ -36,6 +36,7 @@ use lens_client::WsOutbound;
 mod bridge;
 mod clipboard_policy;
 mod engine;
+mod generation;
 mod hit_test;
 mod input_gate;
 mod inspect;
@@ -284,6 +285,14 @@ pub enum DetachedDetail {
     RetriesExhausted,
     DiscoveryFailed,
     EngineStopped,
+    /// A `resource.created` proved our attached id is a new generation, or a
+    /// wake found the observed generation did not survive.
+    IdentityChanged,
+    /// `ReplacementWaiting` elapsed without an exact-key successor appearing.
+    ReplacementTimedOut,
+    /// The engine worker/forwarder thread could not be spawned (resource
+    /// exhaustion). Never a panic — modeled as a lifecycle value.
+    EngineSpawnFailed,
 }
 
 // ---------------------------------------------------------------------------
@@ -371,6 +380,16 @@ pub enum TerminalHostEvent {
         id: HostRequestId,
         decision: HostRequestDecision,
     },
+    /// Normalized `session.resource.created` for a terminal in this session.
+    /// The host forwards these verbatim; the tab filters to its own identity.
+    ResourceCreated {
+        session_id: SessionId,
+        terminal_id: TerminalId,
+        terminal_name: String,
+        session_key: String,
+    },
+    /// Normalized `session.resource.deleted` (server carries only the id).
+    ResourceDeleted { terminal_id: TerminalId },
 }
 
 /// The single typed **outbound** stream: tab → host, via gpui's
@@ -598,6 +617,10 @@ impl TerminalTab {
     pub fn on_host_event(&mut self, event: TerminalHostEvent, cx: &mut Context<Self>) {
         match event {
             TerminalHostEvent::Sleep | TerminalHostEvent::Wake => {}
+            TerminalHostEvent::ResourceCreated { .. }
+            | TerminalHostEvent::ResourceDeleted { .. } => {
+                // Wired in Task 3 (correlation). No-op until then.
+            }
             TerminalHostEvent::HostRequestResponse { id, decision } => {
                 let pos = self
                     .pending_clipboard_writes
@@ -2602,6 +2625,25 @@ mod tests {
         let json = serde_json::to_string(&t).unwrap();
         let back: TerminalTarget = serde_json::from_str(&json).unwrap();
         assert_eq!(back, t);
+    }
+
+    #[test]
+    fn detached_detail_round_trips_json() {
+        for detail in [
+            DetachedDetail::TerminalGone,
+            DetachedDetail::ClientDetached,
+            DetachedDetail::Unauthorized,
+            DetachedDetail::RetriesExhausted,
+            DetachedDetail::DiscoveryFailed,
+            DetachedDetail::EngineStopped,
+            DetachedDetail::IdentityChanged,
+            DetachedDetail::ReplacementTimedOut,
+            DetachedDetail::EngineSpawnFailed,
+        ] {
+            let json = serde_json::to_string(&detail).unwrap();
+            let back: DetachedDetail = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, detail, "round-trip for {detail:?}");
+        }
     }
 
     #[test]
