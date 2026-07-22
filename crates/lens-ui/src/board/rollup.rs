@@ -114,17 +114,6 @@ pub fn format_age(oldest_created_at_secs: Option<i64>, now_ms: i64) -> String {
     }
 }
 
-/// The header-lane text (spec §3): `name · spend · age · ✓N`. The colored dot and
-/// the `⌄` caret are rendered as elements, not part of this string.
-pub fn group_header_text(name: &str, rollup: &GroupRollup, now_ms: i64) -> String {
-    format!(
-        "{name} · {} · {} · ✓{}",
-        format_group_spend(rollup.spend_usd),
-        format_age(rollup.oldest_created_at, now_ms),
-        rollup.completed_count
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,19 +181,6 @@ mod tests {
         assert_eq!(format_age(Some(10_000), 0), "0m");
         // extreme/corrupt created must not overflow-panic (saturating_sub) — no-panic UI.
         assert!(format_age(Some(i64::MIN), 0).ends_with('d'));
-    }
-
-    #[test]
-    fn header_text_assembles_spec_order() {
-        let r = GroupRollup {
-            spend_usd: Some(3.5),
-            oldest_created_at: Some(0),
-            completed_count: 2,
-        };
-        assert_eq!(
-            group_header_text("Refactor", &r, 7_200_000),
-            "Refactor · ~$3.50 · 2h · ✓2"
-        );
     }
 
     #[test]

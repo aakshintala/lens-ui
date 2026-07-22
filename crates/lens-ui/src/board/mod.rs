@@ -55,7 +55,10 @@ pub struct GroupChromeSnapshot {
     pub name: String,
     pub accent: gpui::Hsla,
     pub rollup: rollup::GroupRollup,
-    pub header: String,
+    /// The "spend · age" middle text — the single source for the rendered element.
+    pub spend_age: String,
+    /// Whether the `✓N` element is rendered (⇔ `rollup.completed_count > 0`).
+    pub shows_completed: bool,
 }
 
 pub struct BoardView {
@@ -388,14 +391,20 @@ impl BoardView {
                 .collect()
         };
         let rollup = rollup::group_rollup(&members, completed);
-        let header = rollup::group_header_text(&name, &rollup, now_ms);
+        let spend_age = format!(
+            "{} · {}",
+            rollup::format_group_spend(rollup.spend_usd),
+            rollup::format_age(rollup.oldest_created_at, now_ms),
+        );
+        let shows_completed = rollup.completed_count > 0;
 
         let snapshot = GroupChromeSnapshot {
             session_ids: sessions.to_vec(),
             name: name.clone(),
             accent,
             rollup: rollup.clone(),
-            header: header.clone(),
+            spend_age: spend_age.clone(),
+            shows_completed,
         };
 
         let mut out: Vec<AnyElement> = Vec::with_capacity(sessions.len() + 2);
@@ -434,17 +443,13 @@ impl BoardView {
                     div()
                         .flex_grow()
                         .text_color(gpui::rgb(0x8a8a94))
-                        .child(format!(
-                            "{} · {}",
-                            rollup::format_group_spend(rollup.spend_usd),
-                            rollup::format_age(rollup.oldest_created_at, now_ms),
-                        )),
+                        .child(spend_age.clone()),
                 )
-                .child(
+                .children(shows_completed.then(|| {
                     div()
                         .text_color(gpui::rgb(0x8a8a94))
-                        .child(format!("✓{completed}")),
-                )
+                        .child(format!("✓{}", rollup.completed_count))
+                }))
                 .child(div().text_color(gpui::rgb(0x8a8a94)).child("⌄"))
                 .into_any_element(),
         );
@@ -807,6 +812,59 @@ mod tests {
         }
 
         let _ = (fleet, replica);
+    }
+
+    #[gpui::test]
+    async fn expanded_group_shows_completed_only_when_positive(cx: &mut gpui::TestAppContext) {
+        use lens_core::domain::board::{DEFAULT_BOARD_ID, PlacementTarget};
+        use lens_core::domain::ids::{BoardId, ConnectionId};
+        use lens_core::persist::{BoardStore, SqliteBoardStore};
+
+        let clock = Arc::new(ManualUiClock::new(10_000)) as Arc<dyn UiClock>;
+        let fleet = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::install_at_startup(cx);
+            let fleet = FleetStore::new(clock, cx);
+            fleet.update(cx, |f, cx| {
+                f.spawn_fake_session(SessionId::new("s1"), cx);
+            });
+            fleet
+        });
+        let conn = ConnectionId::new("conn_test");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.db");
+        let store = SqliteBoardStore::open(&path).unwrap();
+        let board = BoardId::new(DEFAULT_BOARD_ID);
+        let g1 = store.create_group(&board, None, 0, "G").unwrap();
+        store
+            .place_session(
+                &conn,
+                &SessionId::new("s1"),
+                &PlacementTarget {
+                    board_id: Some(board.clone()),
+                    parent_item_id: Some(g1.clone()),
+                    ordinal: Some(0),
+                },
+            )
+            .unwrap();
+        let boxed: Box<dyn BoardStore + Send> = Box::new(store);
+        let replica = cx.update(|cx| {
+            cx.new(|cx| BoardReplica::new(Some(boxed), path, conn, fleet.clone(), cx))
+        });
+        cx.run_until_parked();
+
+        let (board_view, vcx) = cx.add_window_view(|_, cx| {
+            BoardView::mount(fleet, replica, placeholder_tab(cx), None, cx)
+        });
+        vcx.run_until_parked();
+
+        board_view.read_with(vcx, |b, _| {
+            let chrome = b.group_chrome_for_test();
+            assert_eq!(chrome.len(), 1);
+            // completed_count is Archive-side (B-6) → 0 → the ✓N element is suppressed.
+            assert_eq!(chrome[0].rollup.completed_count, 0);
+            assert!(!chrome[0].shows_completed, "✓N hidden when count is 0");
+        });
     }
 
     #[test]
