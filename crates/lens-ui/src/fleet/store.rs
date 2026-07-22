@@ -6,11 +6,36 @@ use crate::fleet::poller::spawn_session_poller;
 use gpui::{App, AppContext, Context, Entity, Task};
 use lens_client::{Client, Connection};
 use lens_core::actor::{ClientSessionApi, FleetScheduler, OutputMode, SessionCommand};
-use lens_core::domain::ids::SessionId;
+use lens_core::domain::ids::{ConnectionId, SessionId};
+use lens_core::persist::{PersistError, SqliteTranscriptReader};
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReconcileEpoch {
+    pub epoch: u64,
+    pub in_flight: bool,
+}
+
+#[derive(Clone)]
+pub struct ReaderFactory {
+    data_dir: PathBuf,
+    #[allow(dead_code)] // Task 9 replica install reads connection context from here.
+    conn_id: ConnectionId,
+    session_id: SessionId,
+}
+
+impl ReaderFactory {
+    pub fn open(&self, busy_timeout: Duration) -> Result<SqliteTranscriptReader, PersistError> {
+        SqliteTranscriptReader::open_read_only(
+            &self.data_dir.join(format!("{}.db", self.session_id)),
+            busy_timeout,
+        )
+    }
+}
 
 pub struct FleetStore {
     pub cards: HashMap<SessionId, Entity<SessionCard>>,
@@ -22,6 +47,8 @@ pub struct FleetStore {
     command_txs: HashMap<SessionId, crossbeam_channel::Sender<SessionCommand>>,
     pollers: HashMap<SessionId, Task<()>>,
     stream_bridges: HashMap<SessionId, StreamBridge>,
+    reader_factories: HashMap<SessionId, ReaderFactory>,
+    reconcile_epochs: HashMap<SessionId, ReconcileEpoch>,
 }
 
 impl FleetStore {
@@ -36,6 +63,8 @@ impl FleetStore {
             command_txs: HashMap::new(),
             pollers: HashMap::new(),
             stream_bridges: HashMap::new(),
+            reader_factories: HashMap::new(),
+            reconcile_epochs: HashMap::new(),
         })
     }
 
@@ -50,6 +79,8 @@ impl FleetStore {
             command_txs: HashMap::new(),
             pollers: HashMap::new(),
             stream_bridges: HashMap::new(),
+            reader_factories: HashMap::new(),
+            reconcile_epochs: HashMap::new(),
         })
     }
 
@@ -85,6 +116,14 @@ impl FleetStore {
 
     pub fn focused(&self) -> Option<&SessionId> {
         self.focused.as_ref()
+    }
+
+    pub fn reader_factory(&self, id: &SessionId) -> Option<&ReaderFactory> {
+        self.reader_factories.get(id)
+    }
+
+    pub fn reconcile_epoch(&self, id: &SessionId) -> ReconcileEpoch {
+        self.reconcile_epochs.get(id).cloned().unwrap_or_default()
     }
 
     pub fn focus_session(&mut self, id: SessionId, cx: &mut Context<Self>) {
@@ -175,6 +214,16 @@ impl FleetStore {
             .map_err(|e| format!("stream: {e}"))?;
         let (bridge, events_rx) = live::start_stream_bridge(stream);
         let stores = live::open_stores(data_dir, &conn.id, &session_id)?;
+        self.reader_factories.insert(
+            session_id.clone(),
+            ReaderFactory {
+                data_dir: data_dir.to_path_buf(),
+                conn_id: conn.id.clone(),
+                session_id: session_id.clone(),
+            },
+        );
+        self.reconcile_epochs
+            .insert(session_id.clone(), ReconcileEpoch::default());
         let api = Box::new(ClientSessionApi::new(
             Client::new(conn.clone()).map_err(|e| format!("client handshake: {e}"))?,
         ));
@@ -268,5 +317,203 @@ mod focus_tests {
     fn live_spawn_api_exists() {
         let _spawn = FleetStore::spawn_live_session;
         let _new_live = FleetStore::new_live;
+    }
+}
+
+#[cfg(test)]
+mod reader_factory_tests {
+    use super::*;
+    use crate::clock::ManualUiClock;
+    use lens_client::{Auth, Client, Connection, PINNED_OMNIGENT_VERSION};
+    use lens_core::domain::SessionState;
+    use lens_core::domain::ids::AgentId;
+    use lens_core::domain::scalars::{SessionLifecycle, SessionStatusValue};
+    use lens_core::persist::{
+        ConnectionRecord, ControlStore, ReadRange, SqliteControlStore, TranscriptReader,
+    };
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread::{self, JoinHandle};
+
+    struct MockOmnigent {
+        base_url: String,
+        _server: JoinHandle<()>,
+    }
+
+    impl MockOmnigent {
+        fn start(session_id: &SessionId) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+            listener
+                .set_nonblocking(true)
+                .expect("mock listener nonblocking");
+            let addr = listener.local_addr().expect("mock addr");
+            let sid = session_id.as_str().to_string();
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_for_thread = Arc::clone(&stop);
+            let server = thread::spawn(move || {
+                while !stop_for_thread.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let sid = sid.clone();
+                            thread::spawn(move || handle_mock_conn(&mut stream, &sid));
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(e) => panic!("mock accept: {e}"),
+                    }
+                }
+            });
+            let base_url = format!("http://{addr}");
+            Self {
+                base_url,
+                _server: server,
+            }
+        }
+    }
+
+    fn http_response(status: &str, content_type: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn session_json(session_id: &str, include_items: bool) -> String {
+        if include_items {
+            format!(
+                r#"{{"id":"{session_id}","status":"idle","agent_id":"ag_test","created_at":1,"items":[]}}"#
+            )
+        } else {
+            format!(
+                r#"{{"id":"{session_id}","status":"idle","agent_id":"ag_test","created_at":1}}"#
+            )
+        }
+    }
+
+    fn handle_mock_conn(stream: &mut TcpStream, session_id: &str) {
+        stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+        let mut buf = [0u8; 4096];
+        let n = match stream.read(&mut buf) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => n,
+        };
+        let req = String::from_utf8_lossy(&buf[..n]);
+        let request_line = req.lines().next().unwrap_or("");
+        if request_line.contains("/health") {
+            let body = http_response("200 OK", "text/plain", "ok");
+            let _ = stream.write_all(body.as_bytes());
+            return;
+        }
+        if request_line.contains("/api/version") {
+            let body = http_response(
+                "200 OK",
+                "application/json",
+                &format!(r#"{{"version":"{PINNED_OMNIGENT_VERSION}"}}"#),
+            );
+            let _ = stream.write_all(body.as_bytes());
+            return;
+        }
+        if request_line.contains("/v1/info") {
+            let body = http_response("200 OK", "application/json", "{}");
+            let _ = stream.write_all(body.as_bytes());
+            return;
+        }
+        if request_line.contains("/stream") {
+            let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: keep-alive\r\n\r\n";
+            if stream.write_all(headers.as_bytes()).is_err() {
+                return;
+            }
+            let heartbeat = b"event: session.heartbeat\ndata: {}\n\n";
+            loop {
+                if stream.write_all(heartbeat).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            return;
+        }
+        if request_line.contains("/items") {
+            let json = r#"{"data":[{"id":"item_a","type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}],"has_more":false}"#;
+            let body = http_response("200 OK", "application/json", json);
+            let _ = stream.write_all(body.as_bytes());
+            return;
+        }
+        if request_line.contains("/v1/sessions/") {
+            let include_items = req.contains("include_items=true");
+            let json = session_json(session_id, include_items);
+            let body = http_response("200 OK", "application/json", &json);
+            let _ = stream.write_all(body.as_bytes());
+        }
+    }
+
+    fn seed_control(data_dir: &Path, conn: &Connection, session_id: &SessionId) {
+        let control = SqliteControlStore::open(&data_dir.join("lens.db")).unwrap();
+        control
+            .upsert_connection(&ConnectionRecord {
+                id: conn.id.clone(),
+                base_url: conn.base_url.to_string(),
+                auth_kind: "none".into(),
+                label: None,
+                server_info: None,
+                created_at: 1_700_000_000_000,
+            })
+            .unwrap();
+        let mut state =
+            SessionState::new(conn.id.clone(), session_id.clone(), AgentId::new("ag_test"));
+        state.lifecycle = SessionLifecycle::Active;
+        state.status = SessionStatusValue::Idle;
+        control.upsert_session(&state, 1_700_000_000_000).unwrap();
+    }
+
+    #[gpui::test]
+    async fn spawned_session_retains_reader_factory(cx: &mut gpui::TestAppContext) {
+        let session_id = SessionId::new("conv_task7");
+        let mock = MockOmnigent::start(&session_id);
+        let conn_id = ConnectionId::new("conn_task7");
+        let conn = Connection::new(
+            conn_id,
+            mock.base_url.parse().expect("mock base url"),
+            Auth::None,
+        );
+        let client = Client::new(conn.clone()).expect("mock client handshake");
+
+        let data_dir = std::env::temp_dir().join(format!(
+            "lens-task7-{}-{}",
+            std::process::id(),
+            session_id.as_str()
+        ));
+        std::fs::create_dir_all(&data_dir).expect("temp data dir");
+        seed_control(&data_dir, &conn, &session_id);
+
+        let clock: Arc<dyn UiClock> = Arc::new(ManualUiClock::new(1_700_000_000_000));
+        let fleet = cx.update(|cx| FleetStore::new_live(Arc::clone(&clock), cx));
+        cx.update(|cx| {
+            fleet.update(cx, |store, cx| {
+                store
+                    .spawn_live_session(&conn, &client, session_id.clone(), &data_dir, cx)
+                    .expect("spawn live session");
+            });
+        });
+        cx.run_until_parked();
+        for _ in 0..20 {
+            thread::sleep(Duration::from_millis(25));
+            cx.run_until_parked();
+        }
+
+        let factory = fleet
+            .read_with(cx, |store, _| store.reader_factory(&session_id).cloned())
+            .expect("reader factory retained");
+        let reader = factory
+            .open(Duration::from_millis(200))
+            .expect("factory opens reader");
+        assert!(
+            reader.read_range(ReadRange::All).is_ok(),
+            "reader reads committed baseline"
+        );
+
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 }
