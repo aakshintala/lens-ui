@@ -7,7 +7,7 @@ use gpui::{Context, Entity};
 use lens_core::domain::board::{
     Board, BoardItemKind, BoardLayout, DEFAULT_BOARD_ID, DEFAULT_BOARD_NAME, PlacementTarget,
 };
-use lens_core::domain::ids::{BoardId, ConnectionId, SessionId};
+use lens_core::domain::ids::{BoardId, BoardItemId, ConnectionId, SessionId};
 use lens_core::persist::{BoardStore, PersistError, SqliteBoardStore, StoreMode};
 
 use crate::fleet::store::FleetStore;
@@ -15,8 +15,15 @@ use crate::fleet::store::FleetStore;
 pub(crate) const MAX_RETRIES: u32 = 5;
 
 pub(crate) enum Op {
-    Load { initial: bool },
+    Load {
+        initial: bool,
+    },
     PlaceSessions(Vec<(ConnectionId, SessionId)>),
+    /// B-4b: idempotent group-collapse write (set the flag to an absolute value).
+    SetCollapsed {
+        group_id: BoardItemId,
+        collapsed: bool,
+    },
 }
 
 enum OpOutcome {
@@ -26,6 +33,11 @@ enum OpOutcome {
         mode: StoreMode,
     },
     Placed {
+        layout: BoardLayout,
+        skipped_empty: bool,
+        mode: StoreMode,
+    },
+    Wrote {
         layout: BoardLayout,
         skipped_empty: bool,
         mode: StoreMode,
@@ -235,6 +247,10 @@ impl BoardReplica {
                     self.dropped_writes = self.dropped_writes.saturating_add(1);
                     continue;
                 }
+                Some(Op::SetCollapsed { .. }) if !self.is_writable() => {
+                    self.dropped_writes = self.dropped_writes.saturating_add(1);
+                    continue;
+                }
                 Some(op) => break op,
             }
         };
@@ -288,6 +304,15 @@ impl BoardReplica {
                 self.reconcile_in_flight = false;
                 self.note_place_result(); // suppress stuck keys (Task 6, C1)
                 self.reconcile(cx); // re-diff on reply (Task 6)
+            }
+            OpOutcome::Wrote {
+                layout,
+                skipped_empty,
+                mode,
+            } => {
+                self.op_retries = 0;
+                self.layout = Arc::new(layout);
+                self.state = load_state(mode, skipped_empty);
             }
             OpOutcome::Failed { op, err } => {
                 self.on_op_failed(op, err, cx); // Task 5
@@ -391,12 +416,15 @@ impl BoardReplica {
             Op::PlaceSessions(_) => {
                 self.state = ReplicaState::Stale; // keep current layout
             }
+            Op::SetCollapsed { .. } => {
+                self.state = ReplicaState::Stale; // keep current layout
+            }
         }
         // Persistent failure: queued writes won't succeed on replay — drop (banner names them).
         let dropped = self
             .pending
             .iter()
-            .filter(|o| matches!(o, Op::PlaceSessions(_)))
+            .filter(|o| !matches!(o, Op::Load { .. }))
             .count() as u32;
         self.dropped_writes = self.dropped_writes.saturating_add(dropped);
         self.pending.retain(|o| matches!(o, Op::Load { .. }));
@@ -500,6 +528,18 @@ fn run_op_inner(slot: &mut StoreSlot, op: &Op) -> lens_core::persist::Result<OpO
             store.place_sessions(keys, &default_root_target())?; // persist
             let (layout, skipped_empty, mode) = read_committed(store)?; // reconciled read (M5 rebuttal)
             Ok(OpOutcome::Placed {
+                layout,
+                skipped_empty,
+                mode,
+            })
+        }
+        Op::SetCollapsed {
+            group_id,
+            collapsed,
+        } => {
+            store.set_collapsed(group_id, *collapsed)?; // persist (idempotent, absolute value)
+            let (layout, skipped_empty, mode) = read_committed(store)?;
+            Ok(OpOutcome::Wrote {
                 layout,
                 skipped_empty,
                 mode,
@@ -691,6 +731,83 @@ mod tests {
                 DEFAULT_BOARD_ID
             );
         });
+    }
+
+    #[gpui::test]
+    async fn set_collapsed_round_trips_and_persists(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.db");
+        // Seed a group into a real store on `path`, capture its id, drop the handle.
+        let gid = {
+            let store = SqliteBoardStore::open(&path).unwrap();
+            store
+                .create_group(&BoardId::new(DEFAULT_BOARD_ID), None, 0, "G")
+                .unwrap()
+        };
+
+        let fleet = cx.update(test_fleet);
+        let replica = cx
+            .update(|cx| cx.new(|cx| BoardReplica::for_test_file(fleet.clone(), path.clone(), cx)));
+        cx.run_until_parked(); // Load the seeded group (collapsed == false).
+
+        let is_collapsed = |r: &BoardReplica| {
+            matches!(
+                r.layout().item(&gid).map(|it| &it.kind),
+                Some(BoardItemKind::Group {
+                    collapsed: true,
+                    ..
+                })
+            )
+        };
+        replica.read_with(cx, |r, _| assert!(!is_collapsed(r), "seeded expanded"));
+
+        replica.update(cx, |r, cx| {
+            r.write(
+                Op::SetCollapsed {
+                    group_id: gid.clone(),
+                    collapsed: true,
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        replica.read_with(cx, |r, _| {
+            assert_eq!(r.state(), ReplicaState::Writable);
+            assert!(is_collapsed(r), "flag flipped in the committed layout");
+        });
+
+        // Reopen the same path in a fresh replica — the collapse persisted.
+        let fleet2 = cx.update(test_fleet);
+        let replica2 =
+            cx.update(|cx| cx.new(|cx| BoardReplica::for_test_file(fleet2, path.clone(), cx)));
+        cx.run_until_parked();
+        replica2.read_with(cx, |r, _| {
+            assert!(is_collapsed(r), "persisted across reopen")
+        });
+    }
+
+    #[gpui::test]
+    async fn set_collapsed_refused_when_non_writable(cx: &mut gpui::TestAppContext) {
+        // A LoadFailed replica (bad path) refuses the write (banner honesty).
+        let fleet = cx.update(test_fleet);
+        let replica = cx.update(|cx| {
+            cx.new(|cx| BoardReplica::for_test_file(fleet, "/dev/null/nope.db".into(), cx))
+        });
+        cx.run_until_parked();
+        replica.read_with(cx, |r, _| assert_eq!(r.state(), ReplicaState::LoadFailed));
+        let disp = replica.update(cx, |r, cx| {
+            r.write(
+                Op::SetCollapsed {
+                    group_id: BoardItemId::new("g_x"),
+                    collapsed: true,
+                },
+                cx,
+            )
+        });
+        assert!(matches!(
+            disp,
+            WriteDisposition::Rejected(ReplicaState::LoadFailed)
+        ));
     }
 
     #[gpui::test]
