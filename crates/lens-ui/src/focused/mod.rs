@@ -1,8 +1,9 @@
 //! Store-owned focused transcript replica (T-2 §5). State machine + fold rules;
 //! rendering (Task 13) and staged finalize (Task 12) land later.
 
+pub mod reader;
+
 use crate::fleet::store::{ReaderFactory, ReconcileEpoch};
-use async_channel::Receiver;
 use gpui::Context;
 use lens_core::domain::ids::{AccId, ResponseId, SessionId};
 use lens_core::domain::item::{Item, StreamScratch};
@@ -11,44 +12,7 @@ use lens_core::reduce::{StreamUpdate, project};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-// ── reader-enqueue seam (Task 10 moves worker loop to `focused/reader.rs`) ──
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Priority {
-    Baseline,
-    Delta,
-    Reconcile,
-    Rewrite,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReadTarget {
-    pub range: ReadRange,
-    pub generation: u64,
-    pub priority: Priority,
-}
-
-#[derive(Clone)]
-pub struct ReaderWorkerHandle {
-    tx: async_channel::Sender<ReadTarget>,
-}
-
-impl ReaderWorkerHandle {
-    pub fn enqueue(&self, target: ReadTarget) {
-        let _ = self.tx.try_send(target);
-    }
-
-    fn new_channel() -> (Self, Receiver<ReadTarget>) {
-        let (tx, rx) = async_channel::bounded(16);
-        (Self { tx }, rx)
-    }
-
-    /// Test-only: observe exactly what the replica enqueues.
-    #[cfg(test)]
-    pub fn new_test() -> (Self, Receiver<ReadTarget>) {
-        Self::new_channel()
-    }
-}
+pub use reader::{Priority, ReadTarget, ReaderWorkerHandle};
 
 // ── stubs — later tasks flesh these out ──
 
@@ -77,6 +41,7 @@ pub struct FocusedTranscript {
     markers: Vec<Marker>,
     focus_generation: u64,
     reader: ReaderWorkerHandle,
+    reader_error: Option<String>,
     #[allow(dead_code)]
     session_id: SessionId,
     baseline_epoch: u64,
@@ -92,17 +57,13 @@ impl FocusedTranscript {
         focus_generation: u64,
         cx: &mut Context<Self>,
     ) -> Self {
-        let (reader, _rx) = ReaderWorkerHandle::new_channel();
-        Self::new_with_reader(
-            reader,
-            factory.session_id().clone(),
-            seed_epoch,
-            focus_generation,
-            cx,
-        )
+        let session_id = factory.session_id().clone();
+        let weak = cx.weak_entity();
+        let reader = ReaderWorkerHandle::spawn(factory, weak, cx);
+        Self::new_with_reader(reader, session_id, seed_epoch, focus_generation, cx)
     }
 
-    fn new_with_reader(
+    pub(crate) fn new_with_reader(
         reader: ReaderWorkerHandle,
         session_id: SessionId,
         seed_epoch: ReconcileEpoch,
@@ -120,12 +81,42 @@ impl FocusedTranscript {
             markers: Vec::new(),
             focus_generation,
             reader,
+            reader_error: None,
             session_id,
             baseline_epoch: seed_epoch.epoch,
             baseline_reconcile_in_flight: seed_epoch.in_flight,
             live_section_projection_count: 0,
         };
         replica.enqueue_read(ReadRange::All, Priority::Baseline, focus_generation);
+        cx.notify();
+        replica
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_reader_no_baseline(
+        reader: ReaderWorkerHandle,
+        session_id: SessionId,
+        seed_epoch: ReconcileEpoch,
+        focus_generation: u64,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let replica = Self {
+            items: Vec::new(),
+            scratch: Arc::new(StreamScratch::default()),
+            active_response: None,
+            last_rendered_ordinal: -1,
+            live_section_start: 0,
+            rows: RowStore,
+            pending_finalize: HashMap::new(),
+            markers: Vec::new(),
+            focus_generation,
+            reader,
+            reader_error: None,
+            session_id,
+            baseline_epoch: seed_epoch.epoch,
+            baseline_reconcile_in_flight: seed_epoch.in_flight,
+            live_section_projection_count: 0,
+        };
         cx.notify();
         replica
     }
@@ -218,6 +209,7 @@ impl FocusedTranscript {
         if generation != self.focus_generation {
             return;
         }
+        self.reader_error = None;
         match range {
             ReadRange::All => self.replace_read_rows(&read.rows),
             ReadRange::Delta { .. } | ReadRange::One { .. } => {
@@ -230,6 +222,29 @@ impl FocusedTranscript {
         self.recompute_live_section_start();
         self.reproject_live_section();
         cx.notify();
+    }
+
+    pub(crate) fn on_read_error(&mut self, generation: u64, err: String, cx: &mut Context<Self>) {
+        if generation != self.focus_generation {
+            return;
+        }
+        self.reader_error = Some(err);
+        cx.notify();
+    }
+
+    pub(crate) fn on_reader_fatal(&mut self, err: String, cx: &mut Context<Self>) {
+        self.reader_error = Some(err);
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reader_handle(&self) -> ReaderWorkerHandle {
+        self.reader.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reader_error(&self) -> Option<&str> {
+        self.reader_error.as_deref()
     }
 
     fn enqueue_read(&self, range: ReadRange, priority: Priority, generation: u64) {
@@ -297,6 +312,7 @@ impl FocusedTranscript {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_channel::Receiver;
     use gpui::AppContext;
     use lens_core::domain::ids::{AgentId, ConnectionId, ItemId, SessionId as Sid};
     use lens_core::domain::item::{BlockContext, ContentBlock, ItemKind};
