@@ -5,7 +5,7 @@ the current forward-looking state only. **Full dated session entries live in
 [`STATUS-ARCHIVE.md`](./STATUS-ARCHIVE.md)** — write each session's detail there
 and roll older "Recent" pointers off this page as they age.
 
-_Last curated 2026-07-21 (B-3 group chrome & rollups SHIPPED — merged to main UNPUSHED; B-4 drag/move + write-path next. Earlier same day: turn-counter Ready-flash bug FIXED+pushed; B-2 packing/scroll/culling SHIPPED+pushed)._
+_Last curated 2026-07-21 (B-3 SHIPPED — merged to main UNPUSHED; **B-4 decomposed → B-4a foundation design LOCKED** (grilled + codex-reviewed + §3 re-grilled), ready for writing-plans in a fresh session. Earlier same day: turn-counter fix + B-2 shipped)._
 
 ---
 
@@ -46,12 +46,23 @@ _Last curated 2026-07-21 (B-3 group chrome & rollups SHIPPED — merged to main 
     render from one source); the integration test proves data-wiring not pixels (correct under
     NoopTextSystem — B-4 adds the live check); spec §3 fidelity nits (`.border_1()` 1px vs 1.5px; flat
     wash vs glow/vignette — gpui 0.2.2 has no radial gradient, [[wave-card-body-wash]]).
-  - **B-4 — drag/move + context-menu grouping — NEXT.** Drives B-1's `move_item`/`ungroup`/`create_group`;
-    lands the store→replica **write** path that deletes the ephemeral `build_ephemeral_layout` stub and
-    makes groups runtime-reachable (retiring the B-3 `test_layout` seam); collapse toggle + §7 collapsed-tile
-    render. Also owed here: verify the B-3 `absolute_group` member-card read-during-render does not re-trip
-    the `.cached()` freeze ([[viewport-reentry-freeze]]) once groups go live; if it does, hoist the rollup
-    fold into `sync_card_views`.
+  - **B-4 — drag/move + context-menu grouping — decomposed into B-4a…B-4d.** At design time B-4 was split
+    into a **foundation slice B-4a** (store→replica write-path; NO interactions) + interaction follow-ons
+    B-4b (collapse + §7 collapsed-tile) / B-4c (drag/move) / B-4d (context-menu grouping).
+    - **B-4a — store→replica write-path foundation — DESIGN LOCKED, ready to plan (NEXT).** Spec
+      `docs/specs/2026-07-21-board-b4a-store-replica-write-path-design.md` — grilled + gpt-5.6 codex
+      spec-review folded + §3 re-grilled. Replaces `build_ephemeral_layout` with a persisted `BoardLayout`
+      via a new `BoardReplica` gpui entity; **off-thread store access** (`Arc<Mutex>` + `cx.background_spawn`
+      behind a serialized single-in-flight `run_op`; renders read the in-memory replica, never SQLite) —
+      the codex review caught that inline SQLite violates AGENTS.md's MANDATORY off-thread rule. Conn pinned
+      to the app `Connection.id` (`"lens-app"`) so FleetStore placement converges with `load_layout`'s
+      sessions-table reconcile; explicit `ReplicaState` (Loading/Writable/Degraded/LoadFailed/Stale) + always-
+      allowed recovery `Load` + non-blocking banner; demo seeds a group (B-3 chrome renders live for the first
+      time); MANDATORY frame-budget benchmark = E2E lens-ui on-device measurement (not just the pure lens-core
+      pack bench). Verifies the B-3 `.cached()` member-read-during-render carryforward now that groups render
+      for real. Memory [[board-b4a-design]]; handoff `docs/handoffs/2026-07-21-board-b4a-design-locked.md`.
+    - **B-4b/c/d** — collapse (+§7 collapsed-tile), drag/move (spike candidate: gpui `on_drag`/`on_drop` vs
+      packer geometry), context-menu grouping. Each adds `write()` op variants via B-4a's `run_op` seam.
   - **B-5 — multiple boards + rail switcher** — board CRUD (B-1 seeds only the default board), the
     externally-discovered-session landing policy, and `FleetStore` connection-scoping.
   - **B-6 — archive-as-board surface.**
