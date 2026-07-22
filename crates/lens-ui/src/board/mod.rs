@@ -5,7 +5,7 @@ pub use replica::{BoardReplica, ReplicaState, WriteDisposition};
 
 use crate::PtyProbe;
 use crate::card::view::{SessionCardView, mount_cached_card};
-use crate::card::wave::{Wave, derive_wave};
+use crate::card::wave::{Wave, derive_wave, wave_deadline};
 use crate::fleet::store::FleetStore;
 use crate::slot::TabHandle;
 use crate::theme::ActiveLensTheme as _;
@@ -17,6 +17,7 @@ use lens_core::domain::board::BoardNode;
 use lens_core::domain::ids::{BoardItemId, SessionId};
 use lens_core::pack::{self, CARD_H, CARD_W, CELL_H, CELL_W, GAP, HEADER, INSET, Item};
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 /// Width of the left nav rail (unchanged placeholder).
 const NAV_RAIL_W: f32 = 48.0;
@@ -88,6 +89,13 @@ pub struct BoardView {
     /// B-3 render snapshot: the group chrome computed at the last render (test hook;
     /// also the eventual B-4 live-inspection point). Recomputed each frame.
     last_group_chrome: Vec<GroupChromeSnapshot>,
+    /// One-shot repaint timer for the earliest collapsed-group time-based wave deadline
+    /// (Ready decay / Scheduled wake). Collapsed members hold no per-card anim timer, so
+    /// without this their rollup would show a stale wave until an unrelated re-render
+    /// (codex final-review Important #1). `gpui::Task` is cancel-on-drop.
+    rollup_wake: Option<gpui::Task<()>>,
+    /// The deadline `rollup_wake` is currently armed for — re-arm only when it changes.
+    armed_rollup_deadline: Option<i64>,
 }
 
 impl BoardView {
@@ -134,6 +142,8 @@ impl BoardView {
             rail_scroll: ScrollHandle::new(),
             last_built: Vec::new(),
             last_group_chrome: Vec::new(),
+            rollup_wake: None,
+            armed_rollup_deadline: None,
         }
     }
 
@@ -227,6 +237,46 @@ impl BoardView {
             collect_collapsed_group_members(node, &mut out);
         }
         out
+    }
+
+    /// Schedule a single repaint at the earliest clock deadline across collapsed-group
+    /// members (Ready decay / Scheduled wake), so their status rollup — which holds no
+    /// per-card anim timer — refreshes when a time-based wave expires (codex final-review
+    /// Important #1). The gpui timer is real-time; the fired repaint re-derives waves from
+    /// the UI clock (the same dual-clock pattern as the card anim timer). Re-armed only
+    /// when the deadline changes (no per-frame task churn); the fired task clears the
+    /// armed deadline so the re-render re-arms the next one. Converges: once every
+    /// collapsed member is clock-stable the deadline is `None` and no timer is held.
+    fn arm_collapsed_rollup_wake(&mut self, cx: &mut Context<Self>) {
+        let now_ms = self.fleet.read(cx).clock().now_millis();
+        let members = self.collapsed_group_member_ids(cx);
+        let next = {
+            let fleet = self.fleet.read(cx);
+            members
+                .iter()
+                .filter_map(|s| {
+                    fleet
+                        .cards
+                        .get(s)
+                        .and_then(|e| wave_deadline(e.read(cx), now_ms))
+                })
+                .min()
+        };
+        if next == self.armed_rollup_deadline {
+            return; // unchanged — keep the pending timer, avoid re-spawning every frame
+        }
+        self.armed_rollup_deadline = next;
+        self.rollup_wake = next.map(|deadline| {
+            let delay = Duration::from_millis((deadline - now_ms).max(0) as u64);
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(delay).await;
+                let _ = this.update(cx, |this, cx| {
+                    // Spent — let the re-render re-arm the next deadline (or none).
+                    this.armed_rollup_deadline = None;
+                    cx.notify();
+                });
+            })
+        });
     }
 
     fn card_click(
@@ -725,6 +775,17 @@ impl BoardView {
         self.last_group_chrome.clone()
     }
 
+    /// Test hook: the deadline the collapsed-rollup repaint wake is armed for.
+    pub fn armed_rollup_deadline_for_test(&self) -> Option<i64> {
+        self.armed_rollup_deadline
+    }
+
+    /// Test hook: whether a live repaint-wake `Task` is actually held (a dropped task
+    /// would be cancelled and never fire).
+    pub fn rollup_wake_held_for_test(&self) -> bool {
+        self.rollup_wake.is_some()
+    }
+
     /// Acceptance-test hook: map session id → cached card view entity.
     pub fn card_views_for_test(&self) -> &HashMap<SessionId, Entity<SessionCardView>> {
         &self.card_views
@@ -876,6 +937,7 @@ impl Render for BoardView {
             }
         };
         self.apply_visibility_gate(visible.into_iter().collect(), cx);
+        self.arm_collapsed_rollup_wake(cx); // refresh collapsed rollups on Ready/Scheduled expiry
         let banner = self.banner_text(cx);
         let mut root = div().id("board-view").size_full().relative().child(body);
         if let Some(text) = banner {
@@ -1263,6 +1325,77 @@ mod tests {
                 !views.contains_key(&SessionId::new("s1"))
                     && !views.contains_key(&SessionId::new("s2")),
                 "no card view spawned for a collapsed member"
+            );
+        });
+    }
+
+    // codex final-review Important #1: a collapsed group's rollup has no per-card anim
+    // timer, so the board must schedule a repaint at the earliest time-based wave
+    // deadline. Here a collapsed `Ready` member (idle + just-completed) must arm the wake
+    // for `last_completed_at + READY_DECAY_MS`. (The real-time timer FIRING vs the manual
+    // test clock is the dual-clock limitation — we assert the ARMED deadline, as the card
+    // anim tests assert `timer_running` rather than real firing.)
+    #[gpui::test]
+    async fn collapsed_ready_member_arms_rollup_wake_for_decay(cx: &mut gpui::TestAppContext) {
+        use lens_core::domain::board::{DEFAULT_BOARD_ID, PlacementTarget};
+        use lens_core::domain::ids::{BoardId, ConnectionId};
+        use lens_core::persist::{BoardStore, SqliteBoardStore};
+
+        const NOW: i64 = 10_000;
+        let clock = Arc::new(ManualUiClock::new(NOW)) as Arc<dyn UiClock>;
+        let conn = ConnectionId::new("conn_test");
+        let s1 = SessionId::new("s1");
+        let fleet = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::install_at_startup(cx);
+            let fleet = FleetStore::new(clock, cx);
+            fleet.update(cx, |f, cx| {
+                let card = f.spawn_fake_session(s1.clone(), cx);
+                // Idle + just-completed + unfocused → Wave::Ready (decays at NOW + decay).
+                card.update(cx, |c, _| c.last_completed_at = Some(NOW));
+            });
+            fleet
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.db");
+        let store = SqliteBoardStore::open(&path).unwrap();
+        let board = BoardId::new(DEFAULT_BOARD_ID);
+        let g1 = store.create_group(&board, None, 0, "G").unwrap();
+        store
+            .place_session(
+                &conn,
+                &s1,
+                &PlacementTarget {
+                    board_id: Some(board.clone()),
+                    parent_item_id: Some(g1.clone()),
+                    ordinal: Some(0),
+                },
+            )
+            .unwrap();
+        store.set_collapsed(&g1, true).unwrap();
+        let boxed: Box<dyn BoardStore + Send> = Box::new(store);
+        let replica = cx.update(|cx| {
+            cx.new(|cx| BoardReplica::new(Some(boxed), path, conn, fleet.clone(), cx))
+        });
+        cx.run_until_parked();
+
+        let (board_view, vcx) = cx.add_window_view(|_, cx| {
+            BoardView::mount(fleet, replica, placeholder_tab(cx), None, cx)
+        });
+        vcx.run_until_parked();
+
+        board_view.read_with(vcx, |b, _| {
+            // The collapsed Ready member's rollup will go stale at decay unless a repaint
+            // is scheduled for exactly that instant.
+            assert_eq!(
+                b.armed_rollup_deadline_for_test(),
+                Some(NOW + crate::card::model::READY_DECAY_MS),
+                "collapsed Ready member must arm the rollup wake for its decay deadline"
+            );
+            assert!(
+                b.rollup_wake_held_for_test(),
+                "a live repaint-wake Task must be held (a dropped one never fires)"
             );
         });
     }
