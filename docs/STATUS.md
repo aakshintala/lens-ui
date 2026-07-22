@@ -65,7 +65,7 @@ _Last curated 2026-07-22 (**B-4a store→replica write-path EXECUTED** on branch
       **MANDATORY on-device FPS-at-120 confirmation OWED (headless can't measure — run
       `LENS_DEMO_N=125 ./target/release/lens-app --demo` on a display).** Gate green (clippy -D warnings,
       fmt, lens-core 254 / lens-client 150 / lens-ui 83 lib + 5 acceptance). Memory [[board-b4a-plan-executed]].
-      **NEXT: merge `board-b4a`→main (solo workflow) after final review clears — user's merge call.** Original design spec:
+      **MERGED + PUSHED 2026-07-22** (board-b4a FF→main, `4d31c9d..c189d4c`, incl. previously-unpushed B-2/B-3). NEXT interaction slices B-4b/c/d; **B-4d blocker:** non-idempotent-retry commit-phase tracking (design §8 seam). Original design spec:
       `docs/specs/2026-07-21-board-b4a-store-replica-write-path-design.md` — grilled + gpt-5.6 codex
       spec-review folded + §3 re-grilled. Replaces `build_ephemeral_layout` with a persisted `BoardLayout`
       via a new `BoardReplica` gpui entity; **off-thread store access** (`Arc<Mutex>` + `cx.background_spawn`
