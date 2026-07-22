@@ -175,13 +175,19 @@ fn demo_session_ids() -> Vec<String> {
     ids
 }
 
-/// Open a temp board store and seed a "Demo group" over HALF the demo session ids (conn
-/// `lens-app`, matching the replica) so the loaded board renders B-3 group chrome — and,
-/// crucially, exercises group member-reads AT SCALE under `LENS_DEMO_N` (the other half
-/// reconciles loose; half-group/half-loose matches the criterion fixture — codex I3).
+/// Open a temp board store and seed TWO adjacent, distinctly-colored 2×2 groups over the
+/// first 8 demo stems (conn `lens-app`, matching the replica) so the loaded board renders
+/// B-3 group chrome AND exercises two group tiles meeting in the inter-tile gap:
+/// - "Demo group A" (blue): the loud pair — needs-input, ready, working, failed (failed
+///   lands bottom-right, on the shared edge, so its attention ring reaches toward group B).
+/// - "Demo group B" (orange): the quiet four — slept, neutral, scheduled, awaiting-review.
+///
+/// Adjacency is what makes the on-device check meaningful: now that the ring-gutter (12) >
+/// half the inter-tile gap (8), two group tint boxes overlap ~8px in the seam. At
+/// `LENS_DEMO_N>1` the extra replicas reconcile loose, still exercising group/loose at scale.
 /// Best-effort: any store failure just yields `None` → the demo board still renders loose.
 #[cfg(feature = "demo")]
-fn seed_demo_group(
+fn seed_demo_groups(
     db: &std::path::Path,
     conn: &ConnectionId,
 ) -> Option<Box<dyn BoardStore + Send>> {
@@ -190,10 +196,29 @@ fn seed_demo_group(
 
     let store = SqliteBoardStore::open(db).ok()?;
     let board = BoardId::new(DEFAULT_BOARD_ID);
-    if let Ok(group) = store.create_group(&board, None, 0, "Demo group") {
-        let ids = demo_session_ids();
-        let half = (ids.len() / 2).max(1);
-        for (i, sid) in ids.iter().take(half).enumerate() {
+    let ids = demo_session_ids();
+
+    let groups: [(&str, &str, &[String]); 2] = [
+        ("Demo group A", "blue", &ids[..ids.len().min(4)]),
+        (
+            "Demo group B",
+            "orange",
+            if ids.len() > 4 {
+                &ids[4..ids.len().min(8)]
+            } else {
+                &[]
+            },
+        ),
+    ];
+    for (ordinal, (name, color, slice)) in groups.iter().enumerate() {
+        if slice.is_empty() {
+            continue;
+        }
+        let Ok(group) = store.create_group(&board, None, ordinal as i32, name) else {
+            continue;
+        };
+        let _ = store.set_color(&group, color);
+        for (i, sid) in slice.iter().enumerate() {
             let _ = store.place_session(
                 conn,
                 &SessionId::new(sid.clone()),
@@ -213,20 +238,21 @@ fn seed_demo_group(
 /// one still toggles focus (and suppresses that card's glow while focused).
 #[cfg(feature = "demo")]
 fn run_demo() {
-    // A held TempDir (auto-cleaned on app exit; no PID-reuse stale data). Seed a group
+    // A held TempDir (auto-cleaned on app exit; no PID-reuse stale data). Seed the groups
     // BEFORE Application::run (compliant — no cx.new SQLite) so B-3 group chrome renders
-    // live over two of the demo cards; the rest reconcile loose.
+    // live over the demo cards; extra replicas reconcile loose.
     let demo_dir = tempfile::tempdir().expect("demo tempdir");
     let demo_db = demo_dir.path().join("board.db");
     let demo_conn = ConnectionId::new("lens-app");
-    let mut demo_store = seed_demo_group(&demo_db, &demo_conn);
+    let mut demo_store = seed_demo_groups(&demo_db, &demo_conn);
 
     Application::new()
         .with_assets(lens_ui::assets::LensAssets)
         .run(move |cx: &mut App| {
             let _demo_dir = &demo_dir; // hold the TempDir for the app's lifetime
             gpui_component::init(cx);
-            lens_ui::theme::install_at_startup(cx);
+            // Demo defaults to the dark palette; `LENS_THEME=light` still overrides.
+            lens_ui::theme::install_at_startup_with_default(gpui_component::ThemeMode::Dark, cx);
 
             let clock = Arc::new(WallUiClock) as Arc<dyn UiClock>;
             let now = clock.now_millis();

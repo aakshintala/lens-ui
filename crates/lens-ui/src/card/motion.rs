@@ -166,13 +166,28 @@ pub fn render_working_spinner(status: Hsla, now_ms: i64) -> impl IntoElement {
         .with_transformation(Transformation::rotate(radians(spin_phase(now_ms) * TAU)))
 }
 
+/// Max distance (px) the expanding attention ring reaches beyond the card edge at full
+/// phase. Kept small on purpose: the board's group ring-gutter must both CONTAIN it (so a
+/// member's pulse doesn't leak past the group border — on-device: "ring leaks past the
+/// bounding box") AND fit two adjacent groups' overhangs inside one inter-tile `GAP` (16)
+/// so their boxes don't overlap ("the groups clip"). That caps the reach below `GAP/2`.
+/// See `board::GUTTER`. The animation's max reach MUST equal this (guarded by `ring_inset`).
+pub const RING_REACH_PX: f32 = 6.0;
+
+/// The ring's inset (px; negative = outside the card) at animation `phase` (0..=1): starts
+/// 2px out and expands to `-RING_REACH_PX` at full phase. Extracted so the layout-critical
+/// max reach is unit-testable.
+fn ring_inset(phase: f32) -> f32 {
+    -(2.0 + phase * (RING_REACH_PX - 2.0))
+}
+
 /// Expanding ring outside the card clip (NeedsInput / Failed), positioned at `phase`.
 pub fn render_expanding_ring(wave: Wave, status_color: Hsla, phase: f32) -> impl IntoElement {
     let mut slot = div().absolute().size_full();
     if !matches!(wave, Wave::NeedsInput | Wave::Failed) {
         return slot;
     }
-    let inset = -2.0 + phase * -10.0;
+    let inset = ring_inset(phase);
     let opacity = 0.9 * (1.0 - phase);
     slot = slot.child(
         div()
@@ -299,6 +314,16 @@ pub fn wave_status_line(wave: Wave, card: &SessionCard) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ring_inset_full_phase_equals_ring_reach() {
+        // The board reserves RING_REACH_PX as the group gutter / board-edge margin; if the
+        // animation's max reach drifts past it, the pulse leaks past the group border again.
+        assert_eq!(ring_inset(1.0), -RING_REACH_PX);
+        // Starts just outside the card, monotonically expands outward.
+        assert_eq!(ring_inset(0.0), -2.0);
+        assert!(ring_inset(0.5) > ring_inset(1.0) && ring_inset(0.5) < ring_inset(0.0));
+    }
 
     #[test]
     fn wave_icon_path_maps_every_glyph_wave() {

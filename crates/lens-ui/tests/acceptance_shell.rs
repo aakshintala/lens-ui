@@ -798,7 +798,8 @@ async fn board_group_renders_chrome_and_rollup_via_replica(cx: &mut gpui::TestAp
     assert_eq!(g.rollup.spend_usd, Some(3.50), "spend sums members");
     assert_eq!(g.rollup.oldest_created_at, Some(0), "oldest member wins");
     assert_eq!(g.rollup.completed_count, 0, "✓N is 0 until B-6");
-    assert_eq!(g.header, "Refactor · ~$3.50 · 2h · ✓0");
+    assert_eq!(g.spend_age, "~$3.50 · 2h");
+    assert!(!g.shows_completed, "✓N suppressed at count 0");
     assert_eq!(g.session_ids, vec![s1.clone(), s2.clone()]);
 
     let built = vcx.read(|cx| board_handle.read(cx).visible_session_ids_for_test());

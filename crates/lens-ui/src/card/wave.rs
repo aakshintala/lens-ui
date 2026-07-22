@@ -64,6 +64,22 @@ pub fn derive_wave(card: &SessionCard, now_ms: i64, is_focused: bool) -> Wave {
     Wave::Neutral
 }
 
+/// The next clock instant (epoch ms) at which `card`'s wave changes purely from time
+/// advancing — `Ready` decaying to `Neutral` at `last_completed_at + READY_DECAY_MS`, or
+/// `Scheduled` clearing at `scheduled_wake_at` — or `None` when the wave is clock-stable.
+///
+/// A collapsed group's rollup members hold no `SessionCardView` (hence no anim timer), so
+/// the board schedules a single repaint at the earliest such deadline and re-derives
+/// (codex final-review Important #1). A returned deadline is always in the future: a
+/// `Ready`/`Scheduled` wave by construction has not yet expired at `now_ms`.
+pub fn wave_deadline(card: &SessionCard, now_ms: i64) -> Option<i64> {
+    match derive_wave(card, now_ms, false) {
+        Wave::Ready => card.last_completed_at.map(|t| t + READY_DECAY_MS),
+        Wave::Scheduled => card.scheduled_wake_at,
+        _ => None,
+    }
+}
+
 impl Wave {
     /// The saturated status color for this wave (spec §7). Keeps `theme` a leaf — the
     /// Wave→status map lives here in `card`, not in `theme`.
@@ -201,6 +217,42 @@ mod tests {
         card.lifecycle = SessionLifecycle::Slept;
         card.scheduled_wake_at = Some(now + 10_000);
         assert_eq!(derive_wave(&card, now, false), Wave::Slept);
+    }
+
+    #[test]
+    fn wave_deadline_ready_is_completion_plus_decay() {
+        let now = 10_000_i64;
+        let mut card = SessionCard::new(SessionId::new("s"));
+        card.status = SessionStatusValue::Idle;
+        card.last_completed_at = Some(now); // Ready (within decay), unfocused
+        assert_eq!(derive_wave(&card, now, false), Wave::Ready);
+        // Decays at completion + READY_DECAY_MS — the instant it leaves Ready.
+        assert_eq!(wave_deadline(&card, now), Some(now + READY_DECAY_MS));
+    }
+
+    #[test]
+    fn wave_deadline_scheduled_is_the_wake() {
+        let now = 10_000_i64;
+        let mut card = SessionCard::new(SessionId::new("s"));
+        card.status = SessionStatusValue::Idle;
+        card.scheduled_wake_at = Some(now + 30_000);
+        assert_eq!(derive_wave(&card, now, false), Wave::Scheduled);
+        assert_eq!(wave_deadline(&card, now), Some(now + 30_000));
+    }
+
+    #[test]
+    fn wave_deadline_none_for_clock_stable_waves() {
+        let now = 10_000_i64;
+        // Working: no clock-driven transition.
+        let mut working = SessionCard::new(SessionId::new("s"));
+        working.status = SessionStatusValue::Running;
+        assert_eq!(wave_deadline(&working, now), None);
+        // Already decayed (Neutral): stable, no deadline.
+        let mut neutral = SessionCard::new(SessionId::new("s"));
+        neutral.status = SessionStatusValue::Idle;
+        neutral.last_completed_at = Some(now - READY_DECAY_MS - 1);
+        assert_eq!(derive_wave(&neutral, now, false), Wave::Neutral);
+        assert_eq!(wave_deadline(&neutral, now), None);
     }
 
     #[test]

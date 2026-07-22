@@ -7,7 +7,7 @@ use gpui::{Context, Entity};
 use lens_core::domain::board::{
     Board, BoardItemKind, BoardLayout, DEFAULT_BOARD_ID, DEFAULT_BOARD_NAME, PlacementTarget,
 };
-use lens_core::domain::ids::{BoardId, ConnectionId, SessionId};
+use lens_core::domain::ids::{BoardId, BoardItemId, ConnectionId, SessionId};
 use lens_core::persist::{BoardStore, PersistError, SqliteBoardStore, StoreMode};
 
 use crate::fleet::store::FleetStore;
@@ -15,8 +15,15 @@ use crate::fleet::store::FleetStore;
 pub(crate) const MAX_RETRIES: u32 = 5;
 
 pub(crate) enum Op {
-    Load { initial: bool },
+    Load {
+        initial: bool,
+    },
     PlaceSessions(Vec<(ConnectionId, SessionId)>),
+    /// B-4b: idempotent group-collapse write (set the flag to an absolute value).
+    SetCollapsed {
+        group_id: BoardItemId,
+        collapsed: bool,
+    },
 }
 
 enum OpOutcome {
@@ -26,6 +33,11 @@ enum OpOutcome {
         mode: StoreMode,
     },
     Placed {
+        layout: BoardLayout,
+        skipped_empty: bool,
+        mode: StoreMode,
+    },
+    Wrote {
         layout: BoardLayout,
         skipped_empty: bool,
         mode: StoreMode,
@@ -235,6 +247,10 @@ impl BoardReplica {
                     self.dropped_writes = self.dropped_writes.saturating_add(1);
                     continue;
                 }
+                Some(Op::SetCollapsed { .. }) if !self.is_writable() => {
+                    self.dropped_writes = self.dropped_writes.saturating_add(1);
+                    continue;
+                }
                 Some(op) => break op,
             }
         };
@@ -288,6 +304,15 @@ impl BoardReplica {
                 self.reconcile_in_flight = false;
                 self.note_place_result(); // suppress stuck keys (Task 6, C1)
                 self.reconcile(cx); // re-diff on reply (Task 6)
+            }
+            OpOutcome::Wrote {
+                layout,
+                skipped_empty,
+                mode,
+            } => {
+                self.op_retries = 0;
+                self.layout = Arc::new(layout);
+                self.state = load_state(mode, skipped_empty);
             }
             OpOutcome::Failed { op, err } => {
                 self.on_op_failed(op, err, cx); // Task 5
@@ -358,6 +383,9 @@ impl BoardReplica {
     }
 
     fn on_op_failed(&mut self, op: Op, err: PersistError, cx: &mut Context<Self>) {
+        // The op that just failed is no longer in `pending` (pump moved it out); remember
+        // whether it was a write so a terminal failure counts it too (below).
+        let current_is_write = !matches!(op, Op::Load { .. });
         // Transient (SQLITE_BUSY/LOCKED beyond busy_timeout): keep the op, back off, retry.
         // SEAM (B-4d): this re-enqueues the WHOLE op. Safe here because B-4a's ops are
         // idempotent (Load; PlaceSessions skips already-present) — a `place then compose-reload`
@@ -391,13 +419,21 @@ impl BoardReplica {
             Op::PlaceSessions(_) => {
                 self.state = ReplicaState::Stale; // keep current layout
             }
+            Op::SetCollapsed { .. } => {
+                self.state = ReplicaState::Stale; // keep current layout
+            }
         }
         // Persistent failure: queued writes won't succeed on replay — drop (banner names them).
-        let dropped = self
+        // The op that just failed terminally is itself an unsaved write (it was already
+        // popped from `pending`), so count it too (codex final-review Important #2).
+        let mut dropped = self
             .pending
             .iter()
-            .filter(|o| matches!(o, Op::PlaceSessions(_)))
+            .filter(|o| !matches!(o, Op::Load { .. }))
             .count() as u32;
+        if current_is_write {
+            dropped += 1;
+        }
         self.dropped_writes = self.dropped_writes.saturating_add(dropped);
         self.pending.retain(|o| matches!(o, Op::Load { .. }));
         self.banner_dismissed = false;
@@ -420,9 +456,12 @@ impl BoardReplica {
 
     /// The B-4b/c/d write seam: B-4a exercises it only in tests (no user interactions yet),
     /// so it's dead in the non-test build until the interaction slices call it.
-    #[allow(dead_code)]
     pub(crate) fn write(&mut self, op: Op, cx: &mut Context<Self>) -> WriteDisposition {
         if !self.is_writable() {
+            // Count the rejected user write so the banner names the loss (§5 "never
+            // *silently* drop a user write"; write() is the user-write entry point —
+            // reconcile places go via run_op). B-4b ships the first real user write.
+            self.dropped_writes = self.dropped_writes.saturating_add(1);
             self.banner_dismissed = false; // re-surface the banner on a rejected gesture
             cx.notify();
             return WriteDisposition::Rejected(self.state);
@@ -500,6 +539,18 @@ fn run_op_inner(slot: &mut StoreSlot, op: &Op) -> lens_core::persist::Result<OpO
             store.place_sessions(keys, &default_root_target())?; // persist
             let (layout, skipped_empty, mode) = read_committed(store)?; // reconciled read (M5 rebuttal)
             Ok(OpOutcome::Placed {
+                layout,
+                skipped_empty,
+                mode,
+            })
+        }
+        Op::SetCollapsed {
+            group_id,
+            collapsed,
+        } => {
+            store.set_collapsed(group_id, *collapsed)?; // persist (idempotent, absolute value)
+            let (layout, skipped_empty, mode) = read_committed(store)?;
+            Ok(OpOutcome::Wrote {
                 layout,
                 skipped_empty,
                 mode,
@@ -691,6 +742,89 @@ mod tests {
                 DEFAULT_BOARD_ID
             );
         });
+    }
+
+    #[gpui::test]
+    async fn set_collapsed_round_trips_and_persists(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.db");
+        // Seed a group into a real store on `path`, capture its id, drop the handle.
+        let gid = {
+            let store = SqliteBoardStore::open(&path).unwrap();
+            store
+                .create_group(&BoardId::new(DEFAULT_BOARD_ID), None, 0, "G")
+                .unwrap()
+        };
+
+        let fleet = cx.update(test_fleet);
+        let replica = cx
+            .update(|cx| cx.new(|cx| BoardReplica::for_test_file(fleet.clone(), path.clone(), cx)));
+        cx.run_until_parked(); // Load the seeded group (collapsed == false).
+
+        let is_collapsed = |r: &BoardReplica| {
+            matches!(
+                r.layout().item(&gid).map(|it| &it.kind),
+                Some(BoardItemKind::Group {
+                    collapsed: true,
+                    ..
+                })
+            )
+        };
+        replica.read_with(cx, |r, _| assert!(!is_collapsed(r), "seeded expanded"));
+
+        replica.update(cx, |r, cx| {
+            r.write(
+                Op::SetCollapsed {
+                    group_id: gid.clone(),
+                    collapsed: true,
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        replica.read_with(cx, |r, _| {
+            assert_eq!(r.state(), ReplicaState::Writable);
+            assert!(is_collapsed(r), "flag flipped in the committed layout");
+        });
+
+        // Reopen the same path in a fresh replica — the collapse persisted.
+        let fleet2 = cx.update(test_fleet);
+        let replica2 =
+            cx.update(|cx| cx.new(|cx| BoardReplica::for_test_file(fleet2, path.clone(), cx)));
+        cx.run_until_parked();
+        replica2.read_with(cx, |r, _| {
+            assert!(is_collapsed(r), "persisted across reopen")
+        });
+    }
+
+    #[gpui::test]
+    async fn set_collapsed_refused_when_non_writable(cx: &mut gpui::TestAppContext) {
+        // A LoadFailed replica (bad path) refuses the write (banner honesty).
+        let fleet = cx.update(test_fleet);
+        let replica = cx.update(|cx| {
+            cx.new(|cx| BoardReplica::for_test_file(fleet, "/dev/null/nope.db".into(), cx))
+        });
+        cx.run_until_parked();
+        let before = replica.read_with(cx, |r, _| {
+            assert_eq!(r.state(), ReplicaState::LoadFailed);
+            r.dropped_writes()
+        });
+        let disp = replica.update(cx, |r, cx| {
+            r.write(
+                Op::SetCollapsed {
+                    group_id: BoardItemId::new("g_x"),
+                    collapsed: true,
+                },
+                cx,
+            )
+        });
+        assert!(matches!(
+            disp,
+            WriteDisposition::Rejected(ReplicaState::LoadFailed)
+        ));
+        // Contract (§5): a rejected user write is COUNTED so the banner names the loss
+        // (codex final-review Important #2). It is never silently dropped.
+        replica.read_with(cx, |r, _| assert_eq!(r.dropped_writes(), before + 1));
     }
 
     #[gpui::test]
@@ -1139,6 +1273,9 @@ mod tests {
                 r.layout().default_board_id().unwrap().as_str(),
                 DEFAULT_BOARD_ID
             );
+            // The write that failed TERMINALLY is counted (codex final-review Important #2):
+            // this exercises the op-agnostic `current_is_write` accounting in on_op_failed.
+            assert_eq!(r.dropped_writes(), 1);
         });
         drop(dir);
     }

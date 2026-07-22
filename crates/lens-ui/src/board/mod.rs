@@ -4,17 +4,43 @@ mod rollup;
 pub use replica::{BoardReplica, ReplicaState, WriteDisposition};
 
 use crate::PtyProbe;
+use crate::card::motion::RING_REACH_PX;
 use crate::card::view::{SessionCardView, mount_cached_card};
+use crate::card::wave::{Wave, derive_wave, wave_deadline};
 use crate::fleet::store::FleetStore;
 use crate::slot::{TabHandle, focused_transcript_tab};
+use crate::theme::ActiveLensTheme as _;
 use gpui::{
     AnyElement, AnyView, App, AppContext, Bounds, ClickEvent, Context, Entity, EntityId,
     IntoElement, ParentElement, Pixels, Render, ScrollHandle, Styled, Window, div, prelude::*, px,
 };
 use lens_core::domain::board::BoardNode;
-use lens_core::domain::ids::SessionId;
+use lens_core::domain::ids::{BoardItemId, SessionId};
 use lens_core::pack::{self, CARD_H, CARD_W, CELL_H, CELL_W, GAP, HEADER, INSET, Item};
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
+
+/// Ring-gutter: a group's tint/border overhangs its tile by this on every side, and the
+/// board reserves it around the whole grid. Two bounds pin it (see `gutter_bounds` test):
+/// - `>= RING_REACH_PX` — contains a member's attention pulse inside the group border
+///   (and keeps a loose card's pulse off the viewport edge). `+1` gives 1px slack.
+/// - `<= GAP/2` — two ADJACENT groups each overhang into the shared inter-tile gap; if the
+///   sum exceeds `GAP` their boxes overlap (on-device: "the groups clip"). GAP/2 = 8.
+///
+/// Distinct from `pack::INSET` (the card-origin offset within a cell, which cancels in
+/// member placement).
+const GUTTER: f32 = RING_REACH_PX + 1.0;
+
+// The two bounds above are compile-time invariants — a runtime test would const-fold to
+// `assert!(true)`. Break either (e.g. bump RING_REACH_PX past GAP/2) and the build fails here.
+const _: () = assert!(
+    GUTTER >= RING_REACH_PX,
+    "GUTTER must contain the attention ring, else a member pulse leaks past the group border",
+);
+const _: () = assert!(
+    2.0 * GUTTER <= pack::GAP,
+    "2*GUTTER must be <= GAP, else two adjacent groups' boxes overlap in the shared gap",
+);
 
 /// Width of the left nav rail (unchanged placeholder).
 const NAV_RAIL_W: f32 = 48.0;
@@ -42,8 +68,10 @@ impl ShellMode {
 /// Per-tile group metadata threaded from `board_tree` into the renderer (B-3).
 /// `completed_count` is Archive-side (B-6); B-3 passes 0.
 struct GroupMeta {
+    id: BoardItemId,
     name: String,
     color_token: Option<String>,
+    collapsed: bool,
     completed_count: u32,
 }
 
@@ -55,7 +83,12 @@ pub struct GroupChromeSnapshot {
     pub name: String,
     pub accent: gpui::Hsla,
     pub rollup: rollup::GroupRollup,
-    pub header: String,
+    /// The "spend · age" middle text — the single source for the rendered element.
+    pub spend_age: String,
+    /// Whether the `✓N` element is rendered (⇔ `rollup.completed_count > 0`).
+    pub shows_completed: bool,
+    pub collapsed: bool,
+    pub status_rows: Vec<(Wave, u32)>,
 }
 
 pub struct BoardView {
@@ -81,6 +114,13 @@ pub struct BoardView {
     /// B-3 render snapshot: the group chrome computed at the last render (test hook;
     /// also the eventual B-4 live-inspection point). Recomputed each frame.
     last_group_chrome: Vec<GroupChromeSnapshot>,
+    /// One-shot repaint timer for the earliest collapsed-group time-based wave deadline
+    /// (Ready decay / Scheduled wake). Collapsed members hold no per-card anim timer, so
+    /// without this their rollup would show a stale wave until an unrelated re-render
+    /// (codex final-review Important #1). `gpui::Task` is cancel-on-drop.
+    rollup_wake: Option<gpui::Task<()>>,
+    /// The deadline `rollup_wake` is currently armed for — re-arm only when it changes.
+    armed_rollup_deadline: Option<i64>,
 }
 
 impl BoardView {
@@ -130,6 +170,8 @@ impl BoardView {
             rail_scroll: ScrollHandle::new(),
             last_built: Vec::new(),
             last_group_chrome: Vec::new(),
+            rollup_wake: None,
+            armed_rollup_deadline: None,
         }
     }
 
@@ -198,12 +240,29 @@ impl BoardView {
     }
 
     fn sync_card_views(&mut self, cx: &mut Context<Self>) {
+        // Collapsed-group members feed the status rollup (fleet card read) but must
+        // not hold a SessionCardView entity — prune any that slipped in at mount.
+        //
+        // INVARIANT (do not break): pruning here is what CANCELS a collapsed member's
+        // anim timer — `anim_task` is an entity-owned `gpui::Task` (cancel-on-drop) whose
+        // spawn captures a WeakEntity, so dropping the last strong ref (these two maps are
+        // the only holders) cancels the timer. The visibility gate never sends
+        // `set_visible(false)` here (it clones `card_views` AFTER this prune, so the id
+        // misses). Therefore: NEVER retain an `Entity<SessionCardView>` for a collapsed
+        // member anywhere else, or its timer would leak with nothing to stop it.
+        let collapsed_members = self.collapsed_group_member_ids(cx);
+        self.card_views
+            .retain(|id, _| !collapsed_members.contains(id));
+        self.cached_tiles
+            .retain(|id, _| !collapsed_members.contains(id));
+
         let missing: Vec<_> = {
             let fleet = self.fleet.read(cx);
             fleet
                 .cards
                 .iter()
                 .filter(|(id, _)| !self.card_views.contains_key(*id))
+                .filter(|(id, _)| !collapsed_members.contains(*id))
                 .map(|(id, card)| (id.clone(), card.clone()))
                 .collect()
         };
@@ -211,6 +270,62 @@ impl BoardView {
             let view = self.make_card_view(id.clone(), card, cx);
             self.insert_card_view(id, view);
         }
+    }
+
+    /// Session ids placed under a collapsed group on the default board — excluded
+    /// from card-view entities (§3.1 visibility fork).
+    fn collapsed_group_member_ids(&self, cx: &App) -> HashSet<SessionId> {
+        let layout = self.replica.read(cx).layout();
+        let board_id = match layout.default_board_id() {
+            Ok(id) => id.clone(),
+            Err(_) => return HashSet::new(),
+        };
+        let nodes = layout.board_tree(&board_id).unwrap_or_default();
+        let mut out = HashSet::new();
+        for node in &nodes {
+            collect_collapsed_group_members(node, &mut out);
+        }
+        out
+    }
+
+    /// Schedule a single repaint at the earliest clock deadline across collapsed-group
+    /// members (Ready decay / Scheduled wake), so their status rollup — which holds no
+    /// per-card anim timer — refreshes when a time-based wave expires (codex final-review
+    /// Important #1). The gpui timer is real-time; the fired repaint re-derives waves from
+    /// the UI clock (the same dual-clock pattern as the card anim timer). Re-armed only
+    /// when the deadline changes (no per-frame task churn); the fired task clears the
+    /// armed deadline so the re-render re-arms the next one. Converges: once every
+    /// collapsed member is clock-stable the deadline is `None` and no timer is held.
+    fn arm_collapsed_rollup_wake(&mut self, cx: &mut Context<Self>) {
+        let now_ms = self.fleet.read(cx).clock().now_millis();
+        let members = self.collapsed_group_member_ids(cx);
+        let next = {
+            let fleet = self.fleet.read(cx);
+            members
+                .iter()
+                .filter_map(|s| {
+                    fleet
+                        .cards
+                        .get(s)
+                        .and_then(|e| wave_deadline(e.read(cx), now_ms))
+                })
+                .min()
+        };
+        if next == self.armed_rollup_deadline {
+            return; // unchanged — keep the pending timer, avoid re-spawning every frame
+        }
+        self.armed_rollup_deadline = next;
+        self.rollup_wake = next.map(|deadline| {
+            let delay = Duration::from_millis((deadline - now_ms).max(0) as u64);
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(delay).await;
+                let _ = this.update(cx, |this, cx| {
+                    // Spent — let the re-render re-arm the next deadline (or none).
+                    this.armed_rollup_deadline = None;
+                    cx.notify();
+                });
+            })
+        });
     }
 
     fn card_click(
@@ -222,6 +337,32 @@ impl BoardView {
     ) {
         self.fleet
             .update(cx, |fleet, cx| fleet.focus_session(session_id, cx));
+    }
+
+    /// The caret toggle entry point (both ⌄ expanded and ▸ collapsed call this).
+    /// Reads the current flag from the replica's committed layout, issues the flipped
+    /// `SetCollapsed` write (commit-gated; a non-writable replica refuses + banners).
+    fn toggle_group_collapsed(&mut self, group_id: BoardItemId, cx: &mut Context<Self>) {
+        let current = matches!(
+            self.replica
+                .read(cx)
+                .layout()
+                .item(&group_id)
+                .map(|it| &it.kind),
+            Some(lens_core::domain::board::BoardItemKind::Group {
+                collapsed: true,
+                ..
+            })
+        );
+        self.replica.update(cx, |r, cx| {
+            r.write(
+                replica::Op::SetCollapsed {
+                    group_id,
+                    collapsed: !current,
+                },
+                cx,
+            );
+        });
     }
 
     fn render_nav_rail(&self) -> impl IntoElement {
@@ -260,21 +401,28 @@ impl BoardView {
             let (item, meta) = match node {
                 BoardNode::Card(_) => (Item::card(), None),
                 BoardNode::Group { item, .. } => {
-                    let meta = match &item.kind {
+                    let (name, color_token, collapsed) = match &item.kind {
                         lens_core::domain::board::BoardItemKind::Group {
                             name,
                             color_token,
+                            collapsed,
                             ..
-                        } => Some(GroupMeta {
-                            name: name.clone(),
-                            color_token: color_token.clone(),
-                            // ✓N is Archive-side (B-6); B-3 has no source → 0.
-                            completed_count: 0,
-                        }),
-                        // A Group node always carries a Group kind; defensively None.
-                        _ => None,
+                        } => (name.clone(), color_token.clone(), *collapsed),
+                        _ => (String::new(), None, false),
                     };
-                    (Item::group(sessions.len()), meta)
+                    let meta = GroupMeta {
+                        id: item.id.clone(),
+                        name,
+                        color_token,
+                        collapsed,
+                        completed_count: 0, // Archive-side (B-6)
+                    };
+                    let item = if collapsed {
+                        Item::group_collapsed(sessions.len())
+                    } else {
+                        Item::group(sessions.len())
+                    };
+                    (item, Some(meta))
                 }
             };
             items.push(item);
@@ -294,8 +442,15 @@ impl BoardView {
         let now_ms = self.fleet.read(cx).clock().now_millis();
         let mut group_chrome: Vec<GroupChromeSnapshot> = Vec::new();
 
+        // Grid offset by GUTTER inside `padded` (below): group rings/tints — and loose
+        // cards' expanding attention rings — overhang their tile by up to GUTTER on every
+        // side, so a tile at cell (0,0) would paint at (-GUTTER, -GUTTER) and clip against
+        // the scroll viewport (on-device: "Group card clipped on the left and top"; the ring
+        // reach also clipped loose top-left cards). `content` stays a positioning context.
         let mut content = div()
-            .relative()
+            .absolute()
+            .left(px(GUTTER))
+            .top(px(GUTTER))
             .w(px(cols as f32 * CELL_W))
             .h(px(packing.content_height));
 
@@ -305,11 +460,9 @@ impl BoardView {
                 continue; // culled → absent from child vec → gpui never builds it
             }
             let sessions = &tile_sessions[placed.item_index];
-            for s in sessions {
-                visible.push(s.clone());
-            }
             match placed.item.kind {
                 pack::Kind::Card => {
+                    visible.push(sessions[0].clone());
                     if let Some(tile) = self.absolute_card(
                         &sessions[0],
                         placed.cell_left(),
@@ -321,11 +474,24 @@ impl BoardView {
                 }
                 pack::Kind::Group { .. } => {
                     let meta = tile_groups[placed.item_index].as_ref();
-                    let (els, snap) = self.absolute_group(placed, sessions, meta, now_ms, cx);
-                    for el in els {
+                    let collapsed = meta.map(|m| m.collapsed).unwrap_or(false);
+                    if collapsed {
+                        // FORK: members feed the rollup (read inside), but are NOT visible —
+                        // no card views spawn for a collapsed group's members.
+                        let (el, snap) =
+                            self.absolute_collapsed_group(placed, sessions, meta, now_ms, cx);
                         content = content.child(el);
+                        group_chrome.push(snap);
+                    } else {
+                        for s in sessions {
+                            visible.push(s.clone());
+                        }
+                        let (els, snap) = self.absolute_group(placed, sessions, meta, now_ms, cx);
+                        for el in els {
+                            content = content.child(el);
+                        }
+                        group_chrome.push(snap);
                     }
-                    group_chrome.push(snap);
                 }
             }
         }
@@ -333,12 +499,19 @@ impl BoardView {
         self.last_built = visible.clone();
         self.last_group_chrome = group_chrome;
 
+        // Reserve the GUTTER margin the offset grid needs (2×GUTTER total: the grid sits at
+        // +GUTTER, and rings overhang +GUTTER past the bottom-right tile).
+        let padded = div()
+            .relative()
+            .w(px(cols as f32 * CELL_W + 2.0 * GUTTER))
+            .h(px(packing.content_height + 2.0 * GUTTER))
+            .child(content);
         let el = div()
             .id("board-scroll")
             .size_full()
             .overflow_scroll()
             .track_scroll(&scroll)
-            .child(content)
+            .child(padded)
             .into_any_element();
         (el, visible)
     }
@@ -398,6 +571,7 @@ impl BoardView {
         let name = meta.map(|m| m.name.clone()).unwrap_or_default();
         let completed = meta.map(|m| m.completed_count).unwrap_or(0);
         let accent = group_accent(meta.and_then(|m| m.color_token.as_deref()));
+        let group_id = meta.map(|m| m.id.clone());
 
         // Fold the rollup from member cards via a NARROW projection (cost + created_at
         // only) — no full SessionCard clone per member per frame (codex final-review I2).
@@ -414,26 +588,39 @@ impl BoardView {
                 .collect()
         };
         let rollup = rollup::group_rollup(&members, completed);
-        let header = rollup::group_header_text(&name, &rollup, now_ms);
+        let spend_age = format!(
+            "{} · {}",
+            rollup::format_group_spend(rollup.spend_usd),
+            rollup::format_age(rollup.oldest_created_at, now_ms),
+        );
+        // One source for the ✓N badge: the painted string AND the snapshot bool both
+        // derive from `badge` (the "render ✓N iff N>0" rule lives in `completed_badge`).
+        let badge = completed_badge(rollup.completed_count);
+        let shows_completed = badge.is_some();
 
         let snapshot = GroupChromeSnapshot {
             session_ids: sessions.to_vec(),
             name: name.clone(),
             accent,
             rollup: rollup.clone(),
-            header: header.clone(),
+            spend_age: spend_age.clone(),
+            shows_completed,
+            collapsed: false,
+            status_rows: Vec::new(),
         };
 
         let mut out: Vec<AnyElement> = Vec::with_capacity(sessions.len() + 2);
 
-        // Ring + tint box in the gap (spec §3). Sibling of the member cards.
+        // Ring + tint box in the gap (spec §3). Sibling of the member cards. Overhangs by
+        // GUTTER (= ring reach) so an edge member's NeedsInput/Failed pulse is contained by
+        // this border rather than leaking past it (on-device: "ring leaks past the box").
         out.push(
             div()
                 .absolute()
-                .left(px(x - INSET))
-                .top(px(y - INSET))
-                .w(px(block_w + 2.0 * INSET))
-                .h(px(block_h + 2.0 * INSET))
+                .left(px(x - GUTTER))
+                .top(px(y - GUTTER))
+                .w(px(block_w + 2.0 * GUTTER))
+                .h(px(block_h + 2.0 * GUTTER))
                 .rounded(px(12.0))
                 .border_1()
                 .border_color(accent)
@@ -460,18 +647,27 @@ impl BoardView {
                     div()
                         .flex_grow()
                         .text_color(gpui::rgb(0x8a8a94))
-                        .child(format!(
-                            "{} · {}",
-                            rollup::format_group_spend(rollup.spend_usd),
-                            rollup::format_age(rollup.oldest_created_at, now_ms),
-                        )),
+                        .child(spend_age.clone()),
                 )
-                .child(
+                .children(
+                    badge
+                        .clone()
+                        .map(|t| div().text_color(gpui::rgb(0x8a8a94)).child(t)),
+                )
+                .child({
+                    let gid = group_id.clone();
                     div()
+                        .id(("group-caret", placed.item_index))
+                        .cursor_pointer()
                         .text_color(gpui::rgb(0x8a8a94))
-                        .child(format!("✓{completed}")),
-                )
-                .child(div().text_color(gpui::rgb(0x8a8a94)).child("⌄"))
+                        .child("⌄")
+                        .on_click(cx.listener(move |board, _ev, _win, cx| {
+                            cx.stop_propagation();
+                            if let Some(gid) = gid.clone() {
+                                board.toggle_group_collapsed(gid, cx);
+                            }
+                        }))
+                })
                 .into_any_element(),
         );
 
@@ -489,6 +685,151 @@ impl BoardView {
         (out, snapshot)
     }
 
+    /// A collapsed group (§7): a 1×1 tile reusing the group ring/accent/tint, with a
+    /// header `● name · [spend · age] · ▸` and a body of status-rollup rows
+    /// (`● N <label>` per non-empty wave), plus a `✓N done` footer rendered iff N>0.
+    /// Members feed the rollup (read here) but are not rendered as cards.
+    fn absolute_collapsed_group(
+        &self,
+        placed: &pack::Placed,
+        sessions: &[SessionId],
+        meta: Option<&GroupMeta>,
+        now_ms: i64,
+        cx: &mut Context<Self>,
+    ) -> (AnyElement, GroupChromeSnapshot) {
+        let x = placed.cell_left();
+        let y = placed.cell_top();
+        let block_w = CELL_W - GAP;
+        let block_h = CELL_H - GAP;
+
+        let name = meta.map(|m| m.name.clone()).unwrap_or_default();
+        let completed = meta.map(|m| m.completed_count).unwrap_or(0);
+        let accent = group_accent(meta.and_then(|m| m.color_token.as_deref()));
+        let group_id = meta.map(|m| m.id.clone());
+
+        // Narrow projections read from member cards: cost/age (spend·age) + Wave (rollup).
+        let (member_costs, member_waves): (Vec<rollup::MemberCost>, Vec<Wave>) = {
+            let fleet = self.fleet.read(cx);
+            let mut costs = Vec::with_capacity(sessions.len());
+            let mut waves = Vec::with_capacity(sessions.len());
+            for s in sessions {
+                if let Some(e) = fleet.cards.get(s) {
+                    let card = e.read(cx);
+                    costs.push(rollup::MemberCost::from_card(card));
+                    waves.push(derive_wave(card, now_ms, false));
+                }
+            }
+            (costs, waves)
+        };
+        let rollup = rollup::group_rollup(&member_costs, completed);
+        let status = rollup::status_rollup(&member_waves);
+        let spend_age = format!(
+            "{} · {}",
+            rollup::format_group_spend(rollup.spend_usd),
+            rollup::format_age(rollup.oldest_created_at, now_ms),
+        );
+        // Same source as the expanded header (§5 "one rule, both sites"): the collapsed
+        // footer's `✓ N done →` gates through `completed_badge` so a future threshold
+        // change propagates to both chrome forms.
+        let shows_completed = completed_badge(rollup.completed_count).is_some();
+
+        let snapshot = GroupChromeSnapshot {
+            session_ids: sessions.to_vec(),
+            name: name.clone(),
+            accent,
+            rollup: rollup.clone(),
+            spend_age: spend_age.clone(),
+            shows_completed,
+            collapsed: true,
+            status_rows: status.rows.clone(),
+        };
+
+        let theme = cx.lens_theme();
+        let mut body = div()
+            .absolute()
+            .left(px(x))
+            .top(px(y + HEADER))
+            .w(px(block_w))
+            .h(px(block_h - HEADER))
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .px_1p5();
+        for (w, n) in &status.rows {
+            body = body.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1p5()
+                    .child(div().size(px(8.0)).rounded_full().bg(w.status_color(theme)))
+                    .child(
+                        div()
+                            .text_color(gpui::rgb(0xc4c4cc))
+                            .child(format!("{n} {}", wave_rollup_label(*w))),
+                    ),
+            );
+        }
+        body = body.children(shows_completed.then(|| {
+            div()
+                .text_color(gpui::rgb(0x8a8a94))
+                .child(format!("✓ {} done →", rollup.completed_count))
+        }));
+
+        // Ring/tint + header. The `▸` caret is interactive (Task 6); mirrors expanded `⌄`.
+        // Same GUTTER overhang as the expanded box so the border does not jump on toggle.
+        let ring = div()
+            .absolute()
+            .left(px(x - GUTTER))
+            .top(px(y - GUTTER))
+            .w(px(block_w + 2.0 * GUTTER))
+            .h(px(block_h + 2.0 * GUTTER))
+            .rounded(px(12.0))
+            .border_1()
+            .border_color(accent)
+            .bg(accent.opacity(0.07));
+        let header = div()
+            .absolute()
+            .left(px(x))
+            .top(px(y))
+            .w(px(block_w))
+            .h(px(HEADER))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1p5()
+            .px_1p5()
+            .child(div().size(px(8.0)).rounded_full().bg(accent))
+            .child(div().text_color(gpui::rgb(0xd6d6de)).child(name.clone()))
+            .child(
+                div()
+                    .flex_grow()
+                    .text_color(gpui::rgb(0x8a8a94))
+                    .child(spend_age.clone()),
+            )
+            .child({
+                let gid = group_id.clone();
+                div()
+                    .id(("group-caret", placed.item_index))
+                    .cursor_pointer()
+                    .text_color(gpui::rgb(0x8a8a94))
+                    .child("▸")
+                    .on_click(cx.listener(move |board, _ev, _win, cx| {
+                        cx.stop_propagation();
+                        if let Some(gid) = gid.clone() {
+                            board.toggle_group_collapsed(gid, cx);
+                        }
+                    }))
+            });
+
+        let tile = div()
+            .child(ring)
+            .child(header)
+            .child(body)
+            .into_any_element();
+        (tile, snapshot)
+    }
+
     /// Test hook: the session ids whose tiles were built (in the visible band) at
     /// the last render — proves culling.
     pub fn visible_session_ids_for_test(&self) -> Vec<SessionId> {
@@ -498,6 +839,17 @@ impl BoardView {
     /// Test hook: the group chrome computed at the last render.
     pub fn group_chrome_for_test(&self) -> Vec<GroupChromeSnapshot> {
         self.last_group_chrome.clone()
+    }
+
+    /// Test hook: the deadline the collapsed-rollup repaint wake is armed for.
+    pub fn armed_rollup_deadline_for_test(&self) -> Option<i64> {
+        self.armed_rollup_deadline
+    }
+
+    /// Test hook: whether a live repaint-wake `Task` is actually held (a dropped task
+    /// would be cancelled and never fire).
+    pub fn rollup_wake_held_for_test(&self) -> bool {
+        self.rollup_wake.is_some()
     }
 
     /// Acceptance-test hook: map session id → cached card view entity.
@@ -662,6 +1014,7 @@ impl Render for BoardView {
             }
         };
         self.apply_visibility_gate(visible.into_iter().collect(), cx);
+        self.arm_collapsed_rollup_wake(cx); // refresh collapsed rollups on Ready/Scheduled expiry
         let banner = self.banner_text(cx);
         let mut root = div().id("board-view").size_full().relative().child(body);
         if let Some(text) = banner {
@@ -669,6 +1022,14 @@ impl Render for BoardView {
         }
         root
     }
+}
+
+/// The `✓N` completed-badge text for group chrome (§5). `Some("✓{n}")` iff `n > 0`
+/// (the unified "render ✓N iff N>0" rule — one source for both the painted string and
+/// the snapshot bool); `None` suppresses the element. `completed_count` is Archive-side
+/// (B-6), structurally 0 until then — this locks the rule for when B-6 makes it non-zero.
+fn completed_badge(count: u32) -> Option<String> {
+    (count > 0).then(|| format!("✓{count}"))
 }
 
 /// Group accent color from its persisted `color_token` (spec §3, SSOT palette
@@ -684,6 +1045,46 @@ fn group_accent(token: Option<&str>) -> gpui::Hsla {
         _ => 0x6b7280, // neutral slate
     };
     gpui::rgb(hex).into()
+}
+
+/// The prune set for a single **top-level** `board_tree` node: if it is a collapsed
+/// group, every leaf session under it (those hide behind the 1×1 rollup tile). An
+/// expanded group renders its members as cards (they need views), so nothing is
+/// pruned — and we do NOT recurse into it. Recursing would prune a *nested* collapsed
+/// group's members while `pack`/`absolute_group` (top-level tiles only) still render
+/// them as cards → orphaned `visible` ids with no view (Grok T5 review Important #2).
+/// Nested groups are unreachable until B-5; B-5 owns nested collapse rendering + prune
+/// together. Keeping prune scope == pack scope (top-level tiles) makes B-4b consistent.
+fn collect_collapsed_group_members(node: &BoardNode<'_>, out: &mut HashSet<SessionId>) {
+    if let BoardNode::Group { item, .. } = node {
+        let collapsed = matches!(
+            &item.kind,
+            lens_core::domain::board::BoardItemKind::Group {
+                collapsed: true,
+                ..
+            }
+        );
+        if collapsed {
+            for sid in node.leaf_sessions() {
+                out.insert(sid.clone());
+            }
+        }
+    }
+}
+
+/// Title-case label for a status-rollup row (§7). `Neutral` is never in a rollup
+/// (excluded by `status_rollup`), so it maps to an empty label.
+fn wave_rollup_label(w: Wave) -> &'static str {
+    match w {
+        Wave::NeedsInput => "Needs input",
+        Wave::Failed => "Failed",
+        Wave::Working => "Working",
+        Wave::AwaitingReview => "Awaiting review",
+        Wave::Scheduled => "Scheduled",
+        Wave::Ready => "Ready",
+        Wave::Slept => "Slept",
+        Wave::Neutral => "",
+    }
 }
 
 #[cfg(test)]
@@ -846,6 +1247,68 @@ mod tests {
         let _ = (fleet, replica);
     }
 
+    #[gpui::test]
+    async fn expanded_group_snapshot_suppresses_completed_when_zero(cx: &mut gpui::TestAppContext) {
+        use lens_core::domain::board::{DEFAULT_BOARD_ID, PlacementTarget};
+        use lens_core::domain::ids::{BoardId, ConnectionId};
+        use lens_core::persist::{BoardStore, SqliteBoardStore};
+
+        let clock = Arc::new(ManualUiClock::new(10_000)) as Arc<dyn UiClock>;
+        let fleet = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::install_at_startup(cx);
+            let fleet = FleetStore::new(clock, cx);
+            fleet.update(cx, |f, cx| {
+                f.spawn_fake_session(SessionId::new("s1"), cx);
+            });
+            fleet
+        });
+        let conn = ConnectionId::new("conn_test");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.db");
+        let store = SqliteBoardStore::open(&path).unwrap();
+        let board = BoardId::new(DEFAULT_BOARD_ID);
+        let g1 = store.create_group(&board, None, 0, "G").unwrap();
+        store
+            .place_session(
+                &conn,
+                &SessionId::new("s1"),
+                &PlacementTarget {
+                    board_id: Some(board.clone()),
+                    parent_item_id: Some(g1.clone()),
+                    ordinal: Some(0),
+                },
+            )
+            .unwrap();
+        let boxed: Box<dyn BoardStore + Send> = Box::new(store);
+        let replica = cx.update(|cx| {
+            cx.new(|cx| BoardReplica::new(Some(boxed), path, conn, fleet.clone(), cx))
+        });
+        cx.run_until_parked();
+
+        let (board_view, vcx) = cx.add_window_view(|_, cx| {
+            BoardView::mount(fleet, replica, placeholder_tab(cx), None, cx)
+        });
+        vcx.run_until_parked();
+
+        board_view.read_with(vcx, |b, _| {
+            let chrome = b.group_chrome_for_test();
+            assert_eq!(chrome.len(), 1);
+            // completed_count is Archive-side (B-6) → 0 → the ✓N element is suppressed.
+            assert_eq!(chrome[0].rollup.completed_count, 0);
+            assert!(!chrome[0].shows_completed, "✓N hidden when count is 0");
+        });
+    }
+
+    #[test]
+    fn completed_badge_renders_only_when_positive() {
+        // The unified "✓N iff N>0" rule, both sides (closes the N>0 coverage the
+        // retired `group_header_text` test used to hold — Grok T4 review Important #2).
+        assert_eq!(completed_badge(0), None);
+        assert_eq!(completed_badge(2), Some("✓2".to_string()));
+        assert_eq!(completed_badge(1), Some("✓1".to_string()));
+    }
+
     #[test]
     fn group_accent_maps_ssot_tokens() {
         assert_eq!(group_accent(Some("blue")), gpui::rgb(0x4c8dff).into());
@@ -859,5 +1322,250 @@ mod tests {
         let neutral: gpui::Hsla = gpui::rgb(0x6b7280).into();
         assert_eq!(group_accent(None), neutral);
         assert_eq!(group_accent(Some("chartreuse")), neutral);
+    }
+
+    #[gpui::test]
+    async fn collapsed_group_renders_1x1_and_excludes_members_from_visible(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use lens_core::domain::board::{DEFAULT_BOARD_ID, PlacementTarget};
+        use lens_core::domain::ids::{BoardId, ConnectionId};
+        use lens_core::domain::scalars::SessionStatusValue;
+        use lens_core::persist::{BoardStore, SqliteBoardStore};
+
+        let clock = Arc::new(ManualUiClock::new(10_000)) as Arc<dyn UiClock>;
+        let conn = ConnectionId::new("conn_test");
+        let (s1, s2) = (SessionId::new("s1"), SessionId::new("s2"));
+        let fleet = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::install_at_startup(cx);
+            let fleet = FleetStore::new(clock, cx);
+            fleet.update(cx, |f, cx| {
+                for s in [&s1, &s2] {
+                    let card = f.spawn_fake_session(s.clone(), cx);
+                    card.update(cx, |c, _| c.status = SessionStatusValue::Running); // → Wave::Working
+                }
+            });
+            fleet
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.db");
+        let store = SqliteBoardStore::open(&path).unwrap();
+        let board = BoardId::new(DEFAULT_BOARD_ID);
+        let g1 = store.create_group(&board, None, 0, "G").unwrap();
+        for (i, s) in [&s1, &s2].into_iter().enumerate() {
+            store
+                .place_session(
+                    &conn,
+                    s,
+                    &PlacementTarget {
+                        board_id: Some(board.clone()),
+                        parent_item_id: Some(g1.clone()),
+                        ordinal: Some(i as i32),
+                    },
+                )
+                .unwrap();
+        }
+        store.set_collapsed(&g1, true).unwrap(); // collapsed on disk
+        let boxed: Box<dyn BoardStore + Send> = Box::new(store);
+        let replica = cx.update(|cx| {
+            cx.new(|cx| BoardReplica::new(Some(boxed), path, conn, fleet.clone(), cx))
+        });
+        cx.run_until_parked();
+
+        let (board_view, vcx) = cx.add_window_view(|_, cx| {
+            BoardView::mount(fleet, replica, placeholder_tab(cx), None, cx)
+        });
+        vcx.run_until_parked();
+
+        board_view.read_with(vcx, |b, _| {
+            let chrome = b.group_chrome_for_test();
+            assert_eq!(chrome.len(), 1);
+            assert!(chrome[0].collapsed, "group renders collapsed");
+            // 2 Running members → one Working row, count 2.
+            assert_eq!(
+                chrome[0].status_rows,
+                vec![(crate::card::wave::Wave::Working, 2)]
+            );
+            // THE FORK: collapsed members are NOT in the visible (card-view) set.
+            let visible: HashSet<SessionId> =
+                b.visible_session_ids_for_test().into_iter().collect();
+            assert!(
+                !visible.contains(&SessionId::new("s1"))
+                    && !visible.contains(&SessionId::new("s2")),
+                "collapsed members must be excluded from the visibility gate"
+            );
+            // and no card view is instantiated for them (no hidden-entity leak).
+            let views = b.card_views_for_test();
+            assert!(
+                !views.contains_key(&SessionId::new("s1"))
+                    && !views.contains_key(&SessionId::new("s2")),
+                "no card view spawned for a collapsed member"
+            );
+        });
+    }
+
+    // codex final-review Important #1: a collapsed group's rollup has no per-card anim
+    // timer, so the board must schedule a repaint at the earliest time-based wave
+    // deadline. Here a collapsed `Ready` member (idle + just-completed) must arm the wake
+    // for `last_completed_at + READY_DECAY_MS`. (The real-time timer FIRING vs the manual
+    // test clock is the dual-clock limitation — we assert the ARMED deadline, as the card
+    // anim tests assert `timer_running` rather than real firing.)
+    #[gpui::test]
+    async fn collapsed_ready_member_arms_rollup_wake_for_decay(cx: &mut gpui::TestAppContext) {
+        use lens_core::domain::board::{DEFAULT_BOARD_ID, PlacementTarget};
+        use lens_core::domain::ids::{BoardId, ConnectionId};
+        use lens_core::persist::{BoardStore, SqliteBoardStore};
+
+        const NOW: i64 = 10_000;
+        let clock = Arc::new(ManualUiClock::new(NOW)) as Arc<dyn UiClock>;
+        let conn = ConnectionId::new("conn_test");
+        let s1 = SessionId::new("s1");
+        let fleet = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::install_at_startup(cx);
+            let fleet = FleetStore::new(clock, cx);
+            fleet.update(cx, |f, cx| {
+                let card = f.spawn_fake_session(s1.clone(), cx);
+                // Idle + just-completed + unfocused → Wave::Ready (decays at NOW + decay).
+                card.update(cx, |c, _| c.last_completed_at = Some(NOW));
+            });
+            fleet
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.db");
+        let store = SqliteBoardStore::open(&path).unwrap();
+        let board = BoardId::new(DEFAULT_BOARD_ID);
+        let g1 = store.create_group(&board, None, 0, "G").unwrap();
+        store
+            .place_session(
+                &conn,
+                &s1,
+                &PlacementTarget {
+                    board_id: Some(board.clone()),
+                    parent_item_id: Some(g1.clone()),
+                    ordinal: Some(0),
+                },
+            )
+            .unwrap();
+        store.set_collapsed(&g1, true).unwrap();
+        let boxed: Box<dyn BoardStore + Send> = Box::new(store);
+        let replica = cx.update(|cx| {
+            cx.new(|cx| BoardReplica::new(Some(boxed), path, conn, fleet.clone(), cx))
+        });
+        cx.run_until_parked();
+
+        let (board_view, vcx) = cx.add_window_view(|_, cx| {
+            BoardView::mount(fleet, replica, placeholder_tab(cx), None, cx)
+        });
+        vcx.run_until_parked();
+
+        board_view.read_with(vcx, |b, _| {
+            // The collapsed Ready member's rollup will go stale at decay unless a repaint
+            // is scheduled for exactly that instant.
+            assert_eq!(
+                b.armed_rollup_deadline_for_test(),
+                Some(NOW + crate::card::model::READY_DECAY_MS),
+                "collapsed Ready member must arm the rollup wake for its decay deadline"
+            );
+            assert!(
+                b.rollup_wake_held_for_test(),
+                "a live repaint-wake Task must be held (a dropped one never fires)"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn toggle_group_collapsed_flips_render_and_visibility(cx: &mut gpui::TestAppContext) {
+        use lens_core::domain::board::{DEFAULT_BOARD_ID, PlacementTarget};
+        use lens_core::domain::ids::{BoardId, ConnectionId};
+        use lens_core::domain::scalars::SessionStatusValue;
+        use lens_core::persist::{BoardStore, SqliteBoardStore};
+
+        let clock = Arc::new(ManualUiClock::new(10_000)) as Arc<dyn UiClock>;
+        let conn = ConnectionId::new("conn_test");
+        let (s1, s2) = (SessionId::new("s1"), SessionId::new("s2"));
+        let fleet = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::install_at_startup(cx);
+            let fleet = FleetStore::new(clock, cx);
+            fleet.update(cx, |f, cx| {
+                for s in [&s1, &s2] {
+                    let card = f.spawn_fake_session(s.clone(), cx);
+                    card.update(cx, |c, _| c.status = SessionStatusValue::Running);
+                }
+            });
+            fleet
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.db");
+        let store = SqliteBoardStore::open(&path).unwrap();
+        let board = BoardId::new(DEFAULT_BOARD_ID);
+        let g1 = store.create_group(&board, None, 0, "G").unwrap();
+        for (i, s) in [&s1, &s2].into_iter().enumerate() {
+            store
+                .place_session(
+                    &conn,
+                    s,
+                    &PlacementTarget {
+                        board_id: Some(board.clone()),
+                        parent_item_id: Some(g1.clone()),
+                        ordinal: Some(i as i32),
+                    },
+                )
+                .unwrap();
+        }
+        let boxed: Box<dyn BoardStore + Send> = Box::new(store);
+        let replica = cx.update(|cx| {
+            cx.new(|cx| BoardReplica::new(Some(boxed), path, conn, fleet.clone(), cx))
+        });
+        cx.run_until_parked();
+        let (board_view, vcx) = cx.add_window_view(|_, cx| {
+            BoardView::mount(fleet, replica, placeholder_tab(cx), None, cx)
+        });
+        vcx.run_until_parked();
+
+        let collapsed = |b: &BoardView| b.group_chrome_for_test()[0].collapsed;
+        board_view.read_with(vcx, |b, _| assert!(!collapsed(b), "starts expanded"));
+
+        // Toggle → collapse (the caret closure calls exactly this).
+        let gid = g1.clone();
+        vcx.update(|_, cx| {
+            board_view.update(cx, |b, cx| b.toggle_group_collapsed(gid.clone(), cx));
+        });
+        vcx.run_until_parked();
+        board_view.read_with(vcx, |b, _| {
+            assert!(collapsed(b), "collapsed after toggle");
+            let visible: HashSet<SessionId> =
+                b.visible_session_ids_for_test().into_iter().collect();
+            assert!(
+                visible.is_empty(),
+                "collapsed members leave the visible set"
+            );
+            let views = b.card_views_for_test();
+            assert!(
+                !views.contains_key(&s1) && !views.contains_key(&s2),
+                "collapse drops member card views (cancels anim timers)"
+            );
+        });
+
+        // Toggle again → expand.
+        vcx.update(|_, cx| {
+            board_view.update(cx, |b, cx| b.toggle_group_collapsed(g1.clone(), cx));
+        });
+        vcx.run_until_parked();
+        board_view.read_with(vcx, |b, _| {
+            assert!(!collapsed(b), "expanded after second toggle");
+            let visible: HashSet<SessionId> =
+                b.visible_session_ids_for_test().into_iter().collect();
+            assert_eq!(visible.len(), 2, "members visible again");
+            let views = b.card_views_for_test();
+            assert!(
+                views.contains_key(&s1) && views.contains_key(&s2),
+                "expand recreates member card views via sync_card_views"
+            );
+        });
     }
 }

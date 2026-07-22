@@ -4,6 +4,7 @@
 //! it as an input defaulting to 0.
 
 use crate::card::model::SessionCard;
+use crate::card::wave::Wave;
 
 /// Pure fold over a group's member cards (spec §3.1). `completed_count` is supplied
 /// by the caller (Archive-side; B-6 wires the real source, B-3 passes 0).
@@ -54,6 +55,48 @@ pub fn group_rollup(members: &[MemberCost], completed_count: u32) -> GroupRollup
     }
 }
 
+/// The status-rollup body of a collapsed group (spec §7 / §4.1): one row per
+/// non-empty wave, in `derive_wave` priority-ladder order. `Neutral` is excluded
+/// (no meaningful status). Pure — the caller projects each member card to a `Wave`
+/// via `derive_wave` and passes the slice; label + dot color are resolved at render.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StatusRollup {
+    pub rows: Vec<(Wave, u32)>,
+}
+
+/// Rollup rank for a wave: `Some(priority)` in `derive_wave`'s resolution order, or
+/// `None` for waves excluded from the rollup (`Neutral` = no meaningful status). This
+/// `match` is EXHAUSTIVE, so adding a `Wave` variant is a COMPILE ERROR here until it is
+/// placed in (or explicitly excluded from) the ladder — the "self-maintaining" property
+/// (codex final-review Minor; a `const` array silently omitted new variants).
+fn wave_rank(w: Wave) -> Option<u8> {
+    match w {
+        Wave::NeedsInput => Some(0),
+        Wave::Failed => Some(1),
+        Wave::Working => Some(2),
+        Wave::AwaitingReview => Some(3),
+        Wave::Scheduled => Some(4),
+        Wave::Ready => Some(5),
+        Wave::Slept => Some(6),
+        Wave::Neutral => None,
+    }
+}
+
+pub fn status_rollup(member_waves: &[Wave]) -> StatusRollup {
+    // Distinct ranked waves present, each with its count, in ladder order.
+    let mut ranked: Vec<(u8, Wave, u32)> = Vec::new();
+    for &w in member_waves {
+        let Some(rank) = wave_rank(w) else { continue };
+        match ranked.iter_mut().find(|(_, cw, _)| *cw == w) {
+            Some((_, _, n)) => *n += 1,
+            None => ranked.push((rank, w, 1)),
+        }
+    }
+    ranked.sort_by_key(|(rank, _, _)| *rank);
+    let rows = ranked.into_iter().map(|(_, w, n)| (w, n)).collect();
+    StatusRollup { rows }
+}
+
 /// `~$X.XX`, or `—` when unknown. Mirrors `card::chrome::format_spend`.
 pub fn format_group_spend(spend_usd: Option<f64>) -> String {
     match spend_usd {
@@ -79,17 +122,6 @@ pub fn format_age(oldest_created_at_secs: Option<i64>, now_ms: i64) -> String {
     } else {
         format!("{}d", secs / 86_400)
     }
-}
-
-/// The header-lane text (spec §3): `name · spend · age · ✓N`. The colored dot and
-/// the `⌄` caret are rendered as elements, not part of this string.
-pub fn group_header_text(name: &str, rollup: &GroupRollup, now_ms: i64) -> String {
-    format!(
-        "{name} · {} · {} · ✓{}",
-        format_group_spend(rollup.spend_usd),
-        format_age(rollup.oldest_created_at, now_ms),
-        rollup.completed_count
-    )
 }
 
 #[cfg(test)]
@@ -162,15 +194,32 @@ mod tests {
     }
 
     #[test]
-    fn header_text_assembles_spec_order() {
-        let r = GroupRollup {
-            spend_usd: Some(3.5),
-            oldest_created_at: Some(0),
-            completed_count: 2,
-        };
+    fn status_rollup_counts_orders_and_drops_empties() {
+        use crate::card::wave::Wave;
+        // 2 Working, 1 Failed, 1 Ready, 1 Neutral (excluded).
+        let waves = [
+            Wave::Working,
+            Wave::Ready,
+            Wave::Working,
+            Wave::Failed,
+            Wave::Neutral,
+        ];
+        let r = status_rollup(&waves);
+        // Ladder order: Failed before Working before Ready; Neutral absent; no zero rows.
         assert_eq!(
-            group_header_text("Refactor", &r, 7_200_000),
-            "Refactor · ~$3.50 · 2h · ✓2"
+            r.rows,
+            vec![(Wave::Failed, 1), (Wave::Working, 2), (Wave::Ready, 1)]
+        );
+    }
+
+    #[test]
+    fn status_rollup_empty_and_all_neutral_are_empty() {
+        use crate::card::wave::Wave;
+        assert!(status_rollup(&[]).rows.is_empty());
+        assert!(
+            status_rollup(&[Wave::Neutral, Wave::Neutral])
+                .rows
+                .is_empty()
         );
     }
 }
