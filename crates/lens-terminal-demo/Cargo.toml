@@ -13,6 +13,10 @@ workspace = true
 name = "lens-terminal-demo"
 path = "src/main.rs"
 
+[[bin]]
+name = "rss_probe"
+path = "src/bin/rss_probe.rs"
+
 [dependencies]
 gpui = "0.2.2"
 gpui-component = "0.5.1"
