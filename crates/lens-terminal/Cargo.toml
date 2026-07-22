@@ -1,0 +1,89 @@
+[package]
+name = "lens-terminal"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-channel = "2"
+gpui = "0.2.2"
+lens-client = { path = "../lens-client" }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+libghostty-vt = { path = "../../vendor/libghostty-rs/libghostty-vt" }
+arc-swap = "1"
+crossbeam-channel = "0.5"
+futures = "0.3"
+url = "2"
+
+[features]
+bench = []
+# Exposes `render_test_api` for the real-window harness. Integration tests link
+# the crate's normal build (not cfg(test)), so the harness runs with this on.
+test-util = []
+live-tests = ["lens-client/live-tests"]
+
+[dev-dependencies]
+base64 = "0.22"
+criterion = { version = "0.5", default-features = false }
+gpui = { version = "0.2.2", features = ["test-support"] }
+lens-client = { path = "../lens-client", features = ["test-util"] }
+serde_json = "1"
+url = "2"
+
+[[bench]]
+name = "engine"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "render"
+harness = false
+required-features = ["bench"]
+
+# Real-window render harness (Slice 1c C1/C5). `harness = false` → a plain
+# `fn main()` that opens a real GPUI window and drives Menlo/paint/perf
+# assertions from a canvas paint callback (gpui's NoopTextSystem is useless for
+# these). `required-features` keeps `cargo test --workspace` from building it;
+# xtask executes it on macOS with `--features test-util`.
+[[test]]
+name = "render_realwindow"
+path = "tests/render_realwindow.rs"
+harness = false
+required-features = ["test-util"]
+
+[[test]]
+name = "stream_perf_realwindow"
+harness = false
+required-features = ["test-util"]
+
+[[test]]
+name = "input_realwindow"
+path = "tests/input_realwindow.rs"
+harness = false
+required-features = ["test-util"]
+
+[[test]]
+name = "presentation_realwindow"
+path = "tests/presentation_realwindow.rs"
+harness = false
+required-features = ["test-util"]
+
+[[test]]
+name = "mouse_realwindow"
+path = "tests/mouse_realwindow.rs"
+harness = false
+required-features = ["test-util"]
+
+# Live open()+paint+reconnect rider (Slice 1d). `harness = false` → real GPUI
+# window; env-gated skip vs fail; not part of default `cargo test --workspace`.
+[[test]]
+name = "terminal_live"
+path = "tests/terminal_live.rs"
+harness = false
+required-features = ["live-tests", "test-util"]

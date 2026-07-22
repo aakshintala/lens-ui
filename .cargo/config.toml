@@ -1,0 +1,19 @@
+# Lens cargo config.
+#
+# The vendored `libghostty-vt-sys` build script compiles Ghostty's VT library
+# from source with zig. On macOS 26 this MUST be the patched Homebrew/Nix
+# `zig@0.15` (0.15.2) — the vanilla ziglang.org tarball fails to link against
+# the macOS 26 SDK (ziglang/zig#31658). Homebrew installs it keg-only, so it is
+# NOT on PATH by default.
+#
+# We point the build script at it directly via a `ZIG` override (honored by the
+# Lens-local patch in vendor/libghostty-rs/libghostty-vt-sys/build.rs) so plain
+# `cargo build`/`cargo test` works with no per-shell PATH edit. `force = false`
+# (the default) means an explicit `ZIG` in your environment still wins — e.g. a
+# Nix shell or a different install path.
+#
+# Prereq: `brew install zig@0.15`. If your brew prefix differs, override `ZIG`
+# in your environment or edit the path below. Verify with:
+#   test -x "$(brew --prefix zig@0.15)/bin/zig"
+[env]
+ZIG = { value = "/opt/homebrew/opt/zig@0.15/bin/zig", force = false }

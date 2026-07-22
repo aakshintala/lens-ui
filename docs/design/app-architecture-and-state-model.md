@@ -384,6 +384,14 @@ Auto-sleep **excludes**:
   `stop_session` best-effort, terminal-awareness is load-bearing: a live terminal
   counts as not-quiesced.
 
+When a session is deliberately slept despite an open terminal tab, the terminal
+module closes its WS and releases its Ghostty engine/full scrollback. The tab
+retains only an immutable final viewport labeled `Session sleeping`; wake
+reattaches only if the same observed terminal generation survived and otherwise
+turns that viewport into `Detached`. Omnigent 0.5.1's missing immutable
+generation token leaves the narrow same-ID race documented in the terminal
+spec. This is not the transport-reconnect path and adds no output-gap marker.
+
 ### 3.3 No stream cap (self-bounding)
 
 There is **no connection cap.** A session streams iff it is **Active**. The

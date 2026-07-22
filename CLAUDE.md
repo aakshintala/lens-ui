@@ -13,10 +13,13 @@
   security-sensitive code, final review synthesis.
 - **MANDATORY** Review diversity — every non-trivial change gets ≥1 review from
   a model family *other* than the author's.
-- **MANDATORY** Route **all `gpt-5.5` delegation through `codex`**
-  (`codex exec -s read-only`), **not** `cursor-delegate` — codex is the free
-  gpt-5.5 path (memory `codex-as-reviewer`). Other families (`gemini-3.5`) still
-  route through `cursor-delegate`.
+- **MANDATORY** Cross-family **reviews** default to **`gpt-5.6`** — always run it
+  via **`codex exec -s read-only`**, **never via `cursor-delegate`**. (User rule
+  2026-07-21: "Never use gpt-5.6 via Cursor — we have Codex for that." `codex` now
+  resolves to `gpt-5.6-sol` at high effort. Memory `codex-as-reviewer`.) Codex
+  output is not truncated the way cursor-delegate truncates long chat replies —
+  capture stdout. Other families (`gemini-3.5`, `grok-4.5`) still route through
+  `cursor-delegate`; `composer-2.5` is the author, so it can't be the reviewer.
 
 ## Skills
 

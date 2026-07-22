@@ -1,0 +1,13 @@
+[package]
+name = "terminal-render"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Deliberately NO `[lints] workspace = true` — spikes live outside the
+# production lint wall. This crate is also listed in root `Cargo.toml`
+# `exclude` so it is not a workspace member.
+
+[dependencies]
+gpui = "0.2.2"
+libghostty-vt = { path = "../../vendor/libghostty-rs/libghostty-vt" }

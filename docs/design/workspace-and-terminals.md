@@ -33,8 +33,8 @@ diff).
 - **Review tab data** — the cumulative git diff of the working tree vs. base,
   driven by `GET changes` + `GET diff/{path}`, with inline comment authoring
   (§8).
-- **Terminals** — the WS attach client, the ring-buffer reconnect decision
-  (capability map §0.7-C), the transfer lifecycle (§9).
+- **Terminals** — the WS attach client, retained-emulator reconnect decision
+  (capability map §0.7-C), and terminal lifecycle (§9).
 - **Worktree provider** — pluggable; default `git worktree`; the new-session
   repo rows (§10).
 
@@ -43,7 +43,7 @@ diff).
 - The navigator panel UI (the application shell).
 - The transcript's per-edit tool-span diff (the transcript doc).
 - The terminal as a live PTY *rendering* (a working-area tab the shell hosts;
-  this document owns the WS data stream + the reconnect buffer).
+  this document owns the data contract and lifecycle semantics).
 - Host filesystem browsing (the server-lifecycle document owns the `/v1/hosts/
   {id}/filesystem` path — useful for new-session repo picking).
 
@@ -224,79 +224,121 @@ map §0.3, the highest-value control-room surface).
 
 ## 9. Terminals
 
+REST/resource-event facts in this section are grounded in
+`vendor/omnigent-0.5.1/openapi.json`: the terminal collection/item paths and
+`SessionResourceObject`, `ResourceEventData`, resource-created/deleted, and
+`SessionSupersededEvent` schemas. WS/internal behavior absent from OpenAPI was
+audited at omnigent `08285468` in `server/routes/terminal_attach.py`,
+`server/app.py`, `terminals/{ws_bridge,control_bridge}.py`, and
+`server/routes/sessions.py`.
+
 ### 9.1 WS attach
 
 `WS /v1/sessions/{id}/resources/terminals/{terminal_id}/attach` — **the `/v1`
 prefix IS required.** The router declares the bare `/sessions/.../attach` path
-(`terminal_attach.py:103-130`), but `create_app` mounts that router with
-`prefix="/v1"` (`app.py:1635-1642`), so the external WS URL carries `/v1` (the
-runner proxy + the `web` client both use the prefixed URL). The typed client's WS client
-(typed client §5) owns the connection; this document owns the Lens-side ring
-buffer + the lifecycle.
+(`terminal_attach.py:104-145`), but `create_app` mounts that router with
+`prefix="/v1"` (`app.py:2041-2046`), so the external WS URL carries `/v1` (the
+runner proxy + the `web` client both use the prefixed URL). The typed client's WS
+client (typed client §5) owns the connection; `lens-terminal` owns retained
+emulator state and terminal-local lifecycle.
 
 - **Frames** — binary PTY bytes inbound/outbound; control is text JSON
   (`{"type":"resize", ...}`); a `read_only` query param gates write access.
-- **Read-only by default** — `tmux attach -r`. Write attach requires
-  `LEVEL_OWNER`.
-- **No replay buffer** — live attach only. Reconnect loses scrollback.
+- **Explicit native transport** — Lens requests `transport=pty`; omnigent's
+  `control` default captures tmux history for xterm.js and must not be replayed
+  into Lens's retained Ghostty engine.
+- **Server-authoritative access** — `read_only=true` requires read access,
+  drops binary input, retains resize, and uses `tmux attach -r`; interactive
+  attach requires `LEVEL_OWNER`.
+- **No replay guarantee** — the attach stream has no sequence or replay proof.
+  Lens marks every successful post-establishment reconnect as a possible output
+  gap.
 
-### 9.2 Ring-buffer reconnect (decision C — LOCKED)
+### 9.2 Retained emulator reconnect (decision C — reconciled)
 
-**The Lens-side ring buffer** keeps scrollback across reconnects. The user-
-facing pain of "lost scrollback on reconnect" is high; a ring buffer
-(bounded, e.g. 10 MB per terminal — the size is an implementation detail,
-not load-bearing on the spec) keeps the live tail visible across stream
-interruptions. On reconnect:
+Lens keeps one bounded Ghostty emulator alive across a brief transport
+interruption. There is no second raw-byte ring and no replay into a fresh
+engine. The provisional per-terminal scrollback limit is 10 MB (10,000,000
+bytes), allocated lazy, with oldest-first eviction and the visible grid always
+preserved. On
+reconnect:
 
-1. Stream re-attaches via WS.
-2. The ring buffer's contents paint immediately.
-3. Live bytes resume appending; the buffer is a circular tail, so only the
-   recent N bytes survive (older scrollback ages out).
+1. The existing engine and viewport remain visible but read-only.
+2. `lens-client` GETs the exact resource ID to verify liveness and checks the
+   observed generation signals, then reattaches with `transport=pty` and the
+   newest size.
+3. Input is re-enabled only after access and resize are re-established.
+4. A persistent marker states that output during the interruption may be
+   missing.
 
-**Visual cue on reconnect:** a `↻ reconnected` hairline in the terminal
-scrollback, mirroring the transcript's reconnect break (transcript doc §11).
-Only shown if the buffer's tail < wall-clock-since-disconnect (i.e. we *know*
-we missed something); if the buffer holds the whole gap, no cue.
+Retry is automatic for 30 seconds with bounded exponential backoff. Queue
+saturation never drops arbitrary PTY chunks: sustained saturation deliberately
+disconnects into this same visible flow. `4404`/GET `404` means the terminal is
+gone; `4405` immediately becomes `Detached` with an explicit reattach action
+while tmux remains alive; `4500` and generic transport failures are retryable.
 
-**Scope: brief reconnects only — not a deliberate Sleep.** The ring buffer
-covers transient stream blips. It does **not** survive a Lens **Sleep**: Sleep
-closes Lens-local observation and sends best-effort `stop_session` (state model
-§3), so the server may terminate the tmux PTY. This is why auto-sleep is
-**terminal-aware** — a session with live/recent terminal activity is not
-"quiet" and is excluded from auto-sleep, so Lens doesn't request stop for a
-terminal you were watching.
+**Sleep is distinct.** A deliberate Sleep closes the WS and releases the
+Ghostty engine/full scrollback. An open tab retains only an immutable final
+viewport labeled `Session sleeping`. Wake reattaches only if the same observed
+terminal generation survived; otherwise that viewport becomes `Detached`. The
+missing immutable token leaves the narrow same-ID race recorded below. Sleep
+has no gap marker and never creates a terminal. Scrollback is memory-only and
+is also released on tab close or Lens exit.
+
+Fleet policy tracks actual retained bytes. macOS memory warning trims oldest
+history from least-recently-viewed hidden terminals first and inserts a visible
+truncation marker. Critical pressure deliberately disconnects hidden LRU tabs,
+preserves their final viewport, and exposes explicit reattach. The active tab is
+kept live and trimmed only as a last resort.
 
 ### 9.3 Terminal lifecycle
 
 - `GET /v1/sessions/{id}/resources/terminals` — list
 - `POST /v1/sessions/{id}/resources/terminals` — create (optionally with
   `terminal_launch_args` from the session PATCH)
+- `GET /v1/sessions/{id}/resources/terminals/{terminal_id}` — fetch one and
+  verify that its tmux pane is still live
 - `DELETE /v1/sessions/{id}/resources/terminals/{terminal_id}` — destroy
-- `POST /v1/sessions/{id}/resources/terminals/{terminal_id}/transfer` — move
-  a terminal to another session without closing it (live `/clear` rotation).
-  This is a 0.2.0 net-new affordance: when a session's context fills and
-  compaction fires, a long-running terminal can be transferred to a fresh
-  session — preserves the shell, renews the conversation.
+
+There is **no public transfer endpoint** in the pinned 0.5.1 OpenAPI contract.
+Omnigent uses an internal, schema-hidden transfer during native `/clear`, then
+publishes public `session.superseded` to the old session. `lens-ui` follows the
+target session and tells `lens-terminal` to reattach the same `TerminalId`
+under it; Lens never invokes transfer itself.
 
 **Events:** `session.terminal.activity` (notification only — actual PTY bytes
 come via the WS) + `session.terminal_pending` (0.2.0 — a terminal is about
-to be created; gives the UI a chance to pre-paint).
+to be created; gives the UI a chance to pre-paint), resource created/deleted,
+and `session.superseded` for live `/clear` routing.
 
 **Switch-agent resets terminals.** A live agent-switch
 (`POST /switch-agent`, agent-definition §7) fires the server's
 `_reset_runner_resources_after_switch`, so a session's terminals **drop and must
-re-attach** after a swap — the transcript survives, the terminals do not. The
-terminal tab should show a `↻ re-attaching` state and reconnect when the new
-runner's terminals come up.
+be replaced** after a swap — the transcript survives, the terminal process does
+not. An `OpenOrCreate` tab may wait for the exact-key server-created successor,
+show the old final frame, then install a fresh engine. An `Existing` tab never
+adopts the successor.
+
+The public target modes are `Existing { session_id, terminal_id }` and
+`OpenOrCreate { session_id, key }`. `OpenOrCreate` discovers/creates only during
+initial open; later deletion or unexplained disappearance becomes `Detached`
+until explicit user action. `Ended` is reserved for positive process-exit
+evidence, which 0.5.1 does not expose distinctly from deletion.
+
+Omnigent can recreate a few server-owned terminal roles while reusing their
+deterministic ID. Lens treats a second observed `resource.created` as a new
+generation and does not mix it into the old engine. The live SSE event is also
+normally persisted as a `ResourceEventData` item for reconnect discovery, but
+that persistence is best-effort. An immutable server-provided terminal
+generation ID therefore remains an upstream contract gap.
 
 ### 9.4 Shells vs. agent-terminals
 
-Both render in the **same terminal widget** — a tmux PTY is a tmux PTY; the
-distinction is purely the `kind` label on the terminal resource. Shells are
+Both render in the **same terminal widget** — a tmux PTY is a tmux PTY. Shells are
 user-spawned; agent-terminals are the harness's TUI (e.g. `claude --resume`
-for claude-native). Agent-terminals are read-only by default for
-non-owners; the owner may write-attach. **No separate UI**; the tab's icon
-distinguishes shell vs. agent-terminal.
+for claude-native). Non-owners are read-only; the owner may write-attach.
+**No separate renderer**; resource metadata/presentation supplies any icon or
+label distinction.
 
 ---
 
@@ -344,15 +386,15 @@ the typed model the shell consumes.
 
 ## 12. Open questions
 
-- **Ring buffer size** — 10 MB is a starting point; tune against real
-  scrollback usage. The spec is agnostic to the size; the contract is "bounded
-  tail + reconnect-safe."
+- **Measured memory budget** — 10 MB (10,000,000 bytes) per terminal is
+  provisional. Release
+  benchmarks on the available Apple Silicon machine must measure real resident
+  memory with many hidden streaming tabs before the fleet soft budget is final.
 - **Multi-root worktree navigation** — single root by default (decision A,
   resolved §3); when the user opts sibling roots in, the UX for cross-worktree
   search (one query, N roots) is a shell call.
 - **Sparse-checkout provider** — the pluggable provider seam (§10) is pinned,
   but the sparse-checkout UX is not; defer to first build.
-- **Terminal `transfer` UX** — when a terminal transfers to a new session,
-  the old session's terminal tab should close (or re-route); the new session's
-  terminal list gains it. The state-model + shell coordination here is
-  straightforward but not pinned.
+- **Terminal generation identity** — request an immutable generation/resource
+  ID from omnigent so reconnect can prove that a same-ID server recreation is
+  the same process rather than relying on best-effort persisted resource events.

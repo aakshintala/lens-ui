@@ -354,10 +354,12 @@ view. See §8 for the launcher taxonomy.
 ### 7.3 Persistence extends to content
 
 The state model's persistence covers not just *which* tabs/tiles are open but
-their **content state** (within reason): unsaved file buffers, diff/terminal
-scroll position, terminal scrollback (the **Lens-side ring buffer** — the
-server keeps none). Reopen a session and your layout + working state are
-restored.
+their **persistable content state** (within reason): unsaved file buffers and
+diff/editor scroll position. Terminal contents are deliberately different:
+Ghostty screen/scrollback is memory-only, survives brief transport reconnects,
+and is released on tab close, deliberate Sleep, or Lens exit. An open tab may
+retain an immutable final viewport during Sleep, but reopening Lens never
+silently restores terminal contents from disk.
 
 ### 7.4 The session header (slim status bar)
 
