@@ -14,9 +14,10 @@ use lens_core::domain::session::SessionState;
 #[cfg(feature = "demo")]
 use lens_core::domain::usage::Cost;
 use lens_core::persist::{
-    ConnectionRecord, ControlStore, SqliteControlStore, SqliteTranscriptStore,
+    BoardStore, ConnectionRecord, ControlStore, SqliteBoardStore, SqliteControlStore,
+    SqliteTranscriptStore,
 };
-use lens_ui::board::BoardView;
+use lens_ui::board::{BoardReplica, BoardView};
 #[cfg(feature = "demo")]
 use lens_ui::card::model::SessionCard;
 use lens_ui::clock::{UiClock, WallUiClock};
@@ -80,6 +81,12 @@ fn main() {
         }
     };
 
+    let board_db = config.data_dir.join("lens.db");
+    let mut board_store: Option<Box<dyn BoardStore + Send>> = SqliteBoardStore::open(&board_db)
+        .ok()
+        .map(|s| Box::new(s) as _);
+    let conn_id = ConnectionId::new("lens-app");
+
     Application::new()
         .with_assets(lens_ui::assets::LensAssets)
         .run(move |cx: &mut App| {
@@ -106,8 +113,24 @@ fn main() {
                         }
                     });
                 }
-                let board =
-                    cx.new(|cx| BoardView::mount(fleet.clone(), placeholder_tab(cx), None, cx));
+                let replica = cx.new(|cx| {
+                    BoardReplica::new(
+                        board_store.take(),
+                        board_db.clone(),
+                        conn_id.clone(),
+                        fleet.clone(),
+                        cx,
+                    )
+                });
+                let board = cx.new(|cx| {
+                    BoardView::mount(
+                        fleet.clone(),
+                        replica.clone(),
+                        placeholder_tab(cx),
+                        None,
+                        cx,
+                    )
+                });
                 let any: gpui::AnyView = board.into();
                 cx.new(|cx| Root::new(any, window, cx))
             })
@@ -121,9 +144,20 @@ fn main() {
 /// one still toggles focus (and suppresses that card's glow while focused).
 #[cfg(feature = "demo")]
 fn run_demo() {
+    let demo_db = std::env::temp_dir()
+        .join(format!("lens-demo-{}", process::id()))
+        .join("board.db");
+    if let Some(parent) = demo_db.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut demo_store: Option<Box<dyn BoardStore + Send>> = SqliteBoardStore::open(&demo_db)
+        .ok()
+        .map(|s| Box::new(s) as _);
+    let demo_conn = ConnectionId::new("lens-app");
+
     Application::new()
         .with_assets(lens_ui::assets::LensAssets)
-        .run(|cx: &mut App| {
+        .run(move |cx: &mut App| {
             gpui_component::init(cx);
             lens_ui::theme::install_at_startup(cx);
 
@@ -161,8 +195,24 @@ fn run_demo() {
                     }
                     cx.notify();
                 });
-                let board =
-                    cx.new(|cx| BoardView::mount(fleet.clone(), placeholder_tab(cx), None, cx));
+                let replica = cx.new(|cx| {
+                    BoardReplica::new(
+                        demo_store.take(),
+                        demo_db.clone(),
+                        demo_conn.clone(),
+                        fleet.clone(),
+                        cx,
+                    )
+                });
+                let board = cx.new(|cx| {
+                    BoardView::mount(
+                        fleet.clone(),
+                        replica.clone(),
+                        placeholder_tab(cx),
+                        None,
+                        cx,
+                    )
+                });
                 let card_views = board.read(cx).card_views_for_test().clone();
                 lens_ui::card::spawn_demo_paint_instrumentation(&card_views, cx);
                 let any: gpui::AnyView = board.into();

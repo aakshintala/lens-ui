@@ -1,4 +1,3 @@
-mod layout_adapter;
 pub mod replica;
 mod rollup;
 
@@ -8,16 +7,17 @@ use crate::PtyProbe;
 use crate::card::model::SessionCard;
 use crate::card::view::{SessionCardView, mount_cached_card};
 use crate::fleet::store::FleetStore;
-use crate::slot::{TabHandle, placeholder_tab};
+use crate::slot::TabHandle;
 use gpui::{
     AnyElement, AnyView, App, AppContext, Bounds, ClickEvent, Context, Entity, IntoElement,
     ParentElement, Pixels, Render, ScrollHandle, Styled, Window, div, prelude::*, px,
 };
-use layout_adapter::build_ephemeral_layout;
-use lens_core::domain::board::{BoardLayout, BoardNode};
+use lens_core::domain::board::BoardNode;
 use lens_core::domain::ids::SessionId;
 use lens_core::pack::{self, CARD_H, CARD_W, CELL_H, CELL_W, GAP, HEADER, INSET, Item};
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 /// Width of the left nav rail (unchanged placeholder).
 const NAV_RAIL_W: f32 = 48.0;
@@ -63,6 +63,7 @@ pub struct GroupChromeSnapshot {
 
 pub struct BoardView {
     fleet: Entity<FleetStore>,
+    replica: Entity<BoardReplica>,
     card_views: HashMap<SessionId, Entity<SessionCardView>>,
     /// Stable `.cached()` wrappers — created once per card so layout recompose reuses cache.
     cached_tiles: HashMap<SessionId, AnyView>,
@@ -71,6 +72,9 @@ pub struct BoardView {
     /// Session ids currently gated visible (their anim timers allowed to run).
     /// The container is the sole authority; diffed each render, applied via defer.
     gated_visible: HashSet<SessionId>,
+    /// Bumps on each gate apply so stale `defer` closures from an older `want`
+    /// cannot resurrect visibility after a newer gate (replica async re-notify path).
+    gate_epoch: Rc<Cell<u64>>,
     /// Scroll position of the board masonry surface (spec §4 unknown 1).
     board_scroll: ScrollHandle,
     /// Scroll position of the focused-mode rail (same container at 1 col, §5).
@@ -81,20 +85,19 @@ pub struct BoardView {
     /// B-3 render snapshot: the group chrome computed at the last render (test hook;
     /// also the eventual B-4 live-inspection point). Recomputed each frame.
     last_group_chrome: Vec<GroupChromeSnapshot>,
-    /// B-3 TEST SEAM: a hand-built layout injected in place of `build_ephemeral_layout`
-    /// so fixture tests can reach the group path (no group is runtime-creatable until
-    /// B-4). `None` in production. B-4's real store→replica seam supersedes this.
-    test_layout: Option<BoardLayout>,
 }
 
 impl BoardView {
     /// Builds a board view inside an existing entity context (window root or `cx.new`).
     pub fn mount(
         fleet: Entity<FleetStore>,
+        replica: Entity<BoardReplica>,
         working_tab: TabHandle,
         pty_probe: Option<PtyProbe>,
         cx: &mut Context<Self>,
     ) -> Self {
+        cx.observe(&replica, |_b: &mut BoardView, _, cx| cx.notify())
+            .detach();
         let cards: Vec<_> = fleet
             .read(cx)
             .cards
@@ -118,22 +121,18 @@ impl BoardView {
         .detach();
         Self {
             fleet: fleet_for_observe,
+            replica,
             card_views,
             cached_tiles,
             working_tab,
             pty_probe,
             gated_visible: HashSet::new(),
+            gate_epoch: Rc::new(Cell::new(0)),
             board_scroll: ScrollHandle::new(),
             rail_scroll: ScrollHandle::new(),
             last_built: Vec::new(),
             last_group_chrome: Vec::new(),
-            test_layout: None,
         }
-    }
-
-    pub fn new(fleet: Entity<FleetStore>, cx: &mut App) -> Entity<Self> {
-        let working_tab = placeholder_tab(cx);
-        cx.new(|cx| Self::mount(fleet, working_tab, None, cx))
     }
 
     fn make_card_view(
@@ -165,7 +164,13 @@ impl BoardView {
         let newly_hid: Vec<SessionId> = self.gated_visible.difference(&want).cloned().collect();
         let views = self.card_views.clone(); // Entity clones are cheap (Rc)
         self.gated_visible = want;
+        let epoch = self.gate_epoch.get().saturating_add(1);
+        self.gate_epoch.set(epoch);
+        let gate_epoch = self.gate_epoch.clone();
         cx.defer(move |app: &mut App| {
+            if gate_epoch.get() != epoch {
+                return;
+            }
             for id in newly_vis {
                 if let Some(v) = views.get(&id) {
                     v.update(app, |c, cx| c.set_visible(true, cx));
@@ -226,10 +231,7 @@ impl BoardView {
         scroll: ScrollHandle,
         cx: &mut Context<Self>,
     ) -> (AnyElement, Vec<SessionId>) {
-        let layout = self
-            .test_layout
-            .clone()
-            .unwrap_or_else(|| build_ephemeral_layout(self.fleet.read(cx)));
+        let layout = self.replica.read(cx).layout().clone();
         let board_id = match layout.default_board_id() {
             Ok(id) => id.clone(),
             Err(_) => return (div().into_any_element(), Vec::new()),
@@ -478,12 +480,6 @@ impl BoardView {
     /// Test hook: the group chrome computed at the last render.
     pub fn group_chrome_for_test(&self) -> Vec<GroupChromeSnapshot> {
         self.last_group_chrome.clone()
-    }
-
-    /// Test hook (B-3): inject a hand-built layout so the group render path is
-    /// reachable. Production uses `build_ephemeral_layout` (no groups until B-4).
-    pub fn set_test_layout_for_test(&mut self, layout: BoardLayout) {
-        self.test_layout = Some(layout);
     }
 
     /// Acceptance-test hook: map session id → cached card view entity.
