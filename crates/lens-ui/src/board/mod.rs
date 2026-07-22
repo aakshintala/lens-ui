@@ -4,6 +4,7 @@ mod rollup;
 pub use replica::{BoardReplica, ReplicaState, WriteDisposition};
 
 use crate::PtyProbe;
+use crate::card::motion::RING_REACH_PX;
 use crate::card::view::{SessionCardView, mount_cached_card};
 use crate::card::wave::{Wave, derive_wave, wave_deadline};
 use crate::fleet::store::FleetStore;
@@ -18,6 +19,14 @@ use lens_core::domain::ids::{BoardItemId, SessionId};
 use lens_core::pack::{self, CARD_H, CARD_W, CELL_H, CELL_W, GAP, HEADER, INSET, Item};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
+
+/// Ring-gutter: a group's tint/border overhangs its tile by this on every side, and the
+/// board reserves it around the whole grid. Sized to the expanding attention ring's reach
+/// (`RING_REACH_PX`) so a member's pulse is contained by the group border instead of
+/// leaking past it, and a loose card's pulse never clips at the viewport edge. Distinct
+/// from `pack::INSET` (the card-origin offset within a cell, which cancels in member
+/// placement) — they merely shared a value before.
+const GUTTER: f32 = RING_REACH_PX;
 
 /// Width of the left nav rail (unchanged placeholder).
 const NAV_RAIL_W: f32 = 48.0;
@@ -393,14 +402,15 @@ impl BoardView {
         let now_ms = self.fleet.read(cx).clock().now_millis();
         let mut group_chrome: Vec<GroupChromeSnapshot> = Vec::new();
 
-        // Grid offset by INSET inside `padded` (below): group rings/tints overhang their
-        // tile by INSET on every side, so a group at cell (0,0) would paint at (-INSET,
-        // -INSET) and clip against the scroll viewport (on-device: "Group card clipped on
-        // the left and top"). `content` stays a positioning context for its absolute tiles.
+        // Grid offset by GUTTER inside `padded` (below): group rings/tints — and loose
+        // cards' expanding attention rings — overhang their tile by up to GUTTER on every
+        // side, so a tile at cell (0,0) would paint at (-GUTTER, -GUTTER) and clip against
+        // the scroll viewport (on-device: "Group card clipped on the left and top"; the ring
+        // reach also clipped loose top-left cards). `content` stays a positioning context.
         let mut content = div()
             .absolute()
-            .left(px(INSET))
-            .top(px(INSET))
+            .left(px(GUTTER))
+            .top(px(GUTTER))
             .w(px(cols as f32 * CELL_W))
             .h(px(packing.content_height));
 
@@ -449,12 +459,12 @@ impl BoardView {
         self.last_built = visible.clone();
         self.last_group_chrome = group_chrome;
 
-        // Reserve the INSET margin the offset grid needs (2×INSET total: the grid sits at
-        // +INSET, and its rings overhang +INSET past the bottom-right tile).
+        // Reserve the GUTTER margin the offset grid needs (2×GUTTER total: the grid sits at
+        // +GUTTER, and rings overhang +GUTTER past the bottom-right tile).
         let padded = div()
             .relative()
-            .w(px(cols as f32 * CELL_W + 2.0 * INSET))
-            .h(px(packing.content_height + 2.0 * INSET))
+            .w(px(cols as f32 * CELL_W + 2.0 * GUTTER))
+            .h(px(packing.content_height + 2.0 * GUTTER))
             .child(content);
         let el = div()
             .id("board-scroll")
@@ -561,14 +571,16 @@ impl BoardView {
 
         let mut out: Vec<AnyElement> = Vec::with_capacity(sessions.len() + 2);
 
-        // Ring + tint box in the gap (spec §3). Sibling of the member cards.
+        // Ring + tint box in the gap (spec §3). Sibling of the member cards. Overhangs by
+        // GUTTER (= ring reach) so an edge member's NeedsInput/Failed pulse is contained by
+        // this border rather than leaking past it (on-device: "ring leaks past the box").
         out.push(
             div()
                 .absolute()
-                .left(px(x - INSET))
-                .top(px(y - INSET))
-                .w(px(block_w + 2.0 * INSET))
-                .h(px(block_h + 2.0 * INSET))
+                .left(px(x - GUTTER))
+                .top(px(y - GUTTER))
+                .w(px(block_w + 2.0 * GUTTER))
+                .h(px(block_h + 2.0 * GUTTER))
                 .rounded(px(12.0))
                 .border_1()
                 .border_color(accent)
@@ -725,12 +737,13 @@ impl BoardView {
         }));
 
         // Ring/tint + header. The `▸` caret is interactive (Task 6); mirrors expanded `⌄`.
+        // Same GUTTER overhang as the expanded box so the border does not jump on toggle.
         let ring = div()
             .absolute()
-            .left(px(x - INSET))
-            .top(px(y - INSET))
-            .w(px(block_w + 2.0 * INSET))
-            .h(px(block_h + 2.0 * INSET))
+            .left(px(x - GUTTER))
+            .top(px(y - GUTTER))
+            .w(px(block_w + 2.0 * GUTTER))
+            .h(px(block_h + 2.0 * GUTTER))
             .rounded(px(12.0))
             .border_1()
             .border_color(accent)
