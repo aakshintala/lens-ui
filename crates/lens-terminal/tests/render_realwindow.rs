@@ -40,15 +40,21 @@ use lens_terminal::render_test_api::{
 /// ceiling all of these clear.
 ///
 /// Observed release p95 (this hardware): ascii ~0.9–1.3ms, wide-200×50
-/// ~3.2–3.7ms, wide-400×100 ~4.8–6.2ms, pathological ~2.9–3.3ms (the upper end
-/// is under full-gate system load, which adds ~30% to the heavy per-cell phases
-/// — budgets carry margin for it so the gate does not flap).
+/// ~3.2–3.7ms, wide-400×100 ~4.8–6.2ms isolated, pathological ~2.9–3.3ms. The
+/// heavy per-cell phases inflate substantially under full-gate machine load —
+/// the 400×100 phase has been seen at ~8.2ms during a full `xtask gate` (~75%
+/// over its isolated median), not the ~30% the earlier budget assumed. The
+/// isolated figures above are the perf SSOT; the budgets add margin for that
+/// load tail so the gate does not flap on scheduler contention.
 const BUDGET_ASCII_MS: f64 = 3.0;
 const BUDGET_WIDE_200_MS: f64 = 5.5;
-/// 400×100: the absolute 8.3ms target was re-scoped to Slice 4, but release
-/// already meets it — this budget locks in sub-8.3 (no longer a 20ms interim)
-/// while clearing the ~6.2ms observed under gate load with margin.
-const BUDGET_WIDE_400_MS: f64 = 8.0;
+/// 400×100: the absolute 8.3ms product target (re-scoped to Slice 4) is met by
+/// release isolated (~4.8–6.2ms). This budget is deliberately looser than that
+/// target because the phase is measured under whole-gate CPU load, where it has
+/// reached ~8.2ms; 10.0 clears that observed load tail with margin while still
+/// tripping on a ≥~1.5× real regression. A breach means investigate the
+/// isolated number, not raise this. (codex I7 re-baseline; was 8.0 and flapped.)
+const BUDGET_WIDE_400_MS: f64 = 10.0;
 /// Pathological (100%-wide, 50%-emoji) regression guard — a tripwire against
 /// gross per-cell degradation, not a target.
 const BUDGET_PATHOLOGICAL_MS: f64 = 6.0;

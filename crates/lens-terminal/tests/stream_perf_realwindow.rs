@@ -32,6 +32,12 @@ const ROWS: u16 = 50;
 const BUILD_P95_MS: f64 = 3.0;
 const PAINT_P95_MS: f64 = 5.5;
 const WARMUP: usize = 60;
+/// Minimum builds the flipped-visible tab must complete in the ~`measure/3`
+/// post-flip window. Expected count there is tens of builds (16 ms build
+/// throttle over that window); this floor sits far below that yet far above a
+/// one-build-then-stall, so it rejects a stale-frame / dead-feeder false-green
+/// without flapping. codex I6.
+const MIN_POST_FLIP_BUILDS: u64 = 8;
 
 fn measure_frames() -> usize {
     if std::env::var("LENS_STREAM_SOAK").ok().as_deref() == Some("1") {
@@ -152,11 +158,24 @@ struct StreamView {
     state: TabRenderState,
     metrics: Rc<RefCell<Option<CellMetrics>>>,
     paint_samples: Rc<RefCell<Vec<Duration>>>,
-    /// Max `last_build_micros` seen per frame across visible engines.
+    /// One build-time sample per DISTINCT build (guarded on `frames_built`
+    /// advancing) — NOT per UI frame. Sampling `last_build_micros` once per
+    /// frame aliases builds (misses builds between frames, double-counts a
+    /// build straddling two frames); codex I7.
     build_samples: Rc<RefCell<Vec<Duration>>>,
+    /// Last `frames_built` seen per engine — the guard for per-distinct-build
+    /// sampling above.
+    last_frames_built: Rc<RefCell<Vec<u64>>>,
     frame_idx: Rc<RefCell<usize>>,
     flipped: Rc<RefCell<bool>>,
     hidden_frames_at_start: Rc<RefCell<Option<u64>>>,
+    /// The flipped tab's `frames_built` captured AT the flip. The exit check
+    /// requires it to advance by at least `MIN_POST_FLIP_BUILDS` — a SUSTAINED
+    /// floor, not merely ≥1. That single check subsumes two false-greens (codex
+    /// I6): a stale-frame / one-build-then-stall (delta stays tiny) AND a dead
+    /// feeder (once its backlog drains the tab stops going dirty, so builds
+    /// stop) — sustained builds require sustained dirtying require a live feeder.
+    flip_progress_baseline: Rc<RefCell<Option<u64>>>,
     rss_start: u64,
     measure: usize,
 }
@@ -169,6 +188,7 @@ impl StreamView {
         measure: usize,
         cx: &mut Context<Self>,
     ) -> Self {
+        let engine_count = engines.len();
         Self {
             engines,
             stop,
@@ -177,9 +197,11 @@ impl StreamView {
             metrics: Rc::new(RefCell::new(None)),
             paint_samples: Rc::new(RefCell::new(Vec::new())),
             build_samples: Rc::new(RefCell::new(Vec::new())),
+            last_frames_built: Rc::new(RefCell::new(vec![0; engine_count])),
             frame_idx: Rc::new(RefCell::new(0)),
             flipped: Rc::new(RefCell::new(false)),
             hidden_frames_at_start: Rc::new(RefCell::new(None)),
+            flip_progress_baseline: Rc::new(RefCell::new(None)),
             rss_start,
             measure,
         }
@@ -226,20 +248,42 @@ impl Render for StreamView {
                 }
             }
             let _ = self.engines[1].set_visible(true);
+            // Baseline for the exit-time sustained-progress check (codex I6):
+            // record the shown tab's build count now so we can require it to
+            // climb by MIN_POST_FLIP_BUILDS before measurement ends.
+            *self.flip_progress_baseline.borrow_mut() = Some(self.engines[1].inspect().frames_built);
             *self.flipped.borrow_mut() = true;
         }
 
-        // Sample the max build time across engines this frame.
-        let max_build_us = self
-            .engines
-            .iter()
-            .map(|e| e.inspect().last_build_micros)
-            .max()
-            .unwrap_or(0);
-        if idx >= WARMUP {
-            self.build_samples
-                .borrow_mut()
-                .push(Duration::from_micros(max_build_us));
+        // Sample each engine's build time once per DISTINCT build — guard on
+        // `frames_built` advancing rather than reading `last_build_micros` every
+        // UI frame. The build cadence (~60 Hz) and the UI frame rate are
+        // independent, so a per-frame read aliases the build stream (misses
+        // builds that land between frames, re-counts a build sampled twice).
+        // codex I7.
+        //
+        // Accepted limitation: if `frames_built` jumps by >1 between UI frames
+        // (only when a UI frame is delayed past ~2 build intervals, ~32 ms) we
+        // record just the latest duration and lose the intermediates — there is
+        // only one `last_build_micros` slot, and the event ring is unusable here
+        // (the per-feed BytesFed flood evicts FrameBuilt within ms). The residual
+        // is small: builds are throttled ~= the frame rate so Δ>1 is rare, a
+        // systemic regression still shows on the Δ=1 majority, and build p95 runs
+        // ~2.5× under budget. Revisit with a dedicated build-micros ring only if
+        // build p95 becomes load-bearing.
+        {
+            let mut last_fb = self.last_frames_built.borrow_mut();
+            for (k, e) in self.engines.iter().enumerate() {
+                let snap = e.inspect();
+                if snap.frames_built > last_fb[k] {
+                    last_fb[k] = snap.frames_built;
+                    if idx >= WARMUP {
+                        self.build_samples
+                            .borrow_mut()
+                            .push(Duration::from_micros(snap.last_build_micros));
+                    }
+                }
+            }
         }
 
         // Load the visible tab-0 frame for painting.
@@ -254,6 +298,8 @@ impl Render for StreamView {
         let stop = Arc::clone(&self.stop);
         let measure = self.measure;
         let rss_start = self.rss_start;
+        let flipped_tab = Arc::clone(&self.engines[1]);
+        let flip_baseline = Rc::clone(&self.flip_progress_baseline);
 
         // Paint via a timed canvas (PerCell path), then advance/finish.
         // `TabRenderState::latest_frame()` is already public via render_test_api —
@@ -287,6 +333,13 @@ impl Render for StreamView {
                 if i >= WARMUP + measure {
                     let paints = paint_cell.borrow();
                     let builds = build_samples.borrow();
+                    // Per-distinct-build sampling can legitimately produce fewer
+                    // samples than frames, but ZERO under sustained wide-stream
+                    // load means the build/feed path stalled — fail closed rather
+                    // than index an empty vec. codex I7-follow-up (Low).
+                    if builds.is_empty() {
+                        fail("no builds sampled under sustained streaming — build/feed path stalled");
+                    }
                     let paint_p95 = percentile_ms(&paints, 0.95);
                     let build_p95 = percentile_ms(&builds, 0.95);
                     let rss_end = rss_bytes();
@@ -297,6 +350,23 @@ impl Render for StreamView {
                          delta_rss_bytes={d_rss}"
                     );
                     stop.store(true, Ordering::Relaxed);
+                    // Prove the mid-run visibility flip did SUSTAINED work: the
+                    // shown tab must build ≥ MIN_POST_FLIP_BUILDS new frames, not
+                    // merely one. A single build then stall (stale-frame
+                    // false-green) or a dead feeder (backlog drains, tab stops
+                    // dirtying, builds stop) both leave the delta below the floor.
+                    // codex I6.
+                    if let Some(fb0) = *flip_baseline.borrow() {
+                        let built = flipped_tab.inspect().frames_built.saturating_sub(fb0);
+                        if built < MIN_POST_FLIP_BUILDS {
+                            fail(&format!(
+                                "flipped tab built only {built} frames after being shown \
+                                 (need ≥ {MIN_POST_FLIP_BUILDS}) — stale-frame / stalled-feeder false-green"
+                            ));
+                        }
+                    } else {
+                        fail("visibility flip never fired before measurement ended");
+                    }
                     if paint_p95 > PAINT_P95_MS {
                         fail(&format!(
                             "paint p95 {paint_p95:.3}ms > budget {PAINT_P95_MS}ms"

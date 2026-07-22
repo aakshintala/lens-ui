@@ -23,7 +23,18 @@ pub(crate) type WakerSlot = Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>;
 
 /// Engine worker thread stack. Larger than the ~2 MiB default because
 /// libghostty's scrollback operations overflow it once history grows large
-/// (see `spawn_worker`). Lazily committed, so the reservation is virtual-only.
+/// (see `spawn_worker`). Lazily committed, so the reservation is virtual-only —
+/// physical RSS is bounded by the deepest stack actually touched, not by this
+/// number, so the fleet cost of the large reservation is address space (free on
+/// 64-bit), not memory.
+///
+/// This is an empirical figure (verified to 50k rows), NOT a derived bound: we
+/// have not characterised whether libghostty's stack use grows with row count
+/// (in which case a large-enough `max_scrollback` would move the cliff again) or
+/// is a fixed deep frame. In production the `max_scrollback` **byte** budget
+/// (~10 MiB) caps `total_rows` well under the 50k verified here, so 64 MiB is
+/// safe-by-margin. If `max_scrollback` is raised by an order of magnitude,
+/// revisit this and characterise the real stack requirement.
 const WORKER_STACK_BYTES: usize = 64 * 1024 * 1024;
 
 const CMD_CHANNEL_CAP: usize = 256;

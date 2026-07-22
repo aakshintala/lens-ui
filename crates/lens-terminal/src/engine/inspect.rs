@@ -43,6 +43,16 @@ pub struct EngineInspect {
     pub rows: u16,
     pub max_scrollback: usize,
     pub total_rows: usize,
+    /// **Ordinal ranking score, NOT an absolute byte count.** Computed as
+    /// `total_rows × cols × PER_CELL_BYTES` with a placeholder per-cell figure,
+    /// so it tracks memory *ordering* across tabs (its only sanctioned use — LRV
+    /// trimming compares tabs against each other) but is a large undercount in
+    /// absolute terms: Job B measured real RSS at ~2.5–3.7× this at scale, and
+    /// up to ~19× for small tabs (fixed overhead dominates). It is also
+    /// content-blind — equal `total_rows` yields an equal score even when real
+    /// RSS diverges by ~50% (compressible vs incompressible). NEVER surface or
+    /// budget against this as bytes; for that you need byte-accurate FFI (the
+    /// parked escalation). See `PER_CELL_BYTES`.
     pub retained_bytes_estimate: usize,
     pub visible: bool,
     pub frames_built: u64,
@@ -176,8 +186,14 @@ impl InspectShared {
     }
 
     pub fn record_frame_built(&self, micros: u64) {
-        self.frames_built.fetch_add(1, Ordering::Relaxed);
-        self.last_build_micros.store(micros, Ordering::Relaxed);
+        // Store the duration BEFORE publishing the incremented count, and use
+        // Release/Acquire (see `snapshot`) so a reader that observes the new
+        // `frames_built` is guaranteed to also see THIS build's `micros` — not
+        // the previous build's. Consumers that pair the two (the Job-A
+        // per-distinct-build sampler) would otherwise associate a fresh count
+        // with a stale duration. codex I7-follow-up.
+        self.last_build_micros.store(micros, Ordering::Release);
+        self.frames_built.fetch_add(1, Ordering::Release);
         self.record_event(InspectEvent {
             kind: InspectEventKind::FrameBuilt { micros },
         });
@@ -423,8 +439,11 @@ impl InspectShared {
             total_rows,
             retained_bytes_estimate,
             visible: self.visible.load(Ordering::Relaxed),
-            frames_built: self.frames_built.load(Ordering::Relaxed),
-            last_build_micros: self.last_build_micros.load(Ordering::Relaxed),
+            // Load the count with Acquire FIRST (pairs with the Release in
+            // `record_frame_built`), then the duration — so an observed count
+            // implies its build's duration is visible. codex I7-follow-up.
+            frames_built: self.frames_built.load(Ordering::Acquire),
+            last_build_micros: self.last_build_micros.load(Ordering::Acquire),
             bytes_fed: self.bytes_fed.load(Ordering::Relaxed),
             egress_emitted: self.egress_emitted.load(Ordering::Relaxed),
             user_egress_accepted: self.user_egress_accepted.load(Ordering::Relaxed),
