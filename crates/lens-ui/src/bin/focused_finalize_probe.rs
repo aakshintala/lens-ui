@@ -11,7 +11,7 @@ use gpui::{
     App, Application, AsyncWindowContext, Context, Entity, EntityId, ListAlignment, ListOffset,
     ListState, Render, Styled, WeakEntity, Window, div, list, prelude::*, px,
 };
-use lens_core::domain::ids::{AccId, ItemId, ResponseId};
+use lens_core::domain::ids::{AccId, ItemId, ResponseId, SessionId};
 use lens_core::domain::item::{BlockContext, ContentBlock, ItemKind, StreamScratch};
 use lens_core::domain::scalars::Role;
 use lens_core::persist::{RangeRead, ReadRange};
@@ -42,9 +42,18 @@ struct ProbeState {
     min_row_count: usize,
 }
 
+/// When true, the harness list follows `FocusedTranscript`'s internal `ListState`
+/// (production path) instead of a manually-spliced harness copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ListBinding {
+    HarnessManual,
+    ReplicaSynced,
+}
+
 struct HarnessView {
     replica: Entity<FocusedTranscript>,
     list_state: ListState,
+    list_binding: ListBinding,
     probe: Rc<RefCell<ProbeState>>,
     acc_id: AccId,
     item_id: ItemId,
@@ -92,16 +101,34 @@ fn assistant_item(id: &str, text: &str, resp: &str) -> lens_core::domain::item::
     }
 }
 
-async fn drive_finalize_probe(
-    weak: WeakEntity<HarnessView>,
-    mut wcx: AsyncWindowContext,
-    acc_id: AccId,
-    item_id: ItemId,
-    exit_ok: Rc<RefCell<bool>>,
-) {
-    wait_frames(&mut wcx, 3).await;
+fn reset_probe(probe: &Rc<RefCell<ProbeState>>) {
+    *probe.borrow_mut() = ProbeState::default();
+}
 
-    let _ = weak.update_in(&mut wcx, |view, _, cx| {
+fn spawn_replica(cx: &mut App) -> Entity<FocusedTranscript> {
+    let (reader, _rx) = ReaderWorkerHandle::new_test();
+    let session_id = SessionId::new("sess_rw");
+    cx.new(|cx| {
+        FocusedTranscript::new_test_no_baseline(
+            reader,
+            session_id,
+            ReconcileEpoch::default(),
+            1,
+            cx,
+        )
+    })
+}
+
+/// Legacy path: holds `active_response = Some` through disk read; manually splices harness list.
+async fn drive_legacy_finalize_probe(
+    weak: &WeakEntity<HarnessView>,
+    wcx: &mut AsyncWindowContext,
+    acc_id: &AccId,
+    item_id: &ItemId,
+) {
+    wait_frames(wcx, 3).await;
+
+    let _ = weak.update_in(wcx, |view, _, cx| {
         view.replica.update(cx, |r, cx| {
             r.fold_detailed(
                 StreamUpdate::ActiveResponseChanged(Some(ResponseId::new("resp_a"))),
@@ -126,9 +153,9 @@ async fn drive_finalize_probe(
         view.list_state.reset(count);
         cx.notify();
     });
-    wait_frames(&mut wcx, 3).await;
+    wait_frames(wcx, 3).await;
 
-    let _ = weak.update_in(&mut wcx, |view, _, cx| {
+    let _ = weak.update_in(wcx, |view, _, cx| {
         view.replica.update(cx, |r, cx| {
             r.fold_detailed(
                 StreamUpdate::Retired {
@@ -149,9 +176,9 @@ async fn drive_finalize_probe(
             .splice(0..view.list_state.item_count(), count);
         cx.notify();
     });
-    wait_frames(&mut wcx, 3).await;
+    wait_frames(wcx, 3).await;
 
-    let _ = weak.update_in(&mut wcx, |view, _, cx| {
+    let _ = weak.update_in(wcx, |view, _, cx| {
         view.finalized = true;
         view.replica.update(cx, |r, cx| {
             r.apply_read(
@@ -173,7 +200,190 @@ async fn drive_finalize_probe(
             .splice(0..view.list_state.item_count(), count);
         cx.notify();
     });
-    wait_frames(&mut wcx, 3).await;
+    wait_frames(wcx, 3).await;
+}
+
+/// Canonical end-of-turn path: `active→None` before disk; no manual list splice.
+async fn drive_canonical_finalize_probe(
+    weak: &WeakEntity<HarnessView>,
+    wcx: &mut AsyncWindowContext,
+    acc_id: &AccId,
+    item_id: &ItemId,
+) {
+    wait_frames(wcx, 3).await;
+
+    let _ = weak.update_in(wcx, |view, _, cx| {
+        view.replica.update(cx, |r, cx| {
+            r.fold_detailed(
+                StreamUpdate::ActiveResponseChanged(Some(ResponseId::new("resp_a"))),
+                cx,
+            );
+        });
+        view.replica.update(cx, |r, cx| {
+            r.fold_detailed(
+                StreamUpdate::ScratchChanged(std::sync::Arc::new(StreamScratch {
+                    open_message: Some(lens_core::domain::item::MessageAcc {
+                        acc_id: acc_id.clone(),
+                        message_id: None,
+                        text: "streaming text".into(),
+                        block_index: 0,
+                    }),
+                    ..Default::default()
+                })),
+                cx,
+            );
+        });
+        // Production reproject/sync_list_count grows replica ListState — no manual splice.
+        cx.notify();
+    });
+    wait_frames(wcx, 3).await;
+
+    let _ = weak.update_in(wcx, |view, _, cx| {
+        view.replica.update(cx, |r, cx| {
+            r.fold_detailed(
+                StreamUpdate::Retired {
+                    acc_id: acc_id.clone(),
+                    disposition: RetireDisposition::Finalizing {
+                        item_id: item_id.clone(),
+                    },
+                },
+                cx,
+            );
+            r.fold_detailed(
+                StreamUpdate::ScratchChanged(std::sync::Arc::new(StreamScratch::default())),
+                cx,
+            );
+            r.fold_detailed(StreamUpdate::ActiveResponseChanged(None), cx);
+        });
+        // No manual list splice — production `sync_list_count` must keep ListState aligned.
+        cx.notify();
+    });
+    wait_frames(wcx, 3).await;
+
+    let _ = weak.update_in(wcx, |view, _, cx| {
+        let r = view.replica.read(cx);
+        let store_len = r.rows().len();
+        let list_len = r.list_state().item_count();
+        if list_len != store_len {
+            view.probe.borrow_mut().failures.push(format!(
+                "canonical pre-disk: list_count {list_len} != store_len {store_len}"
+            ));
+        }
+        let tail = RowId::StreamTail(acc_id.clone());
+        if r.rows().order().iter().any(|id| id == &tail) {
+            // Staged tail is fine before disk; ensure it is not a dead entity.
+            if r.rows().entity(&tail).is_none() {
+                view.probe
+                    .borrow_mut()
+                    .failures
+                    .push("dead StreamTail before disk commit".into());
+            }
+        }
+    });
+
+    let _ = weak.update_in(wcx, |view, _, cx| {
+        view.finalized = true;
+        view.replica.update(cx, |r, cx| {
+            r.apply_read(
+                1,
+                ReadRange::Delta {
+                    after: -1,
+                    through: 0,
+                },
+                RangeRead {
+                    rows: vec![(0, assistant_item("msg_canon_0", "hi", "resp_a"))],
+                    skipped: vec![],
+                    watermark: Some(0),
+                },
+                cx,
+            );
+        });
+        // No manual list splice after disk read either.
+        cx.notify();
+    });
+    wait_frames(wcx, 3).await;
+
+    let _ = weak.update_in(wcx, |view, _, cx| {
+        let r = view.replica.read(cx);
+        let sibling = RowId::Sibling(item_id.clone());
+        let tail = RowId::StreamTail(acc_id.clone());
+        let order = r.rows().order();
+        if !order.iter().any(|id| id == &sibling) {
+            view.probe.borrow_mut().failures.push(format!(
+                "canonical post-disk: missing Sibling in order {order:?}"
+            ));
+        }
+        if order.iter().any(|id| id == &tail) {
+            view.probe.borrow_mut().failures.push(format!(
+                "canonical post-disk: dead StreamTail still in order {order:?}"
+            ));
+        }
+        if r.rows().entity(&sibling).is_none() {
+            view.probe
+                .borrow_mut()
+                .failures
+                .push("canonical post-disk: Sibling entity missing".into());
+        }
+        let list_len = r.list_state().item_count();
+        let store_len = r.rows().len();
+        if list_len != store_len {
+            view.probe.borrow_mut().failures.push(format!(
+                "canonical post-disk: list_count {list_len} != store_len {store_len}"
+            ));
+        }
+    });
+}
+
+async fn drive_finalize_probe(
+    weak: WeakEntity<HarnessView>,
+    mut wcx: AsyncWindowContext,
+    exit_ok: Rc<RefCell<bool>>,
+) {
+    // Phase 1: legacy path (active held; manual harness list splice).
+    drive_legacy_finalize_probe(
+        &weak,
+        &mut wcx,
+        &AccId::new("acc_rw"),
+        &ItemId::new("msg_local_0"),
+    )
+    .await;
+
+    let legacy_ok = weak
+        .update_in(&mut wcx, |view, _, _| {
+            let p = view.probe.borrow();
+            p.failures.is_empty()
+                && p.samples >= 4
+                && p.target_entity.is_some()
+                && p.min_row_count > 0
+        })
+        .unwrap_or(false);
+
+    if !legacy_ok {
+        let _ = weak.update_in(&mut wcx, |view, _, _| {
+            let p = view.probe.borrow();
+            eprintln!("LEGACY PROBE FAILURES: {:?}", p.failures);
+            eprintln!("samples={} min_rows={}", p.samples, p.min_row_count);
+        });
+        *exit_ok.borrow_mut() = false;
+        process::exit(1);
+    }
+    eprintln!("FINALIZE PROBE (legacy): staged finalize flash-free (real paint)");
+
+    // Phase 2: canonical end-of-turn ordering on a fresh replica, replica-synced list.
+    let acc_canon = AccId::new("acc_canon");
+    let item_canon = ItemId::new("msg_canon_0");
+    let _ = weak.update_in(&mut wcx, |view, _, cx| {
+        view.replica = spawn_replica(cx);
+        view.acc_id = acc_canon.clone();
+        view.item_id = item_canon.clone();
+        view.finalized = false;
+        view.list_binding = ListBinding::ReplicaSynced;
+        reset_probe(&view.probe);
+        view.list_state.reset(0);
+        cx.notify();
+    });
+
+    drive_canonical_finalize_probe(&weak, &mut wcx, &acc_canon, &item_canon).await;
 
     let ok = weak
         .update_in(&mut wcx, |view, _, _| {
@@ -188,16 +398,13 @@ async fn drive_finalize_probe(
     if !ok {
         let _ = weak.update_in(&mut wcx, |view, _, _| {
             let p = view.probe.borrow();
-            eprintln!("REAL-WINDOW FAILURES: {:?}", p.failures);
+            eprintln!("CANONICAL PROBE FAILURES: {:?}", p.failures);
             eprintln!("samples={} min_rows={}", p.samples, p.min_row_count);
         });
     } else {
-        eprintln!("FINALIZE PROBE: staged finalize flash-free (real paint)");
+        eprintln!("FINALIZE PROBE (canonical): end-of-turn active-none-before-disk renders");
     }
     *exit_ok.borrow_mut() = ok;
-    // `cx.quit()` routes through AppKit `[NSApp terminate:]`, which calls
-    // `exit(0)` itself and never returns to `main`'s `process::exit` — so the
-    // exit code would always be 0. Exit directly here to make it trustworthy.
     process::exit(if ok { 0 } else { 1 });
 }
 
@@ -205,13 +412,11 @@ impl Render for HarnessView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.spawned {
             self.spawned = true;
-            let acc = self.acc_id.clone();
-            let item = self.item_id.clone();
             let exit_ok = Rc::clone(&self.exit_ok);
             cx.spawn_in(window, move |weak, wcx: &mut AsyncWindowContext| {
                 let wcx = wcx.clone();
                 async move {
-                    drive_finalize_probe(weak, wcx, acc, item, exit_ok).await;
+                    drive_finalize_probe(weak, wcx, exit_ok).await;
                 }
             })
             .detach();
@@ -242,7 +447,11 @@ impl Render for HarnessView {
             .and_then(|id| self.replica.read(cx).rows().entity(id))
             .map(|e| e.read(cx).presentation.text.clone())
             .unwrap_or_default();
-        let anchor = AnchorSnapshot::from(self.list_state.logical_scroll_top());
+        let list_state = match self.list_binding {
+            ListBinding::HarnessManual => self.list_state.clone(),
+            ListBinding::ReplicaSynced => self.replica.read(cx).list_state().clone(),
+        };
+        let anchor = AnchorSnapshot::from(list_state.logical_scroll_top());
 
         {
             let mut p = self.probe.borrow_mut();
@@ -260,6 +469,11 @@ impl Render for HarnessView {
                     .push(format!("row count dipped {min_before} -> {count}"));
             }
             p.min_row_count = p.min_row_count.max(count);
+            let list_count = list_state.item_count();
+            if list_count != count && self.list_binding == ListBinding::ReplicaSynced {
+                p.failures
+                    .push(format!("list item_count {list_count} != row store {count}"));
+            }
             if count > 0 && (anchor.top_item_index != count || anchor.sub_offset != px(0.)) {
                 p.failures.push(format!(
                     "bottom pin lost: anchor=({}, {:?}) count={count}",
@@ -272,7 +486,6 @@ impl Render for HarnessView {
             p.samples += 1;
         }
 
-        let list_state = self.list_state.clone();
         let replica = self.replica.clone();
         div().size_full().child(
             list(list_state, move |ix, _window, cx| {
@@ -303,23 +516,13 @@ fn main() {
         gpui_component::init(cx);
         lens_ui::theme::install_at_startup(cx);
 
-        let (reader, _rx) = ReaderWorkerHandle::new_test();
-        let session_id = lens_core::domain::ids::SessionId::new("sess_rw");
-        let replica = cx.new(|cx| {
-            FocusedTranscript::new_test_no_baseline(
-                reader,
-                session_id,
-                ReconcileEpoch::default(),
-                1,
-                cx,
-            )
-        });
-
+        let replica = spawn_replica(cx);
         let list_state = ListState::new(0, ListAlignment::Bottom, px(200.));
         cx.open_window(gpui::WindowOptions::default(), move |_window, cx| {
             cx.new(|_| HarnessView {
                 replica: replica.clone(),
                 list_state: list_state.clone(),
+                list_binding: ListBinding::HarnessManual,
                 probe: Rc::clone(&probe),
                 acc_id: acc_id.clone(),
                 item_id: item_id.clone(),

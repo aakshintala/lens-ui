@@ -400,7 +400,7 @@ impl RowStore {
             }
         }
         if let Some(pos) = self.order.iter().position(|c| c == &tail_id) {
-            self.order[pos] = durable_id;
+            self.order[pos] = durable_id.clone();
             if let Some(list) = list {
                 self.invalidate_row_height(list, pos);
             }
@@ -409,6 +409,15 @@ impl RowStore {
             self.rebuild_flat_order();
             if let Some(list) = list {
                 self.sync_list_count(list, prev_len);
+            }
+        }
+        if as_sibling {
+            for entry in &mut self.structure {
+                if let StructureEntry::Sibling(row) = entry {
+                    if *row == tail_id {
+                        *row = durable_id.clone();
+                    }
+                }
             }
         }
         entity_id

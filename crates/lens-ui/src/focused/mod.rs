@@ -317,8 +317,18 @@ impl FocusedTranscript {
                 self.upsert_read_rows(&read.rows);
             }
         }
-        if let Some(watermark) = read.watermark {
-            self.last_rendered_ordinal = watermark;
+        match range {
+            ReadRange::All => {
+                if let Some(watermark) = read.watermark {
+                    self.last_rendered_ordinal = watermark;
+                }
+            }
+            ReadRange::Delta { through, .. } => {
+                if through > self.last_rendered_ordinal {
+                    self.last_rendered_ordinal = through;
+                }
+            }
+            ReadRange::One { .. } => {}
         }
         self.recompute_live_section_start();
         self.recompute_settled_prefix();
@@ -419,6 +429,7 @@ impl FocusedTranscript {
         disposition: RetireDisposition,
         cx: &mut Context<Self>,
     ) {
+        let prev_len = self.rows.len();
         match disposition {
             RetireDisposition::Finalizing { item_id } => {
                 self.pending_item_ids.insert(item_id, acc_id.clone());
@@ -432,6 +443,7 @@ impl FocusedTranscript {
                         });
                 self.pending_finalize.insert(acc_id.clone(), pres.clone());
                 self.rows.stage_stream_finalize(&acc_id, pres, cx);
+                self.rows.sync_list_count(&self.list_state, prev_len);
             }
             RetireDisposition::Discarded => {
                 self.pending_finalize.remove(&acc_id);
@@ -440,8 +452,6 @@ impl FocusedTranscript {
                     .discard_stream_tail(&acc_id, Some(&self.list_state), cx);
             }
         }
-        let prev_len = self.rows.len();
-        self.rows.sync_list_count(&self.list_state, prev_len);
     }
 
     fn stream_presentation(&self, acc_id: &AccId, cx: &Context<Self>) -> Option<RowPresentation> {
@@ -2176,6 +2186,241 @@ mod tests {
                     .presentation
                     .text,
                 "hi"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn finalized_message_renders_when_active_none_before_disk(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        let acc = AccId::new("acc_fin");
+        let item_id = ItemId::new("msg_local_0");
+        let resp = ResponseId::new("resp_a");
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::All,
+                    range_read(vec![(0, user_item("u0", "hello"))], 0),
+                    cx,
+                );
+            });
+            replica.update(cx, |r, cx| {
+                r.fold_detailed(StreamUpdate::ActiveResponseChanged(Some(resp.clone())), cx);
+            });
+            replica.update(cx, |r, cx| {
+                r.fold_detailed(
+                    StreamUpdate::ScratchChanged(Arc::new(StreamScratch {
+                        open_message: Some(lens_core::domain::item::MessageAcc {
+                            acc_id: acc.clone(),
+                            message_id: None,
+                            text: "streaming text".into(),
+                            block_index: 0,
+                        }),
+                        ..Default::default()
+                    })),
+                    cx,
+                );
+            });
+            replica.update(cx, |r, cx| {
+                r.fold_detailed(
+                    StreamUpdate::Retired {
+                        acc_id: acc.clone(),
+                        disposition: RetireDisposition::Finalizing {
+                            item_id: item_id.clone(),
+                        },
+                    },
+                    cx,
+                );
+                r.fold_detailed(
+                    StreamUpdate::ScratchChanged(Arc::new(StreamScratch::default())),
+                    cx,
+                );
+                r.fold_detailed(StreamUpdate::ActiveResponseChanged(None), cx);
+            });
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Delta {
+                        after: 0,
+                        through: 1,
+                    },
+                    range_read(vec![(1, message_item("msg_local_0", Some("resp_a")))], 1),
+                    cx,
+                );
+            });
+        });
+
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            let order = r.rows().order();
+            let sibling = RowId::Sibling(item_id.clone());
+            let tail = RowId::StreamTail(acc.clone());
+            assert!(
+                order.iter().any(|id| id == &sibling),
+                "order must contain durable Sibling({item_id:?}), got {order:?}"
+            );
+            assert!(
+                !order.iter().any(|id| id == &tail),
+                "dead StreamTail must not remain in order: {order:?}"
+            );
+            assert_eq!(
+                r.rows()
+                    .entity(&sibling)
+                    .unwrap()
+                    .read(cx)
+                    .presentation
+                    .text,
+                "hi",
+                "finalized message must render its disk text"
+            );
+            assert_eq!(
+                r.list_state().item_count(),
+                r.rows().len(),
+                "ListState count must match RowStore after finalize"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn finalize_staging_keeps_list_count_synced(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        let acc = AccId::new("acc_list");
+        let item_id = ItemId::new("msg_local_1");
+        let resp = ResponseId::new("resp_a");
+
+        cx.update(|cx| {
+            replica.update(cx, |r, _| {
+                r.active_response = Some(resp.clone());
+            });
+            replica.update(cx, |r, cx| {
+                r.fold_detailed(
+                    StreamUpdate::ScratchChanged(Arc::new(StreamScratch {
+                        open_message: Some(lens_core::domain::item::MessageAcc {
+                            acc_id: acc.clone(),
+                            message_id: None,
+                            text: "streaming".into(),
+                            block_index: 0,
+                        }),
+                        ..Default::default()
+                    })),
+                    cx,
+                );
+            });
+        });
+
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert!(
+                r.list_state().item_count() == r.rows().len() && r.rows().len() > 0,
+                "tail visible: list count must include stream tail"
+            );
+        });
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                // Canonical reducer order: scratch-clear, then Retired{Finalizing}.
+                r.fold_detailed(
+                    StreamUpdate::ScratchChanged(Arc::new(StreamScratch::default())),
+                    cx,
+                );
+                r.fold_detailed(
+                    StreamUpdate::Retired {
+                        acc_id: acc.clone(),
+                        disposition: RetireDisposition::Finalizing { item_id },
+                    },
+                    cx,
+                );
+            });
+        });
+
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert_eq!(
+                r.list_state().item_count(),
+                r.rows().len(),
+                "after Retired Finalizing, ListState must not dip below RowStore count"
+            );
+            assert!(r.rows().len() > 0, "staged tail must remain visible");
+        });
+    }
+
+    #[gpui::test]
+    async fn bounded_delta_read_does_not_overadvance_frontier(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Delta {
+                        after: 0,
+                        through: 1,
+                    },
+                    RangeRead {
+                        rows: vec![(1, message_item("m1", Some("resp_a")))],
+                        skipped: vec![],
+                        watermark: Some(5),
+                    },
+                    cx,
+                );
+            });
+        });
+
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert_eq!(
+                r.last_rendered_ordinal, 1,
+                "bounded Delta must advance frontier only to through, not global watermark"
+            );
+        });
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.fold_detailed(
+                    StreamUpdate::TranscriptAdvanced {
+                        committed_ordinal: 2,
+                    },
+                    cx,
+                );
+            });
+        });
+
+        let delta = rx.try_recv().expect("ordinal 2 must enqueue delta read");
+        assert_eq!(
+            delta.range,
+            ReadRange::Delta {
+                after: 1,
+                through: 2
+            }
+        );
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::One { ordinal: 0 },
+                    RangeRead {
+                        rows: vec![(0, user_item("u0", "rewrite"))],
+                        skipped: vec![],
+                        watermark: Some(9),
+                    },
+                    cx,
+                );
+            });
+        });
+
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert_eq!(
+                r.last_rendered_ordinal, 1,
+                "One read must not advance the append frontier"
             );
         });
     }
