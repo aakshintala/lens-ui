@@ -167,12 +167,12 @@ pub fn render_working_spinner(status: Hsla, now_ms: i64) -> impl IntoElement {
 }
 
 /// Max distance (px) the expanding attention ring reaches beyond the card edge at full
-/// phase. The board reserves exactly this as the group ring-gutter and the board-edge
-/// margin (see `board`), so the pulse is contained by the group border instead of leaking
-/// past it, and never clips at the viewport (on-device: "ring leaks past the bounding
-/// box"). The animation's max reach MUST equal this (guarded by `ring_inset` tests) — the
-/// layout's gutter depends on it.
-pub const RING_REACH_PX: f32 = 12.0;
+/// phase. Kept small on purpose: the board's group ring-gutter must both CONTAIN it (so a
+/// member's pulse doesn't leak past the group border — on-device: "ring leaks past the
+/// bounding box") AND fit two adjacent groups' overhangs inside one inter-tile `GAP` (16)
+/// so their boxes don't overlap ("the groups clip"). That caps the reach below `GAP/2`.
+/// See `board::GUTTER`. The animation's max reach MUST equal this (guarded by `ring_inset`).
+pub const RING_REACH_PX: f32 = 6.0;
 
 /// The ring's inset (px; negative = outside the card) at animation `phase` (0..=1): starts
 /// 2px out and expands to `-RING_REACH_PX` at full phase. Extracted so the layout-critical

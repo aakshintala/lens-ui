@@ -21,12 +21,26 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 /// Ring-gutter: a group's tint/border overhangs its tile by this on every side, and the
-/// board reserves it around the whole grid. Sized to the expanding attention ring's reach
-/// (`RING_REACH_PX`) so a member's pulse is contained by the group border instead of
-/// leaking past it, and a loose card's pulse never clips at the viewport edge. Distinct
-/// from `pack::INSET` (the card-origin offset within a cell, which cancels in member
-/// placement) — they merely shared a value before.
-const GUTTER: f32 = RING_REACH_PX;
+/// board reserves it around the whole grid. Two bounds pin it (see `gutter_bounds` test):
+/// - `>= RING_REACH_PX` — contains a member's attention pulse inside the group border
+///   (and keeps a loose card's pulse off the viewport edge). `+1` gives 1px slack.
+/// - `<= GAP/2` — two ADJACENT groups each overhang into the shared inter-tile gap; if the
+///   sum exceeds `GAP` their boxes overlap (on-device: "the groups clip"). GAP/2 = 8.
+///
+/// Distinct from `pack::INSET` (the card-origin offset within a cell, which cancels in
+/// member placement).
+const GUTTER: f32 = RING_REACH_PX + 1.0;
+
+// The two bounds above are compile-time invariants — a runtime test would const-fold to
+// `assert!(true)`. Break either (e.g. bump RING_REACH_PX past GAP/2) and the build fails here.
+const _: () = assert!(
+    GUTTER >= RING_REACH_PX,
+    "GUTTER must contain the attention ring, else a member pulse leaks past the group border",
+);
+const _: () = assert!(
+    2.0 * GUTTER <= pack::GAP,
+    "2*GUTTER must be <= GAP, else two adjacent groups' boxes overlap in the shared gap",
+);
 
 /// Width of the left nav rail (unchanged placeholder).
 const NAV_RAIL_W: f32 = 48.0;
