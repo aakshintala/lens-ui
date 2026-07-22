@@ -523,8 +523,73 @@ mod fold_session_feed_tests {
 mod focus_tests {
     use super::*;
     use crate::clock::ManualUiClock;
+    use gpui::{IntoElement, Render};
     use lens_core::actor::SessionCommand;
     use std::sync::Arc;
+    use std::time::Duration;
+
+    struct TimerBoard;
+
+    impl Render for TimerBoard {
+        fn render(&mut self, _: &mut gpui::Window, _: &mut Context<Self>) -> impl IntoElement {
+            gpui::div()
+        }
+    }
+
+    #[gpui::test]
+    async fn focus_session_reconcile_in_flight_arms_syncing_after_debounce(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let clock = Arc::new(ManualUiClock::new(0));
+        let sid = SessionId::new("sync_focus");
+        let data_dir = std::env::temp_dir().join(format!(
+            "lens-focus-sync-{}-{}",
+            std::process::id(),
+            sid.as_str()
+        ));
+
+        let fleet = cx.update(|cx| {
+            let f = FleetStore::new(clock, cx);
+            f.update(cx, |f, cx| {
+                f.spawn_fake_session(sid.clone(), cx);
+                f.reader_factories.insert(
+                    sid.clone(),
+                    ReaderFactory::test_with_data_dir(data_dir.clone(), sid.clone()),
+                );
+                f.reconcile_epochs.insert(
+                    sid.clone(),
+                    ReconcileEpoch {
+                        epoch: 1,
+                        in_flight: true,
+                    },
+                );
+            });
+            f
+        });
+
+        cx.update(|cx| {
+            fleet.update(cx, |f, cx| f.focus_session(sid.clone(), cx));
+        });
+
+        let replica = cx.read(|cx| {
+            fleet
+                .read(cx)
+                .focused_replica()
+                .expect("focus_session must mount replica when reader factory is installed")
+        });
+
+        {
+            let (_board, vcx) = cx.add_window_view(|_, _| TimerBoard);
+            vcx.run_until_parked();
+            vcx.executor().advance_clock(Duration::from_millis(200));
+            vcx.run_until_parked();
+        }
+
+        assert!(
+            replica.read_with(cx, |r, _| r.syncing()),
+            "focus_session must seed in-flight reconcile and show syncing after 150 ms debounce"
+        );
+    }
 
     #[gpui::test]
     async fn click_focus_sends_promote_and_demote_previous(cx: &mut gpui::TestAppContext) {

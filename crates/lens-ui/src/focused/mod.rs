@@ -2577,40 +2577,6 @@ mod tests {
         );
     }
 
-    #[gpui::test]
-    async fn focus_seed_reconcile_in_flight_arms_syncing_after_debounce(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        // Mirrors `FleetStore::focus_session`: after creating a replica whose seed
-        // epoch is in-flight, call `set_reconcile_in_flight(true)` to arm debounce.
-        let (replica, rx) = new_replica(
-            cx,
-            ReconcileEpoch {
-                epoch: 1,
-                in_flight: true,
-            },
-            1,
-        );
-        let _ = rx.try_recv().expect("baseline");
-
-        {
-            let (_board, vcx) = cx.add_window_view(|_, _| ReplicaBoard {
-                _replica: replica.clone(),
-            });
-            vcx.run_until_parked();
-            vcx.update(|_, cx| {
-                replica.update(cx, |r, cx| r.set_reconcile_in_flight(true, cx));
-            });
-            vcx.executor().advance_clock(Duration::from_millis(200));
-            vcx.run_until_parked();
-        }
-
-        assert!(
-            replica.read_with(cx, |r, _| r.syncing()),
-            "focus into in-flight reconcile must arm debounce and show syncing after 150 ms"
-        );
-    }
-
     fn settled_turn_rows(turns: usize) -> Vec<(i64, Item)> {
         let mut rows = Vec::with_capacity(turns * 2 + 1);
         for i in 0..turns {

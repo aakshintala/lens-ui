@@ -211,7 +211,9 @@ async fn run_resident_probe(
                 "resident={resident} delta {i}: render_calls {calls} >= cap {RENDER_CALL_CAP}"
             ));
         }
-        if calls >= resident {
+        // Only when resident dwarfs visible+overdraw: at SMALL_RESIDENT=30 a healthy
+        // O(visible) window can paint 30–79 rows without scaling with resident count.
+        if resident > RENDER_CALL_CAP && calls >= resident {
             failures.push(format!(
                 "resident={resident} delta {i}: render_calls {calls} scaled with resident count"
             ));
