@@ -147,6 +147,24 @@ Ordering below is by "blocks shipping Lens to a second human" (roughly).
     session-event subscription shrinks the missed-live-delete window); **true
     closure needs this upstream token.** Do not claim reconnect recovers it.
     (Memory `terminal-resource-event-granularity`.)
+  - **Slice-4 whole-branch review carry → Slice-5 integration (2026-07-22):**
+    the bridge close (WS `4404`) and the host resource-signal are two views of
+    the same agent reset arriving on **independent transports**, so their
+    ordering is a race. Slice 4 fixed the *clobber* direction (a late bridge
+    close can no longer overwrite `ReplacementWaiting`/`Sleeping` —
+    `apply_bridge_event` is gated in those states). The **unfixed** direction is
+    **`4404`-first**: on an `OpenOrCreate` reset where the WS `4404` lands
+    *before* the `resource.deleted`, the tab goes `Detached(TerminalGone)` and a
+    subsequent delete→create is ignored (no re-adopt from `Detached`) → the
+    successor is not adopted. Not resolvable at the module level (a `4404` alone
+    can't distinguish reset from genuine deletion, and speculatively waiting
+    would violate the spec's "unexplained disappearance → `Detached`" for real
+    deletions). Resolve when the **real bridge↔host event model** is designed in
+    Slice 5 (FleetStore forwards resource signals + owns the WS lifecycle) —
+    e.g. an `OpenOrCreate` tab that observes a positive reset while `Detached`
+    could re-arm adoption, or the host could order/serialize the two channels.
+    In Slice-4 (deterministic demo/tests) there is no real race, so demo
+    adoption works. Do NOT claim `4404`-first adoption works in production.
 10. **Keyboard shortcuts + macOS app menu** — *surfaced 2026-07-16 during the
     theming demo (Cmd+Q dead; ⌘. was silently focus-dependent).* gpui apps get
     **no standard macOS menu/shortcuts for free**: `Cmd+Q` (quit), `Cmd+W`,
