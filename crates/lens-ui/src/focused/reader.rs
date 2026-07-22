@@ -8,7 +8,6 @@ use lens_core::persist::{PersistError, RangeRead, ReadRange, TranscriptReader};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-const CHANNEL_BOUND: usize = 16;
 const BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
 #[cfg(test)]
 const RETRY_BACKOFF_MS: [u64; 5] = [0, 0, 0, 0, 0];
@@ -55,7 +54,8 @@ impl Clone for ReaderWorkerHandle {
 
 impl ReaderWorkerHandle {
     pub fn enqueue(&self, target: ReadTarget) {
-        let _ = self.tx.try_send(target);
+        // Unbounded send never blocks and never drops; coalescing bounds actual reads.
+        let _ = self.tx.send_blocking(target);
     }
 
     pub fn spawn(
@@ -63,39 +63,41 @@ impl ReaderWorkerHandle {
         replica: WeakEntity<FocusedTranscript>,
         cx: &mut Context<FocusedTranscript>,
     ) -> Self {
-        match factory.open(BUSY_TIMEOUT) {
-            Ok(reader) => {
-                let reader = Arc::new(Mutex::new(reader));
-                let read_fn: ReadFn = Arc::new(move |range| {
-                    reader
-                        .lock()
-                        .expect("reader mutex poisoned")
-                        .read_range(range)
-                });
-                Self::spawn_with_reader(read_fn, replica, cx)
-            }
-            Err(err) => {
-                let msg = err.to_string();
-                let (tx, _rx) = async_channel::bounded(CHANNEL_BOUND);
-                let worker = cx.spawn(async move |_this, cx| {
+        // Open is deferred into the worker's background context — no foreground disk I/O.
+        let (tx, rx) = async_channel::unbounded();
+        let worker = cx.spawn(async move |_this, cx| {
+            let open_result = cx
+                .background_executor()
+                .spawn(async move { factory.open(BUSY_TIMEOUT) })
+                .await;
+            match open_result {
+                Ok(reader) => {
+                    let reader = Arc::new(Mutex::new(reader));
+                    let read_fn: ReadFn =
+                        Arc::new(move |range| lock_reader(&reader).read_range(range));
+                    run_worker(read_fn, replica, rx, cx).await;
+                }
+                Err(err) => {
+                    let msg = err.to_string();
                     let _ = replica.update(cx, |replica, cx| {
                         replica.on_reader_fatal(msg, cx);
                     });
-                });
-                Self {
-                    tx,
-                    _worker: worker,
                 }
             }
+        });
+        Self {
+            tx,
+            _worker: worker,
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn spawn_with_reader(
         read_fn: ReadFn,
         replica: WeakEntity<FocusedTranscript>,
         cx: &mut Context<FocusedTranscript>,
     ) -> Self {
-        let (tx, rx) = async_channel::bounded(CHANNEL_BOUND);
+        let (tx, rx) = async_channel::unbounded();
         let worker = cx.spawn(async move |_this, cx| {
             run_worker(read_fn, replica, rx, cx).await;
         });
@@ -108,7 +110,7 @@ impl ReaderWorkerHandle {
     /// Test-only: observe exactly what the replica enqueues (no worker).
     #[cfg(test)]
     pub fn new_test() -> (Self, Receiver<ReadTarget>) {
-        let (tx, rx) = async_channel::bounded(CHANNEL_BOUND);
+        let (tx, rx) = async_channel::unbounded();
         (
             Self {
                 tx,
@@ -128,8 +130,16 @@ impl ReaderWorkerHandle {
     }
 }
 
+/// A poisoned reader mutex still holds a usable read-only connection; recover rather
+/// than killing the worker.
+fn lock_reader<T>(reader: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    reader
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 struct TargetCoalescer {
-    rewrite: Option<ReadTarget>,
+    rewrites: Vec<ReadTarget>,
     reconcile: Option<ReadTarget>,
     baseline: Option<ReadTarget>,
     delta: Option<ReadTarget>,
@@ -138,7 +148,7 @@ struct TargetCoalescer {
 impl TargetCoalescer {
     fn new() -> Self {
         Self {
-            rewrite: None,
+            rewrites: Vec::new(),
             reconcile: None,
             baseline: None,
             delta: None,
@@ -146,7 +156,7 @@ impl TargetCoalescer {
     }
 
     fn is_empty(&self) -> bool {
-        self.rewrite.is_none()
+        self.rewrites.is_empty()
             && self.reconcile.is_none()
             && self.baseline.is_none()
             && self.delta.is_none()
@@ -154,7 +164,18 @@ impl TargetCoalescer {
 
     fn insert(&mut self, target: ReadTarget) {
         match target.priority {
-            Priority::Rewrite => self.rewrite = Some(target),
+            Priority::Rewrite => {
+                if let ReadRange::One { ordinal } = target.range
+                    && let Some(existing) = self
+                        .rewrites
+                        .iter_mut()
+                        .find(|t| matches!(t.range, ReadRange::One { ordinal: o } if o == ordinal))
+                {
+                    *existing = target;
+                    return;
+                }
+                self.rewrites.push(target);
+            }
             Priority::Reconcile => self.reconcile = Some(target),
             Priority::Baseline => self.baseline = Some(target),
             Priority::Delta => {
@@ -169,8 +190,8 @@ impl TargetCoalescer {
     }
 
     fn pop_highest(&mut self) -> Option<ReadTarget> {
-        if let Some(target) = self.rewrite.take() {
-            return Some(target);
+        if !self.rewrites.is_empty() {
+            return Some(self.rewrites.remove(0));
         }
         if let Some(target) = self.reconcile.take() {
             return Some(target);
@@ -297,14 +318,17 @@ async fn run_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fleet::store::ReconcileEpoch;
+    use crate::fleet::store::{ReaderFactory, ReconcileEpoch};
     use crate::focused::FocusedTranscript;
     use gpui::AppContext;
     use lens_core::domain::ids::{ItemId, SessionId};
     use lens_core::domain::item::{BlockContext, ContentBlock, Item, ItemKind};
     use lens_core::domain::scalars::Role;
     use std::collections::VecDeque;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+    use std::time::Duration as StdDuration;
 
     #[derive(Clone)]
     enum ScriptedOutcome {
@@ -392,16 +416,47 @@ mod tests {
         }
     }
 
-    fn spawn_replica_with_fake(
+    struct SlowFakeReader {
+        delay: StdDuration,
+        inner: FakeReader,
+    }
+
+    impl SlowFakeReader {
+        fn new(delay: StdDuration, outcomes: Vec<ScriptedOutcome>) -> Self {
+            Self {
+                delay,
+                inner: FakeReader::new(outcomes),
+            }
+        }
+
+        fn read_log(&self) -> Arc<Mutex<Vec<ReadRange>>> {
+            self.inner.read_log()
+        }
+
+        fn read_range(&self, range: ReadRange) -> Result<RangeRead, PersistError> {
+            thread::sleep(self.delay);
+            self.inner.read_range(range)
+        }
+    }
+
+    fn spawn_replica_with_slow(
         cx: &mut gpui::TestAppContext,
-        fake: Arc<FakeReader>,
+        slow: Arc<SlowFakeReader>,
+        focus_generation: u64,
+    ) -> (gpui::Entity<FocusedTranscript>, ReaderWorkerHandle) {
+        let read_fn: ReadFn = {
+            let slow = Arc::clone(&slow);
+            Arc::new(move |range| slow.read_range(range))
+        };
+        spawn_replica_with_fake_read_fn(cx, read_fn, focus_generation, true)
+    }
+
+    fn spawn_replica_with_fake_read_fn(
+        cx: &mut gpui::TestAppContext,
+        read_fn: ReadFn,
         focus_generation: u64,
         enqueue_baseline: bool,
     ) -> (gpui::Entity<FocusedTranscript>, ReaderWorkerHandle) {
-        let read_fn: ReadFn = {
-            let fake = Arc::clone(&fake);
-            Arc::new(move |range| fake.read_range(range))
-        };
         let session_id = SessionId::new("sess_reader_test");
         cx.update(|cx| {
             let replica = cx.new(|cx| {
@@ -428,6 +483,19 @@ mod tests {
             let reader = replica.read_with(cx, |replica, _| replica.reader_handle());
             (replica, reader)
         })
+    }
+
+    fn spawn_replica_with_fake(
+        cx: &mut gpui::TestAppContext,
+        fake: Arc<FakeReader>,
+        focus_generation: u64,
+        enqueue_baseline: bool,
+    ) -> (gpui::Entity<FocusedTranscript>, ReaderWorkerHandle) {
+        let read_fn: ReadFn = {
+            let fake = Arc::clone(&fake);
+            Arc::new(move |range| fake.read_range(range))
+        };
+        spawn_replica_with_fake_read_fn(cx, read_fn, focus_generation, enqueue_baseline)
     }
 
     fn spawn_and_drain_baseline(
@@ -693,5 +761,134 @@ mod tests {
                 through: 9
             }
         );
+    }
+
+    #[test]
+    fn coalescer_keeps_distinct_rewrite_ordinals() {
+        let mut coalescer = TargetCoalescer::new();
+        coalescer.insert(ReadTarget {
+            range: ReadRange::One { ordinal: 2 },
+            generation: 1,
+            priority: Priority::Rewrite,
+        });
+        coalescer.insert(ReadTarget {
+            range: ReadRange::One { ordinal: 5 },
+            generation: 1,
+            priority: Priority::Rewrite,
+        });
+        assert_eq!(
+            coalescer.pop_highest().expect("first rewrite").range,
+            ReadRange::One { ordinal: 2 }
+        );
+        assert_eq!(
+            coalescer.pop_highest().expect("second rewrite").range,
+            ReadRange::One { ordinal: 5 }
+        );
+        assert!(coalescer.is_empty());
+    }
+
+    #[gpui::test]
+    async fn burst_enqueue_does_not_drop_reconcile(cx: &mut gpui::TestAppContext) {
+        const OLD_CHANNEL_BOUND: usize = 16;
+        let slow = Arc::new(SlowFakeReader::new(
+            StdDuration::from_millis(250),
+            vec![
+                ScriptedOutcome::Ok(empty_read()),
+                ScriptedOutcome::Ok(empty_read()),
+                ScriptedOutcome::Ok(empty_read()),
+            ],
+        ));
+        let read_log = slow.read_log();
+        let (_replica, reader) = spawn_replica_with_slow(cx, Arc::clone(&slow), 1);
+        // Baseline read is in flight (slow); flood the channel before the worker drains.
+        for i in 0..=OLD_CHANNEL_BOUND {
+            reader.enqueue(ReadTarget {
+                range: ReadRange::Delta {
+                    after: 0,
+                    through: i as i64,
+                },
+                generation: 1,
+                priority: Priority::Delta,
+            });
+        }
+        reader.enqueue(ReadTarget {
+            range: ReadRange::All,
+            generation: 1,
+            priority: Priority::Reconcile,
+        });
+        cx.run_until_parked();
+
+        let ranges = read_log.lock().expect("read log lock");
+        assert!(
+            ranges.contains(&ReadRange::All),
+            "reconcile read must not be dropped by a full channel: {ranges:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn two_rewrites_both_served(cx: &mut gpui::TestAppContext) {
+        let fake = Arc::new(FakeReader::new(vec![
+            ScriptedOutcome::Ok(empty_read()),
+            ScriptedOutcome::Ok(empty_read()),
+            ScriptedOutcome::Ok(empty_read()),
+        ]));
+        let read_log = fake.read_log();
+        let (_replica, reader) = spawn_and_drain_baseline(cx, fake, 1);
+
+        reader.enqueue(ReadTarget {
+            range: ReadRange::One { ordinal: 2 },
+            generation: 1,
+            priority: Priority::Rewrite,
+        });
+        reader.enqueue(ReadTarget {
+            range: ReadRange::One { ordinal: 5 },
+            generation: 1,
+            priority: Priority::Rewrite,
+        });
+        cx.run_until_parked();
+
+        let ranges = read_log.lock().expect("read log lock");
+        assert!(
+            ranges.contains(&ReadRange::One { ordinal: 2 }),
+            "rewrite ordinal 2 must be read: {ranges:?}"
+        );
+        assert!(
+            ranges.contains(&ReadRange::One { ordinal: 5 }),
+            "rewrite ordinal 5 must be read: {ranges:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn spawn_open_failure_surfaces_fatal_error(cx: &mut gpui::TestAppContext) {
+        let factory = ReaderFactory::test_with_data_dir(
+            PathBuf::from("/nonexistent/lens-reader-open-failure"),
+            SessionId::new("sess_open_fail"),
+        );
+        let replica = cx.update(|cx| {
+            cx.new(|cx| FocusedTranscript::new(factory, ReconcileEpoch::default(), 1, cx))
+        });
+        cx.run_until_parked();
+
+        cx.read(|cx| {
+            let replica = replica.read(cx);
+            assert!(
+                replica.reader_error().is_some(),
+                "open failure must surface via on_reader_fatal"
+            );
+        });
+    }
+
+    #[test]
+    fn lock_reader_recovers_from_poisoned_mutex() {
+        let reader = Arc::new(Mutex::new(42));
+        let reader_for_panic = Arc::clone(&reader);
+        let handle = std::thread::spawn(move || {
+            let _guard = reader_for_panic.lock().expect("lock for poison");
+            panic!("simulate poison");
+        });
+        let _ = handle.join();
+        assert!(reader.is_poisoned());
+        let guard = lock_reader(reader.as_ref());
+        assert_eq!(*guard, 42);
     }
 }

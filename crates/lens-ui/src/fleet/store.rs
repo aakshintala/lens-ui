@@ -38,6 +38,15 @@ impl ReaderFactory {
         &self.session_id
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_with_data_dir(data_dir: PathBuf, session_id: SessionId) -> Self {
+        Self {
+            data_dir,
+            conn_id: ConnectionId::new("conn_reader_test"),
+            session_id,
+        }
+    }
+
     pub fn open(&self, busy_timeout: Duration) -> Result<SqliteTranscriptReader, PersistError> {
         SqliteTranscriptReader::open_read_only(
             &self.data_dir.join(format!("{}.db", self.session_id)),
