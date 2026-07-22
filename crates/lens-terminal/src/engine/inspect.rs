@@ -8,6 +8,16 @@ use serde::Serialize;
 
 const RING_CAP: usize = 32;
 
+/// Provisional retained-bytes-per-cell multiplier for the fleet-accounting
+/// **estimate** (`total_rows × cols × PER_CELL_BYTES`). This is a documented
+/// placeholder: it affects only the estimate's *scale*, never its *ordinal*
+/// use (LRV trimming compares estimates against each other). Slice 3 Job B
+/// (`xtask terminal-rss-sweep`) reports the empirically-calibrated value from
+/// RSS-vs-total_rows; folding it back here is a one-line edit. Byte-*accurate*
+/// accounting (a Ghostty byte selector) is a fail-closed conditional escalated
+/// ONLY if Job B shows the estimate is ordinally unreliable.
+pub const PER_CELL_BYTES: usize = 4;
+
 /// A single diagnostic event in the engine ring.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct InspectEvent {
@@ -32,6 +42,8 @@ pub struct EngineInspect {
     pub cols: u16,
     pub rows: u16,
     pub max_scrollback: usize,
+    pub total_rows: usize,
+    pub retained_bytes_estimate: usize,
     pub visible: bool,
     pub frames_built: u64,
     pub last_build_micros: u64,
@@ -71,6 +83,7 @@ pub(crate) struct InspectShared {
     cols: AtomicU16,
     rows: AtomicU16,
     max_scrollback: AtomicU64,
+    total_rows: AtomicU64,
     visible: AtomicBool,
     frames_built: AtomicU64,
     last_build_micros: AtomicU64,
@@ -110,6 +123,7 @@ impl InspectShared {
             cols: AtomicU16::new(cols),
             rows: AtomicU16::new(rows),
             max_scrollback: AtomicU64::new(max_scrollback as u64),
+            total_rows: AtomicU64::new(0),
             visible: AtomicBool::new(true),
             frames_built: AtomicU64::new(0),
             last_build_micros: AtomicU64::new(0),
@@ -175,6 +189,14 @@ impl InspectShared {
         self.record_event(InspectEvent {
             kind: InspectEventKind::Resize { cols, rows },
         });
+    }
+
+    /// Sample the emulator's retained row count (scrollback + viewport). The
+    /// store is unconditional (cheap, like `cols`/`rows`) so the estimate is
+    /// available even with the ring disabled; the caller supplies the value it
+    /// already read from the terminal after a build.
+    pub fn record_retained_rows(&self, total_rows: usize) {
+        self.total_rows.store(total_rows as u64, Ordering::Relaxed);
     }
 
     pub fn record_egress(&self, len: usize) {
@@ -388,10 +410,18 @@ impl InspectShared {
             Vec::new()
         };
 
+        let cols = self.cols.load(Ordering::Relaxed);
+        let total_rows = self.total_rows.load(Ordering::Relaxed) as usize;
+        let retained_bytes_estimate = total_rows
+            .saturating_mul(cols as usize)
+            .saturating_mul(PER_CELL_BYTES);
+
         EngineInspect {
-            cols: self.cols.load(Ordering::Relaxed),
+            cols,
             rows: self.rows.load(Ordering::Relaxed),
             max_scrollback: self.max_scrollback.load(Ordering::Relaxed) as usize,
+            total_rows,
+            retained_bytes_estimate,
             visible: self.visible.load(Ordering::Relaxed),
             frames_built: self.frames_built.load(Ordering::Relaxed),
             last_build_micros: self.last_build_micros.load(Ordering::Relaxed),
@@ -444,6 +474,26 @@ mod tests {
     }
 
     #[test]
+    fn retained_rows_and_estimate_default_zero() {
+        let shared = super::InspectShared::new(80, 24, 1000);
+        let snap = shared.snapshot();
+        assert_eq!(snap.total_rows, 0);
+        assert_eq!(snap.retained_bytes_estimate, 0);
+    }
+
+    #[test]
+    fn retained_estimate_is_total_rows_times_cols_times_per_cell() {
+        let shared = super::InspectShared::new(200, 50, 100_000);
+        shared.record_retained_rows(10_000);
+        let snap = shared.snapshot();
+        assert_eq!(snap.total_rows, 10_000);
+        assert_eq!(
+            snap.retained_bytes_estimate,
+            10_000usize * 200 * super::PER_CELL_BYTES
+        );
+    }
+
+    #[test]
     fn inspect_mouse_copy_counters_default_zero() {
         let h = EngineHandle::spawn(test_config());
         let snap = h.inspect();
@@ -455,6 +505,41 @@ mod tests {
         assert_eq!(snap.copy_completed, 0);
         assert_eq!(snap.copy_empty, 0);
         assert_eq!(snap.local_clicks_dropped, 0);
+        h.stop();
+    }
+
+    #[test]
+    fn handle_inspect_reports_retained_estimate_after_streaming() {
+        use std::time::{Duration, Instant};
+        let cfg = EngineConfig {
+            cols: 40,
+            rows: 4,
+            max_scrollback: 500,
+            cell_w_px: 8,
+            cell_h_px: 16,
+        };
+        let h = EngineHandle::spawn(cfg);
+        for i in 0..200 {
+            let _ = h.feed(format!("streaming line {i}\r\n").into_bytes());
+        }
+        let _ = h.build_now();
+        // Poll until the worker has built at least one frame and sampled rows.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let snap = loop {
+            let s = h.inspect();
+            if s.frames_built > 0 && s.total_rows > cfg.rows as usize {
+                break s;
+            }
+            if Instant::now() > deadline {
+                panic!("engine never reported retained rows: {s:?}");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(snap.total_rows > 4, "total_rows={}", snap.total_rows);
+        assert_eq!(
+            snap.retained_bytes_estimate,
+            snap.total_rows * snap.cols as usize * crate::PER_CELL_BYTES
+        );
         h.stop();
     }
 }

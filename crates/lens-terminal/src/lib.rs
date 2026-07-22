@@ -331,7 +331,7 @@ pub use engine::frame::{CellStyle, Frame, FrameCell, FrameRow, Rgb, UnderlineSty
 pub use engine::presentation::{ClipboardLocation, ClipboardMimePart};
 pub use engine::{
     CursorPos, EgressFrame, EgressKind, EngineConfig, EngineError, EngineHandle, EngineInspect,
-    FeedError, VtEngine,
+    FeedError, PER_CELL_BYTES, VtEngine,
 };
 pub use inspect::TerminalInspect;
 pub use render::inspect::{RenderInspect, RenderInspectEvent, RenderInspectEventKind};

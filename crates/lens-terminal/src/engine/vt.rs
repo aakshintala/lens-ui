@@ -315,6 +315,12 @@ impl VtEngine {
         self.terminal.vt_write(bytes);
     }
 
+    /// The emulator's total retained row count (scrollback + active viewport).
+    /// Fail-soft to 0 — the accounting *estimate* must never panic the worker.
+    pub(crate) fn total_rows(&self) -> usize {
+        self.terminal.total_rows().unwrap_or(0)
+    }
+
     /// Drain bytes accumulated by `on_pty_write` since the last drain.
     pub fn take_replies(&mut self) -> Vec<u8> {
         self.reply_buffer.borrow_mut().drain(..).collect()
@@ -1115,6 +1121,21 @@ mod tests {
             e.extract_selection_text().as_deref(),
             Some("bar"),
             "gap <=500ms still widens to word"
+        );
+    }
+
+    #[test]
+    fn total_rows_grows_past_viewport_after_scrollback() {
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        let mut e = VtEngine::new(&test_config(), |_| {}, tx).unwrap(); // 20x3, scrollback 100
+        assert_eq!(e.total_rows().max(3), e.total_rows(), "sanity");
+        for i in 0..50 {
+            e.feed(format!("line{i}\r\n").as_bytes());
+        }
+        assert!(
+            e.total_rows() > 3,
+            "total_rows must exceed the 3-row viewport once scrollback fills, got {}",
+            e.total_rows()
         );
     }
 }

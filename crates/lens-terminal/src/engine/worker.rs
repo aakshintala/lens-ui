@@ -849,6 +849,7 @@ fn maybe_publish(
         Ok(frame) => {
             let micros = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
             inspect.record_frame_built(micros);
+            inspect.record_retained_rows(engine.total_rows());
             frame_slot.store(Some(Arc::new(frame)));
             frame_ready.store(true, Ordering::Release);
             *dirty = false;

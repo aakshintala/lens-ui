@@ -13,7 +13,7 @@ mod reconnect_seed;
 
 pub use frame::CursorPos;
 pub use handle::{EngineHandle, FeedError};
-pub use inspect::EngineInspect;
+pub use inspect::{EngineInspect, PER_CELL_BYTES};
 #[expect(
     unused_imports,
     reason = "re-exported presentation surface for Slice 2d+"
