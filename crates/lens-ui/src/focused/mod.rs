@@ -208,11 +208,22 @@ impl FocusedTranscript {
         }
     }
 
-    pub fn apply_read(&mut self, generation: u64, read: RangeRead, cx: &mut Context<Self>) {
+    pub fn apply_read(
+        &mut self,
+        generation: u64,
+        range: ReadRange,
+        read: RangeRead,
+        cx: &mut Context<Self>,
+    ) {
         if generation != self.focus_generation {
             return;
         }
-        self.upsert_read_rows(&read.rows);
+        match range {
+            ReadRange::All => self.replace_read_rows(&read.rows),
+            ReadRange::Delta { .. } | ReadRange::One { .. } => {
+                self.upsert_read_rows(&read.rows);
+            }
+        }
         if let Some(watermark) = read.watermark {
             self.last_rendered_ordinal = watermark;
         }
@@ -253,6 +264,12 @@ impl FocusedTranscript {
         let refs: Vec<&Item> = slice.iter().collect();
         self.live_section_projection_count =
             project(&refs, self.scratch.as_ref(), self.active_response.as_ref()).len();
+    }
+
+    fn replace_read_rows(&mut self, rows: &[(i64, Item)]) {
+        let mut sorted: Vec<_> = rows.iter().collect();
+        sorted.sort_by_key(|(ordinal, _)| *ordinal);
+        self.items = sorted.into_iter().map(|(_, item)| item.clone()).collect();
     }
 
     fn upsert_read_rows(&mut self, rows: &[(i64, Item)]) {
@@ -540,6 +557,127 @@ mod tests {
         assert_eq!(reconcile.priority, Priority::Reconcile);
     }
 
+    fn range_read(rows: Vec<(i64, Item)>, watermark: i64) -> RangeRead {
+        RangeRead {
+            rows,
+            skipped: vec![],
+            watermark: Some(watermark),
+        }
+    }
+
+    #[gpui::test]
+    async fn reconcile_drops_deleted_row(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        let a = message_item("a", None);
+        let b = message_item("b", None);
+        let c = message_item("c", None);
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::All,
+                    range_read(vec![(0, a.clone()), (1, b.clone()), (2, c.clone())], 2),
+                    cx,
+                );
+            });
+        });
+        cx.read(|cx| {
+            assert_eq!(replica.read(cx).items.len(), 3);
+        });
+
+        let c_reord = message_item("c", None);
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::All,
+                    range_read(vec![(0, a.clone()), (1, c_reord.clone())], 1),
+                    cx,
+                );
+            });
+        });
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert_eq!(r.items.len(), 2, "deleted row b must not ghost");
+            assert_eq!(r.items[0].id, a.id);
+            assert_eq!(r.items[1].id, c_reord.id);
+            assert!(
+                r.items.iter().all(|item| item.id != b.id),
+                "b must be gone after reconcile All read"
+            );
+        });
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[gpui::test]
+    async fn reconcile_rekey_no_stale_twin(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        let x = message_item("x", None);
+        let y = message_item("y", None);
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(1, ReadRange::All, range_read(vec![(0, x.clone())], 0), cx);
+            });
+        });
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(1, ReadRange::All, range_read(vec![(0, y.clone())], 0), cx);
+            });
+        });
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert_eq!(r.items.len(), 1, "rekey must not leave stale twin");
+            assert_eq!(r.items[0].id, y.id);
+            assert!(
+                r.items.iter().all(|item| item.id != x.id),
+                "stale x must be gone after reconcile All read"
+            );
+        });
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[gpui::test]
+    async fn delta_still_upserts(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        let a = message_item("a", None);
+        let b = message_item("b", None);
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(1, ReadRange::All, range_read(vec![(0, a.clone())], 0), cx);
+            });
+        });
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Delta {
+                        after: 0,
+                        through: 1,
+                    },
+                    range_read(vec![(1, b.clone())], 1),
+                    cx,
+                );
+            });
+        });
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert_eq!(
+                r.items.len(),
+                2,
+                "delta must append without dropping baseline rows"
+            );
+            assert_eq!(r.items[0].id, a.id);
+            assert_eq!(r.items[1].id, b.id);
+        });
+        assert!(rx.try_recv().is_err());
+    }
+
     #[gpui::test]
     async fn apply_read_drops_stale_generation(cx: &mut gpui::TestAppContext) {
         let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
@@ -550,6 +688,7 @@ mod tests {
             replica.update(cx, |r, cx| {
                 r.apply_read(
                     99,
+                    ReadRange::All,
                     RangeRead {
                         rows: vec![(0, item.clone())],
                         skipped: vec![],
@@ -567,6 +706,7 @@ mod tests {
             replica.update(cx, |r, cx| {
                 r.apply_read(
                     1,
+                    ReadRange::All,
                     RangeRead {
                         rows: vec![(0, item)],
                         skipped: vec![],
