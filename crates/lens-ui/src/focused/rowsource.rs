@@ -418,6 +418,13 @@ impl RowStore {
         self.structure.len()
     }
 
+    /// Remove marker entries from `structure` so live-tail truncation uses a
+    /// marker-free prefix consistent with marker-exclusive `settled_structure_len`.
+    pub(crate) fn strip_markers(&mut self) {
+        self.structure
+            .retain(|e| !matches!(e, StructureEntry::Marker(_)));
+    }
+
     /// Re-insert reconnect markers into `structure` at their `after_ordinal` anchor,
     /// then rebuild the flat order. Deterministic across full reprojections.
     pub(crate) fn reinsert_markers(
@@ -451,11 +458,11 @@ impl RowStore {
                 .structure
                 .iter()
                 .enumerate()
-                .filter_map(|(idx, entry)| {
+                .rev()
+                .find_map(|(idx, entry)| {
                     let repr = entry_repr(entry, &self.sections, item_ordinals);
                     (repr != i64::MAX && repr <= marker.after_ordinal).then_some(idx)
                 })
-                .last()
                 .map(|idx| idx + 1)
                 .unwrap_or(0);
 

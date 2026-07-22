@@ -493,6 +493,8 @@ impl FocusedTranscript {
         let prev_len = self.rows.len();
         self.rows.set_all_response_expansion(&expansion, None);
 
+        self.rows.strip_markers();
+
         if full {
             let refs: Vec<&Item> = self.items.iter().collect();
             let blocks = group_work_section(
@@ -2273,6 +2275,8 @@ mod tests {
 
         let item_a = message_item("m_a", Some("resp_a"));
         let item_b = message_item("m_b", Some("resp_b"));
+        let sibling_a = RowId::Sibling(item_a.id.clone());
+        let sibling_b = RowId::Sibling(item_b.id.clone());
 
         cx.update(|cx| {
             replica.update(cx, |r, cx| {
@@ -2284,55 +2288,95 @@ mod tests {
                 );
                 r.last_rendered_ordinal = 0;
                 r.fold_detailed(StreamUpdate::Reconnected { gap: Some(5) }, cx);
+                r.active_response = Some(ResponseId::new("resp_b"));
             });
         });
 
-        let marker_seq = cx.read(|cx| replica.read(cx).markers[0].seq);
-        let marker_id = marker_row_id(marker_seq);
-        let sibling_a = RowId::Sibling(item_a.id.clone());
-
-        let expected_idx = cx.read(|cx| {
+        let marker_id = cx.read(|cx| {
             let r = replica.read(cx);
-            let order = r.rows().order();
-            let item_a_idx = order
-                .iter()
-                .position(|id| id == &sibling_a)
-                .expect("item at ordinal 0");
-            let marker_idx = order
-                .iter()
-                .position(|id| id == &marker_id)
-                .expect("marker present after inject");
-            assert!(
-                marker_idx > item_a_idx,
-                "marker must appear after the item at after_ordinal"
-            );
-            marker_idx
+            marker_row_id(r.markers[0].seq)
         });
+
+        let mut expected_idx = None;
 
         for i in 0..3 {
             cx.update(|cx| {
                 replica.update(cx, |r, cx| {
-                    r.fold_detailed(
-                        StreamUpdate::ActiveResponseChanged(Some(ResponseId::new("resp_b"))),
+                    r.apply_read(
+                        1,
+                        ReadRange::All,
+                        range_read(
+                            vec![(0, item_a.clone()), (1, item_b.clone())],
+                            1,
+                        ),
                         cx,
                     );
                 });
             });
+
+            cx.read(|cx| {
+                let r = replica.read(cx);
+                let order = r.rows().order();
+                let item_a_idx = order
+                    .iter()
+                    .position(|id| id == &sibling_a)
+                    .expect("full reproject {i}: item A must be present");
+                let item_b_idx = order
+                    .iter()
+                    .position(|id| id == &sibling_b)
+                    .expect("full reproject {i}: item B must be present");
+                let marker_idx = order
+                    .iter()
+                    .position(|id| id == &marker_id)
+                    .expect("full reproject {i}: marker must be present");
+                assert!(
+                    item_a_idx < marker_idx && marker_idx < item_b_idx,
+                    "full reproject {i}: marker must sit after A and before B (got a={item_a_idx}, marker={marker_idx}, b={item_b_idx})"
+                );
+                match expected_idx {
+                    None => expected_idx = Some(marker_idx),
+                    Some(prev) => assert_eq!(
+                        marker_idx, prev,
+                        "full reproject {i}: marker index must stay stable"
+                    ),
+                }
+            });
+
+            // Live-tail reproject: without marker stripping this truncates B off structure.
+            cx.update(|cx| {
+                replica.update(cx, |r, cx| {
+                    r.fold_detailed(StreamUpdate::ActiveResponseChanged(None), cx);
+                });
+            });
+
             cx.read(|cx| {
                 let r = replica.read(cx);
                 let order = r.rows().order();
                 assert_eq!(
                     count_markers_in_order(order),
                     1,
-                    "reprojection {i}: marker must not vanish"
+                    "live-tail reproject {i}: marker must not vanish"
                 );
+                let item_a_idx = order
+                    .iter()
+                    .position(|id| id == &sibling_a)
+                    .expect("live-tail reproject {i}: item A must be present");
+                let item_b_idx = order
+                    .iter()
+                    .position(|id| id == &sibling_b)
+                    .expect("live-tail reproject {i}: item B must be present");
                 let marker_idx = order
                     .iter()
                     .position(|id| id == &marker_id)
-                    .expect("reprojection {i}: marker must remain in order");
+                    .expect("live-tail reproject {i}: marker must be present");
+                assert!(
+                    item_a_idx < marker_idx && marker_idx < item_b_idx,
+                    "live-tail reproject {i}: marker must sit after A and before B (got a={item_a_idx}, marker={marker_idx}, b={item_b_idx})"
+                );
                 assert_eq!(
-                    marker_idx, expected_idx,
-                    "reprojection {i}: marker index must stay stable"
+                    marker_idx,
+                    expected_idx.expect("expected_idx set"),
+                    "live-tail reproject {i}: marker index must stay stable"
                 );
             });
         }
