@@ -256,6 +256,13 @@ pub(crate) fn spawn_worker(
             let mut last_build = Instant::now()
                 .checked_sub(DEFAULT_BUILD_INTERVAL)
                 .unwrap_or_else(Instant::now);
+            // Retained-rows accounting is sampled here, on the throttle cadence,
+            // independent of visibility — a HIDDEN tab still ingests output and is
+            // the prime fleet-trim target, so its estimate must track (codex I1).
+            // Kept off the `maybe_publish` (visible-only build) path.
+            let mut last_rows_sample = Instant::now()
+                .checked_sub(DEFAULT_BUILD_INTERVAL)
+                .unwrap_or_else(Instant::now);
             let mut egress: Option<Sender<EgressFrame>> = None;
             let mut mouse_state = MouseState::default();
 
@@ -330,6 +337,16 @@ pub(crate) fn spawn_worker(
                         &presentation_tx_for_local_click,
                         &mut mouse_state,
                     );
+                }
+
+                // Sample retained rows on the throttle cadence, regardless of
+                // `visible` (a hidden tab keeps ingesting output). Skip on FFI
+                // error rather than record a spurious 0 (codex I1/I2).
+                if dirty && last_rows_sample.elapsed() >= DEFAULT_BUILD_INTERVAL {
+                    if let Some(rows) = engine.total_rows() {
+                        inspect.record_retained_rows(rows);
+                    }
+                    last_rows_sample = Instant::now();
                 }
 
                 maybe_publish(
@@ -864,7 +881,6 @@ fn maybe_publish(
         Ok(frame) => {
             let micros = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
             inspect.record_frame_built(micros);
-            inspect.record_retained_rows(engine.total_rows());
             frame_slot.store(Some(Arc::new(frame)));
             frame_ready.store(true, Ordering::Release);
             *dirty = false;

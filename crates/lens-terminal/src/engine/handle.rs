@@ -536,6 +536,50 @@ mod tests {
         h.stop();
     }
 
+    /// Retained-rows accounting must track a HIDDEN tab (it keeps ingesting
+    /// output and is the prime fleet-trim target). Regression for codex I1: the
+    /// sample used to ride the visible-only build path, so a hidden tab reported
+    /// a stale/zero estimate.
+    #[test]
+    fn retained_rows_track_a_hidden_tab() {
+        let cfg = EngineConfig {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 4_000_000, // BYTES
+            cell_w_px: 8,
+            cell_h_px: 16,
+        };
+        let h = EngineHandle::spawn(cfg);
+        h.set_visible(false).expect("hide");
+        let mut fed_bytes: u64 = 0;
+        for i in 0..600 {
+            let line = format!("hidden line {i}\r\n").into_bytes();
+            fed_bytes += line.len() as u64;
+            loop {
+                match h.feed(line.clone()) {
+                    Ok(()) => break,
+                    Err(_) => thread::sleep(Duration::from_millis(1)),
+                }
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let snap = h.inspect();
+            if snap.total_rows > 24 {
+                break; // grew past the viewport while hidden — accounting tracks
+            }
+            assert!(
+                Instant::now() < deadline,
+                "hidden tab retained-rows estimate never grew (bytes_fed={}, total_rows={})",
+                snap.bytes_fed,
+                snap.total_rows
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let _ = fed_bytes;
+        h.stop();
+    }
+
     const TRACKING_SGR: &[u8] = b"\x1b[?1000h\x1b[?1006h";
     const TRACKING_BUTTON_SGR: &[u8] = b"\x1b[?1002h\x1b[?1006h";
     const TRACKING_ANY_SGR: &[u8] = b"\x1b[?1003h\x1b[?1006h";

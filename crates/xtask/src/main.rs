@@ -559,6 +559,16 @@ fn terminal_rss_sweep() -> Result<()> {
                 ])
                 .output()
                 .context("spawn rss_probe")?;
+            // The probe is fail-closed: any non-zero exit means a degenerate
+            // measurement (worker stopped, drain timeout, under-retention, RSS
+            // read failure). Never fold such a run into the verdict (codex I4).
+            if !out.status.success() {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                bail!(
+                    "rss_probe failed (rows={rows} mode={mode}, exit {:?}):\n{stderr}",
+                    out.status.code()
+                );
+            }
             let stdout = String::from_utf8_lossy(&out.stdout);
             let sample = stdout
                 .lines()

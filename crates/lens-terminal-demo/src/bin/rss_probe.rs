@@ -9,7 +9,22 @@
 
 use std::time::{Duration, Instant};
 
-use lens_terminal::{EngineConfig, EngineHandle, PER_CELL_BYTES};
+use lens_terminal::{EngineConfig, EngineHandle, FeedError, PER_CELL_BYTES};
+
+/// Feed one line, retrying only on backpressure. A stopped worker is terminal —
+/// exit non-zero rather than spin forever (codex I3).
+fn feed_or_die(handle: &EngineHandle, line: Vec<u8>) {
+    loop {
+        match handle.feed(line.clone()) {
+            Ok(()) => return,
+            Err(FeedError::Full) => std::thread::sleep(Duration::from_millis(1)),
+            Err(FeedError::Stopped) => {
+                eprintln!("rss_probe: engine worker stopped unexpectedly during feed");
+                std::process::exit(3);
+            }
+        }
+    }
+}
 
 /// A fully compressible line: one byte repeated `cols` times.
 fn compressible_line(cols: usize) -> Vec<u8> {
@@ -114,18 +129,14 @@ fn main() {
         };
         line.extend_from_slice(b"\r\n");
         fed_bytes += line.len() as u64;
-        // Retry on backpressure — the command channel is bounded (cap 256).
-        loop {
-            match handle.feed(line.clone()) {
-                Ok(()) => break,
-                Err(_) => std::thread::sleep(Duration::from_millis(1)),
-            }
-        }
+        feed_or_die(&handle, line);
     }
 
     // Wait until the worker has consumed everything we fed, then force a build
-    // so total_rows reflects the full stream.
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // so total_rows reflects the full stream. A drain timeout is fail-closed:
+    // exit non-zero so the orchestrator never records a stale/partial sample as
+    // OK (codex I4).
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let snap = handle.inspect();
         if snap.bytes_fed >= fed_bytes {
@@ -133,10 +144,10 @@ fn main() {
         }
         if Instant::now() > deadline {
             eprintln!(
-                "timeout draining feed: bytes_fed={} want>={}",
+                "rss_probe: timeout draining feed (bytes_fed={} want>={}) — worker likely stalled",
                 snap.bytes_fed, fed_bytes
             );
-            break;
+            std::process::exit(4);
         }
         std::thread::sleep(Duration::from_millis(2));
     }
@@ -144,12 +155,7 @@ fn main() {
     // no-op when the engine is not dirty (the last feed's frame was already
     // built and cleared the dirty flag). Feed one final CRLF to re-dirty, then
     // force a build so the sample reflects the fully-grown scrollback.
-    loop {
-        match handle.feed(b"\r\n".to_vec()) {
-            Ok(()) => break,
-            Err(_) => std::thread::sleep(Duration::from_millis(1)),
-        }
-    }
+    feed_or_die(&handle, b"\r\n".to_vec());
     std::thread::sleep(Duration::from_millis(50));
     let _ = handle.build_now();
     // Give the build a beat to land the sample.
@@ -157,6 +163,19 @@ fn main() {
 
     let snap = handle.inspect();
     let rss = rss_bytes();
+    // Fail-closed on a degenerate sample so a stale/zero row count or an
+    // unreadable RSS can never be recorded as a passing measurement (codex I4).
+    if snap.total_rows < target_rows {
+        eprintln!(
+            "rss_probe: total_rows {} did not reach target {} — scrollback under-retained",
+            snap.total_rows, target_rows
+        );
+        std::process::exit(5);
+    }
+    if rss == 0 {
+        eprintln!("rss_probe: RSS read failed (0 bytes)");
+        std::process::exit(6);
+    }
     // Read RSS BEFORE stopping the engine (stop drops the worker + terminal).
     println!(
         "RSS_PROBE mode={mode} target_rows={target_rows} total_rows={} cols={} estimate_bytes={} rss_bytes={}",
