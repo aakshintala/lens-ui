@@ -58,6 +58,11 @@ harness = false
 required-features = ["test-util"]
 
 [[test]]
+name = "stream_perf_realwindow"
+harness = false
+required-features = ["test-util"]
+
+[[test]]
 name = "input_realwindow"
 path = "tests/input_realwindow.rs"
 harness = false

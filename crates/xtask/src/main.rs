@@ -486,6 +486,18 @@ fn gate() -> Result<()> {
             "--features",
             "test-util",
         ])?;
+        // Job-A sustained multi-tab streaming perf gate (Slice 3). Short burst
+        // by default (fits the gate); LENS_STREAM_SOAK=1 for a longer soak.
+        run(&[
+            "test",
+            "--release",
+            "-p",
+            "lens-terminal",
+            "--test",
+            "stream_perf_realwindow",
+            "--features",
+            "test-util",
+        ])?;
     } else {
         println!("gate: skip render_realwindow (macOS-only real GPUI text system)");
     }
