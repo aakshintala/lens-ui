@@ -14,13 +14,17 @@ pub enum ViewBlock<'a> {
         call: &'a Item,
         output: Option<&'a Item>,
     },
-    /// One response's folded work, keyed by the shared authoritative response_id (T-6 attaches meta/expansion).
+    /// One contiguous agent-work run, keyed by `(response_id, run_index)` (T-6 attaches meta/expansion).
     WorkSection {
         response_id: &'a ResponseId,
+        run_index: u32,
         blocks: Vec<ViewBlock<'a>>,
     },
     /// Live in-flight reasoning tail (scratch.open_reasoning).
-    StreamingReasoning(&'a ReasoningAcc),
+    StreamingReasoning {
+        response_id: Option<&'a ResponseId>,
+        acc: &'a ReasoningAcc,
+    },
     /// Live in-flight message tail (scratch.open_message).
     StreamingMessage(&'a MessageAcc),
 }
@@ -93,12 +97,15 @@ pub fn project<'a>(
 pub fn project_filtered<'a>(
     items: &[&'a Item],
     scratch: &'a StreamScratch,
-    _active_response: Option<&'a ResponseId>,
+    active_response: Option<&'a ResponseId>,
     splice_reasoning: bool,
 ) -> Vec<ViewBlock<'a>> {
     let mut blocks = pair_tool_spans(items);
     if splice_reasoning && let Some(r) = &scratch.open_reasoning {
-        blocks.push(ViewBlock::StreamingReasoning(r));
+        blocks.push(ViewBlock::StreamingReasoning {
+            response_id: active_response,
+            acc: r,
+        });
     }
     if let Some(m) = &scratch.open_message {
         blocks.push(ViewBlock::StreamingMessage(m));
@@ -116,7 +123,8 @@ pub fn project_all<'a>(
     project(&refs, scratch, active_response)
 }
 
-/// The response_id a block groups under, or None if it is a sibling / streaming tail (never grouped).
+/// The response_id a block groups under, or None if it is a sibling (never grouped).
+/// `StreamingReasoning` folds under its live section; `StreamingMessage` stays a top-level sibling.
 /// Exhaustive over ItemKind — a new kind is a compile error here.
 fn grouping_key<'a>(vb: &ViewBlock<'a>) -> Option<&'a ResponseId> {
     fn item_key(i: &Item) -> Option<&ResponseId> {
@@ -139,37 +147,41 @@ fn grouping_key<'a>(vb: &ViewBlock<'a>) -> Option<&'a ResponseId> {
     match vb {
         ViewBlock::Item(i) => item_key(i),
         ViewBlock::ToolSpan { call, .. } => item_key(call),
-        ViewBlock::WorkSection { .. }
-        | ViewBlock::StreamingReasoning(_)
-        | ViewBlock::StreamingMessage(_) => None,
+        ViewBlock::StreamingReasoning { response_id, .. } => *response_id,
+        ViewBlock::WorkSection { .. } | ViewBlock::StreamingMessage(_) => None,
     }
 }
 
-/// Stage 3: fold each settled response's consecutive agent-work run into a `WorkSection`.
-/// The response `== active_response` stays flat (live turn); all others fold.
+/// Stage 3: fold each CONTIGUOUS agent-work run into a `WorkSection`. A sibling (message,
+/// ResourceEvent, …) closes the current run and renders in place, so an interleaved turn
+/// stays chronological (multiple sections + the siblings between them). Each section carries
+/// `run_index` = the number of prior runs of the SAME `response_id`, giving finalize-stable
+/// `(response_id, run_index)` keys. `_active` is unused — the collapse decision is the renderer's
+/// (derived per `response_id`, T-2 §6/§12).
 pub fn group_work_section<'a>(
     blocks: Vec<ViewBlock<'a>>,
-    active_response: Option<&'a ResponseId>,
+    _active: Option<&'a ResponseId>,
 ) -> Vec<ViewBlock<'a>> {
+    use std::collections::HashMap;
     let mut out: Vec<ViewBlock<'a>> = Vec::with_capacity(blocks.len());
     let mut run: Vec<ViewBlock<'a>> = Vec::new();
     let mut run_key: Option<&'a ResponseId> = None;
+    let mut run_counts: HashMap<&'a ResponseId, u32> = HashMap::new();
 
     fn flush<'a>(
         out: &mut Vec<ViewBlock<'a>>,
         run: &mut Vec<ViewBlock<'a>>,
         run_key: &mut Option<&'a ResponseId>,
-        active: Option<&'a ResponseId>,
+        run_counts: &mut HashMap<&'a ResponseId, u32>,
     ) {
         if let Some(key) = run_key.take() {
-            if Some(key) == active {
-                out.append(run); // live turn: stay flat
-            } else {
-                out.push(ViewBlock::WorkSection {
-                    response_id: key,
-                    blocks: std::mem::take(run),
-                });
-            }
+            let idx = run_counts.entry(key).or_insert(0);
+            out.push(ViewBlock::WorkSection {
+                response_id: key,
+                run_index: *idx,
+                blocks: std::mem::take(run),
+            });
+            *idx += 1;
         }
         run.clear();
     }
@@ -178,17 +190,17 @@ pub fn group_work_section<'a>(
         match grouping_key(&vb) {
             Some(key) if run_key == Some(key) => run.push(vb),
             Some(key) => {
-                flush(&mut out, &mut run, &mut run_key, active_response);
+                flush(&mut out, &mut run, &mut run_key, &mut run_counts);
                 run_key = Some(key);
                 run.push(vb);
             }
             None => {
-                flush(&mut out, &mut run, &mut run_key, active_response);
+                flush(&mut out, &mut run, &mut run_key, &mut run_counts);
                 out.push(vb);
             }
         }
     }
-    flush(&mut out, &mut run, &mut run_key, active_response);
+    flush(&mut out, &mut run, &mut run_key, &mut run_counts);
     out
 }
 
@@ -322,7 +334,7 @@ mod tests {
         let out = project(&refs, &scratch, Some(&resp_a));
         assert_eq!(out.len(), 3);
         assert_item(&out[0], "m1");
-        assert!(matches!(out[1], ViewBlock::StreamingReasoning(_)));
+        assert!(matches!(out[1], ViewBlock::StreamingReasoning { .. }));
         assert!(matches!(out[2], ViewBlock::StreamingMessage(_)));
     }
 
@@ -470,17 +482,23 @@ mod tests {
         )
     }
 
-    fn assert_section<'a>(vb: &'a ViewBlock<'a>, resp: &str) -> &'a [ViewBlock<'a>] {
+    fn assert_section_ri<'a>(vb: &'a ViewBlock<'a>, resp: &str) -> (&'a [ViewBlock<'a>], u32) {
         match vb {
             ViewBlock::WorkSection {
                 response_id,
+                run_index,
                 blocks,
             } => {
                 assert_eq!(response_id.as_str(), resp);
-                blocks.as_slice()
+                (blocks.as_slice(), *run_index)
             }
             other => panic!("expected WorkSection({resp}), got {other:?}"),
         }
+    }
+
+    fn assert_section<'a>(vb: &'a ViewBlock<'a>, resp: &str) -> &'a [ViewBlock<'a>] {
+        let (blocks, _) = assert_section_ri(vb, resp);
+        blocks
     }
 
     #[test]
@@ -501,7 +519,7 @@ mod tests {
     }
 
     #[test]
-    fn live_response_stays_flat() {
+    fn live_response_also_folds_into_section() {
         let items = [
             reasoning("r1", Some("resp_a")),
             call("c1", Some("resp_a"), "call_1", "completed"),
@@ -510,11 +528,11 @@ mod tests {
         let refs: Vec<&Item> = items.iter().collect();
         let scratch = scratch_with(None, None);
         let resp_a = ResponseId::new("resp_a");
-        let projected = project(&refs, &scratch, Some(&resp_a));
-        let out = group_work_section(projected, Some(&resp_a));
-        // resp_a is live ⇒ flat: reasoning + tool-span, no WorkSection.
-        assert_eq!(out.len(), 2);
-        assert!(!matches!(out[0], ViewBlock::WorkSection { .. }));
+        // Even when resp_a is active, grouping folds it — expanded-vs-collapsed is the renderer's job now.
+        let out = group_work_section(project(&refs, &scratch, Some(&resp_a)), Some(&resp_a));
+        assert_eq!(out.len(), 1);
+        let inner = assert_section(&out[0], "resp_a");
+        assert_eq!(inner.len(), 2); // reasoning + tool-span
     }
 
     #[test]
@@ -556,7 +574,7 @@ mod tests {
 
     #[test]
     fn idle_folds_all_but_active_folds_all_others() {
-        // Two responses; resp_b is active ⇒ resp_a folds, resp_b flat.
+        // Two responses; both fold — active_response no longer suppresses grouping.
         let items = [
             reasoning("r1", Some("resp_a")),
             reasoning("r2", Some("resp_b")),
@@ -568,10 +586,7 @@ mod tests {
         let out = group_work_section(projected, Some(&resp_b));
         assert_eq!(out.len(), 2);
         assert_section(&out[0], "resp_a");
-        assert!(matches!(
-            out[1],
-            ViewBlock::StreamingReasoning(_) | ViewBlock::Item(_)
-        ));
+        assert_section(&out[1], "resp_b");
     }
 
     #[test]
@@ -579,12 +594,15 @@ mod tests {
         let items = [reasoning("r1", Some("resp_a"))];
         let refs: Vec<&Item> = items.iter().collect();
         let scratch = scratch_with(Some(r_acc()), None);
-        let projected = project(&refs, &scratch, None);
-        let out = group_work_section(projected, None);
-        // resp_a folds; the StreamingReasoning tail stays flat after it.
-        assert_eq!(out.len(), 2);
-        assert_section(&out[0], "resp_a");
-        assert!(matches!(out[1], ViewBlock::StreamingReasoning(_)));
+        let resp_a = ResponseId::new("resp_a");
+        let projected = project(&refs, &scratch, Some(&resp_a));
+        let out = group_work_section(projected, Some(&resp_a));
+        // resp_a folds; the StreamingReasoning tail folds into the section.
+        assert_eq!(out.len(), 1);
+        let inner = assert_section(&out[0], "resp_a");
+        assert_eq!(inner.len(), 2);
+        assert_item(&inner[0], "r1");
+        assert!(matches!(inner[1], ViewBlock::StreamingReasoning { .. }));
     }
 
     // Count how many input Items are represented across the ViewBlock tree (recursively).
@@ -599,7 +617,7 @@ mod tests {
                     }
                 }
                 ViewBlock::WorkSection { blocks, .. } => covered_item_ids(blocks, acc),
-                ViewBlock::StreamingReasoning(_) | ViewBlock::StreamingMessage(_) => {}
+                ViewBlock::StreamingReasoning { .. } | ViewBlock::StreamingMessage(_) => {}
             }
         }
     }
@@ -607,7 +625,7 @@ mod tests {
     #[test]
     fn full_pipeline_agent_changed_inside_section_live_tail() {
         // user msg (sibling) → resp_a settled work (reasoning + agent_changed + tool) →
-        // resp_b live (flat) → streaming tail.
+        // resp_b live section (reasoning + streaming tail).
         let ac = item(
             "ac1",
             Some("resp_a"),
@@ -630,16 +648,18 @@ mod tests {
         let resp_b = ResponseId::new("resp_b");
         let projected = project(&refs, &scratch, Some(&resp_b));
         let out = group_work_section(projected, Some(&resp_b));
-        // u1 sibling | WorkSection(resp_a){reasoning, agent_changed, tool-span} | r2 flat | streaming
-        assert_eq!(out.len(), 4);
+        // u1 sibling | WorkSection(resp_a){...} | WorkSection(resp_b){r2, StreamingReasoning}
+        assert_eq!(out.len(), 3);
         assert_item(&out[0], "u1");
         let inner = assert_section(&out[1], "resp_a");
         assert_eq!(inner.len(), 3);
         assert_item(&inner[0], "r1");
         assert_item(&inner[1], "ac1");
         assert_span(&inner[2], "c1", Some("o1"));
-        assert_item(&out[2], "r2"); // resp_b live ⇒ flat
-        assert!(matches!(out[3], ViewBlock::StreamingReasoning(_)));
+        let inner_b = assert_section(&out[2], "resp_b");
+        assert_eq!(inner_b.len(), 2);
+        assert_item(&inner_b[0], "r2");
+        assert!(matches!(inner_b[1], ViewBlock::StreamingReasoning { .. }));
     }
 
     #[test]
@@ -698,7 +718,44 @@ mod tests {
         assert_eq!(covered, vec!["a1".to_string()]);
         assert!(
             !out.iter()
-                .any(|b| matches!(b, ViewBlock::StreamingReasoning(_)))
+                .any(|b| matches!(b, ViewBlock::StreamingReasoning { .. }))
         );
+    }
+
+    #[test]
+    fn interleaved_message_keeps_two_runs_in_order_with_run_index() {
+        // reasoning(resp_a), assistant msg(resp_a) [sibling], reasoning(resp_a) again.
+        let items = [
+            reasoning("r1", Some("resp_a")),
+            msg("a1", Some("resp_a"), Role::Assistant, "narration"),
+            reasoning("r2", Some("resp_a")),
+        ];
+        let refs: Vec<&Item> = items.iter().collect();
+        let scratch = scratch_with(None, None);
+        let out = group_work_section(project(&refs, &scratch, None), None);
+        // section(resp_a,#0){r1} | a1 sibling IN PLACE | section(resp_a,#1){r2} — order preserved.
+        assert_eq!(out.len(), 3);
+        let (i0, ri0) = assert_section_ri(&out[0], "resp_a");
+        assert_eq!(ri0, 0);
+        assert_item(&i0[0], "r1");
+        assert_item(&out[1], "a1");
+        let (i1, ri1) = assert_section_ri(&out[2], "resp_a");
+        assert_eq!(ri1, 1);
+        assert_item(&i1[0], "r2");
+    }
+
+    #[test]
+    fn streaming_reasoning_carries_active_response_id() {
+        let items: [Item; 0] = [];
+        let refs: Vec<&Item> = items.iter().collect();
+        let scratch = scratch_with(Some(r_acc()), None);
+        let resp_a = ResponseId::new("resp_a");
+        let out = project(&refs, &scratch, Some(&resp_a));
+        match &out[0] {
+            ViewBlock::StreamingReasoning { response_id, .. } => {
+                assert_eq!(response_id.map(|r| r.as_str()), Some("resp_a"));
+            }
+            other => panic!("expected StreamingReasoning, got {other:?}"),
+        }
     }
 }
