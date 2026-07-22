@@ -149,6 +149,17 @@ impl BoardReplica {
         )
     }
 
+    /// Test ctor with a caller-supplied path and NO pre-opened store: `ensure_open`
+    /// opens `path` on the first Load. A good pre-seeded path → Load reads it; a bad
+    /// path → open fails → LoadFailed (used by Task 5 recovery tests).
+    pub(crate) fn for_test_file(
+        fleet: Entity<FleetStore>,
+        path: std::path::PathBuf,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::build(None, path, ConnectionId::new("conn_test"), None, fleet, cx)
+    }
+
     pub(crate) fn run_op(&mut self, op: Op, cx: &mut Context<Self>) {
         self.pending.push_back(op);
         self.pump(cx);
@@ -389,13 +400,66 @@ mod tests {
         });
         cx.run_until_parked();
         replica.read_with(cx, |r, _| {
-            let n = r
+            // Load-bearing for ORDER (not just "both landed"): single-in-flight commits
+            // 'a' before 'b', so 'a' appends at ordinal 0 and 'b' at 1. If the ops applied
+            // out of enqueue order, 'b' would take ordinal 0 → this fails.
+            let mut cards: Vec<(i32, String)> = r
                 .layout()
                 .items
                 .iter()
-                .filter(|i| matches!(i.kind, BoardItemKind::Card { .. }))
-                .count();
-            assert_eq!(n, 2);
+                .filter_map(|i| match &i.kind {
+                    BoardItemKind::Card { session, .. } => {
+                        Some((i.ordinal, session.as_str().to_string()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            cards.sort_by_key(|(ord, _)| *ord);
+            let sessions: Vec<String> = cards.into_iter().map(|(_, s)| s).collect();
+            assert_eq!(sessions, vec!["a".to_string(), "b".to_string()]);
         });
+    }
+
+    // Load-bearing for the Loaded arm applying `self.layout` (codex Task-4 review): the
+    // replica starts with the empty default board, so an empty-store Load can't prove the
+    // loaded layout was applied. Seed a distinctive card on disk BEFORE the replica opens
+    // it; if apply_outcome's Loaded arm omitted `self.layout = layout`, this fails.
+    #[gpui::test]
+    async fn load_reads_persisted_card(cx: &mut gpui::TestAppContext) {
+        let fleet = cx.update(|cx| test_fleet(cx));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.db");
+        {
+            let store = SqliteBoardStore::open(&path).unwrap();
+            store
+                .place_session(
+                    &ConnectionId::new("conn_test"),
+                    &SessionId::new("persisted_x"),
+                    &PlacementTarget {
+                        board_id: None,
+                        parent_item_id: None,
+                        ordinal: None,
+                    },
+                )
+                .unwrap();
+        }
+        let replica = cx
+            .update(|cx| cx.new(|cx| BoardReplica::for_test_file(fleet.clone(), path.clone(), cx)));
+        cx.run_until_parked();
+        replica.read_with(cx, |r, _| {
+            assert_eq!(r.state(), ReplicaState::Writable);
+            let sessions: Vec<String> = r
+                .layout()
+                .items
+                .iter()
+                .filter_map(|i| match &i.kind {
+                    BoardItemKind::Card { session, .. } => Some(session.as_str().to_string()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(sessions, vec!["persisted_x".to_string()]);
+        });
+        // keep the tempdir alive through the assertion (for_test_file holds no _tempdir)
+        drop(dir);
     }
 }

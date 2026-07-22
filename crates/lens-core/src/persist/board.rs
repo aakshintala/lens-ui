@@ -507,9 +507,12 @@ impl BoardStore for SqliteBoardStore {
                 item_id.clone(),
                 created_at,
             )?;
+            // Typed (not .expect): place_sessions runs on the board replica's async
+            // pump — a panic there never resolves its Task and wedges the pump forever
+            // (M10). A regression in place_session surfaces as Err → OpOutcome::Failed.
             let board_id = layout
                 .item(&item_id)
-                .expect("just inserted")
+                .ok_or(BoardError::ItemNotFound)?
                 .board_id
                 .clone();
             touched.insert(board_id);
