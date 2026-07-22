@@ -1745,9 +1745,7 @@ impl TerminalTab {
     /// tab forever when the new agent never relaunches our key (the delete fires
     /// regardless of whether a successor ever appears — memory
     /// `terminal-resource-event-granularity`).
-    #[cfg(test)]
-    const REPLACEMENT_WAIT: Duration = Duration::ZERO;
-    #[cfg(not(test))]
+    #[cfg_attr(test, allow(dead_code))]
     const REPLACEMENT_WAIT: Duration = Duration::from_secs(30);
 
     fn adopt_successor(
@@ -1792,26 +1790,38 @@ impl TerminalTab {
     }
 
     fn arm_replacement_timeout(&mut self, cx: &mut Context<Self>) {
-        let epoch = self.reconnect_epoch;
-        cx.spawn(async move |weak, cx| {
-            cx.background_executor()
-                .spawn(async move {
-                    std::thread::sleep(Self::REPLACEMENT_WAIT);
-                })
-                .await;
-            let _ = weak.update(cx, |tab, cx| {
-                if tab.reconnect_epoch == epoch && tab.lifecycle == Lifecycle::ReplacementWaiting {
-                    tab.on_detach(DetachedDetail::ReplacementTimedOut, cx);
-                }
-            });
-        })
-        .detach();
+        // Tests drive the timeout deterministically via `fire_replacement_timeout_now`;
+        // arming a real wall-clock timer here would fire on any executor pump (test teardown /
+        // run_until_parked) and clobber ReplacementWaiting state. (Grok review, Task 4.)
+        #[cfg(test)]
+        {
+            let _ = cx;
+            return;
+        }
+        #[cfg(not(test))]
+        {
+            let epoch = self.reconnect_epoch;
+            cx.spawn(async move |weak, cx| {
+                cx.background_executor()
+                    .spawn(async move {
+                        std::thread::sleep(Self::REPLACEMENT_WAIT);
+                    })
+                    .await;
+                let _ = weak.update(cx, |tab, cx| {
+                    if tab.reconnect_epoch == epoch
+                        && tab.lifecycle == Lifecycle::ReplacementWaiting
+                    {
+                        tab.on_detach(DetachedDetail::ReplacementTimedOut, cx);
+                    }
+                });
+            })
+            .detach();
+        }
     }
 
     #[cfg(test)]
     fn fire_replacement_timeout_now(&mut self, cx: &mut Context<Self>) {
-        let epoch = self.reconnect_epoch;
-        if self.reconnect_epoch == epoch && self.lifecycle == Lifecycle::ReplacementWaiting {
+        if self.lifecycle == Lifecycle::ReplacementWaiting {
             self.on_detach(DetachedDetail::ReplacementTimedOut, cx);
         }
     }
