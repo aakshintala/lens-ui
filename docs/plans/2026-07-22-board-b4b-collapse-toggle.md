@@ -793,7 +793,6 @@ struct GroupMeta {
 
         let name = meta.map(|m| m.name.clone()).unwrap_or_default();
         let completed = meta.map(|m| m.completed_count).unwrap_or(0);
-        let group_id = meta.map(|m| m.id.clone());
         let accent = group_accent(meta.and_then(|m| m.color_token.as_deref()));
 
         // Narrow projections read from member cards: cost/age (spend·age) + Wave (rollup).
@@ -862,8 +861,8 @@ struct GroupMeta {
                 .child(format!("✓ {} done →", rollup.completed_count))
         }));
 
-        // caret (▸) — Task 6 wires the on_click; render the glyph here.
-        let _ = group_id; // Task 6 consumes this for the toggle handler
+        // Ring/tint + header. The `▸` caret renders as a static glyph here (mirrors
+        // B-3's static expanded `⌄`); Task 6 makes both carets interactive.
         let ring = div()
             .absolute()
             .left(px(x - INSET))
@@ -1069,26 +1068,32 @@ In `crates/lens-ui/src/board/mod.rs`:
     }
 ```
 
-(b) Wire the collapsed `▸` caret in `absolute_collapsed_group` (Task 5). Replace the `let _ = group_id;` line and the plain `▸` child. Give the caret its own clickable element with `stop_propagation` ([[gpui-nested-click-stop-propagation]]):
+(b) Make the collapsed `▸` caret interactive in `absolute_collapsed_group` (Task 5 ships it as a static glyph). First extract the group id near the top of the fn (after `let accent = ...`):
 
 ```rust
-        let caret = {
-            let gid = group_id.clone();
-            div()
-                .id(("group-caret", placed.item_index))
-                .cursor_pointer()
-                .text_color(gpui::rgb(0x8a8a94))
-                .child("▸")
-                .on_click(cx.listener(move |board, _ev, _win, cx| {
-                    cx.stop_propagation();
-                    if let Some(gid) = gid.clone() {
-                        board.toggle_group_collapsed(gid, cx);
-                    }
-                }))
-        };
+        let group_id = meta.map(|m| m.id.clone());
 ```
 
-and use `.child(caret)` in the header instead of `.child(div()...child("▸"))`. (`group_id` here is `Option<BoardItemId>` from meta; keep the `if let Some` guard.)
+Then replace the header's static `▸` child (`.child(div().text_color(gpui::rgb(0x8a8a94)).child("▸"))`) with a clickable caret carrying `stop_propagation` ([[gpui-nested-click-stop-propagation]]):
+
+```rust
+            .child({
+                let gid = group_id.clone();
+                div()
+                    .id(("group-caret", placed.item_index))
+                    .cursor_pointer()
+                    .text_color(gpui::rgb(0x8a8a94))
+                    .child("▸")
+                    .on_click(cx.listener(move |board, _ev, _win, cx| {
+                        cx.stop_propagation();
+                        if let Some(gid) = gid.clone() {
+                            board.toggle_group_collapsed(gid, cx);
+                        }
+                    }))
+            })
+```
+
+(`group_id` is `Option<BoardItemId>` from meta; keep the `if let Some` guard.)
 
 (c) Wire the expanded `⌄` caret in `absolute_group` (~line 448). `absolute_group` currently has no `group_id` — thread it from meta at the top of the fn:
 
