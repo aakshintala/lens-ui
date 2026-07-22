@@ -23,6 +23,7 @@ use lens_client::sessions::{ItemsPage, PendingInput};
 use lens_client::stream::DisconnectReason;
 use lens_client::stream::Item as WireItem;
 use lens_client::stream::ServerStreamEvent;
+use smallvec::SmallVec;
 use std::thread::JoinHandle;
 
 /// Forward catch-up page size (D19).
@@ -660,12 +661,16 @@ fn apply_reduced_batch(
         ctx.ring,
     );
     let mut batch = batch;
-    if !defer_transcript_commit
-        && let Some(ord) = commit_terminal_prefix(ctx.stores, ctx.state, ctx.next_ordinal, ctx.ring)
-    {
-        batch.push(StreamUpdate::TranscriptAdvanced {
-            committed_ordinal: ord,
-        });
+    if !defer_transcript_commit {
+        let result = commit_terminal_prefix(ctx.stores, ctx.state, ctx.next_ordinal, ctx.ring);
+        if let Some(ord) = result.advanced {
+            batch.push(StreamUpdate::TranscriptAdvanced {
+                committed_ordinal: ord,
+            });
+        }
+        for ordinal in result.rewritten {
+            batch.push(StreamUpdate::TranscriptRewritten { ordinal });
+        }
     }
     let disconnect_reason = batch.iter().find_map(|u| match u {
         StreamUpdate::Disconnected(reason) => Some(*reason),
@@ -822,7 +827,8 @@ fn finish_deferred_transcript_commit(
     ring: &mut OutcomeRing,
     output: &mut ActorOutput,
 ) -> LoopControl {
-    if let Some(ord) = commit_terminal_prefix(stores, state, next_ordinal, ring)
+    let result = commit_terminal_prefix(stores, state, next_ordinal, ring);
+    if let Some(ord) = result.advanced
         && output
             .feed
             .send_blocking(ActorFeed::Detailed(StreamUpdate::TranscriptAdvanced {
@@ -831,6 +837,17 @@ fn finish_deferred_transcript_commit(
             .is_err()
     {
         return LoopControl::Break;
+    }
+    for ordinal in result.rewritten {
+        if output
+            .feed
+            .send_blocking(ActorFeed::Detailed(StreamUpdate::TranscriptRewritten {
+                ordinal,
+            }))
+            .is_err()
+        {
+            return LoopControl::Break;
+        }
     }
     drain_outcome_ring(ring, &output.outcomes);
     LoopControl::Continue
@@ -1166,7 +1183,8 @@ fn persist_scalars(
             | StreamUpdate::PendingUserChanged(_)
             | StreamUpdate::Reconnecting { .. }
             | StreamUpdate::Reconnected { .. }
-            | StreamUpdate::TranscriptAdvanced { .. } => {}
+            | StreamUpdate::TranscriptAdvanced { .. }
+            | StreamUpdate::TranscriptRewritten { .. } => {}
             StreamUpdate::Disconnected(_) => {}
             _ => touched_scalar = true,
         }
@@ -1180,17 +1198,23 @@ fn persist_scalars(
 }
 
 /// D20/D23: commit the terminal PREFIX of the working set to disk in order,
-/// prune it from RAM, advance `next_ordinal`. Returns the new watermark iff ≥1
-/// item committed. A non-terminal front item stops the prefix (it and everything
-/// after stay above the watermark). A persist error stops the prefix and leaves
-/// the item resident for the next batch (no ordinal gap, no RAM loss).
+/// prune it from RAM, advance `next_ordinal`. Returns advanced watermark and any
+/// in-place re-fire ordinals. A non-terminal front item stops the prefix (it and
+/// everything after stay above the watermark). A persist error stops the prefix
+/// and leaves the item resident for the next batch (no ordinal gap, no RAM loss).
+struct CommitResult {
+    advanced: Option<i64>,
+    rewritten: SmallVec<[i64; 2]>,
+}
+
 fn commit_terminal_prefix(
     stores: &ActorStores,
     state: &mut SessionState,
     next_ordinal: &mut i64,
     ring: &mut OutcomeRing,
-) -> Option<i64> {
-    let mut committed = false;
+) -> CommitResult {
+    let mut advanced = None;
+    let mut rewritten = SmallVec::new();
     while let Some(front) = state.items.first() {
         if !front.kind.is_terminal() {
             break;
@@ -1202,7 +1226,9 @@ fn commit_terminal_prefix(
                 state.items.remove(0);
                 if stored_ord == requested {
                     *next_ordinal += 1;
-                    committed = true;
+                    advanced = Some(*next_ordinal - 1);
+                } else {
+                    rewritten.push(stored_ord);
                 }
             }
             Err(e) => {
@@ -1214,7 +1240,10 @@ fn commit_terminal_prefix(
             }
         }
     }
-    committed.then(|| *next_ordinal - 1)
+    CommitResult {
+        advanced,
+        rewritten,
+    }
 }
 
 /// Drop superseded deltas within one batch (keep the last of each discriminant).
@@ -1409,6 +1438,7 @@ mod tests {
                     StreamUpdate::Reconnected { .. }
                     | StreamUpdate::Reconnecting { .. }
                     | StreamUpdate::TranscriptAdvanced { .. }
+                    | StreamUpdate::TranscriptRewritten { .. }
                     | StreamUpdate::SnapshotRestored(_)
                     | StreamUpdate::Rebased(_),
                 ) => {}
@@ -2242,11 +2272,15 @@ mod tests {
             ))
             .unwrap();
         let mut saw_watermark_on_refire = false;
+        let mut rewritten_frames = 0usize;
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
         while std::time::Instant::now() < deadline {
             match feed_rx.try_recv() {
                 Ok(ActorFeed::Detailed(StreamUpdate::TranscriptAdvanced { .. })) => {
                     saw_watermark_on_refire = true;
+                }
+                Ok(ActorFeed::Detailed(StreamUpdate::TranscriptRewritten { ordinal: 0 })) => {
+                    rewritten_frames += 1;
                 }
                 Ok(_) => {}
                 Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
@@ -2255,6 +2289,10 @@ mod tests {
         assert!(
             !saw_watermark_on_refire,
             "re-fire of an already-persisted id must not emit TranscriptAdvanced"
+        );
+        assert_eq!(
+            rewritten_frames, 1,
+            "re-fire of an already-persisted id must emit exactly one TranscriptRewritten{{ordinal:0}}"
         );
 
         ev_tx

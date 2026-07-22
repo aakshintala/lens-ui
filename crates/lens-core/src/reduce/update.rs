@@ -23,6 +23,11 @@ pub enum StreamUpdate {
     TranscriptAdvanced {
         committed_ordinal: i64,
     },
+    /// In-place re-fire at an existing ordinal below the watermark (disk row updated,
+    /// watermark unchanged). The focused replica re-reads exactly this ordinal.
+    TranscriptRewritten {
+        ordinal: i64,
+    },
     ScratchChanged(Arc<StreamScratch>),
     /// Explicit retirement disposition keyed by `acc_id` so the replica never
     /// infers finalize-vs-abandon intent.

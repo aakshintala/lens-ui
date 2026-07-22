@@ -50,7 +50,8 @@ pub fn apply(state: &mut SessionState, update: StreamUpdate) {
         | Reconnecting { .. }
         | Reconnected { .. }
         | Retired { .. }
-        | TranscriptAdvanced { .. } => {}
+        | TranscriptAdvanced { .. }
+        | TranscriptRewritten { .. } => {}
         Disconnected(_) => {}
     }
 }

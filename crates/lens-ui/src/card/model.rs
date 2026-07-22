@@ -234,6 +234,7 @@ impl SessionCard {
             StreamUpdate::SnapshotRestored(_)
             | StreamUpdate::ResourcesChanged
             | StreamUpdate::TranscriptAdvanced { .. }
+            | StreamUpdate::TranscriptRewritten { .. }
             | StreamUpdate::SkillsChanged(_)
             | StreamUpdate::TerminalPendingChanged(_)
             | StreamUpdate::PendingUserChanged(_)
