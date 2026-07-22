@@ -1,6 +1,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use gpui::{Context, Entity, prelude::*};
 use lens_core::domain::board::{
@@ -252,8 +253,81 @@ impl BoardReplica {
 
     fn note_place_result(&mut self) {}
 
-    fn on_op_failed(&mut self, _op: Op, _err: PersistError, _cx: &mut Context<Self>) {
-        self.state = ReplicaState::Stale;
+    fn on_op_failed(&mut self, op: Op, err: PersistError, cx: &mut Context<Self>) {
+        // Transient (SQLITE_BUSY/LOCKED beyond busy_timeout): keep the op, back off, retry.
+        if err.is_transient() && self.op_retries < MAX_RETRIES {
+            self.op_retries += 1;
+            let backoff = Duration::from_millis(50u64 << self.op_retries.min(6)); // 100,200,…,≤3200ms
+            self.schedule_retry(op, backoff, cx);
+            return;
+        }
+        // Persistent (or retries exhausted).
+        self.op_retries = 0;
+        self.reconcile_in_flight = false;
+        self.recovery_in_flight = false;
+        self.last_attempt.clear();
+        match op {
+            Op::Load { initial: true } => {
+                self.state = ReplicaState::LoadFailed;
+                self.layout = default_board_layout(); // never loaded → render empty default, no panic
+            }
+            Op::Load { initial: false } => {
+                // Failed RECOVERY: preserve visible data; a writable store just lost writability.
+                if self.state == ReplicaState::Writable {
+                    self.state = ReplicaState::Stale;
+                } // else keep Degraded/LoadFailed/Stale + existing layout
+            }
+            Op::PlaceSessions(_) => {
+                self.state = ReplicaState::Stale; // keep current layout
+            }
+        }
+        // Persistent failure: queued writes won't succeed on replay — drop (banner names them).
+        let dropped = self
+            .pending
+            .iter()
+            .filter(|o| matches!(o, Op::PlaceSessions(_)))
+            .count() as u32;
+        self.dropped_writes = self.dropped_writes.saturating_add(dropped);
+        self.pending.retain(|o| matches!(o, Op::Load { .. }));
+        self.banner_dismissed = false;
+        cx.notify();
+    }
+
+    fn schedule_retry(&mut self, op: Op, backoff: Duration, cx: &mut Context<Self>) {
+        self.pending.push_front(op); // preserve ordering
+        self.in_flight = true; // hold the single-in-flight slot across the backoff
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(backoff).await;
+            this.update(cx, |this, cx| {
+                this.in_flight = false;
+                this.pump(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub fn write(&mut self, op: Op, cx: &mut Context<Self>) -> WriteDisposition {
+        if !self.is_writable() {
+            self.banner_dismissed = false; // re-surface the banner on a rejected gesture
+            cx.notify();
+            return WriteDisposition::Rejected(self.state);
+        }
+        self.run_op(op, cx);
+        WriteDisposition::Accepted
+    }
+
+    fn begin_recovery(&mut self, cx: &mut Context<Self>) {
+        if self.recovery_in_flight {
+            return; // coalesce: at most one recovery in flight (bounded, §5)
+        }
+        self.recovery_in_flight = true;
+        self.run_op(Op::Load { initial: false }, cx); // Load is always allowed, any state
+    }
+
+    pub fn retry_recovery(&mut self, cx: &mut Context<Self>) {
+        self.banner_dismissed = false;
+        self.begin_recovery(cx);
     }
 
     fn on_fleet_change(&mut self, _cx: &mut Context<Self>) {}
@@ -461,5 +535,38 @@ mod tests {
         });
         // keep the tempdir alive through the assertion (for_test_file holds no _tempdir)
         drop(dir);
+    }
+
+    #[gpui::test]
+    async fn failed_initial_load_seeds_default_board(cx: &mut gpui::TestAppContext) {
+        let fleet = cx.update(|cx| test_fleet(cx));
+        let replica = cx.update(|cx| {
+            cx.new(|cx| BoardReplica::for_test_file(fleet.clone(), "/dev/null/nope.db".into(), cx))
+        });
+        cx.run_until_parked();
+        replica.read_with(cx, |r, _| {
+            assert_eq!(r.state(), ReplicaState::LoadFailed);
+            assert_eq!(
+                r.layout().default_board_id().unwrap().as_str(),
+                DEFAULT_BOARD_ID
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn write_rejected_when_non_writable(cx: &mut gpui::TestAppContext) {
+        let fleet = cx.update(|cx| test_fleet(cx));
+        let replica = cx.update(|cx| {
+            cx.new(|cx| BoardReplica::for_test_file(fleet.clone(), "/dev/null/nope.db".into(), cx))
+        });
+        cx.run_until_parked(); // → LoadFailed
+        let d = replica.update(cx, |r, cx| {
+            r.write(
+                Op::PlaceSessions(vec![(r.conn.clone(), SessionId::new("x"))]),
+                cx,
+            )
+        });
+        assert_eq!(d, WriteDisposition::Rejected(ReplicaState::LoadFailed));
+        replica.read_with(cx, |r, _| assert!(r.pending.is_empty()));
     }
 }
