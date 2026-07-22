@@ -21,6 +21,11 @@ use super::vt::{EngineConfig, VtEngine};
 
 pub(crate) type WakerSlot = Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>;
 
+/// Engine worker thread stack. Larger than the ~2 MiB default because
+/// libghostty's scrollback operations overflow it once history grows large
+/// (see `spawn_worker`). Lazily committed, so the reservation is virtual-only.
+const WORKER_STACK_BYTES: usize = 64 * 1024 * 1024;
+
 const CMD_CHANNEL_CAP: usize = 256;
 pub(crate) const EGRESS_CHANNEL_CAP: usize = 64;
 /// Default min interval between frame builds (~60 Hz).
@@ -218,64 +223,97 @@ pub(crate) fn spawn_worker(
     presentation_tx: Sender<EnginePresentationEvent>,
     latest_title_slot: Arc<ArcSwapOption<super::presentation::TitleUpdate>>,
 ) -> JoinHandle<()> {
-    thread::spawn(move || {
-        let presentation_tx_for_local_click = presentation_tx.clone();
-        let mut engine = match VtEngine::new_shared(
-            &cfg,
-            |_| {},
-            presentation_tx,
-            latest_title_slot,
-            Some(Arc::clone(&waker)),
-            Some(Arc::clone(&inspect)),
-        ) {
-            Ok(e) => e,
-            Err(e) => {
-                eprintln!("lens-terminal engine: failed to create VtEngine: {e}");
-                return;
-            }
-        };
-
-        let mut dirty = false;
-        let mut visible = true;
-        let mut force_build = false;
-        let mut stopping = false;
-        let mut pending: VecDeque<EngineCommand> = VecDeque::new();
-        let mut last_build = Instant::now()
-            .checked_sub(DEFAULT_BUILD_INTERVAL)
-            .unwrap_or_else(Instant::now);
-        let mut egress: Option<Sender<EgressFrame>> = None;
-        let mut mouse_state = MouseState::default();
-
-        loop {
-            #[cfg(any(test, feature = "test-util"))]
-            while worker_stall_gate.load(Ordering::Acquire) {
-                // Sleep rather than busy-spin: a held worker must not monopolize a core, or
-                // (with many engines under `cargo test` parallelism) it starves other
-                // engines' build workers past their deadlines and flakes the suite.
-                thread::sleep(Duration::from_millis(1));
-            }
-
-            let throttle_remaining = DEFAULT_BUILD_INTERVAL.saturating_sub(last_build.elapsed());
-            let wait_for_throttle =
-                dirty && visible && !force_build && throttle_remaining > Duration::ZERO;
-
-            let cmd = if wait_for_throttle {
-                match cmd_rx.recv_timeout(throttle_remaining) {
-                    Ok(cmd) => Some(cmd),
-                    Err(RecvTimeoutError::Timeout) => None,
-                    Err(RecvTimeoutError::Disconnected) => break,
-                }
-            } else {
-                match cmd_rx.recv() {
-                    Ok(cmd) => Some(cmd),
-                    Err(_) => break,
+    // libghostty's scrollback page operations (invoked from `vt_write` as history
+    // grows) recurse/consume stack proportional to scrollback depth, and overflow
+    // the ~2 MiB default thread stack once retained history gets large (empirically
+    // ~2000+ rows at 200 cols → SIGABRT "stack overflow"). A 64 MiB reservation is
+    // lazily committed (virtual only until touched) and covers the production-ceiling
+    // scrollback range (verified to 50k rows). Regression: `large_scrollback_feed_does_not_overflow_worker_stack`.
+    thread::Builder::new()
+        .stack_size(WORKER_STACK_BYTES)
+        .spawn(move || {
+            let presentation_tx_for_local_click = presentation_tx.clone();
+            let mut engine = match VtEngine::new_shared(
+                &cfg,
+                |_| {},
+                presentation_tx,
+                latest_title_slot,
+                Some(Arc::clone(&waker)),
+                Some(Arc::clone(&inspect)),
+            ) {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("lens-terminal engine: failed to create VtEngine: {e}");
+                    return;
                 }
             };
 
-            if let Some(cmd) = cmd {
-                if matches!(cmd, EngineCommand::Stop) {
-                    stopping = true;
+            let mut dirty = false;
+            let mut visible = true;
+            let mut force_build = false;
+            let mut stopping = false;
+            let mut pending: VecDeque<EngineCommand> = VecDeque::new();
+            let mut last_build = Instant::now()
+                .checked_sub(DEFAULT_BUILD_INTERVAL)
+                .unwrap_or_else(Instant::now);
+            let mut egress: Option<Sender<EgressFrame>> = None;
+            let mut mouse_state = MouseState::default();
+
+            loop {
+                #[cfg(any(test, feature = "test-util"))]
+                while worker_stall_gate.load(Ordering::Acquire) {
+                    // Sleep rather than busy-spin: a held worker must not monopolize a core, or
+                    // (with many engines under `cargo test` parallelism) it starves other
+                    // engines' build workers past their deadlines and flakes the suite.
+                    thread::sleep(Duration::from_millis(1));
+                }
+
+                let throttle_remaining =
+                    DEFAULT_BUILD_INTERVAL.saturating_sub(last_build.elapsed());
+                let wait_for_throttle =
+                    dirty && visible && !force_build && throttle_remaining > Duration::ZERO;
+
+                let cmd = if wait_for_throttle {
+                    match cmd_rx.recv_timeout(throttle_remaining) {
+                        Ok(cmd) => Some(cmd),
+                        Err(RecvTimeoutError::Timeout) => None,
+                        Err(RecvTimeoutError::Disconnected) => break,
+                    }
                 } else {
+                    match cmd_rx.recv() {
+                        Ok(cmd) => Some(cmd),
+                        Err(_) => break,
+                    }
+                };
+
+                if let Some(cmd) = cmd {
+                    if matches!(cmd, EngineCommand::Stop) {
+                        stopping = true;
+                    } else {
+                        dispatch_command(
+                            cmd,
+                            &mut engine,
+                            &cmd_rx,
+                            &mut egress,
+                            &inspect,
+                            &mut dirty,
+                            &mut visible,
+                            &mut force_build,
+                            &mut pending,
+                            &mut stopping,
+                            &chunk_barrier,
+                            &access_epoch,
+                            &presentation_tx_for_local_click,
+                            &mut mouse_state,
+                        );
+                    }
+                }
+
+                while let Ok(cmd) = cmd_rx.try_recv() {
+                    if matches!(cmd, EngineCommand::Stop) {
+                        stopping = true;
+                        break;
+                    }
                     dispatch_command(
                         cmd,
                         &mut engine,
@@ -293,64 +331,41 @@ pub(crate) fn spawn_worker(
                         &mut mouse_state,
                     );
                 }
-            }
 
-            while let Ok(cmd) = cmd_rx.try_recv() {
-                if matches!(cmd, EngineCommand::Stop) {
-                    stopping = true;
-                    break;
-                }
-                dispatch_command(
-                    cmd,
+                maybe_publish(
                     &mut engine,
-                    &cmd_rx,
-                    &mut egress,
+                    &frame_slot,
+                    &frame_ready,
+                    &waker,
                     &inspect,
                     &mut dirty,
-                    &mut visible,
+                    visible,
                     &mut force_build,
-                    &mut pending,
-                    &mut stopping,
-                    &chunk_barrier,
-                    &access_epoch,
-                    &presentation_tx_for_local_click,
-                    &mut mouse_state,
+                    &mut last_build,
+                    &test_build_failures,
                 );
-            }
 
-            maybe_publish(
-                &mut engine,
-                &frame_slot,
-                &frame_ready,
-                &waker,
-                &inspect,
-                &mut dirty,
-                visible,
-                &mut force_build,
-                &mut last_build,
-                &test_build_failures,
-            );
-
-            if stopping {
-                if dirty && visible {
-                    force_build = true;
-                    maybe_publish(
-                        &mut engine,
-                        &frame_slot,
-                        &frame_ready,
-                        &waker,
-                        &inspect,
-                        &mut dirty,
-                        visible,
-                        &mut force_build,
-                        &mut last_build,
-                        &test_build_failures,
-                    );
+                if stopping {
+                    if dirty && visible {
+                        force_build = true;
+                        maybe_publish(
+                            &mut engine,
+                            &frame_slot,
+                            &frame_ready,
+                            &waker,
+                            &inspect,
+                            &mut dirty,
+                            visible,
+                            &mut force_build,
+                            &mut last_build,
+                            &test_build_failures,
+                        );
+                    }
+                    break;
                 }
-                break;
             }
-        }
-    })
+        })
+        .expect("spawn engine worker thread")
 }
 
 #[expect(

@@ -481,6 +481,61 @@ mod tests {
         }
     }
 
+    /// Regression: feeding enough output to grow a large scrollback must not
+    /// overflow the worker thread stack. libghostty's scrollback page operations
+    /// consume stack proportional to history depth and blew the ~2 MiB default
+    /// (SIGABRT "stack overflow" at ~2000+ rows) before `WORKER_STACK_BYTES`.
+    /// `max_scrollback` is a BYTE budget (not a line count), so it is sized
+    /// generously here to let the row count actually grow past the 2 MiB failure
+    /// point. Runs in release-ish time; feeds ~2500 rows.
+    #[test]
+    fn large_scrollback_feed_does_not_overflow_worker_stack() {
+        let cfg = EngineConfig {
+            cols: 200,
+            rows: 50,
+            max_scrollback: 8_000_000, // BYTES, generous headroom for ~2500 rows
+            cell_w_px: 8,
+            cell_h_px: 16,
+        };
+        let h = EngineHandle::spawn(cfg);
+        let rows = 2500usize;
+        let mut fed_bytes: u64 = 0;
+        for _ in 0..rows {
+            let mut line = vec![b'a'; 200];
+            line.extend_from_slice(b"\r\n");
+            fed_bytes += line.len() as u64;
+            loop {
+                match h.feed(line.clone()) {
+                    Ok(()) => break,
+                    Err(_) => thread::sleep(Duration::from_millis(1)),
+                }
+            }
+        }
+        // Wait until the worker has consumed the whole stream (no crash) …
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if h.inspect().bytes_fed >= fed_bytes {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "worker did not drain the feed — likely crashed"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        // … then force a fresh build so total_rows samples the grown scrollback.
+        let _ = h.feed(b"\r\n".to_vec());
+        thread::sleep(Duration::from_millis(50));
+        let _ = h.build_now();
+        thread::sleep(Duration::from_millis(80));
+        assert!(
+            h.inspect().total_rows > 1000,
+            "expected scrollback to grow past the 2 MiB stack-overflow point, got {}",
+            h.inspect().total_rows
+        );
+        h.stop();
+    }
+
     const TRACKING_SGR: &[u8] = b"\x1b[?1000h\x1b[?1006h";
     const TRACKING_BUTTON_SGR: &[u8] = b"\x1b[?1002h\x1b[?1006h";
     const TRACKING_ANY_SGR: &[u8] = b"\x1b[?1003h\x1b[?1006h";
