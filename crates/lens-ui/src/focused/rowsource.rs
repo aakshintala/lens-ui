@@ -289,13 +289,42 @@ impl RowStore {
         cx: &mut App,
     ) {
         let id = RowId::StreamTail(acc_id.clone());
-        self.upsert(id.clone(), pres, cx);
-        if !self
-            .structure
-            .iter()
-            .any(|e| matches!(e, StructureEntry::Sibling(row) if row == &id))
-        {
-            self.structure.push(StructureEntry::Sibling(id));
+        self.upsert(id.clone(), pres.clone(), cx);
+        let mut changed = false;
+        match pres.kind {
+            RowKind::StreamingMessage => {
+                if !self
+                    .structure
+                    .iter()
+                    .any(|e| matches!(e, StructureEntry::Sibling(row) if row == &id))
+                {
+                    self.structure.push(StructureEntry::Sibling(id));
+                    changed = true;
+                }
+            }
+            RowKind::StreamingReasoning => {
+                if self
+                    .structure
+                    .iter()
+                    .any(|e| matches!(e, StructureEntry::Sibling(row) if row == &id))
+                {
+                    self.structure
+                        .retain(|e| !matches!(e, StructureEntry::Sibling(row) if row == &id));
+                    changed = true;
+                }
+                if self.section_containing_child(&id).is_none()
+                    && let Some(key) = self.last_section_key()
+                {
+                    let node = self.ensure_section_node(&key, cx);
+                    if !node.children.contains(&id) {
+                        node.children.push(id);
+                        changed = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+        if changed {
             self.rebuild_flat_order();
         }
     }
@@ -306,6 +335,10 @@ impl RowStore {
         for section in self.sections.values_mut() {
             section.children.retain(|c| c != &id);
         }
+        self.structure.retain(|e| match e {
+            StructureEntry::Sibling(row) | StructureEntry::Marker(row) => row != &id,
+            StructureEntry::Section(_) => true,
+        });
         self.entities.remove(&id);
         let prev_len = self.order.len();
         self.rebuild_flat_order();
@@ -372,6 +405,19 @@ impl RowStore {
                 }
             }
         }
+    }
+
+    fn section_containing_child(&self, child: &RowId) -> Option<&SectionKey> {
+        self.sections
+            .iter()
+            .find_map(|(key, node)| node.children.contains(child).then_some(key))
+    }
+
+    fn last_section_key(&self) -> Option<SectionKey> {
+        self.structure.iter().rev().find_map(|e| match e {
+            StructureEntry::Section(key) => Some(key.clone()),
+            _ => None,
+        })
     }
 
     fn push_section_flat(&mut self, key: &SectionKey) {

@@ -466,7 +466,7 @@ impl FocusedTranscript {
                 self.active_response.as_ref(),
             );
             RowStore::materialize_full(&blocks, &mut self.rows, cx);
-            self.settled_structure_len = self.rows.structure_len();
+            self.recompute_settled_prefix();
         } else {
             let prefix = self.settled_structure_len;
             let slice = &self.items[self.live_section_start..];
@@ -1063,10 +1063,19 @@ mod tests {
 
         cx.read(|cx| {
             let r = replica.read(cx);
+            let tail = RowId::StreamTail(acc.clone());
             assert_eq!(r.pending_finalize_len(), 0);
             assert!(
                 r.rows().len() <= rows_before,
                 "discarded stream tail must not leave a ghost row"
+            );
+            assert!(
+                !r.rows().order().iter().any(|id| id == &tail),
+                "discarded stream tail must not remain in order"
+            );
+            assert!(
+                r.rows().entity(&tail).is_none(),
+                "discarded stream tail entity must be removed"
             );
         });
         assert!(rx.try_recv().is_err());
@@ -1193,6 +1202,270 @@ mod tests {
             assert!(
                 r.rows().len() < before_user.1,
                 "collapsed runs shrink row count"
+            );
+        });
+    }
+
+    fn count_in_order(order: &[RowId], id: &RowId) -> usize {
+        order.iter().filter(|row| *row == id).count()
+    }
+
+    fn count_section_visible(order: &[RowId], resp: &ResponseId) -> usize {
+        order
+            .iter()
+            .filter(|id| {
+                matches!(
+                    id,
+                    RowId::SectionRail(r, _) | RowId::Section(r, _) if r == resp
+                )
+            })
+            .count()
+    }
+
+    #[gpui::test]
+    async fn staged_reasoning_finalize_stays_in_section(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        let acc = AccId::new("acc_r_fin");
+        let item_id = ItemId::new("r_local_0");
+        let resp = ResponseId::new("resp_a");
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::All,
+                    range_read(vec![(0, reasoning_item("r_settled", "resp_a"))], 0),
+                    cx,
+                );
+                r.active_response = Some(resp.clone());
+            });
+        });
+
+        let entity_before = cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.fold_detailed(
+                    StreamUpdate::ScratchChanged(Arc::new(StreamScratch {
+                        open_reasoning: Some(lens_core::domain::item::ReasoningAcc {
+                            acc_id: acc.clone(),
+                            full_text: "streaming think".into(),
+                            summary_text: String::new(),
+                            encrypted: false,
+                        }),
+                        ..Default::default()
+                    })),
+                    cx,
+                );
+            });
+            let tail = RowId::StreamTail(acc.clone());
+            replica.read(cx).rows().entity_id(&tail, cx)
+        });
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.fold_detailed(
+                    StreamUpdate::Retired {
+                        acc_id: acc.clone(),
+                        disposition: RetireDisposition::Finalizing {
+                            item_id: item_id.clone(),
+                        },
+                    },
+                    cx,
+                );
+                r.fold_detailed(
+                    StreamUpdate::ScratchChanged(Arc::new(StreamScratch::default())),
+                    cx,
+                );
+            });
+        });
+
+        let count_after_retire = cx.read(|cx| {
+            let r = replica.read(cx);
+            let tail = RowId::StreamTail(acc.clone());
+            let order = r.rows().order();
+            assert_eq!(
+                count_in_order(order, &tail),
+                1,
+                "reasoning tail must appear exactly once during pending finalize"
+            );
+            assert_eq!(
+                count_section_visible(order, &resp),
+                1,
+                "reasoning tail must not float out as a duplicate section"
+            );
+            let tail_idx = order
+                .iter()
+                .position(|id| id == &tail)
+                .expect("staged reasoning tail visible");
+            let section_idx = order
+                .iter()
+                .position(|id| {
+                    matches!(
+                        id,
+                        RowId::SectionRail(r, _) | RowId::Section(r, _) if r == &resp
+                    )
+                })
+                .expect("resp_a section marker");
+            assert!(
+                tail_idx > section_idx,
+                "reasoning tail must stay under its section, not at transcript bottom"
+            );
+            r.rows().len()
+        });
+        assert!(count_after_retire > 0);
+
+        let finalized = reasoning_item("r_local_0", "resp_a");
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Delta {
+                        after: 0,
+                        through: 1,
+                    },
+                    range_read(vec![(1, finalized)], 1),
+                    cx,
+                );
+            });
+        });
+
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert_eq!(r.pending_finalize_len(), 0);
+            assert!(
+                r.rows().len() >= count_after_retire,
+                "row count must not dip during reasoning finalize"
+            );
+            let work = RowId::Work(item_id.clone());
+            let tail = RowId::StreamTail(acc.clone());
+            let entity_after = r.rows().entity_id(&work, cx);
+            assert_eq!(
+                entity_before, entity_after,
+                "finalize must preserve EntityId (acc_id != item_id)"
+            );
+            let order = r.rows().order();
+            assert_eq!(
+                count_in_order(order, &tail),
+                0,
+                "stream tail must be swapped away after disk row"
+            );
+            assert_eq!(
+                count_in_order(order, &work),
+                1,
+                "finalized reasoning work row must appear once"
+            );
+            assert_eq!(
+                count_section_visible(order, &resp),
+                1,
+                "finalized reasoning must remain under resp_a section"
+            );
+            let work_idx = order
+                .iter()
+                .position(|id| id == &work)
+                .expect("finalized work row");
+            let section_idx = order
+                .iter()
+                .position(|id| {
+                    matches!(
+                        id,
+                        RowId::SectionRail(r, _) | RowId::Section(r, _) if r == &resp
+                    )
+                })
+                .expect("resp_a section marker");
+            assert!(
+                work_idx > section_idx,
+                "finalized reasoning must swap in place under the same section"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn reconcile_all_then_scratch_live_tail_no_structure_dup(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        let resp_a = ResponseId::new("resp_a");
+        let resp_b = ResponseId::new("resp_b");
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::All,
+                    range_read(
+                        vec![
+                            (0, reasoning_item("r_a", "resp_a")),
+                            (1, user_item("u1", "hi")),
+                            (2, reasoning_item("r_b0", "resp_b")),
+                        ],
+                        2,
+                    ),
+                    cx,
+                );
+                r.active_response = Some(resp_b.clone());
+            });
+        });
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::All,
+                    range_read(
+                        vec![
+                            (0, reasoning_item("r_a", "resp_a")),
+                            (1, user_item("u1", "hi")),
+                            (2, reasoning_item("r_b0", "resp_b")),
+                        ],
+                        2,
+                    ),
+                    cx,
+                );
+            });
+        });
+
+        let before_scratch = cx.read(|cx| replica.read(cx).rows().len());
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.fold_detailed(
+                    StreamUpdate::ScratchChanged(Arc::new(StreamScratch {
+                        open_message: Some(lens_core::domain::item::MessageAcc {
+                            acc_id: AccId::new("acc_live"),
+                            message_id: None,
+                            text: "live".into(),
+                            block_index: 0,
+                        }),
+                        ..Default::default()
+                    })),
+                    cx,
+                );
+            });
+        });
+
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            let order = r.rows().order();
+            assert_eq!(
+                count_section_visible(order, &resp_a),
+                1,
+                "settled section must not duplicate after reconcile + live reproject"
+            );
+            assert_eq!(
+                count_section_visible(order, &resp_b),
+                1,
+                "active section must not duplicate after reconcile + live reproject"
+            );
+            let tail = RowId::StreamTail(AccId::new("acc_live"));
+            assert_eq!(
+                count_in_order(order, &tail),
+                1,
+                "live stream tail must appear once"
+            );
+            assert!(
+                r.rows().len() >= before_scratch,
+                "live tail reproject must not collapse rows"
             );
         });
     }
