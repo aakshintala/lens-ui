@@ -183,6 +183,14 @@ impl BoardView {
     fn sync_card_views(&mut self, cx: &mut Context<Self>) {
         // Collapsed-group members feed the status rollup (fleet card read) but must
         // not hold a SessionCardView entity — prune any that slipped in at mount.
+        //
+        // INVARIANT (do not break): pruning here is what CANCELS a collapsed member's
+        // anim timer — `anim_task` is an entity-owned `gpui::Task` (cancel-on-drop) whose
+        // spawn captures a WeakEntity, so dropping the last strong ref (these two maps are
+        // the only holders) cancels the timer. The visibility gate never sends
+        // `set_visible(false)` here (it clones `card_views` AFTER this prune, so the id
+        // misses). Therefore: NEVER retain an `Entity<SessionCardView>` for a collapsed
+        // member anywhere else, or its timer would leak with nothing to stop it.
         let collapsed_members = self.collapsed_group_member_ids(cx);
         self.card_views
             .retain(|id, _| !collapsed_members.contains(id));
@@ -605,7 +613,10 @@ impl BoardView {
             rollup::format_group_spend(rollup.spend_usd),
             rollup::format_age(rollup.oldest_created_at, now_ms),
         );
-        let shows_completed = rollup.completed_count > 0;
+        // Same source as the expanded header (§5 "one rule, both sites"): the collapsed
+        // footer's `✓ N done →` gates through `completed_badge` so a future threshold
+        // change propagates to both chrome forms.
+        let shows_completed = completed_badge(rollup.completed_count).is_some();
 
         let snapshot = GroupChromeSnapshot {
             session_ids: sessions.to_vec(),

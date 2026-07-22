@@ -383,6 +383,9 @@ impl BoardReplica {
     }
 
     fn on_op_failed(&mut self, op: Op, err: PersistError, cx: &mut Context<Self>) {
+        // The op that just failed is no longer in `pending` (pump moved it out); remember
+        // whether it was a write so a terminal failure counts it too (below).
+        let current_is_write = !matches!(op, Op::Load { .. });
         // Transient (SQLITE_BUSY/LOCKED beyond busy_timeout): keep the op, back off, retry.
         // SEAM (B-4d): this re-enqueues the WHOLE op. Safe here because B-4a's ops are
         // idempotent (Load; PlaceSessions skips already-present) — a `place then compose-reload`
@@ -421,11 +424,16 @@ impl BoardReplica {
             }
         }
         // Persistent failure: queued writes won't succeed on replay — drop (banner names them).
-        let dropped = self
+        // The op that just failed terminally is itself an unsaved write (it was already
+        // popped from `pending`), so count it too (codex final-review Important #2).
+        let mut dropped = self
             .pending
             .iter()
             .filter(|o| !matches!(o, Op::Load { .. }))
             .count() as u32;
+        if current_is_write {
+            dropped += 1;
+        }
         self.dropped_writes = self.dropped_writes.saturating_add(dropped);
         self.pending.retain(|o| matches!(o, Op::Load { .. }));
         self.banner_dismissed = false;
@@ -450,6 +458,10 @@ impl BoardReplica {
     /// so it's dead in the non-test build until the interaction slices call it.
     pub(crate) fn write(&mut self, op: Op, cx: &mut Context<Self>) -> WriteDisposition {
         if !self.is_writable() {
+            // Count the rejected user write so the banner names the loss (§5 "never
+            // *silently* drop a user write"; write() is the user-write entry point —
+            // reconcile places go via run_op). B-4b ships the first real user write.
+            self.dropped_writes = self.dropped_writes.saturating_add(1);
             self.banner_dismissed = false; // re-surface the banner on a rejected gesture
             cx.notify();
             return WriteDisposition::Rejected(self.state);
@@ -793,7 +805,10 @@ mod tests {
             cx.new(|cx| BoardReplica::for_test_file(fleet, "/dev/null/nope.db".into(), cx))
         });
         cx.run_until_parked();
-        replica.read_with(cx, |r, _| assert_eq!(r.state(), ReplicaState::LoadFailed));
+        let before = replica.read_with(cx, |r, _| {
+            assert_eq!(r.state(), ReplicaState::LoadFailed);
+            r.dropped_writes()
+        });
         let disp = replica.update(cx, |r, cx| {
             r.write(
                 Op::SetCollapsed {
@@ -807,6 +822,9 @@ mod tests {
             disp,
             WriteDisposition::Rejected(ReplicaState::LoadFailed)
         ));
+        // Contract (§5): a rejected user write is COUNTED so the banner names the loss
+        // (codex final-review Important #2). It is never silently dropped.
+        replica.read_with(cx, |r, _| assert_eq!(r.dropped_writes(), before + 1));
     }
 
     #[gpui::test]
@@ -1255,6 +1273,9 @@ mod tests {
                 r.layout().default_board_id().unwrap().as_str(),
                 DEFAULT_BOARD_ID
             );
+            // The write that failed TERMINALLY is counted (codex final-review Important #2):
+            // this exercises the op-agnostic `current_is_write` accounting in on_op_failed.
+            assert_eq!(r.dropped_writes(), 1);
         });
         drop(dir);
     }

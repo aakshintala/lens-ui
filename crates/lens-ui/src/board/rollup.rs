@@ -64,26 +64,36 @@ pub struct StatusRollup {
     pub rows: Vec<(Wave, u32)>,
 }
 
-/// Priority ladder (matches `derive_wave`'s resolution order; `Neutral` omitted).
-/// New waves inherit their ladder position here — no separate list to keep in sync.
-const WAVE_LADDER: [Wave; 7] = [
-    Wave::NeedsInput,
-    Wave::Failed,
-    Wave::Working,
-    Wave::AwaitingReview,
-    Wave::Scheduled,
-    Wave::Ready,
-    Wave::Slept,
-];
+/// Rollup rank for a wave: `Some(priority)` in `derive_wave`'s resolution order, or
+/// `None` for waves excluded from the rollup (`Neutral` = no meaningful status). This
+/// `match` is EXHAUSTIVE, so adding a `Wave` variant is a COMPILE ERROR here until it is
+/// placed in (or explicitly excluded from) the ladder — the "self-maintaining" property
+/// (codex final-review Minor; a `const` array silently omitted new variants).
+fn wave_rank(w: Wave) -> Option<u8> {
+    match w {
+        Wave::NeedsInput => Some(0),
+        Wave::Failed => Some(1),
+        Wave::Working => Some(2),
+        Wave::AwaitingReview => Some(3),
+        Wave::Scheduled => Some(4),
+        Wave::Ready => Some(5),
+        Wave::Slept => Some(6),
+        Wave::Neutral => None,
+    }
+}
 
 pub fn status_rollup(member_waves: &[Wave]) -> StatusRollup {
-    let rows = WAVE_LADDER
-        .into_iter()
-        .filter_map(|w| {
-            let n = member_waves.iter().filter(|&&m| m == w).count() as u32;
-            (n > 0).then_some((w, n))
-        })
-        .collect();
+    // Distinct ranked waves present, each with its count, in ladder order.
+    let mut ranked: Vec<(u8, Wave, u32)> = Vec::new();
+    for &w in member_waves {
+        let Some(rank) = wave_rank(w) else { continue };
+        match ranked.iter_mut().find(|(_, cw, _)| *cw == w) {
+            Some((_, _, n)) => *n += 1,
+            None => ranked.push((rank, w, 1)),
+        }
+    }
+    ranked.sort_by_key(|(rank, _, _)| *rank);
+    let rows = ranked.into_iter().map(|(_, w, n)| (w, n)).collect();
     StatusRollup { rows }
 }
 
