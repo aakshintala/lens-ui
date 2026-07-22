@@ -35,17 +35,38 @@
 use std::process;
 use std::sync::Arc;
 
-use gpui::{App, AppContext, Application, WindowOptions};
+use std::time::Duration;
+
+use gpui::{App, AppContext, Application, Entity, KeyBinding, WindowOptions, actions};
 use gpui_component::Root;
 use lens_client::ids::{ConnectionId, SessionId, TerminalId};
 use lens_client::{Auth, Client, Connection};
 use lens_terminal::{
     ClipboardLocation, ClipboardMimePart, HostRequestDecision, TerminalEvent, TerminalHostEvent,
-    TerminalKey, TerminalOpenOptions, TerminalTarget, open,
+    TerminalKey, TerminalOpenOptions, TerminalTab, TerminalTarget, open,
 };
+
+actions!(
+    lens_terminal_demo,
+    [
+        DemoSleep,
+        DemoWake,
+        DemoReattach,
+        DemoResetAdopt,
+        DemoResetTimeout,
+    ]
+);
 
 struct DemoConfig {
     base_url: url::Url,
+    session_id: SessionId,
+    target: TerminalTarget,
+}
+
+struct DemoHostBindings {
+    tab: Entity<TerminalTab>,
+    client: Arc<Client>,
+    session_id: SessionId,
     target: TerminalTarget,
 }
 
@@ -71,13 +92,24 @@ fn main() {
     };
 
     let target = config.target;
+    let session_id = config.session_id;
     let options = TerminalOpenOptions::default();
 
     Application::new().run(move |cx: &mut App| {
         gpui_component::init(cx);
+        print_host_action_help();
 
         match cx.open_window(WindowOptions::default(), move |window, cx| {
-            let tab = open(target, client, options, cx);
+            let tab = open(target.clone(), client.clone(), options, cx);
+            register_host_action_bindings(
+                DemoHostBindings {
+                    tab: tab.clone(),
+                    client,
+                    session_id,
+                    target,
+                },
+                cx,
+            );
             let tab_for_events = tab.clone();
             let _ = cx.subscribe(&tab_for_events, move |this, event, cx| {
                 match event {
@@ -213,12 +245,12 @@ fn load_config() -> Result<Option<DemoConfig>, String> {
 
     let target = if let Some(tid) = terminal_id {
         TerminalTarget::Existing {
-            session_id,
+            session_id: session_id.clone(),
             terminal_id: TerminalId::new(tid),
         }
     } else if let (Some(terminal_name), Some(session_key)) = (terminal_name, session_key) {
         TerminalTarget::OpenOrCreate {
-            session_id,
+            session_id: session_id.clone(),
             key: TerminalKey {
                 terminal_name,
                 session_key,
@@ -228,7 +260,144 @@ fn load_config() -> Result<Option<DemoConfig>, String> {
         return Ok(None);
     };
 
-    Ok(Some(DemoConfig { base_url, target }))
+    Ok(Some(DemoConfig {
+        base_url,
+        session_id,
+        target,
+    }))
+}
+
+fn print_host_action_help() {
+    eprintln!(
+        "lens-terminal-demo host chords: ctrl-alt-s=Sleep, ctrl-alt-w=Wake, ctrl-alt-r=Reattach, ctrl-alt-x=reset→adopt, ctrl-alt-d=reset→timeout"
+    );
+}
+
+fn register_host_action_bindings(bindings: DemoHostBindings, cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("ctrl-alt-s", DemoSleep, None),
+        KeyBinding::new("ctrl-alt-w", DemoWake, None),
+        KeyBinding::new("ctrl-alt-r", DemoReattach, None),
+        KeyBinding::new("ctrl-alt-x", DemoResetAdopt, None),
+        KeyBinding::new("ctrl-alt-d", DemoResetTimeout, None),
+    ]);
+
+    let tab = bindings.tab.clone();
+    cx.on_action::<DemoSleep>(move |_, cx| {
+        tab.update(cx, |tab, cx| {
+            tab.on_host_event(TerminalHostEvent::Sleep, cx)
+        });
+    });
+
+    let tab = bindings.tab.clone();
+    cx.on_action::<DemoWake>(move |_, cx| {
+        tab.update(cx, |tab, cx| tab.on_host_event(TerminalHostEvent::Wake, cx));
+    });
+
+    let tab = bindings.tab.clone();
+    cx.on_action::<DemoReattach>(move |_, cx| {
+        tab.update(cx, |tab, cx| {
+            tab.on_host_event(TerminalHostEvent::Reattach, cx)
+        });
+    });
+
+    let tab = bindings.tab.clone();
+    let client = bindings.client.clone();
+    let session_id = bindings.session_id.clone();
+    let target = bindings.target.clone();
+    cx.on_action::<DemoResetAdopt>(move |_, cx| {
+        let tab = tab.clone();
+        let client = client.clone();
+        let session_id = session_id.clone();
+        let target = target.clone();
+        cx.spawn(async move |cx| {
+            let Some((terminal_id, terminal_name, session_key)) =
+                resolve_reset_identity(&client, &session_id, &target)
+            else {
+                eprintln!("demo: reset-adopt: could not resolve terminal identity");
+                return;
+            };
+            let _ = tab.update(cx, |tab, cx| {
+                tab.on_host_event(
+                    TerminalHostEvent::ResourceDeleted {
+                        terminal_id: terminal_id.clone(),
+                    },
+                    cx,
+                );
+            });
+            cx.background_executor()
+                .timer(Duration::from_millis(500))
+                .await;
+            let _ = tab.update(cx, |tab, cx| {
+                tab.on_host_event(
+                    TerminalHostEvent::ResourceCreated {
+                        session_id: session_id.clone(),
+                        terminal_id,
+                        terminal_name,
+                        session_key,
+                    },
+                    cx,
+                );
+            });
+        })
+        .detach();
+    });
+
+    let tab = bindings.tab.clone();
+    let client = bindings.client.clone();
+    let session_id = bindings.session_id.clone();
+    let target = bindings.target.clone();
+    cx.on_action::<DemoResetTimeout>(move |_, cx| {
+        let Some((terminal_id, _, _)) = resolve_reset_identity(&client, &session_id, &target)
+        else {
+            eprintln!("demo: reset-timeout: could not resolve terminal identity");
+            return;
+        };
+        tab.update(cx, |tab, cx| {
+            tab.on_host_event(TerminalHostEvent::ResourceDeleted { terminal_id }, cx);
+        });
+    });
+}
+
+fn resolve_reset_identity(
+    client: &Client,
+    session_id: &SessionId,
+    target: &TerminalTarget,
+) -> Option<(TerminalId, String, String)> {
+    match target {
+        TerminalTarget::Existing { terminal_id, .. } => {
+            let (terminal_name, session_key) = lookup_terminal_key(client, session_id, terminal_id)
+                .unwrap_or_else(|| ("terminal".into(), "main".into()));
+            Some((terminal_id.clone(), terminal_name, session_key))
+        }
+        TerminalTarget::OpenOrCreate { key, .. } => client
+            .terminals(session_id.clone())
+            .list()
+            .ok()
+            .and_then(|terminals| {
+                terminals.into_iter().find(|t| {
+                    t.metadata.terminal_name.as_deref() == Some(key.terminal_name.as_str())
+                        && t.metadata.session_key.as_deref() == Some(key.session_key.as_str())
+                })
+            })
+            .map(|t| (t.id, key.terminal_name.clone(), key.session_key.clone())),
+    }
+}
+
+fn lookup_terminal_key(
+    client: &Client,
+    session_id: &SessionId,
+    terminal_id: &TerminalId,
+) -> Option<(String, String)> {
+    client
+        .terminals(session_id.clone())
+        .get(terminal_id)
+        .ok()
+        .and_then(|t| {
+            let name = t.metadata.terminal_name?;
+            let key = t.metadata.session_key?;
+            Some((name, key))
+        })
 }
 
 fn build_client(base_url: &url::Url) -> lens_client::Result<Client> {

@@ -22,18 +22,28 @@
 //! | `LENS_OMNIGENT_TERMINAL_NAME` + `LENS_OMNIGENT_SESSION_KEY` | target B | Open-or-create |
 //! | `LENS_LIVE_CLIPBOARD_PASTE` | no | Set to `1` to run P5 paste round-trip |
 //! | `LENS_LIVE_MOUSE_REPORT` | no | Set to `1` to run P6 mouse-report round-trip (Slice 2c) |
+//! | `LENS_LIVE_SLEEP_WAKE` | no | Set to `1` to run P7 Sleep→Wake round-trip (Slice 4) |
+//! | `LENS_LIVE_REATTACH` | no | Set to `1` to run P8 ClientDetached→Reattach (Slice 4) |
 //!
 //! **Slice 2c (Task 8):** optional P6 leg when `LENS_LIVE_MOUSE_REPORT=1` — enables
 //! DEC mouse tracking (`?1000h?1006h`) via a shell `printf`, runs `cat -v` so stdin
 //! echoes visibly, simulates a Left press through the engine (encode → egress → PTY),
 //! and asserts the SGR report (`^[[<0;…`) round-trips back into the frame.
 //!
+//! **Slice 4 (Task 6):** optional P7 when `LENS_LIVE_SLEEP_WAKE=1` — deliberate
+//! `Sleep` (engine released, `Sleeping`), then `Wake` (re-attaches to `Live` with a
+//! fresh redraw). Optional P8 when `LENS_LIVE_REATTACH=1` — opens a competing attach
+//! to provoke a source-derived `4405`/`ClientDetached`, then `Reattach` → `Live`.
+//! Generation-guard **adoption** (`ReplacementWaiting` → successor) has no cheap live
+//! trigger (needs a real agent switch / `reset-state`); it stays deterministic-test +
+//! demo-covered.
+//!
 //! # Skip vs fail
 //!
 //! - **Skip (exit 0):** `LENS_OMNIGENT_URL` or `LENS_OMNIGENT_SESSION_ID` absent;
 //!   or URL+session present but no valid terminal target.
 //! - **Fail (exit 1):** env configured but client handshake or any driver phase times out.
-//! - **Pass (exit 0):** phases P1–P4 complete; P5/P6 run only when their env flag is `1`.
+//! - **Pass (exit 0):** phases P1–P4 complete; P5/P6/P7/P8 run only when their env flag is `1`.
 //!
 //! Run manually against omnigent 0.5.1 — **not** part of `cargo test --workspace`:
 //!
@@ -53,9 +63,10 @@ use gpui::{
     px, size,
 };
 use lens_client::ids::{ConnectionId, SessionId, TerminalId};
-use lens_client::{Auth, Client, Connection};
+use lens_client::{AttachOptions, Auth, Client, Connection, attach};
 use lens_terminal::{
-    Frame, Lifecycle, TerminalKey, TerminalOpenOptions, TerminalTab, TerminalTarget, open,
+    DetachedDetail, Frame, Lifecycle, TerminalHostEvent, TerminalKey, TerminalOpenOptions,
+    TerminalTab, TerminalTarget, open,
 };
 
 const OVERALL_DEADLINE: Duration = Duration::from_secs(30);
@@ -107,9 +118,9 @@ fn main() {
                 ..Default::default()
             },
             move |_window, cx| {
-                let tab = open(target, client, options, cx);
+                let tab = open(target.clone(), Arc::clone(&client), options, cx);
                 tab.update(cx, |tab, _| tab.set_render_inspect_enabled(true));
-                spawn_driver(tab.clone(), marker.clone(), cx);
+                spawn_driver(tab.clone(), marker.clone(), target, client, cx);
                 tab
             },
         ) {
@@ -207,7 +218,13 @@ fn frame_contains_marker(frame: &Frame, marker: &str) -> bool {
     false
 }
 
-fn spawn_driver(tab: Entity<TerminalTab>, marker: String, cx: &mut App) {
+fn spawn_driver(
+    tab: Entity<TerminalTab>,
+    marker: String,
+    target: TerminalTarget,
+    client: Arc<Client>,
+    cx: &mut App,
+) {
     cx.spawn(async move |cx| {
         let weak = tab.downgrade();
         let deadline = Instant::now() + OVERALL_DEADLINE;
@@ -388,6 +405,123 @@ fn spawn_driver(tab: Entity<TerminalTab>, marker: String, cx: &mut App) {
             eprintln!("terminal_live: P6 mouse report round-trip OK");
         }
 
+        if live_sleep_wake_enabled() {
+            let _ = weak.update(cx, |tab, cx| {
+                tab.on_host_event(TerminalHostEvent::Sleep, cx);
+            });
+            let mut p7_sleep_ok = false;
+            while Instant::now() < deadline {
+                let ok = weak
+                    .update(cx, |tab, _| {
+                        let p = tab.presentation();
+                        let snap = tab.inspect();
+                        p.lifecycle == Lifecycle::Sleeping
+                            && snap.engine.is_none()
+                            && !snap.bridge_alive
+                    })
+                    .unwrap_or(false);
+                if ok {
+                    p7_sleep_ok = true;
+                    break;
+                }
+                cx.background_executor().timer(POLL_INTERVAL).await;
+            }
+            if !p7_sleep_ok {
+                fail_phase("P7 sleep: lifecycle not Sleeping with engine released");
+            }
+
+            let paints_before_wake = weak
+                .update(cx, |tab, _| tab.render_inspect().frames_painted)
+                .unwrap_or(0);
+            let _ = weak.update(cx, |tab, cx| {
+                tab.on_host_event(TerminalHostEvent::Wake, cx);
+            });
+            let mut p7_wake_ok = false;
+            while Instant::now() < deadline {
+                let ok = weak
+                    .update(cx, |tab, _| {
+                        let p = tab.presentation();
+                        let paints = tab.render_inspect().frames_painted;
+                        p.lifecycle == Lifecycle::Live && paints > paints_before_wake
+                    })
+                    .unwrap_or(false);
+                if ok {
+                    p7_wake_ok = true;
+                    break;
+                }
+                cx.background_executor().timer(POLL_INTERVAL).await;
+            }
+            if !p7_wake_ok {
+                fail_phase("P7 wake: lifecycle not Live with fresh redraw");
+            }
+            eprintln!("terminal_live: P7 sleep→wake OK");
+        }
+
+        if live_reattach_enabled() {
+            let (session_id, terminal_id) = match resolve_terminal_ids(&target, &client) {
+                Ok(ids) => ids,
+                Err(msg) => fail_phase(&format!("P8 reattach: {msg}")),
+            };
+            let client_steal = Arc::clone(&client);
+            cx.background_executor()
+                .spawn(async move {
+                    if let Ok(handle) = attach(
+                        client_steal.as_ref(),
+                        &session_id,
+                        &terminal_id,
+                        AttachOptions { read_only: false },
+                    ) {
+                        std::thread::sleep(Duration::from_secs(1));
+                        drop(handle);
+                    }
+                })
+                .detach();
+
+            let mut p8_detached_ok = false;
+            while Instant::now() < deadline {
+                let ok = weak
+                    .update(cx, |tab, _| {
+                        let p = tab.presentation();
+                        let snap = tab.inspect();
+                        p.lifecycle == Lifecycle::Detached
+                            && p.reattach_available
+                            && p.detached_detail == Some(DetachedDetail::ClientDetached)
+                            && snap.engine.is_some()
+                            && !snap.bridge_alive
+                    })
+                    .unwrap_or(false);
+                if ok {
+                    p8_detached_ok = true;
+                    break;
+                }
+                cx.background_executor().timer(POLL_INTERVAL).await;
+            }
+            if !p8_detached_ok {
+                fail_phase(
+                    "P8 reattach: tab did not reach Detached(ClientDetached) with retained engine",
+                );
+            }
+
+            let _ = weak.update(cx, |tab, cx| {
+                tab.on_host_event(TerminalHostEvent::Reattach, cx);
+            });
+            let mut p8_live_ok = false;
+            while Instant::now() < deadline {
+                let live = weak
+                    .update(cx, |tab, _| tab.presentation().lifecycle == Lifecycle::Live)
+                    .unwrap_or(false);
+                if live {
+                    p8_live_ok = true;
+                    break;
+                }
+                cx.background_executor().timer(POLL_INTERVAL).await;
+            }
+            if !p8_live_ok {
+                fail_phase("P8 reattach: lifecycle did not return to Live");
+            }
+            eprintln!("terminal_live: P8 ClientDetached→Reattach OK");
+        }
+
         eprintln!("terminal_live: PASS");
         std::process::exit(0);
     })
@@ -398,6 +532,49 @@ fn live_mouse_report_enabled() -> bool {
     std::env::var("LENS_LIVE_MOUSE_REPORT")
         .ok()
         .is_some_and(|v| v == "1")
+}
+
+fn live_sleep_wake_enabled() -> bool {
+    std::env::var("LENS_LIVE_SLEEP_WAKE")
+        .ok()
+        .is_some_and(|v| v == "1")
+}
+
+fn live_reattach_enabled() -> bool {
+    std::env::var("LENS_LIVE_REATTACH")
+        .ok()
+        .is_some_and(|v| v == "1")
+}
+
+fn resolve_terminal_ids(
+    target: &TerminalTarget,
+    client: &Client,
+) -> Result<(SessionId, TerminalId), String> {
+    match target {
+        TerminalTarget::Existing {
+            session_id,
+            terminal_id,
+        } => Ok((session_id.clone(), terminal_id.clone())),
+        TerminalTarget::OpenOrCreate { session_id, key } => {
+            let terminals = client
+                .terminals(session_id.clone())
+                .list()
+                .map_err(|e| format!("list terminals: {e}"))?;
+            terminals
+                .into_iter()
+                .find(|t| {
+                    t.metadata.terminal_name.as_deref() == Some(key.terminal_name.as_str())
+                        && t.metadata.session_key.as_deref() == Some(key.session_key.as_str())
+                })
+                .map(|t| (session_id.clone(), t.id))
+                .ok_or_else(|| {
+                    format!(
+                        "no terminal for {}:{}",
+                        key.terminal_name, key.session_key
+                    )
+                })
+        }
+    }
 }
 
 fn live_clipboard_paste_enabled() -> bool {
