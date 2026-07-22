@@ -5,7 +5,7 @@ the current forward-looking state only. **Full dated session entries live in
 [`STATUS-ARCHIVE.md`](./STATUS-ARCHIVE.md)** — write each session's detail there
 and roll older "Recent" pointers off this page as they age.
 
-_Last curated 2026-07-22 (transcript **T-0 + T-1 executed**, **T-2 design-locked** on `lens-transript` after 3 gpt-5.6 review rounds — A′/z/ii; **next = `writing-plans` in a fresh session**. **Reorg:** disk-scale → **T-2b** (next-not-deferred); live tool-tail → **T-4**; polymorphic `ContentTab` → terminal-UI-integration, SPEC-GAPS)._
+_Last curated 2026-07-22 (transcript **T-0 + T-1 executed**, **T-2 PLAN-COMPLETE** on `lens-transript` — 15-task plan `docs/plans/2026-07-22-transcript-t2-focused-view-scaffold.md`, 4 spec-deferred mechanism items resolved, **D-3 refined to per-run sections** `(response_id, run_index)` + per-response collapse flag (supersedes merge-and-hoist); **next = execute via subagent-driven-development in a fresh session**, handoff `docs/handoffs/2026-07-22-transcript-t2-plan-complete.md`. **Reorg:** disk-scale → **T-2b** (next-not-deferred); live tool-tail → **T-4**; polymorphic `ContentTab` → terminal-UI-integration, SPEC-GAPS)._
 
 ---
 
@@ -85,15 +85,23 @@ _Last curated 2026-07-22 (transcript **T-0 + T-1 executed**, **T-2 design-locked
     per-turn data → **T-6**); streaming variants carry `&MessageAcc`/`&ReasoningAcc` (stable identity);
     **`OptimisticUser` dropped** (pending is composer-owned → T-7); **`SubAgentSpan` dropped**
     (child-session model → T-5); `ReconnectBreak` emission → T-2.
-  - **T-2 — Focused view scaffold + live disk-sourced surface. ▶ DESIGN-LOCKED 2026-07-22, → `writing-plans`**
-    (spec rev 4 `docs/specs/2026-07-21-transcript-t2-focused-view-scaffold-design.md`; handoff
-    `docs/handoffs/2026-07-22-transcript-t2-design-locked.md`). Three gpt-5.6/codex review rounds; all
+  - **T-2 — Focused view scaffold + live disk-sourced surface. ▶ PLAN-COMPLETE 2026-07-22, → EXECUTE (subagent-driven)**
+    (plan `docs/plans/2026-07-22-transcript-t2-focused-view-scaffold.md` — 15 tasks, Phase A lens-core
+    (Tasks 1–6, exact code) + Phase B lens-ui (7–15, spike-referenced); handoff
+    `docs/handoffs/2026-07-22-transcript-t2-plan-complete.md`; spec rev 4
+    `docs/specs/2026-07-21-transcript-t2-focused-view-scaffold-design.md` incl. **D-3 refinement to per-run
+    sections**). Four spec-deferred mechanism items resolved in-plan: (1) **per-run `(response_id, run_index)`
+    sections**, chronological order preserved (real `claude-native-todos.sse` shape), collapse flag per-response;
+    (2) `Retired{acc_id, Finalizing{item_id}|Discarded}` at Completed/terminal/reconnect; (3) live re-projection
+    index `live_section_start`; (4) **re-fire → precise `TranscriptRewritten{ordinal}` signal** (3-signal
+    actor→replica disk contract: append/in-place/coarse-reconcile). Three gpt-5.6/codex review rounds (design); all
     mechanical/plumbing findings closed; the three hard decisions resolved w/ user — **D-3→A′**
     (WorkSection-from-birth, two-level retained entities, finalize = render-flag flip, no remount; needs a
     T-1 amendment: response-keyed uniform grouping incl. live), **D-1→z** (cache settled sections, per-response
     live projection, coarse invalidate-on-reconcile), **D-2→ii** (reducer `Retired{item_id|Discarded}`).
-    Architecture-locked; residual mechanism detail → the plan (path B). **NEXT: writing-plans in a fresh
-    session** (context budget). §16/§17. **First real consumer of `Vec<ViewBlock>`.** Mount focused view in `#chat-slot`
+    **NEXT: execute the plan via subagent-driven-development in a fresh session** — start Task 1 (T-1
+    amendment). Phase A (Tasks 1–6) high-confidence (verbatim lens-core code); Phase B (7–15) lifts the
+    `transcript-virtual` spike, needs real-window iteration. §16/§17. **First real consumer of `Vec<ViewBlock>`.** Mount focused view in `#chat-slot`
     via a `focused_transcript_tab(replica) -> TabHandle` factory (`ContentTab` left an inert marker — protocol
     deferred, SPEC-GAPS); a **store-side `FocusedTranscript` replica** created on `Promote`/dropped on `Demote`,
     fed the detailed frames by the **existing single poller fanning out** (no channel tee — the feed is
