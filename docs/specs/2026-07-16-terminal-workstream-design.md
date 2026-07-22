@@ -65,7 +65,9 @@ Out of scope:
 - The native-harness rendered-stream/raw-TUI toggle; separate spec cycle.
 - A generic incremental Bash-tool output surface. Omnigent 0.5.1 returns one-shot
   shell output with no `call_id`-correlated stdout/stderr stream.
-- Integrating the tab into the production `lens-ui` working area.
+- Integrating the tab into the production `lens-ui` working area. **⚠ Expired
+  2026-07-21** — pulled back in-scope as **Slice 6** (E2E capstone) so the
+  workstream lands end-to-end in the real app; see the Build-sequence revision note.
 - A local PTY / `portable-pty`; omnigent owns the PTY.
 - Inline graphics. Kitty graphics and Unicode image placement are a deferred
   future parity workstream; Sixel and OSC 1337 are excluded.
@@ -169,11 +171,14 @@ REST assertions are grounded in `openapi.json` (paths
 ## Render contract (from Spike A)
 
 **Full-snapshot repaint.** Each frame, re-read every visible cell from the engine
-snapshot, rebuild an immutable `Frame`, and emit all quads + glyphs. Measured
-**ASCII PerRow** full-redraw p95 = **2.77 ms @ 200×50** (budget 8.3 ms); the
-snapshot read is ≪ 0.2 ms; **shaping + primitive emission dominate** (snapshot is
-negligible). **⚠ The PerCell wide/emoji path is heavier and can miss budget:
-~6.3 ms @ 200×50, ~16.5 ms @ 400×100 (over 8.3 ms).** Therefore:
+snapshot, rebuild an immutable `Frame`, and emit all quads + glyphs. **Measured
+release p95, end-to-end `paint_frame` in a real GPUI window** (`render_realwindow`,
+2026-07-22, all under the 8.3 ms budget): ASCII PerRow **1.33 ms @ 200×50**;
+PerCell wide/emoji **4.02 ms @ 200×50** and **5.57 ms @ 400×100**; pathological
+(100%-wide, 50%-emoji) **2.60 ms @ 200×50**. The snapshot read is ≪ 0.2 ms;
+**shaping + primitive emission dominate** (snapshot is negligible). *(An earlier
+~16.5 ms @ 400×100 figure was a **debug-build artifact** — see the Slice-1c
+perf-resolution plan; release meets budget with headroom.)* Therefore:
 
 - **Dirty/damage tracking is NOT part of the contract** — an optional later
   optimization only. No per-frame diffing machinery.
@@ -198,9 +203,12 @@ negligible). **⚠ The PerCell wide/emoji path is heavier and can miss budget:
   barely helped); (2) the alignment probe must check the cell *after* an emoji,
   not just its start; (3) clear dirty only after confirmed-successful paint and
   surface paint errors.
-- **⚠ Perf caveat:** 2.77 ms is paint-closure CPU only (no vsync/present).
-  Slice 1c **re-measures end-to-end** in the real GPUI demo before the perf
-  verdict is treated as final.
+- **Perf basis:** the numbers above are the real-window end-to-end `paint_frame`
+  p95 (the perf verdict), not the earlier spike's paint-closure-CPU estimate.
+  Slice 1c's `render_realwindow` gate is the authority; Slice 3 adds the
+  **sustained multi-tab streaming** workload (single-frame PerCell is settled —
+  the residual risk is p95 under sustained load, where 400×100 has ~2.7 ms
+  headroom).
 
 ## Threading & the `Frame` seam
 
@@ -357,8 +365,14 @@ effective read-only/write modeled separately.
 - `1008` write rejection disables input immediately; refresh access, may reattach
   read-only; loss of read access → authorization `Detached`.
 - `Ended` only for positively reported process termination (may show exit code).
-  0.5.1 exposes no event distinguishing normal exit from deletion/transfer, so
-  ambiguous disappearance is `Detached`, never guessed `Ended`.
+  **Verified 2026-07-21 against pinned 0.5.1 AND the just-released 0.6.0: neither
+  exposes any positive process-termination signal** — `SessionResourceObject` has
+  no status/exit field; disappearance surfaces only as `resource.deleted` / close
+  `4404`, cause-agnostic (the one `terminal_exited` token is a runner-owned
+  *child-session* error label in `last_task_error`, "clients should not parse").
+  So `Ended` is **modeled-but-inert** (declared for Slice-0 API stability, never
+  entered); ambiguous disappearance is `Detached`, never guessed `Ended`. Un-defer
+  trigger = an upstream omnigent terminal-exit event.
 - Normal exit never auto-closes a tab. `OpenOrCreate` offers explicit relaunch
   only after positive `Ended`; otherwise the action reads "Create terminal again."
 
@@ -400,10 +414,14 @@ auto-creates a terminal.
   bytes, and the binding exposes no byte-level trim (verified in the vendored
   source). Provisional default ≈ the line-equivalent of Ghostty's **10,000,000-byte
   (decimal, not MiB)** app default; lazily allocated, oldest-first eviction, visible
-  grid always preserved; applies to newly opened terminals. **Byte-accurate
-  retained-byte accounting + selective byte-trim require a safe-FFI extension —
-  deferred to Slice 3/4** (fleet memory pressure). Until then fleet accounting
-  *estimates* bytes (≈ lines × cols × per-cell size).
+  grid always preserved; applies to newly opened terminals. The **retained-row
+  count is reachable today** via `ghostty_terminal_get(TOTAL_ROWS / SCROLLBACK_ROWS)`
+  in the vendored C ABI, so the fleet-accounting *estimate* = `total_rows × cols ×
+  per_cell` (`per_cell` empirically calibrated) needs **no re-vendor** (Slice 3).
+  Only **byte-accurate** retained-byte accounting + selective byte-trim require a
+  safe-FFI extension (`GHOSTTY_TERMINAL_DATA_*` byte selector) — a **fail-closed
+  conditional**, escalated only if the row-based estimate proves *ordinally*
+  unreliable (compression flips LRV ordering, not merely scales it).
 - Track retained bytes fleet-wide (estimated until the FFI extension lands). Under
   macOS memory warning, trim
   least-recently-viewed hidden histories first + insert a visible truncation
@@ -492,12 +510,64 @@ per-slice, never deferred.
     1a∥1b are independent; 1c needs 1b; 1d needs 1a+1b+1c.
 - **Slice 2 — Interaction** (next cycle): keyboard/IME/paste/selection/copy/mouse
   modes, OSC 52 policy, titles, hyperlink gestures, read-only gating.
-- **Slice 3 — Lifecycle & fleet:** reset/supersession/generation guard, Sleep/wake
-  reclaim (confirmed-worker-exit teardown), `ReplacementWaiting`/`Sleeping`/`Ended`,
-  memory-pressure trim/disconnect + the byte-accounting FFI extension. (Hidden-tab
-  Frame suppression lands in 1d; fleet *trim/disconnect* is here.)
-- **Slice 4 — Perf acceptance:** full workload harness, real RSS, the numeric
-  frame-budget gate, shipping evidence.
+> **⚠️ Build-sequence tail revised 2026-07-21 (design/grilling pass).** The old
+> two-slice tail (Slice 3 "Lifecycle & fleet" → Slice 4 "Perf acceptance") is
+> superseded by the **3 → 4 → 5 → 6** shape below. Rationale (grill outcomes):
+> (a) lifecycle *mechanisms* are host-agnostic module code the demo can drive,
+> while fleet *policy* genuinely wants a fleet host — so they split; (b) perf and
+> lifecycle-mechanisms are mutually independent, so perf goes first to de-risk the
+> PerCell fail-closed gate while the demo harness is cheap; (c) the workstream's
+> old "lens-ui integration out of scope" boundary is **deliberately expired** — an
+> explicit E2E UI-integration slice (6) is added so the workstream lands
+> end-to-end in the real app; (d) `Ended` is **modeled-but-inert** — verified
+> against pinned 0.5.1 **and** the just-released 0.6.0 that neither exposes a
+> positive process-termination signal (`SessionResourceObject` has no status/exit
+> field; disappearance is only `resource.deleted`/`4404`, cause-agnostic); (e)
+> byte-*accurate* accounting is a **fail-closed conditional**, not scheduled work
+> (see Scrollback/memory + Open contract gaps). Branch plan: 3+4 land on
+> `terminal-ws` (pure `lens-terminal`+demo) → **merge `terminal-ws`→`main`** → 5+6
+> on a fresh branch off `main` (lens-ui/lens-core integration). Memory
+> `terminal-slice-3plus-replan`.
+
+- **Slice 3 — Byte-accounting + perf acceptance** (demo-hosted): a **thin per-tab
+  retained-bytes *estimate*** = `total_rows × cols × per_cell` (task 1 — surface
+  `TOTAL_ROWS`/`SCROLLBACK_ROWS` via `ghostty_terminal_get` through `EngineInspect`;
+  `per_cell` empirically calibrated; **no re-vendor** — the row accessors already
+  exist). Two distinct perf jobs, not one: **(A)** the *several-hidden-tabs
+  streaming* workload (thin multi-tab spawner: spawn-N + visibility toggle — *not*
+  a fleet coordinator) drives the numeric frame-budget gate + PerCell fail-closed
+  under **sustained load**, and records process ΔRSS informationally; **(B)** a
+  *one-tab-per-process* RSS sweep across retained-row sizes — including an
+  **adversarial compressible-vs-incompressible pair at equal `total_rows`** — is
+  the **estimate-fidelity / ordinal-reliability gate**. Single-frame PerCell is
+  already settled (release-measured, all grids under 8.3 ms); the residual perf
+  risk is p95 under (A)'s sustained streaming. Byte-*accurate* FFI is escalated
+  **only if (B)** shows the estimate is *ordinally* unreliable (compression flips
+  LRV ordering, not merely scales it) — RSS already covers the absolute fleet budget.
+  Closes the module performance story.
+- **Slice 4 — Lifecycle mechanisms** (module, demo/deterministic-hosted): full
+  generation guard (in-session resource-generation history / duplicate `resource.created`),
+  Sleep/wake **teardown/recreate**, `ReplacementWaiting` exact-key successor
+  adoption (fresh engine), `4405`/`1008` close-code lifecycle refinements. `Ended`
+  stays **inert** (declared for API stability, never entered — no contract signal).
+  Host-agnostic mechanisms `lens-terminal` owns regardless of host; a host merely
+  *invokes* them (`TerminalHostEvent::Sleep`, reset signal). Finishes module
+  lifecycle *correctness*.
+- **Slice 5 — lens-ui membership + fleet policy** (lens-ui/lens-core-hosted): the
+  terminal tab becomes a **minimal** `FleetStore` member (accounted,
+  LRV-orderable, pressure-addressable — minimal on-screen home, full UX deferred to
+  6); fleet memory-pressure **LRV trim/disconnect** consuming Slice-4 primitives;
+  the *when-to-sleep* policy; and **`session.superseded`** redirect. Supersession
+  needs the lens-core reducer surface (`reduce/folds.rs` drops
+  `target_conversation_id` today) — isolated as sub-slice **5-super**, lens-core
+  surface first (textual collision with T-0 on `lens-transript`; coordinate the
+  merge). This is where lifecycle "lives in lens-ui" — **only** the fleet-level parts.
+- **Slice 6 — E2E UI integration + shipping evidence** (lens-ui/lens-app-hosted):
+  the full production terminal surface in the app (placement/focus/theming beyond
+  minimal membership), integrated **live E2E through lens-ui** (not the demo), an
+  integrated perf sanity check in the real app (module perf authority stays with
+  Slice 3's demo run), workspace clippy/rustfmt, and workstream shipping evidence.
+  The demo persists as the permanent module isolation/perf rig.
 
 Build discipline (house style + `CLAUDE.md`): subagent-driven, composer-2.5
 authors, ≥1 cross-family review at each seam, TDD, frequent commits.
@@ -514,22 +584,25 @@ Every requirement maps to a slice; deferral is explicit, never forgotten.
 | Close-code **policy** (stop/retry/downgrade/reattach) | 1d |
 | Engine: VT parse, scrollback (line-cap), `Frame`, resize reflow (non-`Send` worker) | 1b |
 | DA/DSR (`on_pty_write`) reverse channel | 1b (engine callback), 1d (forward to WS) |
-| Resize end-to-end: codec / engine reflow / newest-size-before-input ordering | 1a + 1b + 1d; during-reconnect 3 |
+| Resize end-to-end: codec / engine reflow / newest-size-before-input ordering | 1a + 1b + 1d; during-reconnect 4 |
 | Render: full-snapshot, per-cell wide/emoji, **full-SGR (extend `paint.rs`)**, **Menlo gate** (bundle-fallback) | 1c |
 | Frame publish/wake protocol + hidden-tab Frame suppression | 1d |
 | Lifecycle basic (`Starting`/`Live`/`Reconnecting`/`Detached`) + gap marker | 1d |
 | Retained-engine reconnect-seed semantics (scrollback dup / gap-marker) | 1d (acceptance test) |
 | Live vertical proof vs real omnigent | 1d |
-| Identity/replacement: `Existing`/`OpenOrCreate`, generation guard | 1d (basic guard), 3 (full) |
+| Identity/replacement: `Existing`/`OpenOrCreate`, generation guard | 1d (basic guard), 4 (full) |
 | Interaction: keyboard/IME/paste/selection/copy/mouse; OSC 52 write-cap + **read-denial**; titles; hyperlink gestures | 2 **(DONE 2026-07-21)** — 2a keyboard/IME, 2d titles/hyperlinks, 2b OSC-52+paste, **2c mouse reporting + format-aware coalescing + mouse-local toggle + local selection + `Cmd+C` copy + `Cmd+A` select-all + read-only report suppression**; XTSHIFTESCAPE **program-override DEFERRED** (no C-ABI accessor — re-vendor trigger `GHOSTTY_TERMINAL_DATA_MOUSE_SHIFT_CAPTURE`; memory `terminal-2c-xtshiftescape-not-in-c-abi`); 2b always-warn-on-multiline-paste nuance deferred |
 | OSC progress + background notification **payloads** | deferred → Slice-2 follow-up (libghostty-vt binding gap — see Open contract gaps; un-defer via upstream Ghostty selector **or** a hand-rolled Lens OSC tap) |
-| Lifecycle full: `ReplacementWaiting`/`Sleeping`/`Ended`, Sleep/wake (confirmed-exit teardown), supersession | 3 |
-| Fleet memory-pressure trim/disconnect + **byte-accounting FFI extension** | 3 |
-| Inspect + diagnostic rings (disabled-path proof) | per-slice (1a/1b/1c/1d **+ 2/3 extensions**), integrated 4 |
-| Benchmarks (client codec/queue, engine parse/frame/scroll/reflow, GPUI frame incl. dense wide/emoji) | per-slice, full harness 4 |
-| Verification gates: deterministic + GPUI + live tests, `rustfmt`, workspace clippy | per-slice, full 4 |
-| Perf acceptance (numeric budgets, real RSS, PerCell fail-closed gate, workloads) | 4 |
-| Build acceptance: offline-after-cache; full clean-build offline (vendored Ghostty tree) | 4 / CI trigger |
+| Lifecycle mechanisms: `ReplacementWaiting` + Sleep/wake (confirmed-exit teardown/recreate), generation guard (full) | 4 (module); `Sleeping` reachable via host `Sleep`; **`Ended` inert** — no 0.5.1/0.6.0 positive-termination signal (verified 2026-07-21) |
+| `session.superseded` redirect (retained engine follows `TerminalId`) | 5 — sub-slice **5-super**, lens-core reducer surface first (`reduce/folds.rs` drops `target_conversation_id`; collides with T-0 on `lens-transript`) |
+| Fleet memory-pressure trim/disconnect (LRV) | 5 (fleet policy in `FleetStore`, consumes Slice-4 module primitives) |
+| Byte accounting: thin per-tab **estimate** (`total_rows × cols × per_cell`) + real process RSS | 3 — estimate via `EngineInspect` (`TOTAL_ROWS`/`SCROLLBACK_ROWS` accessors **exist today**, no re-vendor) recorded with RSS; ordinal-fidelity gate = the (B) one-tab-per-process sweep w/ adversarial compression pair. byte-**accurate** FFI = **fail-closed conditional** (`GHOSTTY_TERMINAL_DATA_*` byte selector + re-vendor — no *byte* accessor today, scrollback is compressed; escalate only if the row estimate is *ordinally* unreliable) |
+| Inspect + diagnostic rings (disabled-path proof) | per-slice (1a/1b/1c/1d **+ 2/4 extensions**), integrated 6 |
+| Benchmarks (client codec/queue, engine parse/frame/scroll/reflow, GPUI frame incl. dense wide/emoji) | per-slice, full harness 3 |
+| Verification gates: deterministic + GPUI + live tests, `rustfmt`, workspace clippy | per-slice, full E2E 6 |
+| Perf acceptance (numeric budgets, real RSS, PerCell fail-closed gate, workloads) | 3 (demo-hosted authority); integrated sanity check 6 |
+| lens-ui integration: terminal as `FleetStore` member (minimal), production surface, E2E-in-app | 5 (minimal membership), 6 (full surface + E2E) — **scope expansion** (old "lens-ui integration out of scope" deliberately expired 2026-07-21) |
+| Build acceptance: offline-after-cache; full clean-build offline (vendored Ghostty tree) | 6 / CI trigger |
 | Font registry / bundled defaults / Nerd-Font symbols | deferred → settings workstream (SPEC-GAPS §7) |
 
 ## Open contract gaps
