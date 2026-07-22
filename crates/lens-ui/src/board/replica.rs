@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use gpui::{Context, Entity, prelude::*};
 use lens_core::domain::board::{
-    Board, BoardLayout, DEFAULT_BOARD_ID, DEFAULT_BOARD_NAME, PlacementTarget,
+    Board, BoardItemKind, BoardLayout, DEFAULT_BOARD_ID, DEFAULT_BOARD_NAME, PlacementTarget,
 };
 use lens_core::domain::ids::{BoardId, ConnectionId, SessionId};
 use lens_core::persist::{BoardStore, PersistError, SqliteBoardStore, StoreMode};
@@ -269,9 +269,61 @@ impl BoardReplica {
         self.pump(cx);
     }
 
-    fn reconcile(&mut self, _cx: &mut Context<Self>) {}
+    fn placed_key_strings(&self) -> HashSet<(String, String)> {
+        self.layout
+            .items
+            .iter()
+            .filter_map(|i| match &i.kind {
+                BoardItemKind::Card { conn, session } => {
+                    Some((conn.as_str().to_string(), session.as_str().to_string()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
 
-    fn note_place_result(&mut self) {}
+    fn missing_keys(&self, cx: &Context<Self>) -> Vec<(ConnectionId, SessionId)> {
+        let placed = self.placed_key_strings();
+        // snapshot fleet keys, then diff (avoids holding the fleet borrow)
+        let live: Vec<SessionId> = self.fleet.read(cx).cards.keys().cloned().collect();
+        live.into_iter()
+            .filter_map(|s| {
+                let k = (self.conn.as_str().to_string(), s.as_str().to_string());
+                if placed.contains(&k) || self.suppressed.contains(&k) {
+                    None
+                } else {
+                    Some((self.conn.clone(), s))
+                }
+            })
+            .collect()
+    }
+
+    fn reconcile(&mut self, cx: &mut Context<Self>) {
+        if !self.is_writable() {
+            return;
+        }
+        let missing = self.missing_keys(cx);
+        if missing.is_empty() {
+            return;
+        }
+        if self.reconcile_in_flight {
+            return; // coalesce; the in-flight place's reply re-diffs
+        }
+        self.reconcile_in_flight = true;
+        self.run_op(Op::PlaceSessions(missing), cx); // pump records last_attempt
+    }
+
+    /// C1: an attempted key STILL missing after its place is tombstoned/stuck → suppress it,
+    /// so re-diff-on-reply cannot re-enqueue it forever.
+    fn note_place_result(&mut self) {
+        let placed = self.placed_key_strings();
+        for (c, s) in std::mem::take(&mut self.last_attempt) {
+            let k = (c.as_str().to_string(), s.as_str().to_string());
+            if !placed.contains(&k) {
+                self.suppressed.insert(k);
+            }
+        }
+    }
 
     fn on_op_failed(&mut self, op: Op, err: PersistError, cx: &mut Context<Self>) {
         // Transient (SQLITE_BUSY/LOCKED beyond busy_timeout): keep the op, back off, retry.
@@ -350,7 +402,17 @@ impl BoardReplica {
         self.begin_recovery(cx);
     }
 
-    fn on_fleet_change(&mut self, _cx: &mut Context<Self>) {}
+    fn on_fleet_change(&mut self, cx: &mut Context<Self>) {
+        if self.is_writable() {
+            self.reconcile(cx);
+        } else if matches!(
+            self.state,
+            ReplicaState::Degraded | ReplicaState::LoadFailed | ReplicaState::Stale
+        ) {
+            self.begin_recovery(cx); // automatic recovery on fleet activity (§5)
+        }
+        // Loading: initial Load in flight; nothing to do.
+    }
 }
 
 fn run_op_blocking(slot: &mut StoreSlot, op: Op) -> OpOutcome {
@@ -811,5 +873,50 @@ mod tests {
             )));
         });
         drop(dir);
+    }
+
+    #[gpui::test]
+    async fn fleet_session_gets_placed_and_persists(cx: &mut gpui::TestAppContext) {
+        let fleet = cx.update(|cx| test_fleet(cx));
+        let replica = cx.update(|cx| cx.new(|cx| BoardReplica::for_test(fleet.clone(), cx)));
+        cx.run_until_parked();
+        fleet.update(cx, |f, cx| {
+            f.spawn_fake_session(SessionId::new("s1"), cx);
+        });
+        cx.run_until_parked();
+        replica.read_with(cx, |r, _| {
+            let placed: Vec<_> = r
+                .layout()
+                .items
+                .iter()
+                .filter_map(|i| match &i.kind {
+                    BoardItemKind::Card { session, .. } => Some(session.as_str().to_string()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(placed, vec!["s1".to_string()]);
+        });
+    }
+
+    #[gpui::test]
+    async fn double_reconcile_idempotent(cx: &mut gpui::TestAppContext) {
+        let fleet = cx.update(|cx| test_fleet(cx));
+        let replica = cx.update(|cx| cx.new(|cx| BoardReplica::for_test(fleet.clone(), cx)));
+        cx.run_until_parked();
+        fleet.update(cx, |f, cx| {
+            f.spawn_fake_session(SessionId::new("s1"), cx);
+        });
+        cx.run_until_parked();
+        replica.update(cx, |r, cx| r.reconcile(cx));
+        cx.run_until_parked();
+        replica.read_with(cx, |r, _| {
+            let n = r
+                .layout()
+                .items
+                .iter()
+                .filter(|i| matches!(i.kind, BoardItemKind::Card { .. }))
+                .count();
+            assert_eq!(n, 1);
+        });
     }
 }
