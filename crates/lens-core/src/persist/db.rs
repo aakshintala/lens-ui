@@ -9,8 +9,9 @@
 //! future-version file it already exists and the statement is a no-op.
 
 use crate::persist::{Result, StoreMode};
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use std::path::Path;
+use std::time::Duration;
 
 /// The three states of a file's `meta.schema_version` cell.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,6 +66,15 @@ pub fn open_db(path: &Path, ddl: &str, current_version: u32) -> Result<(Connecti
         }
     }
     Ok((conn, mode))
+}
+
+/// Open an existing transcript file read-only: no parent-dir creation, no `meta`
+/// bootstrap, no DDL, no schema stamp, no WAL flip. `busy_timeout` retries
+/// `SQLITE_BUSY` from concurrent WAL writers.
+pub fn open_db_read_only(path: &Path, busy_timeout: Duration) -> Result<Connection> {
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    conn.busy_timeout(busy_timeout)?;
+    Ok(conn)
 }
 
 /// Classify the stored `meta.schema_version` cell. Requires `meta` to exist.

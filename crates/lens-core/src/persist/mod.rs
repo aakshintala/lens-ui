@@ -17,7 +17,7 @@ use thiserror::Error;
 
 pub use board::{BoardStore, SqliteBoardStore};
 pub use control::SqliteControlStore;
-pub use transcript::SqliteTranscriptStore;
+pub use transcript::{SqliteTranscriptReader, SqliteTranscriptStore};
 
 pub type Result<T> = std::result::Result<T, PersistError>;
 
@@ -137,6 +137,34 @@ pub struct LiveKey {
 pub enum ReconcileOutcome {
     Folded { ordinal: i64 },
     NoMatch,
+}
+
+/// Read/query-only transcript role — one read-only handle per replica (T-2 §3.3).
+pub trait TranscriptReader {
+    fn mode(&self) -> StoreMode;
+    /// One transaction: the requested `(ordinal, Item)` rows + the snapshot's
+    /// non-provisional watermark.
+    fn read_range(&self, range: ReadRange) -> Result<RangeRead>;
+}
+
+/// Which ordinals to load in a single transactional `read_range`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadRange {
+    /// Full resident set (T-2 baseline + reconcile re-read).
+    All,
+    /// Live growth: ordinals in `(after, through]`.
+    Delta { after: i64, through: i64 },
+    /// Single ordinal (`TranscriptRewritten` re-read).
+    One { ordinal: i64 },
+}
+
+/// Outcome of `TranscriptReader::read_range` — rows, skips, and the snapshot watermark.
+#[derive(Clone, Debug)]
+pub struct RangeRead {
+    pub rows: Vec<(i64, Item)>,
+    pub skipped: Vec<SkippedRow>,
+    /// Newest non-provisional ordinal in the snapshot (`None` when the file is empty).
+    pub watermark: Option<i64>,
 }
 
 /// Per-session transcript role (one file per `(connection, session)`). D-P2-1.

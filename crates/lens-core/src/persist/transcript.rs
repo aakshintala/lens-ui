@@ -5,18 +5,81 @@
 
 use crate::domain::ids::{ConnectionId, ItemId, SessionId};
 use crate::domain::item::{Item, ItemKind};
-use crate::persist::db::open_db;
-use crate::persist::map::{collect_skipping, item_kind_token, json_string, row_to_item};
+use crate::persist::db::{open_db, open_db_read_only};
+use crate::persist::map::{
+    collect_skipping, item_kind_token, json_string, row_to_item, row_to_ordinal_item,
+};
 use crate::persist::schema::{SCHEMA_VERSION, TRANSCRIPT_DDL};
 use crate::persist::{
-    LiveKey, Loaded, PersistError, ReconcileOutcome, Result, StoreMode, TranscriptStore,
+    LiveKey, Loaded, PersistError, RangeRead, ReadRange, ReconcileOutcome, Result, StoreMode,
+    TranscriptReader, TranscriptStore,
 };
 use rusqlite::{Connection, OptionalExtension};
 use std::path::Path;
+use std::time::Duration;
 
 pub struct SqliteTranscriptStore {
     conn: Connection,
     mode: StoreMode,
+}
+
+/// Read-only transcript handle for replica disk reads (T-2 §3.3).
+pub struct SqliteTranscriptReader {
+    conn: Connection,
+}
+
+impl SqliteTranscriptReader {
+    /// Open an existing WAL transcript file read-only — no DDL, meta stamp, or WAL flip.
+    pub fn open_read_only(path: &Path, busy_timeout: Duration) -> Result<Self> {
+        let conn = open_db_read_only(path, busy_timeout)?;
+        Ok(Self { conn })
+    }
+}
+
+impl TranscriptReader for SqliteTranscriptReader {
+    fn mode(&self) -> StoreMode {
+        // Writes are impossible on this handle; reads are always allowed.
+        StoreMode::ReadOnlyDegraded
+    }
+
+    fn read_range(&self, range: ReadRange) -> Result<RangeRead> {
+        const SELECT_PREFIX: &str = "SELECT ordinal, item_id, live_seq, kind, payload, agent, depth, created_at, response_id FROM items";
+        let tx = self.conn.unchecked_transaction()?;
+        let loaded = match range {
+            ReadRange::All => {
+                let mut stmt = tx.prepare(&format!("{SELECT_PREFIX} ORDER BY ordinal"))?;
+                let mut rows = stmt.query([])?;
+                collect_skipping(&mut rows, 1, row_to_ordinal_item)?
+            }
+            ReadRange::Delta { after, through } => {
+                let mut stmt = tx.prepare(&format!(
+                    "{SELECT_PREFIX} WHERE ordinal > ?1 AND ordinal <= ?2 ORDER BY ordinal"
+                ))?;
+                let mut rows = stmt.query(rusqlite::params![after, through])?;
+                collect_skipping(&mut rows, 1, row_to_ordinal_item)?
+            }
+            ReadRange::One { ordinal } => {
+                let mut stmt = tx.prepare(&format!(
+                    "{SELECT_PREFIX} WHERE ordinal = ?1 ORDER BY ordinal"
+                ))?;
+                let mut rows = stmt.query([ordinal])?;
+                collect_skipping(&mut rows, 1, row_to_ordinal_item)?
+            }
+        };
+        let watermark = tx
+            .query_row(
+                "SELECT ordinal FROM items WHERE provisional = 0 ORDER BY ordinal DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        tx.commit()?;
+        Ok(RangeRead {
+            rows: loaded.rows,
+            skipped: loaded.skipped,
+            watermark,
+        })
+    }
 }
 
 fn item_call_id(item: &Item) -> Option<&str> {
@@ -380,9 +443,10 @@ mod tests {
     use crate::domain::ids::{CallId, ConnectionId, ItemId, ResponseId, SessionId};
     use crate::domain::item::{BlockContext, ContentBlock, Item, ItemKind};
     use crate::domain::scalars::Role;
-    use crate::persist::TranscriptStore;
     use crate::persist::db::{VersionState, open_db, read_schema_version};
+    use crate::persist::{ReadRange, TranscriptReader, TranscriptStore};
     use serde_json::json;
+    use std::time::Duration;
     use tempfile::tempdir;
 
     const V1_TRANSCRIPT_DDL: &str = r#"
@@ -865,5 +929,57 @@ CREATE TABLE IF NOT EXISTS items (
         assert_eq!(ids, vec!["item_a", "item_c"]);
         assert_eq!(loaded.skipped.len(), 1);
         assert_eq!(loaded.skipped[0].id, "item_b");
+    }
+
+    #[test]
+    fn read_only_opener_reads_without_ddl_or_meta_write() {
+        let d = tempdir().unwrap();
+        let s = store(d.path()); // write store creates + seeds
+        s.upsert_item(0, &item("item_a", None, "a"), false).unwrap();
+        let r = SqliteTranscriptReader::open_read_only(
+            &d.path().join("conv_1.db"),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        let read = r.read_range(ReadRange::All).unwrap();
+        assert_eq!(read.rows.len(), 1);
+        assert_eq!(read.rows[0].0, 0); // ordinal
+        assert_eq!(read.rows[0].1.id.as_str(), "item_a");
+    }
+
+    #[test]
+    fn read_range_delta_returns_ordinals_and_watermark_in_one_txn() {
+        let d = tempdir().unwrap();
+        let s = store(d.path());
+        s.upsert_item(0, &item("a", None, "a"), false).unwrap();
+        s.upsert_item(1, &item("b", None, "b"), false).unwrap();
+        s.upsert_item(2, &function_call("fc_live", "c1"), true)
+            .unwrap(); // provisional — not the watermark
+        let r = SqliteTranscriptReader::open_read_only(
+            &d.path().join("conv_1.db"),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        let read = r
+            .read_range(ReadRange::Delta {
+                after: 0,
+                through: 2,
+            })
+            .unwrap();
+        let ords: Vec<i64> = read.rows.iter().map(|(o, _)| *o).collect();
+        assert_eq!(ords, vec![1, 2]); // (0, 2]
+        assert_eq!(read.watermark, Some(1)); // newest non-provisional
+    }
+
+    #[test]
+    fn reader_tolerates_concurrent_writer_wal() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("conv_1.db");
+        let s = store(d.path());
+        s.upsert_item(0, &item("a", None, "a"), false).unwrap();
+        let r = SqliteTranscriptReader::open_read_only(&path, Duration::from_millis(500)).unwrap();
+        // writer holds a txn; reader (WAL snapshot) still reads committed rows.
+        let read = r.read_range(ReadRange::All).unwrap();
+        assert_eq!(read.rows.len(), 1);
     }
 }

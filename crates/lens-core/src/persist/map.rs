@@ -166,23 +166,36 @@ pub fn row_to_session(r: &rusqlite::Row) -> rusqlite::Result<SessionState> {
 /// Total over decodable rows. Column order: item_id, live_seq, kind, payload,
 /// agent, depth, created_at, response_id.
 pub fn row_to_item(r: &rusqlite::Row) -> rusqlite::Result<Item> {
+    row_to_item_at_offset(r, 0)
+}
+
+/// Same as `row_to_item`, but column indices are shifted by `offset` (reader SELECT
+/// prepends `ordinal` at column 0).
+pub(crate) fn row_to_item_at_offset(r: &rusqlite::Row, offset: usize) -> rusqlite::Result<Item> {
     fn to_sql_err<E: std::error::Error + Send + Sync + 'static>(e: E) -> rusqlite::Error {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
     }
-    let payload: String = r.get(3)?;
+    let payload: String = r.get(offset + 3)?;
     let kind: ItemKind = from_json(&payload).map_err(to_sql_err)?;
-    let response_id: Option<String> = r.get(7)?;
+    let response_id: Option<String> = r.get(offset + 7)?;
     Ok(Item {
-        id: ItemId::new(r.get::<_, String>(0)?),
-        seq: r.get::<_, Option<i64>>(1)?.map(|v| v as u64),
+        id: ItemId::new(r.get::<_, String>(offset)?),
+        seq: r.get::<_, Option<i64>>(offset + 1)?.map(|v| v as u64),
         ctx: BlockContext {
-            agent: r.get(4)?,
-            depth: r.get::<_, i64>(5)? as u32,
+            agent: r.get(offset + 4)?,
+            depth: r.get::<_, i64>(offset + 5)? as u32,
             response_id: response_id.map(ResponseId::new),
         },
-        created_at: r.get(6)?,
+        created_at: r.get(offset + 6)?,
         kind,
     })
+}
+
+/// Decode a reader row: `ordinal` at column 0, then `row_to_item` columns at `1..`.
+pub(crate) fn row_to_ordinal_item(r: &rusqlite::Row) -> rusqlite::Result<(i64, Item)> {
+    let ordinal = r.get(0)?;
+    let item = row_to_item_at_offset(r, 1)?;
+    Ok((ordinal, item))
 }
 
 #[cfg(test)]
