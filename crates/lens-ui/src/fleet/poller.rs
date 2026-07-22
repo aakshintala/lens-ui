@@ -84,6 +84,8 @@ pub fn spawn_session_poller(
                     }
                     if store
                         .update(cx, |store, cx| {
+                            let card = store.cards.get(&session_id).cloned();
+                            let mut card_notify = false;
                             for o in batch.drain(..) {
                                 match o {
                                     ActorOutcome::TransportChanged {
@@ -96,16 +98,20 @@ pub fn spawn_session_poller(
                                         cx,
                                     ),
                                     other => {
-                                        if let Some(card) = store.cards.get(&session_id) {
-                                            card.update(cx, |card, cx| {
+                                        if let Some(card) = &card {
+                                            card.update(cx, |card, _cx| {
                                                 apply_outcome(card, other);
-                                                card.notify_count =
-                                                    card.notify_count.saturating_add(1);
-                                                cx.notify();
                                             });
+                                            card_notify = true;
                                         }
                                     }
                                 }
+                            }
+                            if card_notify && let Some(card) = card {
+                                card.update(cx, |card, cx| {
+                                    card.notify_count = card.notify_count.saturating_add(1);
+                                    cx.notify();
+                                });
                             }
                         })
                         .is_err()
@@ -144,7 +150,7 @@ mod tests {
     use super::*;
     use crate::clock::ManualUiClock;
     use crate::fleet::store::FleetStore;
-    use lens_core::actor::{ActorFeed, SummaryUpdate};
+    use lens_core::actor::{ActorFeed, ActorOutcome, SummaryUpdate};
     use lens_core::domain::ids::SessionId;
     use lens_core::domain::scalars::SessionStatusValue;
     use lens_core::domain::usage::Cost;
@@ -217,6 +223,47 @@ mod tests {
         assert_eq!(
             store_n, 1,
             "FleetStore notified only on membership spawn, not on scalar folds"
+        );
+    }
+
+    #[gpui::test]
+    async fn poller_coalesces_outcome_batch_card_notify(cx: &mut gpui::TestAppContext) {
+        use lens_core::actor::ParkReason;
+
+        let clock = Arc::new(ManualUiClock::new(1_000));
+        let sid = SessionId::new("s1");
+        let (fleet_entity, card) = cx.update(|cx| {
+            let fleet = FleetStore::new(clock.clone(), cx);
+            let card = fleet.update(cx, |f, cx| f.spawn_fake_session(sid.clone(), cx));
+            (fleet, card)
+        });
+
+        let before = cx.read(|cx| card.read(cx).notify_count);
+
+        cx.update(|cx| {
+            let fleet = fleet_entity.read(cx);
+            let fake = fleet.fake.as_ref().expect("fake mode");
+            for _ in 0..5 {
+                fake.push_outcome(
+                    &sid,
+                    ActorOutcome::Parked {
+                        reason: ParkReason::SessionFailed,
+                    },
+                );
+            }
+        });
+        cx.run_until_parked();
+
+        let after = cx.read(|cx| card.read(cx).notify_count);
+        assert_eq!(
+            after - before,
+            1,
+            "outcome batch must coalesce card notify: before={before} after={after}"
+        );
+        assert_eq!(
+            cx.read(|cx| card.read(cx).connection_overlay),
+            ConnectionOverlay::Disconnected,
+            "last Parked outcome must still apply"
         );
     }
 }
