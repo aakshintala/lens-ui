@@ -8,6 +8,13 @@
 
 **Tech Stack:** Rust, `libghostty-vt` (vendored), `crossbeam-channel`, `gpui 0.2.2` (real-window harness), Criterion (compile-only in gate), `xtask` runner. macOS is the perf-gate authority.
 
+## Findings folded in during execution (2026-07-22)
+
+- **`EngineConfig.max_scrollback` is a BYTE budget, not a line count.** The vendored doc comment ("Maximum number of lines") is misleading — empirically retention scales with *cells* (~1.7 bytes/cell), and the design spec's "10,000,000-byte scrollback" is correct. Sizing scrollback by row count under-retains. Any harness that needs to retain N rows must size `max_scrollback ≈ N × cols × headroom` bytes (Job B uses `× 16 + 4 MiB`).
+- **Worker-thread stack fix landed (`67e8192`).** libghostty's scrollback page ops overflow the ~2 MiB default thread stack once history grows (~2000+ rows → SIGABRT). The worker now reserves `WORKER_STACK_BYTES = 64 MiB` (lazily committed). Regression test `large_scrollback_feed_does_not_overflow_worker_stack`. This was discovered by Job B and is a real product fix.
+- **`build_now` is a no-op when the engine is not dirty** — `total_rows` only samples on a fresh build, so a harness must feed a final dirtying byte before `build_now` to get a current sample.
+- **RSS direction is the opposite of the spec's assumption:** compressible ('a' repeated) uses *more* RSS than incompressible at equal `total_rows`. This does not flip the estimate↔RSS ordering, so the fidelity gate still passes; it is exactly the content-blindness Job B measures.
+
 ## Global Constraints
 
 - **No re-vendor.** `Terminal::total_rows()` / `scrollback_rows()` already exist in `vendor/libghostty-rs/libghostty-vt/src/terminal.rs` (lines 638–644). Byte-*accurate* accounting (a `GHOSTTY_TERMINAL_DATA_*` byte selector) is a **fail-closed conditional** — do NOT build it in this slice; it is escalated ONLY if Job B shows ordinal unreliability.
@@ -972,7 +979,9 @@ fn main() {
     let cfg = EngineConfig {
         cols: COLS,
         rows: ROWS,
-        max_scrollback: 10_000,
+        // BYTE budget (~10 MiB, production-ish). Under sustained streaming the
+        // byte cap binds and old rows drop — realistic for a perf test.
+        max_scrollback: 10_000_000,
         cell_w_px: 8,
         cell_h_px: 16,
     };
