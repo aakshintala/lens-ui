@@ -171,6 +171,9 @@ On each `FleetStore` change (and once at construction), `reconcile`:
 - Computes placed keys as **`(ConnectionId, SessionId)`** (review #6 — a `SessionId`-only
   set cannot detect a cross-conn duplicate).
 - Diffs live `fleet.cards` keys (paired with the pinned `conn`) against placed keys.
+  **Sorts the missing set by `SessionId`** before placing (codex Task-8 review) — `fleet.cards`
+  is a `HashMap` (random iteration), so unsorted placement made board order (and tests)
+  non-deterministic; sorting matches the retired `build_ephemeral_layout`'s stable order.
 - Enqueues **one batched `PlaceSessions`** for the missing set (review #8 — k separate
   `place_session` calls each persist the board → ~O(k·N); one batched transaction is O(N)).
   Skips entirely (no store traffic) when nothing is new — the frequent membership
