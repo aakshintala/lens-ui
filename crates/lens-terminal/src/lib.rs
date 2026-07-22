@@ -381,6 +381,10 @@ pub enum TerminalHostEvent {
     Sleep,
     /// Wake from Sleep: reattach if the same resource generation survived.
     Wake,
+    /// Explicit user reattach after a `ClientDetached` (4405) detach (the only
+    /// detach that sets `reattach_available`). Reuses the retained engine when
+    /// present; else a fresh attach.
+    Reattach,
     /// Host response to a typed permission request emitted on [`TerminalEvent`].
     HostRequestResponse {
         id: HostRequestId,
@@ -637,7 +641,9 @@ impl TerminalTab {
     /// The single typed inbound seam.
     pub fn on_host_event(&mut self, event: TerminalHostEvent, cx: &mut Context<Self>) {
         match event {
-            TerminalHostEvent::Sleep | TerminalHostEvent::Wake => {}
+            TerminalHostEvent::Sleep => self.on_sleep(cx),
+            TerminalHostEvent::Wake => self.on_wake(cx),
+            TerminalHostEvent::Reattach => self.on_reattach(cx),
             TerminalHostEvent::ResourceCreated {
                 session_id,
                 terminal_id,
@@ -1669,6 +1675,159 @@ impl TerminalTab {
         cx.notify();
     }
 
+    fn on_sleep(&mut self, cx: &mut Context<Self>) {
+        // Only sleep from a live-ish state. Sleeping from Detached(ClientDetached) would
+        // `teardown_runtime_full` the engine that the 4405 reattach path relies on (Grok Imp 8).
+        if !matches!(
+            self.lifecycle,
+            Lifecycle::Live | Lifecycle::Reconnecting | Lifecycle::ReplacementWaiting
+        ) {
+            return;
+        }
+        self.reconnect_epoch = self.reconnect_epoch.wrapping_add(1);
+        self.clear_input_composition_state();
+        self.teardown_runtime_full(cx); // release engine + scrollback (confirmed worker exit)
+        self.input_enabled = false;
+        self.presentation.output_gap = false; // deliberate Sleep — frozen frame carries no gap marker
+        self.lifecycle = Lifecycle::Sleeping;
+        self.presentation.lifecycle = Lifecycle::Sleeping;
+        cx.emit(TerminalEvent::PresentationChanged);
+        cx.notify();
+    }
+
+    fn on_wake(&mut self, cx: &mut Context<Self>) {
+        if self.lifecycle != Lifecycle::Sleeping {
+            return;
+        }
+        if self
+            .generation
+            .as_ref()
+            .map(|g| g.is_dirty())
+            .unwrap_or(false)
+        {
+            self.on_detach(DetachedDetail::IdentityChanged, cx);
+            return;
+        }
+        let (Some(session), Some(tid)) = (self.current_session.clone(), self.current_tid.clone())
+        else {
+            self.on_detach(DetachedDetail::TerminalGone, cx);
+            return;
+        };
+        // Fresh attach against the same identity (Sleep released the engine).
+        self.reconnect_epoch = self.reconnect_epoch.wrapping_add(1);
+        let epoch = self.reconnect_epoch;
+        let client = Arc::clone(&self.client);
+        let options = self.options.clone();
+        let target = TerminalTarget::Existing {
+            session_id: session,
+            terminal_id: tid,
+        };
+        cx.spawn(async move |weak, cx| {
+            let outcome = cx
+                .background_executor()
+                .spawn(async move { discover_and_attach(client, target, options) })
+                .await;
+            let _ = weak.update(cx, |tab, cx| {
+                // Re-check at APPLY time, not just before spawning (Grok Critical 2): a
+                // `ResourceDeleted` arriving while the attach was in flight marks the guard
+                // dirty (Task 3 Sleeping arm) without bumping the epoch, so the epoch check
+                // alone would let Wake land Live on a generation that did not survive —
+                // violating spec §Deliberate Sleep/wake ("reattaches only if the same
+                // observed generation survived; else Detached").
+                let dirty = tab
+                    .generation
+                    .as_ref()
+                    .map(|g| g.is_dirty())
+                    .unwrap_or(false);
+                if tab.reconnect_epoch != epoch || tab.lifecycle != Lifecycle::Sleeping || dirty {
+                    if let Ok(parts) = outcome {
+                        tab.close_parts_off_foreground(parts, cx);
+                    }
+                    if dirty && tab.lifecycle == Lifecycle::Sleeping {
+                        tab.on_detach(DetachedDetail::IdentityChanged, cx);
+                    }
+                    return;
+                }
+                match outcome {
+                    Ok(parts) => tab.on_attached(parts, cx), // no gap marker on deliberate wake
+                    Err(detail) => tab.on_detach(detail, cx),
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn on_reattach(&mut self, cx: &mut Context<Self>) {
+        // Reattach is the explicit action for a `ClientDetached` (4405) detach ONLY —
+        // that path retains the engine (`teardown_transport_off_foreground`) and sets
+        // `reattach_available`. Other detaches (`RetriesExhausted`, `TerminalGone`, …)
+        // do a full teardown and do NOT set `reattach_available`, so they are gated out
+        // here (Grok Imp 10 — the earlier "exhausted-retry" wording was wrong).
+        if self.lifecycle != Lifecycle::Detached || !self.presentation.reattach_available {
+            return;
+        }
+        // Retained engine present (ClientDetached path) → re-attach transport only.
+        if self
+            .runtime
+            .as_ref()
+            .map(|r| r.engine_ref().is_some())
+            .unwrap_or(false)
+        {
+            self.lifecycle = Lifecycle::Reconnecting;
+            self.presentation.lifecycle = Lifecycle::Reconnecting;
+            self.presentation.detached_detail = None;
+            self.policy.retry.reset();
+            cx.emit(TerminalEvent::PresentationChanged);
+            cx.notify();
+            self.schedule_reconnect(Duration::ZERO, cx); // sets output_gap on success
+            return;
+        }
+        // Engine gone (rare — ClientDetached retains it, but a later drop is possible)
+        // → fresh attach against the same identity, WITH a gap marker (output during the
+        // detach may be missing). Distinct from Wake (no gap) — do NOT share on_wake's
+        // Sleeping-specific dirty re-check here.
+        let (Some(session), Some(tid)) = (self.current_session.clone(), self.current_tid.clone())
+        else {
+            return; // nothing to reattach to
+        };
+        self.reconnect_epoch = self.reconnect_epoch.wrapping_add(1);
+        let epoch = self.reconnect_epoch;
+        self.lifecycle = Lifecycle::Reconnecting;
+        self.presentation.lifecycle = Lifecycle::Reconnecting;
+        self.presentation.detached_detail = None;
+        cx.emit(TerminalEvent::PresentationChanged);
+        cx.notify();
+        let client = Arc::clone(&self.client);
+        let options = self.options.clone();
+        let target = TerminalTarget::Existing {
+            session_id: session,
+            terminal_id: tid,
+        };
+        cx.spawn(async move |weak, cx| {
+            let outcome = cx
+                .background_executor()
+                .spawn(async move { discover_and_attach(client, target, options) })
+                .await;
+            let _ = weak.update(cx, |tab, cx| {
+                if tab.reconnect_epoch != epoch {
+                    if let Ok(parts) = outcome {
+                        tab.close_parts_off_foreground(parts, cx);
+                    }
+                    return;
+                }
+                match outcome {
+                    Ok(parts) => {
+                        tab.on_attached(parts, cx); // forces output_gap = false…
+                        tab.presentation.output_gap = true; // …but reattach DID miss output.
+                        cx.emit(TerminalEvent::PresentationChanged);
+                    }
+                    Err(detail) => tab.on_detach(detail, cx),
+                }
+            });
+        })
+        .detach();
+    }
+
     fn close_attach_off_foreground(
         &self,
         attach: lens_client::AttachHandle,
@@ -2624,6 +2783,73 @@ mod tests {
             tab
         });
         (engine, tab)
+    }
+
+    #[gpui::test]
+    fn sleep_releases_engine_and_freezes(cx: &mut gpui::TestAppContext) {
+        let (engine, tab) = live_tab_for_test(cx, true, "t1", "main", "k");
+        let weak_engine = Arc::downgrade(&engine);
+        drop(engine); // the tab's runtime holds the only other Arc
+        tab.update(cx, |tab, cx| {
+            tab.on_host_event(TerminalHostEvent::Sleep, cx);
+            assert_eq!(tab.lifecycle, Lifecycle::Sleeping);
+            assert!(!tab.presentation.output_gap, "Sleep adds no gap marker");
+            assert!(tab.runtime.is_none());
+        });
+        // teardown is off-foreground; drain then assert the engine Arc was reclaimed.
+        cx.run_until_parked();
+        assert!(
+            weak_engine.upgrade().is_none(),
+            "Sleep must release the engine + scrollback"
+        );
+    }
+
+    #[gpui::test]
+    fn wake_after_delete_during_sleep_detaches(cx: &mut gpui::TestAppContext) {
+        let (_e, tab) = live_tab_for_test(cx, true, "t1", "main", "k");
+        tab.update(cx, |tab, cx| {
+            tab.on_host_event(TerminalHostEvent::Sleep, cx);
+            // Delete arrives while sleeping — marks the guard dirty.
+            tab.on_host_event(
+                TerminalHostEvent::ResourceDeleted {
+                    terminal_id: TerminalId::new("t1"),
+                },
+                cx,
+            );
+            tab.on_host_event(TerminalHostEvent::Wake, cx);
+            assert_eq!(tab.lifecycle, Lifecycle::Detached);
+            assert_eq!(
+                tab.presentation.detached_detail,
+                Some(DetachedDetail::IdentityChanged)
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn reattach_from_client_detached_enters_reconnecting(cx: &mut gpui::TestAppContext) {
+        use lens_client::CloseCause;
+
+        let (_e, tab) = live_tab_for_test(cx, true, "t1", "main", "k");
+        tab.update(cx, |tab, cx| {
+            tab.apply_bridge_event(BridgeEvent::Closed(CloseCause::TerminalDetached), cx);
+            assert_eq!(tab.lifecycle, Lifecycle::Detached);
+            assert!(tab.presentation.reattach_available);
+            assert!(
+                tab.runtime
+                    .as_ref()
+                    .map(|r| r.engine_ref().is_some())
+                    .unwrap_or(false),
+                "ClientDetached retains the engine"
+            );
+        });
+        tab.update(cx, |tab, cx| {
+            tab.on_host_event(TerminalHostEvent::Reattach, cx);
+            assert_eq!(tab.lifecycle, Lifecycle::Reconnecting);
+            assert_eq!(tab.presentation.lifecycle, Lifecycle::Reconnecting);
+            assert!(tab.presentation.detached_detail.is_none());
+        });
+        // Background attach fails against the stub; must not panic.
+        cx.run_until_parked();
     }
 
     #[gpui::test]

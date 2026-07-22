@@ -57,7 +57,6 @@ impl GenerationGuard {
 
     /// True once a `resource.deleted` for our id has been observed — used by
     /// Sleep/Wake to test whether the same observed generation survived.
-    #[cfg_attr(not(test), expect(dead_code, reason = "Task 5 Sleep/Wake dirty check"))]
     pub fn is_dirty(&self) -> bool {
         self.saw_delete
     }
