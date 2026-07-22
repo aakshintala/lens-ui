@@ -11,10 +11,11 @@ B-2 (packer + container, `14b474c`), B-3 (group chrome, `ac9d5ae`) ·
 > review found the original "inline synchronous write-then-reload" **violates a
 > MANDATORY repo rule** (AGENTS.md:19 / `.agents/rust-ui.md`: *all disk I/O
 > off-thread via `cx.background_spawn`; the UI thread only `cx.update`/`cx.notify`*).
-> §3 is rewritten to an **off-thread store worker + main-thread replica** (the
-> [[state-model-single-writer-decision]] actor/replica pattern). This reverses the
-> grill's Q4 ("inline is fine") and reopens the write-model choice, so §3 warrants
-> a fresh look before planning.
+> §3 is rewritten to **off-thread store access (`Arc<Mutex>` + `cx.background_spawn`)
+> + a main-thread in-memory replica** (a light form of the [[state-model-single-writer-decision]]
+> replica pattern — no command-channel actor, since the board has no write *stream*).
+> This reverses the grill's Q4 ("inline is fine"); §3 was then re-grilled and the light
+> worker shape locked (renders read the in-memory replica, never SQLite).
 
 B-4 was decomposed into a **foundation slice (B-4a, this doc)** plus three
 interaction follow-ons (B-4b/c/d). B-4a replaces the ephemeral
@@ -26,65 +27,73 @@ store and survives restarts.
 ## 0. Codex review dispositions (folded)
 
 All ten findings from the gpt-5.6 spec review were confirmed against code and folded:
-1. **Off-thread I/O (MANDATORY)** → §3 rewritten to a background worker (was inline). 2. **Commit-then-reload divergence** → the worker returns the *committed* layout; no reload step to fail (§3.2). 3. **`new()` couldn't observe FleetStore** → takes `Entity<FleetStore>`, reconciles current keys at construction (§2, §3.3). 4. **Degraded contradictions** → explicit state enum; reconcile also gated; default layout seeds a default board (§5). 5. **`Loaded{rows,skipped}` not `.value`; partial loads** → unpack `rows`, surface `skipped` as degraded (§3.2, §5). 6. **Convergence not conn-scoped** → placed keys are `(ConnectionId, SessionId)`; cross-conn dup noted (§3.3, §4). 7. **`SQLITE_BUSY` on open** → open before actors + busy timeout; open failure → `LoadFailed` (§5, §6). 8. **O(k·N) reconcile** → batch `place_sessions` worker op + benchmark (§3.3). 9. **Tombstone-resurrection already prevented** → deferred guard deleted; replaced with a churn test (§8). 10. **Wrong FleetStore rationale** → corrected (§3.1).
+1. **Off-thread I/O (MANDATORY)** → §3 rewritten to `Arc<Mutex>` + `cx.background_spawn` (was inline). 2. **Commit-then-reload divergence** → the op returns the *committed* layout; no reload step to fail (§3.2). 3. **`new()` couldn't observe FleetStore** → takes `Entity<FleetStore>`, reconciles current keys at construction (§2, §3.3). 4. **Degraded contradictions** → explicit state enum; reconcile also gated; default layout seeds a default board (§5). 5. **`Loaded{rows,skipped}` not `.value`; partial loads** → unpack `rows`, surface `skipped` as degraded (§3.2, §5). 6. **Convergence not conn-scoped** → placed keys are `(ConnectionId, SessionId)`; cross-conn dup noted (§3.3, §4). 7. **`SQLITE_BUSY` on open** → open before actors + busy timeout; open failure → `LoadFailed` (§5, §6). 8. **O(k·N) reconcile** → batch `place_sessions` op + benchmark (§3.3). 9. **Tombstone-resurrection already prevented** → deferred guard deleted; replaced with a churn test (§8). 10. **Wrong FleetStore rationale** → corrected (§3.1).
 
 ---
 
 ## 1. Scope & non-goals
 
-**In scope:** a `BoardReplica` gpui entity (main-thread) + an **off-thread board-store
-worker**; the async write path (worker returns the committed layout); the
+**In scope:** a `BoardReplica` gpui entity (main-thread, in-memory layout) + **off-thread
+store access** (`Arc<Mutex>` + `background_spawn`); the async write path (ops return the
+committed layout); the
 session-lifecycle reconcile (batched); rewiring `pack_and_render` to read the replica;
 non-fatal error handling + a non-blocking banner; a demo-seeded group; retiring
 `build_ephemeral_layout` + the B-3 `test_layout` seam; **the mandatory perf benchmark**.
 
 **Non-goals (deferred):** user interactions → B-4b/c/d; multi-connection → B-5;
 session-archive handling → B-6 (§8); nested-group runtime → B-5. **No spike** for the
-store wiring, but the off-thread worker is new architecture for this crate (precedent:
-the state-model actor) and the perf benchmark is mandatory, not optional (AGENTS.md).
+store wiring. Off-thread I/O is mandatory (AGENTS.md) but does **not** need a full
+command-channel actor — a stream of writes would justify that, and the board has none
+(discrete user ops + occasional reconciles). B-4a uses the lightest compliant shape:
+`Arc<Mutex<store>>` + `cx.background_spawn` per op (§2). The perf benchmark is mandatory.
 
 ---
 
 ## 2. Components
 
-**`BoardStoreWorker` (off-thread).** Owns the `SqliteBoardStore` (the rusqlite
-`Connection`), runs on `cx.background_spawn`, and is the **sole** thing that touches
-the board db — honoring the MANDATORY off-thread-I/O rule. It receives typed commands
-over a bounded channel and replies with the **committed** `BoardLayout` (+ a load
-outcome). Commands: `Load`, `PlaceSessions(Vec<(ConnectionId, SessionId)>)` (batched),
-and (for B-4b/c/d) the mutation ops (`SetCollapsed`, `MoveItem`, `CreateGroup`, …).
-Each command runs the store op **and** returns the resulting layout, so the main thread
-never reloads or re-reads the db. The worker owns store *reopen* (recovery — `mode` is
-immutable, so recovering from degraded/failed requires a fresh `open`).
+**Read/write split (the crux, per the "reads happen constantly" question).** Renders
+read the layout every frame (60–120fps); they read the **in-memory** `BoardReplica.layout`
+and **never touch SQLite**. That is the entire point of the replica: the store is
+canonical/persisted, the replica is the in-memory copy render walks for free. SQLite is
+touched **only** on the rare paths — initial load, a mutation, and reconcile-on-placement.
+So the off-thread machinery only ever handles infrequent, discrete ops; a full
+command-channel actor would optimize a throughput path that doesn't exist here.
 
-**`BoardReplica` (main-thread gpui entity, `crates/lens-ui/src/board/replica.rs`).**
-Holds the layout replica + a handle to the worker + UI-facing state:
+**Store access (off-thread, light).** `BoardReplica` holds an
+`Arc<Mutex<Box<dyn BoardStore>>>`. Each I/O op runs inside a `cx.background_spawn`
+closure that locks the store, runs the op, computes the resulting `BoardLayout`, and
+posts it back to the main thread via `cx.update` (→ set `layout` + `notify`). No UI-thread
+SQLite; the mutex serializes the (infrequent) ops, which they'd serialize on anyway.
+Recovery reopens the store behind the mutex (`mode` is immutable, so degraded/failed
+recovery needs a fresh `open`).
+
+**`BoardReplica` (main-thread gpui entity, `crates/lens-ui/src/board/replica.rs`):**
 
 ```
 BoardReplica {
-    worker: BoardStoreHandle,     // channel to the off-thread worker
-    conn: ConnectionId,           // pinned to the app Connection.id (§4)
-    layout: BoardLayout,          // last committed layout the worker sent back
-    state: ReplicaState,          // Loading | Writable | Degraded | LoadFailed | Stale (§5)
-    fleet: Entity<FleetStore>,    // observed for session-lifecycle reconcile (§3.3)
+    store: Arc<Mutex<Box<dyn BoardStore>>>, // locked inside background_spawn only
+    conn: ConnectionId,                     // pinned to the app Connection.id (§4)
+    layout: BoardLayout,                    // in-memory; every render reads this, no I/O
+    state: ReplicaState,                    // Loading | Writable | Degraded | LoadFailed | Stale (§5)
+    fleet: Entity<FleetStore>,              // observed for session-lifecycle reconcile (§3.3)
 }
 ```
 
 Interface:
-- `BoardReplica::new(worker, conn, fleet, cx) -> Entity<Self>` — takes the fleet
-  (fixing the review's finding #3), starts in `Loading`, spawns a `Load`, installs the
-  `FleetStore` observer, and **immediately reconciles a snapshot of current
-  `fleet.cards` keys** (cards may predate the subscription).
-- `layout(&self) -> &BoardLayout`, `state(&self) -> ReplicaState`, `is_writable(&self)`.
-- `write(&self, cmd, cx)` — enqueue a mutation command **iff** `is_writable()`; when the
-  worker replies, apply the committed layout via `cx.update` + `cx.notify`. Async by
-  construction (no blocking, no return-value layout). B-4b/c/d call this.
+- `BoardReplica::new(store, conn, fleet, cx) -> Entity<Self>` — takes the fleet
+  (review #3), starts in `Loading`, spawns the initial load, installs the `FleetStore`
+  observer, and **immediately reconciles a snapshot of current `fleet.cards` keys**
+  (cards may predate the subscription).
+- `layout(&self) -> &BoardLayout` (the free, in-memory render read), `state(&self)`,
+  `is_writable(&self)`.
+- `write(&self, op, cx)` — **iff** `is_writable()`, spawn the op on `background_spawn`;
+  when it returns the committed layout, apply it via `cx.update` + `cx.notify`. Async by
+  construction (no blocking, no return value). B-4b/c/d call this.
 - `reconcile(&self, cx)` — diff `fleet.cards` keys vs placed `(conn, session)` keys;
-  enqueue one **batched** `PlaceSessions` for the missing set (iff writable).
-- `BoardReplica::in_memory_for_test(fleet, cx)` — `:memory:` worker + fixed conn.
+  spawn one **batched** `PlaceSessions` for the missing set (iff writable).
+- `BoardReplica::in_memory_for_test(fleet, cx)` — `:memory:` store + fixed conn.
 
-Because the worker owns all I/O and the replica only does `cx.update`/`cx.notify`, the
-UI thread never blocks (AGENTS.md), and there is no synchronous SQLite anywhere.
+The UI thread only does `cx.update`/`cx.notify`; all SQLite is inside `background_spawn`.
 
 ---
 
@@ -101,27 +110,29 @@ card *content* (status/cost) does **not** flow through `FleetStore` — each
 `FleetStore` notifies on membership/focus. So `BoardView`'s `FleetStore` observation is
 for *which* cards exist and focus, not their content.
 
-### 3.2 Write path — command → worker → committed layout (async, off-thread)
+### 3.2 Write path — op → background_spawn → committed layout (async, off-thread)
 
-Every mutation is a command to the worker:
+Every mutation runs off-thread:
 
 1. `BoardReplica::write` checks `is_writable()`; if not, it no-ops and surfaces the state
    (§5). No db access on the main thread.
-2. The worker (off-thread) runs the store op in a transaction and, on commit, computes
-   the resulting `BoardLayout`, replying `Ok(layout)` — or `Err` (commit failed / degraded).
-3. On reply, the replica applies the committed layout via `cx.update` + `cx.notify`.
+2. It spawns a `cx.background_spawn` closure that locks the store, runs the op in a
+   transaction and, on commit, computes the resulting `BoardLayout`, returning
+   `Ok(layout)` — or `Err` (commit failed / degraded).
+3. Back on the main thread, `cx.update` applies the committed layout (→ `layout` +
+   `notify`).
 
 This **dissolves review finding #2** (commit-then-reload divergence): there is no separate
-reload that can fail after a commit — the worker returns the layout it just committed
-atomically. On a worker `Err`, the replica transitions to `Stale`/`Degraded` (§5) and
-does **not** blindly retry a non-idempotent op (`create_group`).
+reload that can fail after a commit — the op returns the layout it just committed
+atomically. On `Err`, the replica transitions to `Stale`/`Degraded` (§5) and does **not**
+blindly retry a non-idempotent op (`create_group`).
 
 **No inline cost model.** All SQLite is off-thread, so it never touches the frame budget.
 Per AGENTS.md ("**MANDATORY** Benchmark-or-it's-not-done on perf paths; 120fps/8.3ms
 target, 90fps/11.1ms regression line"), B-4a ships a **release-mode benchmark** of the
-worker round-trip (Load + a batched PlaceSessions of N sessions) and asserts the main
-thread stays within frame budget under a realistic and a stress fixture. (The earlier
-"inline is fine below ~1000 items" reasoning is retired — it was both non-compliant and
+op round-trip (load + a batched `PlaceSessions` of N sessions) and asserts the main thread
+stays within frame budget under a realistic and a stress fixture. (The earlier "inline is
+fine below ~1000 items" reasoning is retired — it was both non-compliant and
 un-benchmarked.)
 
 ### 3.3 Session-lifecycle reconcile (batched, additive, conn-pinned)
@@ -132,7 +143,7 @@ On each `FleetStore` change (and once at construction), `reconcile`:
 - Diffs live `fleet.cards` keys (paired with the pinned `conn`) against placed keys.
 - Enqueues **one batched `PlaceSessions`** for the missing set (review #8 — k separate
   `place_session` calls each persist the board → ~O(k·N); one batched transaction is O(N)).
-  Skips entirely (no worker traffic) when nothing is new — the frequent membership
+  Skips entirely (no store traffic) when nothing is new — the frequent membership
   notifies stay cheap.
 
 **Convergence (review #6, narrowed).** Two placement sources exist: this loop (from
@@ -190,9 +201,9 @@ the reply/next-op failed — read-only until reload). `is_writable()` is `Writab
   deliberately skipped, kept observable). → `Degraded` (write-gated) + a banner noting some
   items couldn't be read (review #5). Unpack `Loaded.rows` (not `.value`).
 
-**Recovery** — because `StoreMode` is immutable (review #4), recovery = the worker
-**reopens** the store on a retry, not a mere reload; success transitions back to `Writable`
-and retires the banner.
+**Recovery** — because `StoreMode` is immutable (review #4), recovery = a spawned op
+**reopens** the store behind the mutex on a retry, not a mere reload; success transitions
+back to `Writable` and retires the banner.
 
 **Mechanics:** the banner is a small **non-blocking, dismissible** notice over the board
 area (never a modal; the rest of Lens stays usable), driven by `ReplicaState`.
@@ -201,11 +212,11 @@ area (never a modal; the rest of Lens stays usable), driven by `ReplicaState`.
 
 ## 6. Construction & startup order
 
-- **App (live):** open the `BoardStoreWorker` on `data_dir/lens.db` **before the session
+- **App (live):** open the board store on `data_dir/lens.db` **before the session
   actors start** (review #7 — minimizes `SQLITE_BUSY`), and give `open_db` a bounded
   **busy timeout** so a transient lock retries rather than fails. conn = `"lens-app"`. Wire
   `BoardReplica` into the `BoardView::mount` sites (`main.rs:110,165`).
-- **Demo (fake):** in-memory worker (`:memory:`; `CONTROL_DDL` still makes the empty
+- **Demo (fake):** in-memory store (`:memory:`; `CONTROL_DDL` still makes the empty
   `sessions` table) + `"conn_demo"`. **Seed a group at construction** (before the first
   fleet reconcile, so its members aren't re-placed loose), with members also spawned as
   fake fleet sessions — rendering B-3 group chrome live for the first time.
@@ -222,7 +233,7 @@ just another path into `LoadFailed` (§5) — non-fatal, banner, retry-reopen.
 ## 7. Testing
 
 `BoardStore` admits an in-memory store; real-window harness per [[gpui-test-noop-text-system]].
-The worker is async, so tests drive `run_until_parked` to settle worker replies.
+Ops are async (`background_spawn`), so tests drive `run_until_parked` to settle replies.
 
 - **Load renders persisted placements**; **new session placed + persists across reopen**.
 - **Convergence / no double-place** with pinned conn → exactly one card row.
@@ -239,7 +250,7 @@ The worker is async, so tests drive `run_until_parked` to settle worker replies.
 - **Tombstoned fleet key** stays absent with no reload/notify churn (review #9).
 - **Reconcile idempotent / batched** — two reconciles → one row per session; a k-session
   batch issues one `PlaceSessions`.
-- **Perf benchmark (MANDATORY):** release-mode worker round-trip (Load + batched
+- **Perf benchmark (MANDATORY):** release-mode op round-trip (load + batched
   PlaceSessions of N) stays within frame budget on realistic + stress fixtures.
 
 Full `xtask gate` green.
