@@ -148,6 +148,12 @@ impl FleetStore {
         self.focused.as_ref()
     }
 
+    pub fn focused_replica(&self) -> Option<Entity<FocusedTranscript>> {
+        self.focused_replica
+            .as_ref()
+            .map(|(_, replica)| replica.clone())
+    }
+
     pub fn reader_factory(&self, id: &SessionId) -> Option<&ReaderFactory> {
         self.reader_factories.get(id)
     }

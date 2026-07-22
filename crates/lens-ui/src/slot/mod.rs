@@ -1,6 +1,7 @@
+use crate::focused::{FocusedTranscript, view::mount_focused_transcript_view};
 use gpui::{
-    AnyView, App, Context, FocusHandle, InteractiveElement, IntoElement, Render, SharedString,
-    Window, div, prelude::*,
+    AnyView, App, Context, Entity, FocusHandle, InteractiveElement, IntoElement, Render,
+    SharedString, Window, div, prelude::*,
 };
 
 pub trait ContentTab {}
@@ -36,6 +37,15 @@ impl Render for PlaceholderTab {
         div()
             .track_focus(&self.focus_handle)
             .child("Working area (placeholder)")
+    }
+}
+
+pub fn focused_transcript_tab(replica: Entity<FocusedTranscript>, cx: &mut App) -> TabHandle {
+    let (view, focus_handle) = mount_focused_transcript_view(replica, cx);
+    TabHandle {
+        view: view.into(),
+        title: SharedString::from("chat"),
+        focus_handle,
     }
 }
 

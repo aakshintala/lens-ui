@@ -103,7 +103,7 @@ pub struct RowStore {
     pub(crate) order: Vec<RowId>,
     entities: HashMap<RowId, Entity<RowState>>,
     sections: HashMap<SectionKey, SectionNode>,
-    structure: Vec<StructureEntry>,
+    pub(crate) structure: Vec<StructureEntry>,
     /// Per-`response_id` derived expand flag (all runs of a turn fold together).
     response_expanded: HashMap<ResponseId, bool>,
     /// Section a staged reasoning tail belonged to at `stage_stream_finalize` time —

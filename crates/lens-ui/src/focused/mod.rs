@@ -3,6 +3,7 @@
 
 pub mod reader;
 mod rowsource;
+pub mod view;
 
 use crate::fleet::store::{ReaderFactory, ReconcileEpoch};
 use gpui::{Context, ListAlignment, ListState, Pixels};
@@ -275,10 +276,18 @@ impl FocusedTranscript {
         &self.rows
     }
 
-    #[cfg(test)]
-    #[allow(dead_code)] // used by Task 13 view tests + the real-window probe
-    pub(crate) fn list_state(&self) -> &ListState {
+    #[allow(dead_code)] // view unit tests
+    pub(crate) fn rows_mut(&mut self) -> &mut RowStore {
+        &mut self.rows
+    }
+
+    #[doc(hidden)]
+    pub fn list_state(&self) -> &ListState {
         &self.list_state
+    }
+
+    pub(crate) fn list_state_mut(&mut self) -> &mut ListState {
+        &mut self.list_state
     }
 
     #[cfg(test)]

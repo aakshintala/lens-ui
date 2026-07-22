@@ -1,10 +1,10 @@
 use crate::PtyProbe;
 use crate::card::view::{SessionCardView, mount_cached_card};
 use crate::fleet::store::FleetStore;
-use crate::slot::{TabHandle, placeholder_tab};
+use crate::slot::{TabHandle, focused_transcript_tab, placeholder_tab};
 use gpui::{
-    AnyView, App, AppContext, Bounds, ClickEvent, Context, Entity, IntoElement, ParentElement,
-    Pixels, Render, Styled, Window, div, prelude::*, px,
+    AnyView, App, AppContext, Bounds, ClickEvent, Context, Entity, EntityId, IntoElement,
+    ParentElement, Pixels, Render, Styled, Window, div, prelude::*, px,
 };
 use lens_core::domain::ids::SessionId;
 use std::collections::HashMap;
@@ -33,6 +33,8 @@ pub struct BoardView {
     /// Stable `.cached()` wrappers — created once per card so layout recompose reuses cache.
     cached_tiles: HashMap<SessionId, AnyView>,
     working_tab: TabHandle,
+    chat_tab: Option<TabHandle>,
+    chat_replica_id: Option<EntityId>,
     pty_probe: Option<PtyProbe>,
     /// Mode at the last `render` (the actually-displayed layout, not merely the last
     /// observed fleet state) — drives the focus→board viewport-gate reset. Tracked in
@@ -67,6 +69,7 @@ impl BoardView {
         let fleet_for_observe = fleet.clone();
         cx.observe(&fleet_for_observe, |board: &mut BoardView, _, cx| {
             board.sync_card_views(cx);
+            board.sync_chat_tab(cx);
             board.recover_viewport_gates_on_reentry(cx);
             cx.notify();
         })
@@ -76,6 +79,8 @@ impl BoardView {
             card_views,
             cached_tiles,
             working_tab,
+            chat_tab: None,
+            chat_replica_id: None,
             pty_probe,
             last_mode: None,
         }
@@ -127,6 +132,27 @@ impl BoardView {
                 v.invalidate_viewport_gate();
                 cx.notify();
             });
+        }
+    }
+
+    fn sync_chat_tab(&mut self, cx: &mut Context<Self>) {
+        match ShellMode::from_fleet(self.fleet.read(cx)) {
+            ShellMode::Board => {
+                self.chat_tab = None;
+                self.chat_replica_id = None;
+            }
+            ShellMode::Focused { .. } => {
+                if let Some(replica) = self.fleet.read(cx).focused_replica() {
+                    let rid = replica.entity_id();
+                    if self.chat_replica_id != Some(rid) {
+                        self.chat_tab = Some(focused_transcript_tab(replica, cx));
+                        self.chat_replica_id = Some(rid);
+                    }
+                } else {
+                    self.chat_tab = None;
+                    self.chat_replica_id = None;
+                }
+            }
         }
     }
 
@@ -250,6 +276,7 @@ impl BoardView {
 impl Render for BoardView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_card_views(cx);
+        self.sync_chat_tab(cx);
         let mode = ShellMode::from_fleet(self.fleet.read(cx));
         // Record the actually-displayed mode so the fleet-observe recovery can detect the
         // focus→board edge even on the very first frame (mount-while-focused). Pure scalar
@@ -263,27 +290,37 @@ impl Render for BoardView {
                 .size_full()
                 .child(self.render_nav_rail())
                 .child(self.render_board_grid(cx)),
-            ShellMode::Focused { .. } => div()
-                .id("shell-focused")
-                .flex()
-                .flex_row()
-                .size_full()
-                .child(self.render_nav_rail())
-                .child(self.render_shrunk_boards(cx))
-                .child(div().id("chat-slot").flex_grow().child("chat"))
-                .child(
+            ShellMode::Focused { .. } => {
+                let chat_slot = if let Some(tab) = &self.chat_tab {
+                    div().id("chat-slot").flex_grow().child(tab.view.clone())
+                } else {
                     div()
-                        .id("navigator-slot")
-                        .w(px(200.0))
-                        .flex_shrink_0()
-                        .child("navigator"),
-                )
-                .child(
-                    div()
-                        .id("working-area-slot")
+                        .id("chat-slot")
                         .flex_grow()
-                        .child(self.working_tab.view.clone()),
-                ),
+                        .child(div().id("chat-empty"))
+                };
+                div()
+                    .id("shell-focused")
+                    .flex()
+                    .flex_row()
+                    .size_full()
+                    .child(self.render_nav_rail())
+                    .child(self.render_shrunk_boards(cx))
+                    .child(chat_slot)
+                    .child(
+                        div()
+                            .id("navigator-slot")
+                            .w(px(200.0))
+                            .flex_shrink_0()
+                            .child("navigator"),
+                    )
+                    .child(
+                        div()
+                            .id("working-area-slot")
+                            .flex_grow()
+                            .child(self.working_tab.view.clone()),
+                    )
+            }
         };
         div().id("board-view").size_full().child(body)
     }
