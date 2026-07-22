@@ -466,8 +466,7 @@ impl RowStore {
                 .map(|idx| idx + 1)
                 .unwrap_or(0);
 
-            self.structure
-                .insert(insert_at, StructureEntry::Marker(id));
+            self.structure.insert(insert_at, StructureEntry::Marker(id));
         }
 
         self.rebuild_flat_order();
@@ -533,9 +532,7 @@ impl Default for RowStore {
 
 fn child_ord(row_id: &RowId, item_ordinals: &HashMap<ItemId, i64>) -> i64 {
     match row_id {
-        RowId::Work(id) | RowId::Sibling(id) => {
-            item_ordinals.get(id).copied().unwrap_or(i64::MAX)
-        }
+        RowId::Work(id) | RowId::Sibling(id) => item_ordinals.get(id).copied().unwrap_or(i64::MAX),
         RowId::StreamTail(_) => i64::MAX,
         _ => i64::MIN,
     }

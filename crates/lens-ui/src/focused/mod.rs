@@ -2305,10 +2305,7 @@ mod tests {
                     r.apply_read(
                         1,
                         ReadRange::All,
-                        range_read(
-                            vec![(0, item_a.clone()), (1, item_b.clone())],
-                            1,
-                        ),
+                        range_read(vec![(0, item_a.clone()), (1, item_b.clone())], 1),
                         cx,
                     );
                 });
@@ -2390,7 +2387,12 @@ mod tests {
         let item = message_item("m0", None);
         cx.update(|cx| {
             replica.update(cx, |r, cx| {
-                r.apply_read(1, ReadRange::All, range_read(vec![(0, item.clone())], 0), cx);
+                r.apply_read(
+                    1,
+                    ReadRange::All,
+                    range_read(vec![(0, item.clone())], 0),
+                    cx,
+                );
             });
         });
 
