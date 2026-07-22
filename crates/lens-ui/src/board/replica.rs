@@ -369,6 +369,14 @@ fn run_op_blocking(slot: &mut StoreSlot, op: Op) -> OpOutcome {
 }
 
 fn run_op_inner(slot: &mut StoreSlot, op: &Op) -> lens_core::persist::Result<OpOutcome> {
+    // Recovery (a non-initial Load) is a FRESH reopen (§5): drop any current handle so a
+    // Degraded/stale handle can't be silently reused. A persistent failure already dropped
+    // it; a Degraded *success* retained it — this is the path that lets a fixed file heal.
+    // (A transient failure during recovery re-reopens on each retry — acceptable churn on a
+    // rare path.)
+    if matches!(op, Op::Load { initial: false }) {
+        slot.store = None;
+    }
     if slot.store.is_none() {
         slot.store = Some(Box::new(SqliteBoardStore::open(&slot.path)?)); // first-open or recovery
     }
@@ -605,6 +613,7 @@ mod tests {
         inner: SqliteBoardStore,
         fail_loads: Cell<u32>,
         err: fn() -> PersistError,
+        mode: StoreMode, // what mode() reports (simulate a Degraded handle)
     }
 
     fn busy_err() -> PersistError {
@@ -616,7 +625,7 @@ mod tests {
 
     impl BoardStore for FlakyStore {
         fn mode(&self) -> StoreMode {
-            self.inner.mode()
+            self.mode
         }
         fn load_layout(&self) -> lens_core::persist::Result<Loaded<BoardLayout>> {
             let n = self.fail_loads.get();
@@ -693,25 +702,62 @@ mod tests {
     // retry_recovery reopens the good `path` as a plain store → Writable. Load-bearing:
     // if Load were gated in LoadFailed, or recovery didn't reopen, it stays LoadFailed.
     #[gpui::test]
-    async fn recovery_load_restores_writable(cx: &mut gpui::TestAppContext) {
+    async fn recovery_reopens_degraded_handle(cx: &mut gpui::TestAppContext) {
+        let fleet = cx.update(|cx| test_fleet(cx));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.db");
+        // The file itself is a healthy ReadWrite store, but this handle REPORTS Degraded
+        // while its load SUCCEEDS — so the replica goes Degraded and RETAINS the handle.
+        // Recovery must force a fresh reopen of `path` (real ReadWrite) to reach Writable.
+        // Load-bearing for the reopen contract: without the force-reopen in run_op_inner,
+        // recovery reuses this Degraded handle and stays Degraded forever.
+        let inner = SqliteBoardStore::open(&path).unwrap();
+        let flaky: Box<dyn BoardStore + Send> = Box::new(FlakyStore {
+            inner,
+            fail_loads: Cell::new(0), // load succeeds…
+            err: || PersistError::ReadOnly,
+            mode: StoreMode::ReadOnlyDegraded, // …but reported Degraded → handle retained
+        });
+        let replica = cx.update(|cx| {
+            cx.new(|cx| BoardReplica::for_test_store(fleet.clone(), flaky, path.clone(), cx))
+        });
+        cx.run_until_parked();
+        replica.read_with(cx, |r, _| assert_eq!(r.state(), ReplicaState::Degraded));
+
+        replica.update(cx, |r, cx| r.retry_recovery(cx));
+        cx.run_until_parked();
+        replica.read_with(cx, |r, _| assert_eq!(r.state(), ReplicaState::Writable));
+        drop(dir);
+    }
+
+    // Retry cap: a transient error that never clears exhausts MAX_RETRIES and falls through
+    // to the persistent branch (LoadFailed) — no infinite retry loop.
+    #[gpui::test]
+    async fn transient_exhausts_retries_then_load_failed(cx: &mut gpui::TestAppContext) {
         let fleet = cx.update(|cx| test_fleet(cx));
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("board.db");
         let inner = SqliteBoardStore::open(&path).unwrap();
         let flaky: Box<dyn BoardStore + Send> = Box::new(FlakyStore {
             inner,
-            fail_loads: Cell::new(1),
-            err: || PersistError::ReadOnly, // non-transient
+            fail_loads: Cell::new(u32::MAX), // always BUSY
+            err: busy_err,
+            mode: StoreMode::ReadWrite,
         });
         let replica = cx.update(|cx| {
             cx.new(|cx| BoardReplica::for_test_store(fleet.clone(), flaky, path.clone(), cx))
         });
-        cx.run_until_parked();
-        replica.read_with(cx, |r, _| assert_eq!(r.state(), ReplicaState::LoadFailed));
-
-        replica.update(cx, |r, cx| r.retry_recovery(cx));
-        cx.run_until_parked();
-        replica.read_with(cx, |r, _| assert_eq!(r.state(), ReplicaState::Writable));
+        cx.run_until_parked(); // Load #1 → BUSY → op_retries=1
+        for _ in 0..(MAX_RETRIES + 1) {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(5000)); // ≥ max backoff (50<<6)
+            cx.run_until_parked();
+        }
+        replica.read_with(cx, |r, _| {
+            // the (MAX_RETRIES+1)th failure falls through to persistent → LoadFailed.
+            assert_eq!(r.state(), ReplicaState::LoadFailed);
+            assert_eq!(r.op_retries, 0);
+        });
         drop(dir);
     }
 
@@ -739,6 +785,7 @@ mod tests {
             inner,
             fail_loads: Cell::new(2),
             err: busy_err,
+            mode: StoreMode::ReadWrite,
         });
         let replica = cx.update(|cx| {
             cx.new(|cx| BoardReplica::for_test_store(fleet.clone(), flaky, path.clone(), cx))
