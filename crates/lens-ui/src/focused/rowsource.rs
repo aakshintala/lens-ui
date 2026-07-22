@@ -22,7 +22,9 @@ pub enum RowId {
     Sibling(ItemId),
     /// Live streaming tail keyed by accumulator id.
     StreamTail(AccId),
-    /// Reconnect-break marker (Task 14); also used for synthetic section-rail rows.
+    /// Section rail row paired with `Section` chip — same `(response_id, run_index)`.
+    SectionRail(ResponseId, u32),
+    /// Reconnect-break marker (Task 14).
     Marker(u64),
 }
 
@@ -160,20 +162,6 @@ impl Default for RowStore {
     }
 }
 
-/// Synthetic `Marker` seq for a section rail row — high bit keeps Task-14 reconnect seqs separate.
-fn section_rail_seq(response_id: &ResponseId, run_index: u32) -> u64 {
-    0x8000_0000_0000_0000 | ((run_index as u64) << 32) ^ fnv1a64(response_id.as_str().as_bytes())
-}
-
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
-}
-
 fn materialize_block(block: &ViewBlock<'_>, into: &mut RowStore, cx: &mut App) {
     match block {
         ViewBlock::Item(item) => materialize_sibling_item(item, into, cx),
@@ -207,7 +195,7 @@ fn materialize_work_section(
     into.upsert(section_id.clone(), chip, cx);
     into.push_order(section_id);
 
-    let rail_id = RowId::Marker(section_rail_seq(response_id, run_index));
+    let rail_id = RowId::SectionRail(response_id.clone(), run_index);
     let rail = RowPresentation {
         kind: RowKind::SectionRail,
         text: format!("rail {} run {run_index}", response_id.as_str()),
@@ -471,6 +459,84 @@ mod tests {
             store.order().last(),
             Some(RowId::StreamTail(acc)) if acc.as_str() == "acc_stream_m"
         ));
+    }
+
+    /// Pre-fix rail keys used `RowId::Marker(0x8000… | hash)`; reconnect markers share that namespace.
+    fn legacy_section_rail_marker_seq(response_id: &ResponseId, run_index: u32) -> u64 {
+        let mut hash = 0xcbf29ce484222325u64;
+        for byte in response_id.as_str().as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        0x8000_0000_0000_0000 | ((run_index as u64) << 32) ^ hash
+    }
+
+    #[gpui::test]
+    fn section_rail_and_marker_do_not_alias(cx: &mut gpui::TestAppContext) {
+        let resp_a = ResponseId::new("resp_a");
+        let items = [reasoning("r1", Some("resp_a"))];
+        let refs: Vec<&Item> = items.iter().collect();
+        let scratch = lens_core::domain::item::StreamScratch::default();
+        let projected = project(&refs, &scratch, Some(&resp_a));
+        let blocks = group_work_section(projected, Some(&resp_a));
+
+        let mut store = RowStore::new();
+        cx.update(|cx| RowStore::materialize(&blocks, &mut store, cx));
+
+        let legacy_seq = legacy_section_rail_marker_seq(&resp_a, 0);
+        let marker_id = RowId::Marker(legacy_seq);
+        let rail_id = RowId::SectionRail(resp_a.clone(), 0);
+        assert_ne!(
+            rail_id, marker_id,
+            "rail and legacy-marker seq must be distinct ids"
+        );
+
+        cx.update(|cx| {
+            store.upsert(
+                marker_id.clone(),
+                RowPresentation {
+                    kind: RowKind::ReconnectBreak,
+                    text: "reconnect".into(),
+                    collapsed: false,
+                    height_hint: None,
+                },
+                cx,
+            );
+            store.push_order(marker_id.clone());
+        });
+
+        let rail_in_order = store.order().iter().filter(|id| **id == rail_id).count();
+        let marker_in_order = store.order().iter().filter(|id| **id == marker_id).count();
+        assert_eq!(
+            rail_in_order, 1,
+            "rail id must appear exactly once in order"
+        );
+        assert_eq!(
+            marker_in_order, 1,
+            "marker id must appear exactly once in order"
+        );
+
+        let (rail_entity, marker_entity) = cx.read(|cx| {
+            (
+                store.entity_id(&rail_id, cx).expect("rail entity"),
+                store.entity_id(&marker_id, cx).expect("marker entity"),
+            )
+        });
+        assert_ne!(
+            rail_entity, marker_entity,
+            "distinct RowIds must map to distinct entities (no HashMap aliasing)"
+        );
+
+        cx.read(|cx| {
+            assert_eq!(
+                store.entity(&rail_id).unwrap().read(cx).presentation.kind,
+                RowKind::SectionRail
+            );
+            assert_eq!(
+                store.entity(&marker_id).unwrap().read(cx).presentation.kind,
+                RowKind::ReconnectBreak
+            );
+        });
     }
 
     #[gpui::test]
