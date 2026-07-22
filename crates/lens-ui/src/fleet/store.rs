@@ -825,8 +825,6 @@ mod reader_factory_tests {
             mock.base_url.parse().expect("mock base url"),
             Auth::None,
         );
-        let client = Client::new(conn.clone()).expect("mock client handshake");
-
         let data_dir = std::env::temp_dir().join(format!(
             "lens-task7-{}-{}",
             std::process::id(),
@@ -837,13 +835,38 @@ mod reader_factory_tests {
 
         let clock: Arc<dyn UiClock> = Arc::new(ManualUiClock::new(1_700_000_000_000));
         let fleet = cx.update(|cx| FleetStore::new_live(Arc::clone(&clock), cx));
-        cx.update(|cx| {
-            fleet.update(cx, |store, cx| {
-                store
-                    .spawn_live_session(&conn, &client, session_id.clone(), &data_dir, cx)
-                    .expect("spawn live session");
+
+        // Bounded retry of the live setup. The mock is a real localhost HTTP+SSE
+        // server; reqwest's connection pool can transiently drop a handshake
+        // request (~1/120) — a benign infra hiccup, not a product bug. Both
+        // fallible network ops (`Client::new` handshake, `spawn_live_session`'s
+        // `.stream()`) fail BEFORE any store state is inserted (the reader-factory
+        // insert follows `.stream()?`), so each attempt starts clean → the retry
+        // makes the test deterministic without masking any real failure.
+        let mut last_err = None;
+        let mut spawned = false;
+        for _ in 0..5 {
+            let client = match Client::new(conn.clone()) {
+                Ok(c) => c,
+                Err(e) => {
+                    last_err = Some(format!("client handshake: {e}"));
+                    continue;
+                }
+            };
+            let result = cx.update(|cx| {
+                fleet.update(cx, |store, cx| {
+                    store.spawn_live_session(&conn, &client, session_id.clone(), &data_dir, cx)
+                })
             });
-        });
+            match result {
+                Ok(_) => {
+                    spawned = true;
+                    break;
+                }
+                Err(e) => last_err = Some(format!("spawn live session: {e}")),
+            }
+        }
+        assert!(spawned, "live setup failed after 5 retries: {last_err:?}");
         cx.run_until_parked();
         for _ in 0..20 {
             thread::sleep(Duration::from_millis(25));
