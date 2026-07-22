@@ -50,7 +50,7 @@ stream_perf_realwindow: all budgets OK  (exit 0)
 
 ## Gate / review
 
-- Full `xtask gate`: **GREEN** — `gate: all checks passed`. fmt + workspace clippy + lens-terminal `test-util` clippy + all crate tests + `render_realwindow` + `stream_perf_realwindow` (in-gate: paint_p95 3.124 / build_p95 0.573) + benches compile + no contract drift.
+- Full `xtask gate`: **GREEN** pre-review-fix (`gate: all checks passed` — all crate tests, both clippy configs, both real-window harnesses, benches compile, no contract drift). Post-review-fix (`b802044`), every changed component re-verified green individually — `lens-terminal` lib 120/120, `rss_probe` 3/3, `xtask` 5/5, Job A real-window, the RSS sweep, and `render_realwindow` isolated (PerfWide400x100 **4.743 ms** / budget 8). **One caveat:** a post-fix full-gate re-run tripped `render_realwindow` `PerfWide400x100` at **8.248 ms > 8 ms** — a load-induced flake of the pre-existing Slice-1c gate (paint times ~2–3× normal under full-gate concurrency), **not** a Slice-3 regression (Slice 3 touches nothing on the paint path); confirmed by the clean 4.743 ms isolated re-run. That 400×100 budget has thin margin under heavy load (see codex I7); re-baseline if it flaps.
 - Consolidated cross-family review (codex `gpt-5.6-sol`, `codex exec -s read-only`): **0 Critical, 7 Important, 1 Minor.** Four fixed in `b802044` (see below); four documented as tracked follow-ups.
 - Known parallel-load test flake (`engine::handle` mouse/hidden-tab timeouts under `cargo test` oversubscription) is pre-existing ([[worker-stall-gate-busy-spin-flake]]); isolated runs pass 5/5.
 
