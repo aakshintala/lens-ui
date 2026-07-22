@@ -675,7 +675,8 @@ mod tests {
         inner: SqliteBoardStore,
         fail_loads: Cell<u32>,
         err: fn() -> PersistError,
-        mode: StoreMode, // what mode() reports (simulate a Degraded handle)
+        mode: StoreMode,  // what mode() reports (simulate a Degraded handle)
+        place_noop: bool, // place_sessions succeeds but places nothing (simulate a tombstoned/unplaceable key)
     }
 
     fn busy_err() -> PersistError {
@@ -717,6 +718,9 @@ mod tests {
             placements: &[(ConnectionId, SessionId)],
             target: &PlacementTarget,
         ) -> lens_core::persist::Result<()> {
+            if self.place_noop {
+                return Ok(()); // "committed" but placed nothing → the key stays missing
+            }
             self.inner.place_sessions(placements, target)
         }
         fn create_group(
@@ -779,6 +783,7 @@ mod tests {
             fail_loads: Cell::new(0), // load succeeds…
             err: || PersistError::ReadOnly,
             mode: StoreMode::ReadOnlyDegraded, // …but reported Degraded → handle retained
+            place_noop: false,
         });
         let replica = cx.update(|cx| {
             cx.new(|cx| BoardReplica::for_test_store(fleet.clone(), flaky, path.clone(), cx))
@@ -805,6 +810,7 @@ mod tests {
             fail_loads: Cell::new(u32::MAX), // always BUSY
             err: busy_err,
             mode: StoreMode::ReadWrite,
+            place_noop: false,
         });
         let replica = cx.update(|cx| {
             cx.new(|cx| BoardReplica::for_test_store(fleet.clone(), flaky, path.clone(), cx))
@@ -848,6 +854,7 @@ mod tests {
             fail_loads: Cell::new(2),
             err: busy_err,
             mode: StoreMode::ReadWrite,
+            place_noop: false,
         });
         let replica = cx.update(|cx| {
             cx.new(|cx| BoardReplica::for_test_store(fleet.clone(), flaky, path.clone(), cx))
@@ -918,5 +925,46 @@ mod tests {
                 .count();
             assert_eq!(n, 1);
         });
+    }
+
+    // C1: a fleet card whose key can never be placed (place_noop simulates a tombstoned/
+    // unplaceable session — FleetStore never drops it) must be SUPPRESSED after one attempt,
+    // else re-diff-on-reply re-enqueues it forever and run_until_parked never settles. This
+    // test PASSING (settling + suppressed) is the load-bearing proof: without note_place_result
+    // the pump loops and this hangs.
+    #[gpui::test]
+    async fn unplaceable_fleet_key_settles_no_loop(cx: &mut gpui::TestAppContext) {
+        let fleet = cx.update(|cx| test_fleet(cx));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.db");
+        let inner = SqliteBoardStore::open(&path).unwrap();
+        let flaky: Box<dyn BoardStore + Send> = Box::new(FlakyStore {
+            inner,
+            fail_loads: Cell::new(0),
+            err: || PersistError::ReadOnly,
+            mode: StoreMode::ReadWrite,
+            place_noop: true, // reconcile's place "succeeds" but never actually places the key
+        });
+        let replica = cx.update(|cx| {
+            cx.new(|cx| BoardReplica::for_test_store(fleet.clone(), flaky, path.clone(), cx))
+        });
+        cx.run_until_parked(); // initial Load → Writable
+        fleet.update(cx, |f, cx| {
+            f.spawn_fake_session(SessionId::new("s_dead"), cx);
+        });
+        cx.run_until_parked(); // reconcile → place(no-op) → re-diff → suppress → SETTLE
+
+        replica.read_with(cx, |r, _| {
+            assert!(
+                !r.in_flight && r.pending.is_empty(),
+                "reconcile settled — no infinite re-diff loop"
+            );
+            assert!(
+                r.suppressed
+                    .contains(&("conn_test".to_string(), "s_dead".to_string())),
+                "the unplaceable key was suppressed after one attempt"
+            );
+        });
+        drop(dir);
     }
 }
