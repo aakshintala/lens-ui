@@ -1660,6 +1660,7 @@ impl TerminalTab {
 
     fn on_detach(&mut self, detail: DetachedDetail, cx: &mut Context<Self>) {
         self.reconnect_epoch = self.reconnect_epoch.wrapping_add(1);
+        self.adopt_in_flight = false;
         let reattach_available = matches!(detail, DetachedDetail::ClientDetached);
         self.clear_input_composition_state();
         self.teardown_runtime_full(cx);
@@ -1677,6 +1678,18 @@ impl TerminalTab {
             cx.background_executor()
                 .spawn(async move {
                     attach.close();
+                })
+                .await;
+        })
+        .detach();
+    }
+
+    fn close_parts_off_foreground(&self, parts: AttachedParts, cx: &mut Context<Self>) {
+        let runtime = parts.runtime;
+        cx.spawn(async move |_w, cx| {
+            cx.background_executor()
+                .spawn(async move {
+                    runtime.teardown_blocking();
                 })
                 .await;
         })
@@ -1728,15 +1741,100 @@ impl TerminalTab {
         cx.notify();
     }
 
+    /// Bounded wait for the exact-key successor. Unbounded waiting would hang the
+    /// tab forever when the new agent never relaunches our key (the delete fires
+    /// regardless of whether a successor ever appears — memory
+    /// `terminal-resource-event-granularity`).
+    #[cfg(test)]
+    const REPLACEMENT_WAIT: Duration = Duration::ZERO;
+    #[cfg(not(test))]
+    const REPLACEMENT_WAIT: Duration = Duration::from_secs(30);
+
     fn adopt_successor(
         &mut self,
-        _session_id: SessionId,
-        _terminal_id: TerminalId,
-        _cx: &mut Context<Self>,
+        session_id: SessionId,
+        terminal_id: TerminalId,
+        cx: &mut Context<Self>,
     ) {
+        if self.adopt_in_flight {
+            return;
+        }
+        self.adopt_in_flight = true;
+        // Cancel the replacement timeout; a successor is in hand.
+        self.reconnect_epoch = self.reconnect_epoch.wrapping_add(1);
+        let epoch = self.reconnect_epoch;
+        let client = Arc::clone(&self.client);
+        let options = self.options.clone();
+        let target = TerminalTarget::Existing {
+            session_id,
+            terminal_id,
+        };
+        cx.spawn(async move |weak, cx| {
+            let outcome = cx
+                .background_executor()
+                .spawn(async move { discover_and_attach(client, target, options) })
+                .await;
+            let _ = weak.update(cx, |tab, cx| {
+                if tab.reconnect_epoch != epoch {
+                    tab.adopt_in_flight = false;
+                    if let Ok(parts) = outcome {
+                        tab.close_parts_off_foreground(parts, cx);
+                    }
+                    return;
+                }
+                match outcome {
+                    Ok(parts) => tab.on_attached(parts, cx),
+                    Err(detail) => tab.on_detach(detail, cx),
+                }
+            });
+        })
+        .detach();
     }
 
-    fn arm_replacement_timeout(&mut self, _cx: &mut Context<Self>) {}
+    fn arm_replacement_timeout(&mut self, cx: &mut Context<Self>) {
+        let epoch = self.reconnect_epoch;
+        cx.spawn(async move |weak, cx| {
+            cx.background_executor()
+                .spawn(async move {
+                    std::thread::sleep(Self::REPLACEMENT_WAIT);
+                })
+                .await;
+            let _ = weak.update(cx, |tab, cx| {
+                if tab.reconnect_epoch == epoch && tab.lifecycle == Lifecycle::ReplacementWaiting {
+                    tab.on_detach(DetachedDetail::ReplacementTimedOut, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    #[cfg(test)]
+    fn fire_replacement_timeout_now(&mut self, cx: &mut Context<Self>) {
+        let epoch = self.reconnect_epoch;
+        if self.reconnect_epoch == epoch && self.lifecycle == Lifecycle::ReplacementWaiting {
+            self.on_detach(DetachedDetail::ReplacementTimedOut, cx);
+        }
+    }
+
+    #[cfg(test)]
+    fn apply_adopt_outcome_for_test(
+        &mut self,
+        epoch: u64,
+        outcome: Result<AttachedParts, DetachedDetail>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.reconnect_epoch != epoch {
+            self.adopt_in_flight = false;
+            if let Ok(parts) = outcome {
+                self.close_parts_off_foreground(parts, cx);
+            }
+            return;
+        }
+        match outcome {
+            Ok(parts) => self.on_attached(parts, cx),
+            Err(detail) => self.on_detach(detail, cx),
+        }
+    }
 
     fn sample_latest_frame_from_engine(&mut self) {
         if let Some(rt) = &self.runtime
@@ -2535,6 +2633,136 @@ mod tests {
             );
         });
         let _ = engine;
+    }
+
+    fn attached_parts_for_test(
+        session_id: &str,
+        terminal_id: &str,
+        terminal_name: &str,
+        session_key: &str,
+    ) -> AttachedParts {
+        use lens_client::TerminalMetadata;
+
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()).expect("spawn engine for test"));
+        let (egress_tx, egress_rx) =
+            crossbeam_channel::bounded(crate::engine::worker::EGRESS_CHANNEL_CAP);
+        engine
+            .attach_egress(egress_tx)
+            .expect("attach egress for test");
+        let (wake_tx, wake_rx) = async_channel::bounded(1);
+        let (policy_tx, policy_rx) = async_channel::bounded(32);
+        let client = Client::stub_for_test();
+        let sid = SessionId::new(session_id);
+        let tid = TerminalId::new(terminal_id);
+        let attach_handle = attach(&client, &sid, &tid, AttachOptions { read_only: false })
+            .expect("attach handle for test");
+        let bridge = spawn_bridge(
+            attach_handle.inbound.clone(),
+            attach_handle.outbound.clone(),
+            Arc::clone(&engine),
+            policy_tx.clone(),
+            egress_rx,
+        );
+        let resource = TerminalResource {
+            id: tid,
+            session_id: sid,
+            name: Some(terminal_name.into()),
+            object: None,
+            kind: Some("terminal".into()),
+            environment: None,
+            metadata: TerminalMetadata {
+                terminal_name: Some(terminal_name.into()),
+                session_key: Some(session_key.into()),
+                running: Some(true),
+                terminal_transport: None,
+            },
+        };
+        AttachedParts {
+            resource,
+            runtime: runtime::TerminalRuntime {
+                bridge: Some(bridge),
+                attach: Some(attach_handle),
+                engine: Some(engine),
+            },
+            wake_tx,
+            wake_rx,
+            policy_rx,
+            policy_tx,
+        }
+    }
+
+    #[gpui::test]
+    async fn replacement_waiting_times_out_to_detached(cx: &mut gpui::TestAppContext) {
+        let (_e, tab) = live_tab_for_test(cx, true, "t1", "main", "k");
+        tab.update(cx, |tab, cx| {
+            tab.on_host_event(
+                TerminalHostEvent::ResourceDeleted {
+                    terminal_id: TerminalId::new("t1"),
+                },
+                cx,
+            );
+            assert_eq!(tab.lifecycle, Lifecycle::ReplacementWaiting);
+        });
+        tab.update(cx, |tab, cx| {
+            tab.fire_replacement_timeout_now(cx);
+        });
+        tab.update(cx, |tab, _| {
+            assert_eq!(tab.lifecycle, Lifecycle::Detached);
+            assert_eq!(
+                tab.presentation.detached_detail,
+                Some(DetachedDetail::ReplacementTimedOut)
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn stale_epoch_adopt_outcome_does_not_go_live(cx: &mut gpui::TestAppContext) {
+        let (_e, tab) = live_tab_for_test(cx, true, "t1", "main", "k");
+        let stale_epoch = tab.update(cx, |tab, cx| {
+            tab.on_host_event(
+                TerminalHostEvent::ResourceDeleted {
+                    terminal_id: TerminalId::new("t1"),
+                },
+                cx,
+            );
+            assert_eq!(tab.lifecycle, Lifecycle::ReplacementWaiting);
+            tab.reconnect_epoch
+        });
+        let parts = attached_parts_for_test("test_sess", "t2", "main", "k");
+        tab.update(cx, |tab, cx| {
+            tab.adopt_in_flight = true;
+            tab.reconnect_epoch = stale_epoch.wrapping_add(1);
+            tab.apply_adopt_outcome_for_test(stale_epoch, Ok(parts), cx);
+            assert_ne!(tab.lifecycle, Lifecycle::Live);
+            assert_eq!(tab.lifecycle, Lifecycle::ReplacementWaiting);
+            assert!(!tab.adopt_in_flight);
+            assert!(tab.runtime.is_none());
+        });
+    }
+
+    #[gpui::test]
+    async fn adopt_outcome_applies_to_live(cx: &mut gpui::TestAppContext) {
+        let (_e, tab) = live_tab_for_test(cx, true, "t1", "main", "k");
+        let epoch = tab.update(cx, |tab, cx| {
+            tab.on_host_event(
+                TerminalHostEvent::ResourceDeleted {
+                    terminal_id: TerminalId::new("t1"),
+                },
+                cx,
+            );
+            assert_eq!(tab.lifecycle, Lifecycle::ReplacementWaiting);
+            tab.adopt_in_flight = true;
+            tab.reconnect_epoch
+        });
+        let parts = attached_parts_for_test("test_sess", "t2", "main", "k");
+        tab.update(cx, |tab, cx| {
+            tab.apply_adopt_outcome_for_test(epoch, Ok(parts), cx);
+            assert_eq!(tab.lifecycle, Lifecycle::Live);
+            assert!(!tab.adopt_in_flight);
+            assert!(!tab.presentation.output_gap);
+            assert!(tab.runtime.is_some());
+            assert_eq!(tab.current_tid.as_ref().map(|t| t.as_str()), Some("t2"));
+        });
     }
 
     #[gpui::test]
