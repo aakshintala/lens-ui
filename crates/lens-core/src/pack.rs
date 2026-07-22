@@ -9,7 +9,7 @@
 pub const CARD_W: f32 = 280.0;
 pub const CARD_H: f32 = 160.0;
 pub const HEADER: f32 = 24.0;
-pub const GAP: f32 = 16.0;
+pub const GAP: f32 = 24.0;
 pub const INSET: f32 = 5.0;
 
 pub const CELL_W: f32 = CARD_W + GAP; // 296
@@ -60,6 +60,25 @@ impl Item {
     }
 }
 
+/// Reshape a group whose natural width (`fc`) exceeds the container's `cols`: clamp columns
+/// to `cols` and re-derive rows from member count (`fr' = ⌈members / fc'⌉`) so it packs and
+/// renders as a 1×N (or k×N) stack. Loose cards, collapsed groups (fc already 1), and groups
+/// that already fit are returned unchanged.
+fn reshape_to_cols(it: &Item, cols: usize) -> Item {
+    match it.kind {
+        Kind::Group { members } if it.fc > cols => {
+            let fc = it.fc.min(cols).max(1);
+            let fr = members.div_ceil(fc).max(1);
+            Item {
+                kind: it.kind,
+                fc,
+                fr,
+            }
+        }
+        _ => *it,
+    }
+}
+
 /// `foot(n)`: n≤3 → n×1; n≥4 → ⌈√n⌉ cols × ⌈n/c⌉ rows (§2.2).
 pub fn foot(n: usize) -> (usize, usize) {
     if n <= 3 {
@@ -99,6 +118,11 @@ pub fn pack(items: &[Item], cols: usize) -> Packing {
     };
 
     for (item_index, it) in items.iter().enumerate() {
+        // Reshape a group wider than the container: clamp columns to `cols` and re-derive
+        // rows from member count so a 2×2 becomes a 1×N stack instead of rendering at full
+        // width and spilling/clipping past the container (Issue 2 — narrow rail + shrunk
+        // window). The reshaped footprint is stored so the renderer places members into it.
+        let it = reshape_to_cols(it, cols);
         let (fc, fr) = (it.fc.max(1).min(cols), it.fr.max(1));
         let mut placed = false;
         let mut r = 0usize;
@@ -108,7 +132,7 @@ pub fn pack(items: &[Item], cols: usize) -> Packing {
                 if free(&occ, r, c, fc, fr) {
                     mark(&mut occ, r, c, fc, fr);
                     out.push(Placed {
-                        item: *it,
+                        item: it,
                         item_index,
                         gx: c,
                         gy: r,
@@ -233,6 +257,36 @@ mod tests {
         assert_eq!(p.tiles.len(), 1);
         assert_eq!((p.tiles[0].gx, p.tiles[0].gy), (0, 0));
         assert_eq!(p.content_height, CELL_H - GAP);
+    }
+
+    #[test]
+    fn group_reflows_to_narrow_container() {
+        // A 4-member group is 2×2 at full width, but in a 1-col container (focused rail
+        // or a shrunk window) it must reshape to 1×4 — NOT render 2-wide and spill/clip
+        // past the container (Issue 2). The stored item carries the reshaped footprint so
+        // `absolute_group` places members by `i % fc` into the narrow stack.
+        let p = pack(&[Item::group(4)], 1);
+        let t = p.tiles[0];
+        assert_eq!((t.item.fc, t.item.fr), (1, 4));
+        assert_eq!((t.gx, t.gy), (0, 0));
+        assert_eq!(p.content_height, 4.0 * CELL_H - GAP);
+    }
+
+    #[test]
+    fn group_reflows_to_two_cols() {
+        // A 9-member group is 3×3 at full width; in a 2-col container it reshapes to
+        // 2×5 (⌈9/2⌉ = 5 rows), the last row half-full.
+        let p = pack(&[Item::group(9)], 2);
+        let t = p.tiles[0];
+        assert_eq!((t.item.fc, t.item.fr), (2, 5));
+    }
+
+    #[test]
+    fn group_keeps_footprint_when_it_fits() {
+        // Wide enough: the natural 2×2 footprint is preserved (no spurious reshape).
+        let p = pack(&[Item::group(4)], 4);
+        let t = p.tiles[0];
+        assert_eq!((t.item.fc, t.item.fr), (2, 2));
     }
 
     #[test]

@@ -365,13 +365,18 @@ impl BoardView {
         });
     }
 
-    fn render_nav_rail(&self) -> impl IntoElement {
+    fn render_nav_rail(&self, cx: &App) -> impl IntoElement {
+        // Placeholder rail (real nav is unbuilt): a clean themed sidebar strip rather than
+        // bare "nav" text bleeding at the window edge.
+        let t = cx.lens_theme();
         div()
             .id("nav-rail")
             .w(px(NAV_RAIL_W))
             .h_full()
             .flex_shrink_0()
-            .child("nav")
+            .bg(t.base.sidebar)
+            .border_r_1()
+            .border_color(t.base.sidebar_border)
     }
 
     /// The masonry scroll container (spec §4). Builds the ephemeral tree, packs
@@ -624,7 +629,7 @@ impl BoardView {
                 .rounded(px(12.0))
                 .border_1()
                 .border_color(accent)
-                .bg(accent.opacity(0.07)) // SSOT color-mix ~7% body wash
+                .bg(accent.opacity(0.12)) // SSOT color-mix ~12% body wash (cards are opaque; no bleed)
                 .into_any_element(),
         );
 
@@ -787,7 +792,7 @@ impl BoardView {
             .rounded(px(12.0))
             .border_1()
             .border_color(accent)
-            .bg(accent.opacity(0.07));
+            .bg(accent.opacity(0.12)); // SSOT color-mix ~12% body wash (matches expanded box)
         let header = div()
             .absolute()
             .left(px(x))
@@ -972,7 +977,7 @@ impl Render for BoardView {
                     .flex()
                     .flex_row()
                     .size_full()
-                    .child(self.render_nav_rail())
+                    .child(self.render_nav_rail(cx))
                     .child(div().flex_grow().h_full().child(surface));
                 (el.into_any_element(), visible)
             }
@@ -994,7 +999,7 @@ impl Render for BoardView {
                     .flex()
                     .flex_row()
                     .size_full()
-                    .child(self.render_nav_rail())
+                    .child(self.render_nav_rail(cx))
                     .child(div().w(px(RAIL_W)).flex_shrink_0().h_full().child(rail))
                     .child(chat_slot)
                     .child(
@@ -1016,11 +1021,24 @@ impl Render for BoardView {
         self.apply_visibility_gate(visible.into_iter().collect(), cx);
         self.arm_collapsed_rollup_wake(cx); // refresh collapsed rollups on Ready/Scheduled expiry
         let banner = self.banner_text(cx);
-        let mut root = div().id("board-view").size_full().relative().child(body);
+        let bg = cx.lens_theme().base.background;
+        // In-app themed titlebar (drag region + traffic-light clearance handled by the
+        // component) over a dark-filled window, replacing the white system titlebar strip.
+        // min_h(0): without it this flex item's default `min-height:auto` = its content
+        // height, so the masonry's full height leaks out and the inner scroll container can
+        // never scroll (offset clamps to 0). min_h(0) lets flex_grow bound it to the window.
+        let mut shell = div().flex_grow().min_h(px(0.0)).relative().child(body);
         if let Some(text) = banner {
-            root = root.child(self.render_replica_banner(text, cx));
+            shell = shell.child(self.render_replica_banner(text, cx));
         }
-        root
+        div()
+            .id("board-view")
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(bg)
+            .child(gpui_component::TitleBar::new())
+            .child(shell)
     }
 }
 
@@ -1102,6 +1120,10 @@ mod tests {
 
     #[gpui::test]
     async fn banner_shows_for_load_failed(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::install_at_startup(cx); // render root now reads lens_theme (bg + nav rail)
+        });
         let fleet = cx.update(test_fleet);
         let replica = cx.update(|cx| {
             cx.new(|cx| BoardReplica::for_test_file(fleet.clone(), "/dev/null/nope.db".into(), cx))
