@@ -972,14 +972,44 @@ CREATE TABLE IF NOT EXISTS items (
     }
 
     #[test]
-    fn reader_tolerates_concurrent_writer_wal() {
+    fn reader_reads_committed_snapshot_while_writer_txn_in_flight() {
+        use crate::persist::map::{item_kind_token, json_string};
+
         let d = tempdir().unwrap();
         let path = d.path().join("conv_1.db");
         let s = store(d.path());
-        s.upsert_item(0, &item("a", None, "a"), false).unwrap();
+        s.upsert_item(0, &item("item_a", None, "a"), false).unwrap();
+
+        let (writer_conn, _) = open_db(&path, TRANSCRIPT_DDL, SCHEMA_VERSION).unwrap();
+        writer_conn.execute("BEGIN IMMEDIATE", []).unwrap();
+        let uncommitted = item("item_b", None, "b");
+        writer_conn
+            .execute(
+                "INSERT INTO items (item_id, live_seq, ordinal, kind, payload, agent, depth, turn, created_at, provisional, call_id, response_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, NULL, NULL)",
+                rusqlite::params![
+                    uncommitted.id.as_str(),
+                    1i64,
+                    1i64,
+                    item_kind_token(&uncommitted.kind),
+                    json_string(&uncommitted.kind).unwrap(),
+                    uncommitted.ctx.agent,
+                    uncommitted.ctx.depth as i64,
+                    0i64,
+                    uncommitted.created_at,
+                ],
+            )
+            .unwrap();
+
+        // busy_timeout retry of SQLITE_BUSY is guarded in code (open_db_read_only sets a
+        // nonzero busy_timeout) and not force-tested here because WAL readers take a snapshot
+        // rather than contending.
         let r = SqliteTranscriptReader::open_read_only(&path, Duration::from_millis(500)).unwrap();
-        // writer holds a txn; reader (WAL snapshot) still reads committed rows.
         let read = r.read_range(ReadRange::All).unwrap();
         assert_eq!(read.rows.len(), 1);
+        assert_eq!(read.rows[0].0, 0);
+        assert_eq!(read.rows[0].1.id.as_str(), "item_a");
+
+        writer_conn.execute("COMMIT", []).unwrap();
     }
 }
