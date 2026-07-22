@@ -29,3 +29,6 @@ demo = []
 
 [dev-dependencies]
 gpui = { version = "0.2.2", features = ["test-support"] }
+# test-only: the FlakyStore double constructs a SQLITE_BUSY PersistError to exercise
+# the replica's transient-retry path. Production lens-ui does not depend on rusqlite.
+rusqlite = { version = "0.32", features = ["bundled"] }

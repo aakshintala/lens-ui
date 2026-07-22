@@ -3410,6 +3410,7 @@ dependencies = [
  "gpui-component",
  "lens-client",
  "lens-core",
+ "rusqlite",
  "serde",
  "serde_json",
  "smallvec",

@@ -161,6 +161,26 @@ impl BoardReplica {
         Self::build(None, path, ConnectionId::new("conn_test"), None, fleet, cx)
     }
 
+    /// Test ctor with a caller-supplied store (e.g. a fault-injecting double) + the `path`
+    /// its recovery reopen will use. On a persistent failure the double is dropped and
+    /// `path` is reopened as a plain store (that's how the recovery test heals).
+    #[cfg(test)]
+    pub(crate) fn for_test_store(
+        fleet: Entity<FleetStore>,
+        store: Box<dyn BoardStore + Send>,
+        path: std::path::PathBuf,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::build(
+            Some(store),
+            path,
+            ConnectionId::new("conn_test"),
+            None,
+            fleet,
+            cx,
+        )
+    }
+
     pub(crate) fn run_op(&mut self, op: Op, cx: &mut Context<Self>) {
         self.pending.push_back(op);
         self.pump(cx);
@@ -307,7 +327,7 @@ impl BoardReplica {
         .detach();
     }
 
-    pub fn write(&mut self, op: Op, cx: &mut Context<Self>) -> WriteDisposition {
+    pub(crate) fn write(&mut self, op: Op, cx: &mut Context<Self>) -> WriteDisposition {
         if !self.is_writable() {
             self.banner_dismissed = false; // re-surface the banner on a rejected gesture
             cx.notify();
@@ -337,7 +357,12 @@ fn run_op_blocking(slot: &mut StoreSlot, op: Op) -> OpOutcome {
     match run_op_inner(slot, &op) {
         Ok(outcome) => outcome,
         Err(err) => {
-            slot.store = None; // reopen fresh on the next Load (recovery)
+            // Drop the handle only on a PERSISTENT error, so recovery reopens fresh. A
+            // transient BUSY/LOCKED keeps the (working) connection — the retry runs against
+            // it rather than churning a reopen.
+            if !err.is_transient() {
+                slot.store = None;
+            }
             OpOutcome::Failed { op, err }
         }
     }
@@ -393,10 +418,12 @@ fn default_root_target() -> PlacementTarget {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::sync::Arc;
 
     use lens_core::domain::board::{BoardItemKind, DEFAULT_BOARD_ID};
-    use lens_core::persist::StoreMode;
+    use lens_core::domain::ids::BoardItemId;
+    use lens_core::persist::{Loaded, StoreMode};
 
     use crate::clock::{ManualUiClock, UiClock};
 
@@ -568,5 +595,174 @@ mod tests {
         });
         assert_eq!(d, WriteDisposition::Rejected(ReplicaState::LoadFailed));
         replica.read_with(cx, |r, _| assert!(r.pending.is_empty()));
+    }
+
+    // Fault-injecting BoardStore: fails the first `fail_loads` load_layout calls with
+    // `err`, then delegates to a real store. `Cell` under &self is safe — the replica's
+    // store mutex serializes access. Send (Cell<u32> + SqliteBoardStore + fn ptr all Send);
+    // the mutex supplies Sync.
+    struct FlakyStore {
+        inner: SqliteBoardStore,
+        fail_loads: Cell<u32>,
+        err: fn() -> PersistError,
+    }
+
+    fn busy_err() -> PersistError {
+        PersistError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(5), // SQLITE_BUSY
+            None,
+        ))
+    }
+
+    impl BoardStore for FlakyStore {
+        fn mode(&self) -> StoreMode {
+            self.inner.mode()
+        }
+        fn load_layout(&self) -> lens_core::persist::Result<Loaded<BoardLayout>> {
+            let n = self.fail_loads.get();
+            if n > 0 {
+                self.fail_loads.set(n - 1);
+                return Err((self.err)());
+            }
+            self.inner.load_layout()
+        }
+        fn place_session(
+            &self,
+            conn: &ConnectionId,
+            session: &SessionId,
+            target: &PlacementTarget,
+        ) -> lens_core::persist::Result<()> {
+            self.inner.place_session(conn, session, target)
+        }
+        fn remove_session(
+            &self,
+            conn: &ConnectionId,
+            session: &SessionId,
+        ) -> lens_core::persist::Result<()> {
+            self.inner.remove_session(conn, session)
+        }
+        fn place_sessions(
+            &self,
+            placements: &[(ConnectionId, SessionId)],
+            target: &PlacementTarget,
+        ) -> lens_core::persist::Result<()> {
+            self.inner.place_sessions(placements, target)
+        }
+        fn create_group(
+            &self,
+            board_id: &BoardId,
+            parent_item_id: Option<BoardItemId>,
+            ordinal: i32,
+            name: &str,
+        ) -> lens_core::persist::Result<BoardItemId> {
+            self.inner
+                .create_group(board_id, parent_item_id, ordinal, name)
+        }
+        fn move_item(
+            &self,
+            item_id: &BoardItemId,
+            new_board_id: &BoardId,
+            new_parent: Option<BoardItemId>,
+            new_ordinal: i32,
+        ) -> lens_core::persist::Result<()> {
+            self.inner
+                .move_item(item_id, new_board_id, new_parent, new_ordinal)
+        }
+        fn ungroup(&self, group_id: &BoardItemId) -> lens_core::persist::Result<()> {
+            self.inner.ungroup(group_id)
+        }
+        fn rename(&self, item_id: &BoardItemId, name: &str) -> lens_core::persist::Result<()> {
+            self.inner.rename(item_id, name)
+        }
+        fn archive(&self, item_id: &BoardItemId) -> lens_core::persist::Result<()> {
+            self.inner.archive(item_id)
+        }
+        fn set_collapsed(
+            &self,
+            group_id: &BoardItemId,
+            collapsed: bool,
+        ) -> lens_core::persist::Result<()> {
+            self.inner.set_collapsed(group_id, collapsed)
+        }
+        fn set_color(&self, group_id: &BoardItemId, token: &str) -> lens_core::persist::Result<()> {
+            self.inner.set_color(group_id, token)
+        }
+    }
+
+    // A PERSISTENT initial-load failure → LoadFailed; the handle is dropped, so
+    // retry_recovery reopens the good `path` as a plain store → Writable. Load-bearing:
+    // if Load were gated in LoadFailed, or recovery didn't reopen, it stays LoadFailed.
+    #[gpui::test]
+    async fn recovery_load_restores_writable(cx: &mut gpui::TestAppContext) {
+        let fleet = cx.update(|cx| test_fleet(cx));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.db");
+        let inner = SqliteBoardStore::open(&path).unwrap();
+        let flaky: Box<dyn BoardStore + Send> = Box::new(FlakyStore {
+            inner,
+            fail_loads: Cell::new(1),
+            err: || PersistError::ReadOnly, // non-transient
+        });
+        let replica = cx.update(|cx| {
+            cx.new(|cx| BoardReplica::for_test_store(fleet.clone(), flaky, path.clone(), cx))
+        });
+        cx.run_until_parked();
+        replica.read_with(cx, |r, _| assert_eq!(r.state(), ReplicaState::LoadFailed));
+
+        replica.update(cx, |r, cx| r.retry_recovery(cx));
+        cx.run_until_parked();
+        replica.read_with(cx, |r, _| assert_eq!(r.state(), ReplicaState::Writable));
+        drop(dir);
+    }
+
+    // A TRANSIENT (BUSY) initial-load failure retries with backoff (keeping the handle),
+    // then succeeds. Load-bearing: op_retries climbs per attempt and resets on success,
+    // and the eventually-loaded layout carries the seeded card.
+    #[gpui::test]
+    async fn transient_busy_retries_then_loads(cx: &mut gpui::TestAppContext) {
+        let fleet = cx.update(|cx| test_fleet(cx));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.db");
+        let inner = SqliteBoardStore::open(&path).unwrap();
+        inner
+            .place_session(
+                &ConnectionId::new("conn_test"),
+                &SessionId::new("x"),
+                &PlacementTarget {
+                    board_id: None,
+                    parent_item_id: None,
+                    ordinal: None,
+                },
+            )
+            .unwrap();
+        let flaky: Box<dyn BoardStore + Send> = Box::new(FlakyStore {
+            inner,
+            fail_loads: Cell::new(2),
+            err: busy_err,
+        });
+        let replica = cx.update(|cx| {
+            cx.new(|cx| BoardReplica::for_test_store(fleet.clone(), flaky, path.clone(), cx))
+        });
+        cx.run_until_parked(); // Load #1 → BUSY → backoff 100ms
+        replica.read_with(cx, |r, _| {
+            assert_eq!(r.state(), ReplicaState::Loading);
+            assert_eq!(r.op_retries, 1);
+        });
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(100)); // 50<<1
+        cx.run_until_parked(); // Load #2 → BUSY → backoff 200ms
+        replica.read_with(cx, |r, _| assert_eq!(r.op_retries, 2));
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(200)); // 50<<2
+        cx.run_until_parked(); // Load #3 → success
+        replica.read_with(cx, |r, _| {
+            assert_eq!(r.state(), ReplicaState::Writable);
+            assert_eq!(r.op_retries, 0);
+            assert!(r.layout().items.iter().any(|i| matches!(
+                &i.kind,
+                BoardItemKind::Card { session, .. } if session.as_str() == "x"
+            )));
+        });
+        drop(dir);
     }
 }
