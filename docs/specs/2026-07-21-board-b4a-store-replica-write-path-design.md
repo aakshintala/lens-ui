@@ -1,21 +1,20 @@
 # Board B-4a — store→replica write-path foundation — design
 
-**Written:** 2026-07-21 · **Status:** design in progress (grilled; then gpt-5.6
-codex spec-review folded — **§3 threading reopened, see banner below**) ·
+**Written:** 2026-07-21 · **Status:** LOCKED — grilled, gpt-5.6 codex spec-review folded,
+§3 re-grilled and settled. Ready for writing-plans. ·
 **Depends on:** B-1 (`SqliteBoardStore` + `BoardStore` trait, `8100cc8`),
 B-2 (packer + container, `14b474c`), B-3 (group chrome, `ac9d5ae`) ·
 **Feeds:** B-4b (collapse), B-4c (drag/move), B-4d (grouping menus), B-5
 (multi-connection scoping), B-6 (archive-as-board)
 
-> **⚠️ NEEDS RE-REVIEW — the write model changed materially.** The codex spec
-> review found the original "inline synchronous write-then-reload" **violates a
-> MANDATORY repo rule** (AGENTS.md:19 / `.agents/rust-ui.md`: *all disk I/O
-> off-thread via `cx.background_spawn`; the UI thread only `cx.update`/`cx.notify`*).
-> §3 is rewritten to **off-thread store access (`Arc<Mutex>` + `cx.background_spawn`)
-> + a main-thread in-memory replica** (a light form of the [[state-model-single-writer-decision]]
-> replica pattern — no command-channel actor, since the board has no write *stream*).
-> This reverses the grill's Q4 ("inline is fine"); §3 was then re-grilled and the light
-> worker shape locked (renders read the in-memory replica, never SQLite).
+> **§3 write model (settled after the codex review + a §3 re-grill).** The original
+> "inline synchronous write-then-reload" **violated a MANDATORY repo rule** (AGENTS.md:19 /
+> `.agents/rust-ui.md`: *all disk I/O off-thread via `cx.background_spawn`; the UI thread only
+> `cx.update`/`cx.notify`*). §3 is now **off-thread store access (`Arc<Mutex>` +
+> `cx.background_spawn`) behind a main-thread in-memory replica**, with a **serialized
+> single-in-flight `run_op`** (a light form of [[state-model-single-writer-decision]] — no
+> command-channel actor; the board has no write *stream*). Renders read the in-memory replica,
+> **never SQLite**. Single-in-flight is required for correctness *and* test determinism (§2).
 
 B-4 was decomposed into a **foundation slice (B-4a, this doc)** plus three
 interaction follow-ons (B-4b/c/d). B-4a replaces the ephemeral
@@ -59,13 +58,18 @@ touched **only** on the rare paths — initial load, a mutation, and reconcile-o
 So the off-thread machinery only ever handles infrequent, discrete ops; a full
 command-channel actor would optimize a throughput path that doesn't exist here.
 
-**Store access (off-thread, light).** `BoardReplica` holds an
-`Arc<Mutex<Box<dyn BoardStore>>>`. Each I/O op runs inside a `cx.background_spawn`
-closure that locks the store, runs the op, computes the resulting `BoardLayout`, and
-posts it back to the main thread via `cx.update` (→ set `layout` + `notify`). No UI-thread
-SQLite; the mutex serializes the (infrequent) ops, which they'd serialize on anyway.
-Recovery reopens the store behind the mutex (`mode` is immutable, so degraded/failed
-recovery needs a fresh `open`).
+**Store access (off-thread, serialized single-in-flight).** `BoardReplica` holds an
+`Arc<Mutex<Box<dyn BoardStore>>>` and runs **one op at a time** through a general
+`run_op` path (below). Each op runs inside a `cx.background_spawn` closure that locks the
+store, runs the op, computes the resulting `BoardLayout`, and posts it back via `cx.update`
+(→ set `layout` + `notify`). **Single-in-flight is load-bearing, not incidental:** two
+concurrent `background_spawn` tasks complete in thread-pool order, so their replies could
+apply out of commit order — leaving the in-memory `layout` regressed at quiescence (it does
+*not* self-heal without another trigger) and making tests non-deterministic. With one op
+outstanding, replies land in enqueue order → correct at quiescence, deterministic tests, and
+the mutex is effectively uncontended (it only satisfies `Arc` sharing across the spawn
+boundary). This is **not** a persistent actor — the queue lives on the main-thread entity and
+each op is a transient spawn; nothing loops forever or pins the `Connection` to a thread.
 
 **`BoardReplica` (main-thread gpui entity, `crates/lens-ui/src/board/replica.rs`):**
 
@@ -76,21 +80,35 @@ BoardReplica {
     layout: BoardLayout,                    // in-memory; every render reads this, no I/O
     state: ReplicaState,                    // Loading | Writable | Degraded | LoadFailed | Stale (§5)
     fleet: Entity<FleetStore>,              // observed for session-lifecycle reconcile (§3.3)
+    in_flight: bool,                        // an op is spawned and not yet applied
+    pending: VecDeque<Op>,                  // serialized queue (load/place/…; writes in B-4b+)
 }
 ```
 
+`Op` is an internal enum the store runner dispatches on: `Load`,
+`PlaceSessions(Vec<(ConnectionId, SessionId)>)` in B-4a; `SetCollapsed`/`MoveItem`/
+`CreateGroup`/… added by B-4b/c/d (**the seam is `run_op`, so those add variants with no
+serialization rework**).
+
 Interface:
 - `BoardReplica::new(store, conn, fleet, cx) -> Entity<Self>` — takes the fleet
-  (review #3), starts in `Loading`, spawns the initial load, installs the `FleetStore`
-  observer, and **immediately reconciles a snapshot of current `fleet.cards` keys**
-  (cards may predate the subscription).
+  (review #3), starts in `Loading`, enqueues `Load` first, installs the `FleetStore`
+  observer, and enqueues a reconcile of the current `fleet.cards` snapshot (cards may
+  predate the subscription). `Load` is first in the queue, so the first reconcile runs
+  **after** the initial layout has landed.
 - `layout(&self) -> &BoardLayout` (the free, in-memory render read), `state(&self)`,
   `is_writable(&self)`.
-- `write(&self, op, cx)` — **iff** `is_writable()`, spawn the op on `background_spawn`;
-  when it returns the committed layout, apply it via `cx.update` + `cx.notify`. Async by
-  construction (no blocking, no return value). B-4b/c/d call this.
-- `reconcile(&self, cx)` — diff `fleet.cards` keys vs placed `(conn, session)` keys;
-  spawn one **batched** `PlaceSessions` for the missing set (iff writable).
+- `run_op(&mut self, op, cx)` (private seam) — the serialized runner: enqueue `op`, then
+  `pump` — if not `in_flight` and `pending` non-empty, pop one, set `in_flight`, spawn it;
+  on reply apply the committed layout (or transition state on `Err`, §5), clear `in_flight`,
+  `pump` again. Applies in enqueue order by construction.
+- `write(&mut self, op, cx)` — **iff** `is_writable()`, `run_op(op)`; else no-op + surface
+  the state (§5). B-4b/c/d call this with mutation ops. Explicit writes **always enqueue**
+  (a user's collapse/drag must never be dropped).
+- `reconcile(&mut self, cx)` — diff `fleet.cards` keys vs placed `(conn, session)` keys; if
+  any missing and writable, `run_op(PlaceSessions(missing))` — but **coalesced**: skip
+  enqueuing if a reconcile is already pending/in-flight (idempotent; a redundant one is
+  safe to drop, unlike a write).
 - `BoardReplica::in_memory_for_test(fleet, cx)` — `:memory:` store + fixed conn.
 
 The UI thread only does `cx.update`/`cx.notify`; all SQLite is inside `background_spawn`.
@@ -110,30 +128,34 @@ card *content* (status/cost) does **not** flow through `FleetStore` — each
 `FleetStore` notifies on membership/focus. So `BoardView`'s `FleetStore` observation is
 for *which* cards exist and focus, not their content.
 
-### 3.2 Write path — op → background_spawn → committed layout (async, off-thread)
+### 3.2 Write path — serialized `run_op` → background_spawn → committed layout
 
-Every mutation runs off-thread:
+Every op (load, place, and later collapse/move/group) runs off-thread through the single
+serialized `run_op` path (§2):
 
-1. `BoardReplica::write` checks `is_writable()`; if not, it no-ops and surfaces the state
-   (§5). No db access on the main thread.
-2. It spawns a `cx.background_spawn` closure that locks the store, runs the op in a
-   transaction and, on commit, computes the resulting `BoardLayout`, returning
-   `Ok(layout)` — or `Err` (commit failed / degraded).
+1. `write` checks `is_writable()`; if not, no-op + surface the state (§5). Then `run_op`
+   enqueues the op. No db access on the main thread.
+2. `pump` spawns **one** `cx.background_spawn` closure (only if nothing is in flight) that
+   locks the store, runs the op in a transaction and, on commit, computes the resulting
+   `BoardLayout`, returning `Ok(layout)` — or `Err` (commit failed / degraded).
 3. Back on the main thread, `cx.update` applies the committed layout (→ `layout` +
-   `notify`).
+   `notify`), clears `in_flight`, and `pump`s the next queued op.
 
-This **dissolves review finding #2** (commit-then-reload divergence): there is no separate
+Because ops apply in enqueue order (single-in-flight), the in-memory `layout` is always the
+latest committed state at quiescence — no out-of-order regress, deterministic in tests. This
+also **dissolves review finding #2** (commit-then-reload divergence): there is no separate
 reload that can fail after a commit — the op returns the layout it just committed
 atomically. On `Err`, the replica transitions to `Stale`/`Degraded` (§5) and does **not**
 blindly retry a non-idempotent op (`create_group`).
 
-**No inline cost model.** All SQLite is off-thread, so it never touches the frame budget.
-Per AGENTS.md ("**MANDATORY** Benchmark-or-it's-not-done on perf paths; 120fps/8.3ms
-target, 90fps/11.1ms regression line"), B-4a ships a **release-mode benchmark** of the
-op round-trip (load + a batched `PlaceSessions` of N sessions) and asserts the main thread
-stays within frame budget under a realistic and a stress fixture. (The earlier "inline is
-fine below ~1000 items" reasoning is retired — it was both non-compliant and
-un-benchmarked.)
+**Perf measurement is three distinct things (§7).** All SQLite is off-thread, so it never
+touches the frame budget — the op round-trip is a *latency* metric, **not** a frame-budget
+one (conflating them was wrong). The frame-budget path (AGENTS.md "**MANDATORY** … 120fps/8.3ms
+target, 90fps/11.1ms regression") is the **per-frame render in lens-ui** — `pack_and_render`'s
+`board_tree` walk + per-tile element build + B-3 rollup folds + cull + gpui layout/paint — and
+its mandatory check is an **E2E on-device measurement** (the pure `lens-core` `pack()` bench is
+only a slice, not the proof). (The earlier "inline is fine below ~1000 items" reasoning is
+retired — non-compliant and un-benchmarked.)
 
 ### 3.3 Session-lifecycle reconcile (batched, additive, conn-pinned)
 
@@ -184,8 +206,10 @@ rebuilding onto a phantom board), so B-4a is non-fatal, **not silent**, and
 
 **`ReplicaState` (explicit — review #4):** `Loading` (initial), `Writable`, `Degraded`
 (read-only, data present), `LoadFailed` (read-only, empty), `Stale` (a write committed but
-the reply/next-op failed — read-only until reload). `is_writable()` is `Writable` only.
-**Both `write` and `reconcile` gate on it** (review #4 — reconcile mutates too).
+the reply/next-op failed — read-only until reopen). `is_writable()` is `Writable` only.
+**`run_op` gates only *write* ops** (`PlaceSessions`/`SetCollapsed`/…) on `is_writable()`
+(review #4 — reconcile mutates too, so it gates alongside user writes). A **`Load`/recovery
+op is always allowed**, in any state — recovery is a read/reopen, not a write (see Recovery).
 
 **Cases (corrected against `open_db`/`open`, review #4/#5/#7):**
 - **`ReadOnlyDegraded`** — the version cell is a *future* version; reads allowed, writes
@@ -201,12 +225,19 @@ the reply/next-op failed — read-only until reload). `is_writable()` is `Writab
   deliberately skipped, kept observable). → `Degraded` (write-gated) + a banner noting some
   items couldn't be read (review #5). Unpack `Loaded.rows` (not `.value`).
 
-**Recovery** — because `StoreMode` is immutable (review #4), recovery = a spawned op
-**reopens** the store behind the mutex on a retry, not a mere reload; success transitions
-back to `Writable` and retires the banner.
+**Recovery (automatic + manual).** Because `StoreMode` is immutable (review #4), recovery
+is a **reopen-`Load`** (a fresh `open` behind the mutex), not a mere reload — and because
+`Load` is always allowed (above), a non-`Writable` replica is never permanently stranded.
+While non-`Writable`, a **`FleetStore` notify** *or* the banner's **"Retry"** enqueues a
+recovery `Load`: a clean open+load → `Writable` (+ retire banner); still-failing → stays
+`Degraded`/`LoadFailed`/`Stale`. It's **bounded** — `run_op` is single-in-flight +
+coalesced, so at most one recovery attempt runs at a time even under frequent notifies. (A
+min-interval throttle is a trivial add if a persistently-degraded store + chatty fleet ever
+makes reopen attempts noisy — noted, not built.)
 
 **Mechanics:** the banner is a small **non-blocking, dismissible** notice over the board
-area (never a modal; the rest of Lens stays usable), driven by `ReplicaState`.
+area (never a modal; the rest of Lens stays usable), driven by `ReplicaState`, with a
+**"Retry"** affordance that triggers a recovery `Load`.
 
 ---
 
@@ -244,16 +275,32 @@ Ops are async (`background_spawn`), so tests drive `run_until_parked` to settle 
   freeze); seed a group → its **member cards render + tick** (closes the B-3
   `absolute_group` render-time member-read carryforward, `board/mod.rs:384`); assert
   **group-rollup freshness** when a member's cost changes.
-- **State gating:** `Degraded`/`LoadFailed`/`Stale` replicas **refuse** `write` **and**
-  `reconcile`; `LoadFailed` renders an empty **default-board** layout (not a panic);
-  partial load (`skipped` non-empty) → `Degraded` + banner.
+- **Serialized `run_op` / determinism:** ops apply in enqueue order (single-in-flight); a
+  `load` chained before the first reconcile; two overlapping writes apply in order (no
+  out-of-order regress), verified deterministically under `run_until_parked`.
+- **State gating + recovery:** `Degraded`/`LoadFailed`/`Stale` replicas **refuse** write ops
+  (`write` **and** `reconcile`) but a **recovery `Load` is accepted** and transitions a
+  now-healthy store back to `Writable` (retiring the banner); `LoadFailed` renders an empty
+  **default-board** layout (not a panic); partial load (`skipped` non-empty) → `Degraded` +
+  banner.
 - **Tombstoned fleet key** stays absent with no reload/notify churn (review #9).
 - **Reconcile idempotent / batched** — two reconciles → one row per session; a k-session
   batch issues one `PlaceSessions`.
-- **Perf benchmark (MANDATORY):** release-mode op round-trip (load + batched
-  PlaceSessions of N) stays within frame budget on realistic + stress fixtures.
 
-Full `xtask gate` green.
+**Perf — three distinct measures (§3.2):**
+1. **Frame-budget E2E (MANDATORY, lens-ui, on-device):** extend the [[wave-perf-fps-attribution]]
+   `measure.sh` rig to render a board of **N items *including a group*** (seedable via the B-4a
+   demo) and sample FPS/CPU at realistic (~100) + stress (~1000+) N; hold 120fps/8.3ms target,
+   90fps regression line. First runtime exercise of group render-time member reads at scale;
+   closes B-2 Task 6's residual (at-scale cull CPU never measured on the real app).
+2. **`lens-core` pack/`board_tree` criterion bench (supporting, gate-automatable):** the pure
+   packing math — a CI regression signal, not the frame-budget proof (matches the existing
+   `persist_throughput`/`reduce_throughput` benches).
+3. **Op-latency (off-frame):** `load` + batched `PlaceSessions` at N as wall-clock, confirming
+   sessions appear promptly and the mutex isn't held excessively — explicitly *not* a
+   frame-budget assertion.
+
+Full `xtask gate` green (incl. the lens-core pack bench building).
 
 ---
 
