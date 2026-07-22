@@ -5,7 +5,7 @@ the current forward-looking state only. **Full dated session entries live in
 [`STATUS-ARCHIVE.md`](./STATUS-ARCHIVE.md)** — write each session's detail there
 and roll older "Recent" pointers off this page as they age.
 
-_Last curated 2026-07-21 (transcript **T-0 + T-1 executed** on `lens-transript`; **T-2 spec written** — focused view scaffold + live disk-sourced surface, first real `Vec<ViewBlock>` consumer. **Reorg:** disk-scale split out to **T-2b** (next-not-deferred); live in-progress tool-tail moved to **T-4**; polymorphic `ContentTab` protocol deferred to terminal-UI-integration, SPEC-GAPS)._
+_Last curated 2026-07-22 (transcript **T-0 + T-1 executed**, **T-2 design-locked** on `lens-transript` after 3 gpt-5.6 review rounds — A′/z/ii; **next = `writing-plans` in a fresh session**. **Reorg:** disk-scale → **T-2b** (next-not-deferred); live tool-tail → **T-4**; polymorphic `ContentTab` → terminal-UI-integration, SPEC-GAPS)._
 
 ---
 
@@ -85,10 +85,15 @@ _Last curated 2026-07-21 (transcript **T-0 + T-1 executed** on `lens-transript`;
     per-turn data → **T-6**); streaming variants carry `&MessageAcc`/`&ReasoningAcc` (stable identity);
     **`OptimisticUser` dropped** (pending is composer-owned → T-7); **`SubAgentSpan` dropped**
     (child-session model → T-5); `ReconnectBreak` emission → T-2.
-  - **T-2 — Focused view scaffold + live disk-sourced surface. ⏳ SPEC IN REVIEW-REWORK 2026-07-21**
-    (`docs/specs/2026-07-21-transcript-t2-focused-view-scaffold-design.md`; rev 2; two gpt-5.6/codex
-    review rounds — round 1 REWORK (10 findings) → rev 2 closed 5, 5 partial; round 2 surfaced 7 new
-    (3 Critical) → **still REWORK, not plan-ready**; rev 3 pending — see handoff). §16/§17. **First real consumer of `Vec<ViewBlock>`.** Mount focused view in `#chat-slot`
+  - **T-2 — Focused view scaffold + live disk-sourced surface. ▶ DESIGN-LOCKED 2026-07-22, → `writing-plans`**
+    (spec rev 4 `docs/specs/2026-07-21-transcript-t2-focused-view-scaffold-design.md`; handoff
+    `docs/handoffs/2026-07-22-transcript-t2-design-locked.md`). Three gpt-5.6/codex review rounds; all
+    mechanical/plumbing findings closed; the three hard decisions resolved w/ user — **D-3→A′**
+    (WorkSection-from-birth, two-level retained entities, finalize = render-flag flip, no remount; needs a
+    T-1 amendment: response-keyed uniform grouping incl. live), **D-1→z** (cache settled sections, per-response
+    live projection, coarse invalidate-on-reconcile), **D-2→ii** (reducer `Retired{item_id|Discarded}`).
+    Architecture-locked; residual mechanism detail → the plan (path B). **NEXT: writing-plans in a fresh
+    session** (context budget). §16/§17. **First real consumer of `Vec<ViewBlock>`.** Mount focused view in `#chat-slot`
     via a `focused_transcript_tab(replica) -> TabHandle` factory (`ContentTab` left an inert marker — protocol
     deferred, SPEC-GAPS); a **store-side `FocusedTranscript` replica** created on `Promote`/dropped on `Demote`,
     fed the detailed frames by the **existing single poller fanning out** (no channel tee — the feed is
