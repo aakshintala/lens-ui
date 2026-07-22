@@ -29,6 +29,7 @@ pub(crate) fn map_wire_item(
 
 use crate::clock::Clock;
 use crate::domain::SessionState;
+use crate::domain::item::ReasoningAcc;
 use lens_client::stream::{ResponseEvent, ServerStreamEvent};
 use smallvec::{SmallVec, smallvec};
 use std::sync::Arc;
@@ -83,12 +84,28 @@ pub fn reduce(state: &mut SessionState, event: &ServerStreamEvent, clock: &dyn C
                 message_id,
                 index,
                 ..
-            } => scratch::accumulate_text(&mut state.stream, delta, message_id.as_deref(), *index),
+            } => {
+                let new_acc_id = if state.stream.open_message.is_none() {
+                    Some(state.mint_acc_id())
+                } else {
+                    None
+                };
+                scratch::accumulate_text(
+                    &mut state.stream,
+                    delta,
+                    message_id.as_deref(),
+                    *index,
+                    new_acc_id,
+                )
+            }
             ResponseEvent::ReasoningStarted => {
-                state
-                    .stream
-                    .open_reasoning
-                    .get_or_insert_with(Default::default);
+                if state.stream.open_reasoning.is_none() {
+                    let acc_id = state.mint_acc_id();
+                    state.stream.open_reasoning = Some(ReasoningAcc {
+                        acc_id,
+                        ..Default::default()
+                    });
+                }
                 smallvec![StreamUpdate::ScratchChanged(Arc::new(state.stream.clone()))]
             }
             ResponseEvent::ReasoningTextDelta { delta } => scratch::accumulate_reasoning(

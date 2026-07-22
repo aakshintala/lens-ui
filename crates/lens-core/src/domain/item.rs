@@ -1,7 +1,7 @@
 //! The canonical conversation unit (§2.3/§2.4) + transient stream accumulators
 //! (§4.2). `Item` is the durable, reduced unit the transcript and disk hold.
 
-use crate::domain::ids::{AgentId, CallId, ItemId, ResponseId};
+use crate::domain::ids::{AccId, AgentId, CallId, ItemId, ResponseId};
 use crate::domain::scalars::{ErrorSource, Role};
 use lens_client::generated::SessionResourceObject;
 use serde::{Deserialize, Serialize};
@@ -128,6 +128,7 @@ pub struct StreamScratch {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MessageAcc {
+    pub acc_id: AccId,
     /// 0.2.0: terminal-observed correlation.
     pub message_id: Option<String>,
     pub text: String,
@@ -136,6 +137,7 @@ pub struct MessageAcc {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ReasoningAcc {
+    pub acc_id: AccId,
     pub full_text: String,
     pub summary_text: String,
     pub encrypted: bool,

@@ -4,7 +4,7 @@
 
 use crate::domain::controls::PendingUserMessage;
 use crate::domain::controls::{Elicitation, ModelOption, SandboxStatus, SkillSummary, Todo};
-use crate::domain::ids::{AgentId, ConnectionId, HostId, ResponseId, RunnerId, SessionId};
+use crate::domain::ids::{AccId, AgentId, ConnectionId, HostId, ResponseId, RunnerId, SessionId};
 use crate::domain::item::{Item, StreamScratch};
 use crate::domain::scalars::{ErrorInfo, HostType, SessionLifecycle, SessionStatusValue};
 use crate::domain::usage::{Cost, PresenceViewer};
@@ -69,6 +69,9 @@ pub struct SessionState {
     /// Live turn id from `response.in_progress`; `None` when idle/unknown (T-0).
     pub active_response: Option<ResponseId>,
 
+    /// Monotonic counter for minting `AccId` on accumulator open (T-2).
+    pub next_acc_seq: u64,
+
     // ── Lens-local persisted metadata ──
     pub archived: bool,
     pub lifecycle: SessionLifecycle,
@@ -118,10 +121,18 @@ impl SessionState {
             stream: StreamScratch::default(),
             pending_user: Vec::new(),
             active_response: None,
+            next_acc_seq: 0,
             archived: false,
             lifecycle: SessionLifecycle::Active,
             last_focused_at: 0,
         }
+    }
+
+    /// Mint a session-unique `AccId` for a streaming accumulator at open (T-2).
+    pub fn mint_acc_id(&mut self) -> AccId {
+        let id = AccId::new(format!("acc_{}", self.next_acc_seq));
+        self.next_acc_seq += 1;
+        id
     }
 
     /// True while the session has in-flight work that must NOT be interrupted by an

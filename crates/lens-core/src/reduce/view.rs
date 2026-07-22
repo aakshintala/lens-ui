@@ -207,7 +207,7 @@ pub fn group_work_section<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::ids::{AgentId, CallId, ItemId};
+    use crate::domain::ids::{AccId, AgentId, CallId, ItemId};
     use crate::domain::item::{BlockContext, ContentBlock};
     use crate::domain::scalars::Role;
     use serde_json::Value;
@@ -299,6 +299,7 @@ mod tests {
 
     fn r_acc() -> ReasoningAcc {
         ReasoningAcc {
+            acc_id: AccId::new("acc_test_r"),
             full_text: "thinking".into(),
             summary_text: String::new(),
             encrypted: false,
@@ -307,6 +308,7 @@ mod tests {
 
     fn m_acc() -> MessageAcc {
         MessageAcc {
+            acc_id: AccId::new("acc_test_m"),
             message_id: Some("msg_live".into()),
             text: "partial".into(),
             block_index: 0,

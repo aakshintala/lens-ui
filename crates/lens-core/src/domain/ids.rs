@@ -13,7 +13,7 @@ pub use lens_client::ids::{
 macro_rules! branded_id {
     ($($name:ident),+ $(,)?) => {
         $(
-            #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+            #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
             #[serde(transparent)]
             pub struct $name(String);
 
@@ -33,7 +33,15 @@ macro_rules! branded_id {
 
 // Engine-local ids not present in lens-client (§2.1). BridgeItemId is Bridge
 // scope (§11) — out of this spec.
-branded_id!(ItemId, CallId, ResponseId, AgentId, BoardId, BoardItemId);
+branded_id!(
+    ItemId,
+    CallId,
+    ResponseId,
+    AgentId,
+    BoardId,
+    BoardItemId,
+    AccId
+);
 
 impl ResponseId {
     /// Normalize wire `response_id`: absent or empty string → `None`.
