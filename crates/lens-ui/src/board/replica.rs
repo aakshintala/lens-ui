@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use gpui::{Context, Entity, prelude::*};
+use gpui::{Context, Entity};
 use lens_core::domain::board::{
     Board, BoardItemKind, BoardLayout, DEFAULT_BOARD_ID, DEFAULT_BOARD_NAME, PlacementTarget,
 };
@@ -24,7 +24,6 @@ enum OpOutcome {
         layout: BoardLayout,
         skipped_empty: bool,
         mode: StoreMode,
-        initial: bool,
     },
     Placed {
         layout: BoardLayout,
@@ -166,6 +165,7 @@ impl BoardReplica {
     /// Test ctor with a caller-supplied path and NO pre-opened store: `ensure_open`
     /// opens `path` on the first Load. A good pre-seeded path → Load reads it; a bad
     /// path → open fails → LoadFailed (used by Task 5 recovery tests).
+    #[cfg(test)]
     pub(crate) fn for_test_file(
         fleet: Entity<FleetStore>,
         path: std::path::PathBuf,
@@ -264,7 +264,6 @@ impl BoardReplica {
                 layout,
                 skipped_empty,
                 mode,
-                initial: _,
             } => {
                 self.op_retries = 0;
                 self.recovery_in_flight = false;
@@ -408,6 +407,9 @@ impl BoardReplica {
         .detach();
     }
 
+    /// The B-4b/c/d write seam: B-4a exercises it only in tests (no user interactions yet),
+    /// so it's dead in the non-test build until the interaction slices call it.
+    #[allow(dead_code)]
     pub(crate) fn write(&mut self, op: Op, cx: &mut Context<Self>) -> WriteDisposition {
         if !self.is_writable() {
             self.banner_dismissed = false; // re-surface the banner on a rejected gesture
@@ -475,13 +477,12 @@ fn run_op_inner(slot: &mut StoreSlot, op: &Op) -> lens_core::persist::Result<OpO
         return Err(PersistError::ReadOnly); // unreachable (just opened); typed, never a panic
     };
     match op {
-        Op::Load { initial } => {
+        Op::Load { .. } => {
             let (layout, skipped_empty, mode) = read_committed(store)?;
             Ok(OpOutcome::Loaded {
                 layout,
                 skipped_empty,
                 mode,
-                initial: *initial,
             })
         }
         Op::PlaceSessions(keys) => {
@@ -519,6 +520,8 @@ fn default_root_target() -> PlacementTarget {
 mod tests {
     use std::cell::Cell;
     use std::sync::Arc;
+
+    use gpui::prelude::*; // AppContext etc. for cx.new/update in tests
 
     use lens_core::domain::board::{BoardItemKind, DEFAULT_BOARD_ID};
     use lens_core::domain::ids::BoardItemId;
@@ -570,7 +573,7 @@ mod tests {
 
     #[gpui::test]
     async fn load_op_populates_layout_and_becomes_writable(cx: &mut gpui::TestAppContext) {
-        let fleet = cx.update(|cx| test_fleet(cx));
+        let fleet = cx.update(test_fleet);
         let replica = cx.update(|cx| cx.new(|cx| BoardReplica::for_test(fleet.clone(), cx)));
         cx.run_until_parked();
         replica.read_with(cx, |r, _| {
@@ -584,7 +587,7 @@ mod tests {
 
     #[gpui::test]
     async fn two_place_ops_apply_in_enqueue_order(cx: &mut gpui::TestAppContext) {
-        let fleet = cx.update(|cx| test_fleet(cx));
+        let fleet = cx.update(test_fleet);
         let replica = cx.update(|cx| cx.new(|cx| BoardReplica::for_test(fleet.clone(), cx)));
         cx.run_until_parked();
         let c = ConnectionId::new("conn_test");
@@ -626,7 +629,7 @@ mod tests {
     // it; if apply_outcome's Loaded arm omitted `self.layout = layout`, this fails.
     #[gpui::test]
     async fn load_reads_persisted_card(cx: &mut gpui::TestAppContext) {
-        let fleet = cx.update(|cx| test_fleet(cx));
+        let fleet = cx.update(test_fleet);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("board.db");
         {
@@ -665,7 +668,7 @@ mod tests {
 
     #[gpui::test]
     async fn failed_initial_load_seeds_default_board(cx: &mut gpui::TestAppContext) {
-        let fleet = cx.update(|cx| test_fleet(cx));
+        let fleet = cx.update(test_fleet);
         let replica = cx.update(|cx| {
             cx.new(|cx| BoardReplica::for_test_file(fleet.clone(), "/dev/null/nope.db".into(), cx))
         });
@@ -681,7 +684,7 @@ mod tests {
 
     #[gpui::test]
     async fn write_rejected_when_non_writable(cx: &mut gpui::TestAppContext) {
-        let fleet = cx.update(|cx| test_fleet(cx));
+        let fleet = cx.update(test_fleet);
         let replica = cx.update(|cx| {
             cx.new(|cx| BoardReplica::for_test_file(fleet.clone(), "/dev/null/nope.db".into(), cx))
         });
@@ -804,7 +807,7 @@ mod tests {
     // if Load were gated in LoadFailed, or recovery didn't reopen, it stays LoadFailed.
     #[gpui::test]
     async fn recovery_reopens_degraded_handle(cx: &mut gpui::TestAppContext) {
-        let fleet = cx.update(|cx| test_fleet(cx));
+        let fleet = cx.update(test_fleet);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("board.db");
         // The file itself is a healthy ReadWrite store, but this handle REPORTS Degraded
@@ -837,7 +840,7 @@ mod tests {
     // to the persistent branch (LoadFailed) — no infinite retry loop.
     #[gpui::test]
     async fn transient_exhausts_retries_then_load_failed(cx: &mut gpui::TestAppContext) {
-        let fleet = cx.update(|cx| test_fleet(cx));
+        let fleet = cx.update(test_fleet);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("board.db");
         let inner = SqliteBoardStore::open(&path).unwrap();
@@ -871,7 +874,7 @@ mod tests {
     // and the eventually-loaded layout carries the seeded card.
     #[gpui::test]
     async fn transient_busy_retries_then_loads(cx: &mut gpui::TestAppContext) {
-        let fleet = cx.update(|cx| test_fleet(cx));
+        let fleet = cx.update(test_fleet);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("board.db");
         let inner = SqliteBoardStore::open(&path).unwrap();
@@ -922,7 +925,7 @@ mod tests {
 
     #[gpui::test]
     async fn fleet_session_gets_placed_and_persists(cx: &mut gpui::TestAppContext) {
-        let fleet = cx.update(|cx| test_fleet(cx));
+        let fleet = cx.update(test_fleet);
         let replica = cx.update(|cx| cx.new(|cx| BoardReplica::for_test(fleet.clone(), cx)));
         cx.run_until_parked();
         fleet.update(cx, |f, cx| {
@@ -945,7 +948,7 @@ mod tests {
 
     #[gpui::test]
     async fn double_reconcile_idempotent(cx: &mut gpui::TestAppContext) {
-        let fleet = cx.update(|cx| test_fleet(cx));
+        let fleet = cx.update(test_fleet);
         let replica = cx.update(|cx| cx.new(|cx| BoardReplica::for_test(fleet.clone(), cx)));
         cx.run_until_parked();
         fleet.update(cx, |f, cx| {
@@ -972,7 +975,7 @@ mod tests {
     // the pump loops and this hangs.
     #[gpui::test]
     async fn unplaceable_fleet_key_settles_no_loop(cx: &mut gpui::TestAppContext) {
-        let fleet = cx.update(|cx| test_fleet(cx));
+        let fleet = cx.update(test_fleet);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("board.db");
         let inner = SqliteBoardStore::open(&path).unwrap();
@@ -1010,7 +1013,7 @@ mod tests {
     // Production new(None, bad path) → LoadFailed with the REAL conn (not a test ctor).
     #[gpui::test]
     async fn new_with_none_store_and_bad_path_is_load_failed(cx: &mut gpui::TestAppContext) {
-        let fleet = cx.update(|cx| test_fleet(cx));
+        let fleet = cx.update(test_fleet);
         let replica = cx.update(|cx| {
             cx.new(|cx| {
                 BoardReplica::new(
@@ -1034,7 +1037,7 @@ mod tests {
     // Load-bearing for re-diff-on-reply: without it, s2 is stranded and this fails.
     #[gpui::test]
     async fn coalesced_late_card_caught_by_re_diff(cx: &mut gpui::TestAppContext) {
-        let fleet = cx.update(|cx| test_fleet(cx));
+        let fleet = cx.update(test_fleet);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("board.db");
         let inner = SqliteBoardStore::open(&path).unwrap();

@@ -660,7 +660,7 @@ mod tests {
 
     #[gpui::test]
     async fn banner_shows_for_load_failed(cx: &mut gpui::TestAppContext) {
-        let fleet = cx.update(|cx| test_fleet(cx));
+        let fleet = cx.update(test_fleet);
         let replica = cx.update(|cx| {
             cx.new(|cx| BoardReplica::for_test_file(fleet.clone(), "/dev/null/nope.db".into(), cx))
         });
@@ -676,7 +676,7 @@ mod tests {
         });
         board.read_with(vcx, |b, cx| assert!(b.banner_text(cx).is_some()));
 
-        let fleet_ok = cx.update(|cx| test_fleet(cx));
+        let fleet_ok = cx.update(test_fleet);
         let writable = cx.update(|cx| cx.new(|cx| BoardReplica::for_test(fleet_ok.clone(), cx)));
         cx.run_until_parked();
         let (board_ok, vcx_ok) = cx.add_window_view(|_, cx| {
