@@ -129,10 +129,24 @@ Ordering below is by "blocks shipping Lens to a second human" (roughly).
   terminal roles on attach while reusing that ID. It emits another live
   `session.resource.created` and normally persists a corresponding
   `ResourceEventData` item for reconnect discovery, but supplies no generation
-  token and persistence is best-effort. Lens preflights GET, consults resource
-  event history, and treats an observed duplicate creation as a replacement,
-  but cannot prove the remaining race away. Omnigent should expose an immutable
-  generation/resource ID (or an equivalent durable replacement discriminator).
+  token and persistence is best-effort. Lens preflights GET and (via the
+  Slice-4 live-stream generation guard) treats an **observed** duplicate
+  creation / delete as a replacement, but cannot prove the remaining race away.
+  Omnigent should expose an immutable generation/resource ID (or an equivalent
+  durable replacement discriminator).
+  - **Slice-4 status (2026-07-22):** the module guard correlates all *observed*
+    `session.resource.created`/`.deleted` signals correctly (delete→create =
+    adopt fresh engine; delete-alone = `ReplacementWaiting`/`Detached`). The
+    **reconnect-path** "full" guard (resource-event-history consultation on
+    preflight) is **NOT implemented** — `preflight_reconnect` only GETs
+    existence. Residual bug: a *missed* live `deleted` + a *non-`4404`* retryable
+    WS close retains the old engine → stale scrollback (active viewport stays
+    correct; `output_gap` marker shown). Bounded because the common server-side
+    teardown closes **`4404`** (`ws_bridge.py:80-83`) → clean `Detached`, no mix.
+    **Practical narrowing at Slice 5** (the `FleetStore`'s persistent host
+    session-event subscription shrinks the missed-live-delete window); **true
+    closure needs this upstream token.** Do not claim reconnect recovers it.
+    (Memory `terminal-resource-event-granularity`.)
 10. **Keyboard shortcuts + macOS app menu** — *surfaced 2026-07-16 during the
     theming demo (Cmd+Q dead; ⌘. was silently focus-dependent).* gpui apps get
     **no standard macOS menu/shortcuts for free**: `Cmd+Q` (quit), `Cmd+W`,
