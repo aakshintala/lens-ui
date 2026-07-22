@@ -7,7 +7,8 @@ use crate::domain::{
 };
 use crate::reduce::items;
 use crate::reduce::reconcile::{ReconcileSignal, reconcile_pending_user};
-use crate::reduce::{StreamUpdate, Updates};
+use crate::reduce::scratch::take_open_acc_ids;
+use crate::reduce::{RetireDisposition, StreamUpdate, Updates};
 use lens_client::stream::event::TodoItemStatus;
 use lens_client::stream::{ResponseEvent, SessionEvent, SessionStatusValue as WireStatus};
 use smallvec::smallvec;
@@ -220,7 +221,18 @@ pub(crate) fn fold_response_marker(
         }
         ResponseEvent::Failed | ResponseEvent::Incomplete | ResponseEvent::Cancelled => {
             state.active_response = None;
-            smallvec![StreamUpdate::ActiveResponseChanged(None)]
+            let mut u: Updates = smallvec![StreamUpdate::ActiveResponseChanged(None)];
+            for acc_id in take_open_acc_ids(&mut state.stream) {
+                u.push(StreamUpdate::Retired {
+                    acc_id,
+                    disposition: RetireDisposition::Discarded,
+                });
+            }
+            if !state.stream.unpaired_calls.is_empty() {
+                state.stream.unpaired_calls.clear();
+            }
+            u.push(StreamUpdate::ScratchChanged(Arc::new(state.stream.clone())));
+            u
         }
         ResponseEvent::CompactionInProgress | ResponseEvent::CompactionFailed => smallvec![],
         // 0.5.0 addition: a native policy DENY was surfaced. Observational, no state-model
@@ -287,8 +299,10 @@ mod tests {
         AgentId, ConnectionId, SessionId, SessionState, SessionStatusValue, TodoStatus,
     };
     use crate::reduce::testutil::parse_session;
-    use crate::reduce::{StreamUpdate, reduce};
-    use lens_client::stream::{ServerStreamEvent, SessionEvent, SessionStatusValue as WireStatus};
+    use crate::reduce::{RetireDisposition, StreamUpdate, reduce};
+    use lens_client::stream::{
+        ResponseEvent, ServerStreamEvent, SessionEvent, SessionStatusValue as WireStatus,
+    };
 
     fn st() -> SessionState {
         SessionState::new(
@@ -299,6 +313,35 @@ mod tests {
     }
     fn clock() -> ManualClock {
         ManualClock::new(1_700_000_000_000)
+    }
+
+    #[test]
+    fn terminal_failure_discards_open_accumulators_and_clears_scratch() {
+        for term in [
+            ResponseEvent::Failed,
+            ResponseEvent::Incomplete,
+            ResponseEvent::Cancelled,
+        ] {
+            let mut s = st();
+            reduce(
+                &mut s,
+                &ServerStreamEvent::Response(ResponseEvent::OutputTextDelta {
+                    delta: "partial".into(),
+                    message_id: None,
+                    index: None,
+                    last: None,
+                }),
+                &clock(),
+            );
+            let acc_id = s.stream.open_message.as_ref().unwrap().acc_id.clone();
+            let u = reduce(&mut s, &ServerStreamEvent::Response(term.clone()), &clock());
+            assert!(
+                s.stream.open_message.is_none(),
+                "{term:?} must clear scratch"
+            );
+            assert!(u.iter().any(|x| matches!(x,
+                StreamUpdate::Retired { acc_id: a, disposition: RetireDisposition::Discarded } if *a == acc_id)));
+        }
     }
 
     #[test]

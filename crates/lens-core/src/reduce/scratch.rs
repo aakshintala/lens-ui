@@ -3,8 +3,20 @@
 use crate::domain::ids::AccId;
 use crate::domain::item::{MessageAcc, ReasoningAcc, StreamScratch};
 use crate::reduce::{StreamUpdate, Updates};
-use smallvec::smallvec;
+use smallvec::{SmallVec, smallvec};
 use std::sync::Arc;
+
+/// Drains both open accumulators and returns their `acc_id`s (terminal/reconnect retirement).
+pub(crate) fn take_open_acc_ids(scratch: &mut StreamScratch) -> SmallVec<[AccId; 2]> {
+    let mut ids = SmallVec::new();
+    if let Some(acc) = scratch.open_message.take() {
+        ids.push(acc.acc_id);
+    }
+    if let Some(acc) = scratch.open_reasoning.take() {
+        ids.push(acc.acc_id);
+    }
+    ids
+}
 
 pub(crate) enum ReasoningKind {
     Full,

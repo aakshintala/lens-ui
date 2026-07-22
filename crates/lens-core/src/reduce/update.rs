@@ -1,7 +1,7 @@
 use crate::domain::controls::{
     Elicitation, ModelOption, PendingUserMessage, SandboxStatus, SkillSummary, Todo,
 };
-use crate::domain::ids::{AgentId, ResponseId};
+use crate::domain::ids::{AccId, AgentId, ItemId, ResponseId};
 use crate::domain::item::StreamScratch;
 use crate::domain::scalars::{ErrorInfo, SessionStatusValue};
 use crate::domain::session::SessionState;
@@ -24,6 +24,12 @@ pub enum StreamUpdate {
         committed_ordinal: i64,
     },
     ScratchChanged(Arc<StreamScratch>),
+    /// Explicit retirement disposition keyed by `acc_id` so the replica never
+    /// infers finalize-vs-abandon intent.
+    Retired {
+        acc_id: AccId,
+        disposition: RetireDisposition,
+    },
 
     // ── scalar / collection folds — carry the just-reduced value ──
     StatusChanged(SessionStatusValue),
@@ -72,6 +78,14 @@ pub enum StreamUpdate {
 
     // D9: once-at-attach full baseline
     Rebased(Box<SessionState>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum RetireDisposition {
+    /// A disk row is coming — swap in place.
+    Finalizing { item_id: ItemId },
+    /// Abandoned — drop, no ghost.
+    Discarded,
 }
 
 pub type Updates = SmallVec<[StreamUpdate; 2]>;

@@ -240,7 +240,8 @@ impl SessionCard {
             | StreamUpdate::ChildSessionChanged
             | StreamUpdate::PresenceChanged(_)
             | StreamUpdate::CollaborationModeChanged(_)
-            | StreamUpdate::ModelOptionsChanged(_) => {}
+            | StreamUpdate::ModelOptionsChanged(_)
+            | StreamUpdate::Retired { .. } => {}
             // Liveness delta is consumed by the T-2 transcript replica, not the summary card.
             StreamUpdate::ActiveResponseChanged(_) => {}
         }

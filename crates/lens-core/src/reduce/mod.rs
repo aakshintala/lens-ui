@@ -15,7 +15,7 @@ pub(crate) mod testutil;
 
 pub(crate) use reconcile::user_text;
 pub use reconcile::{LostSend, reconcile_held_landed};
-pub use update::{StreamUpdate, Updates};
+pub use update::{RetireDisposition, StreamUpdate, Updates};
 pub use view::{
     ViewBlock, group_work_section, pair_tool_spans, project, project_all, project_filtered,
 };

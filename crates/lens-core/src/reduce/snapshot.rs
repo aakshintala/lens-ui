@@ -2,7 +2,8 @@
 
 use crate::domain::{AgentId, HostId, ModelUsage, RunnerId, SessionId, SessionState, SkillSummary};
 use crate::reduce::reconcile::{ReconcileSignal, reconcile_pending_user};
-use crate::reduce::{StreamUpdate, Updates};
+use crate::reduce::scratch::take_open_acc_ids;
+use crate::reduce::{RetireDisposition, StreamUpdate, Updates};
 use lens_client::sessions::{SessionSnapshot, SessionStatus};
 use smallvec::smallvec;
 use std::sync::Arc;
@@ -99,12 +100,18 @@ pub(crate) fn on_reconnected(state: &mut SessionState, gap: Option<u64>) -> Upda
     let mut u: Updates = smallvec![StreamUpdate::Reconnected { gap }];
     if gap != Some(0) {
         // D-P1-16: clear transient scratch; KEEP pending_user (user intent, spec P3b).
-        let had = state.stream.open_message.is_some()
-            || state.stream.open_reasoning.is_some()
-            || !state.stream.unpaired_calls.is_empty();
-        state.stream.open_message = None;
-        state.stream.open_reasoning = None;
-        state.stream.unpaired_calls.clear();
+        let mut had = !state.stream.unpaired_calls.is_empty();
+        for acc_id in take_open_acc_ids(&mut state.stream) {
+            had = true;
+            u.push(StreamUpdate::Retired {
+                acc_id,
+                disposition: RetireDisposition::Discarded,
+            });
+        }
+        if !state.stream.unpaired_calls.is_empty() {
+            state.stream.unpaired_calls.clear();
+            had = true;
+        }
         if had {
             u.push(StreamUpdate::ScratchChanged(Arc::new(state.stream.clone())));
         }
@@ -119,7 +126,7 @@ mod tests {
     use crate::domain::item::ItemKind;
     use crate::domain::{AgentId, ConnectionId, SessionId, SessionState, SessionStatusValue};
     use crate::reduce::testutil::snapshot_fixture as build_snapshot;
-    use crate::reduce::{StreamUpdate, reduce};
+    use crate::reduce::{RetireDisposition, StreamUpdate, reduce};
     use lens_client::stream::{ResponseEvent, ServerStreamEvent};
     use serde_json::json;
 
@@ -175,6 +182,20 @@ mod tests {
                 }
             }]
         }))
+    }
+
+    #[test]
+    fn reconnect_gap_discards_open_accumulator() {
+        let mut s = st();
+        reduce(&mut s, &resp_text("partial", None, None), &clock());
+        let acc_id = s.stream.open_message.as_ref().unwrap().acc_id.clone();
+        let u = reduce(
+            &mut s,
+            &ServerStreamEvent::Reconnected { gap: Some(4) },
+            &clock(),
+        );
+        assert!(u.iter().any(|x| matches!(x,
+            StreamUpdate::Retired { acc_id: a, disposition: RetireDisposition::Discarded } if *a == acc_id)));
     }
 
     #[test]

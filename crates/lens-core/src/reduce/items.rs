@@ -4,7 +4,7 @@ use crate::clock::Clock;
 use crate::domain::item::ReasoningAcc;
 use crate::domain::item::{BlockContext, ContentBlock, Item, ItemKind, StreamScratch};
 use crate::domain::{AgentId, CallId, ErrorSource, ItemId, ResponseId, Role, SessionState};
-use crate::reduce::Updates;
+use crate::reduce::{RetireDisposition, StreamUpdate, Updates};
 use lens_client::stream::Item as WireItem;
 use serde_json::Value;
 use smallvec::smallvec;
@@ -113,6 +113,7 @@ pub(crate) fn finalize_message(state: &mut SessionState, clock: &dyn Clock) -> U
     let Some(acc) = state.stream.open_message.take() else {
         return smallvec![];
     };
+    let acc_id = acc.acc_id.clone();
     let id = acc
         .message_id
         .clone()
@@ -127,13 +128,19 @@ pub(crate) fn finalize_message(state: &mut SessionState, clock: &dyn Clock) -> U
         }],
     };
     let response_id = state.active_response.clone();
-    push_item(state, id, kind, None, response_id, clock)
+    let mut u = push_item(state, id.clone(), kind, None, response_id, clock);
+    u.push(StreamUpdate::Retired {
+        acc_id,
+        disposition: RetireDisposition::Finalizing { item_id: id },
+    });
+    u
 }
 
 pub(crate) fn finalize_reasoning(state: &mut SessionState, clock: &dyn Clock) -> Updates {
     let Some(acc): Option<ReasoningAcc> = state.stream.open_reasoning.take() else {
         return smallvec![];
     };
+    let acc_id = acc.acc_id.clone();
     let id = local_id("reasoning", state);
     let kind = ItemKind::Reasoning {
         full_text: acc.full_text,
@@ -141,7 +148,12 @@ pub(crate) fn finalize_reasoning(state: &mut SessionState, clock: &dyn Clock) ->
         encrypted: acc.encrypted,
     };
     let response_id = state.active_response.clone();
-    push_item(state, id, kind, None, response_id, clock)
+    let mut u = push_item(state, id.clone(), kind, None, response_id, clock);
+    u.push(StreamUpdate::Retired {
+        acc_id,
+        disposition: RetireDisposition::Finalizing { item_id: id },
+    });
+    u
 }
 
 pub(crate) fn push_compaction(
@@ -223,7 +235,7 @@ mod tests {
     use crate::clock::ManualClock;
     use crate::domain::{AgentId, ConnectionId, SessionId, SessionState};
     use crate::reduce::testutil::parse_response;
-    use crate::reduce::{StreamUpdate, reduce};
+    use crate::reduce::{RetireDisposition, StreamUpdate, reduce};
 
     fn st() -> SessionState {
         SessionState::new(
@@ -615,6 +627,39 @@ mod tests {
             u.iter()
                 .any(|update| matches!(update, StreamUpdate::ScratchChanged(_)))
         );
+    }
+
+    #[test]
+    fn completed_emits_finalizing_for_message_and_reasoning() {
+        let mut s = st();
+        let clk = clock();
+        reduce(
+            &mut s,
+            &ServerStreamEvent::Response(ResponseEvent::ReasoningStarted),
+            &clk,
+        );
+        reduce(
+            &mut s,
+            &ServerStreamEvent::Response(ResponseEvent::ReasoningTextDelta {
+                delta: "why".into(),
+            }),
+            &clk,
+        );
+        reduce(&mut s, &resp_text("hi", Some("msg_A"), None), &clk);
+        let r_acc_id = s.stream.open_reasoning.as_ref().unwrap().acc_id.clone();
+        let m_acc_id = s.stream.open_message.as_ref().unwrap().acc_id.clone();
+        let u = reduce(
+            &mut s,
+            &ServerStreamEvent::Response(ResponseEvent::Completed),
+            &clk,
+        );
+        // message finalizes to item_id == "msg_A"; reasoning to a synthesized local id.
+        assert!(u.iter().any(|x| matches!(x,
+            StreamUpdate::Retired { acc_id, disposition: RetireDisposition::Finalizing { item_id } }
+            if *acc_id == m_acc_id && item_id.as_str() == "msg_A")));
+        assert!(u.iter().any(|x| matches!(x,
+            StreamUpdate::Retired { acc_id, disposition: RetireDisposition::Finalizing { .. } }
+            if *acc_id == r_acc_id)));
     }
 
     #[test]
