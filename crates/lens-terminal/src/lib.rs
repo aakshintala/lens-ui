@@ -1954,8 +1954,9 @@ impl TerminalTab {
         // run_until_parked) and clobber ReplacementWaiting state. (Grok review, Task 4.)
         #[cfg(test)]
         {
+            // Tests drive the timeout deterministically via `fire_replacement_timeout_now`;
+            // arming a real wall-clock timer here would fire on any executor pump.
             let _ = cx;
-            return;
         }
         #[cfg(not(test))]
         {

@@ -418,8 +418,7 @@ mod tests {
 
     #[test]
     fn engine_spawn_error_converts_to_engine_spawn_failed() {
-        let err = crate::engine::EngineSpawnError::from_io_for_test(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        let err = crate::engine::EngineSpawnError::from_io_for_test(std::io::Error::other(
             "no threads",
         ));
         let detail: DetachedDetail = err.into();

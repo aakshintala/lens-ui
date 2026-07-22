@@ -116,7 +116,7 @@ fn main() {
         cell_w_px: 8,
         cell_h_px: 16,
     };
-    let handle = EngineHandle::spawn(cfg);
+    let handle = EngineHandle::spawn(cfg).expect("spawn engine worker for rss_probe");
 
     // Feed `target_rows` lines of the chosen content, each terminated CRLF.
     let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
