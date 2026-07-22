@@ -5,7 +5,7 @@ the current forward-looking state only. **Full dated session entries live in
 [`STATUS-ARCHIVE.md`](./STATUS-ARCHIVE.md)** — write each session's detail there
 and roll older "Recent" pointers off this page as they age.
 
-_Last curated 2026-07-22 (**B-4a store→replica write-path EXECUTED** on branch `board-b4a` — 10 TDD tasks, subagent-driven (composer implementers + codex per-task + final whole-branch review); gate green; on-device FPS confirmation owed to user; awaiting merge decision. Earlier: B-3 SHIPPED merged-unpushed; B-4a design LOCKED then planned+codex-reviewed)._
+_Last curated 2026-07-22 (**B-4a cull-at-scale residual CLOSED** — `5de3b93`, two sabotage-verified regression tests proving off-screen animating cards drop their anim timers at scale; gate green; on `main`. Earlier: B-4a store→replica write-path MERGED+PUSHED; B-3/B-2/B-1 shipped)._
 
 ---
 
@@ -62,7 +62,7 @@ _Last curated 2026-07-22 (**B-4a store→replica write-path EXECUTED** on branch
       the C1 tombstone infinite-loop (self-introduced by re-diff-on-reply), a buggy `gate_epoch` composer
       over-reach for a non-existent race, and non-deterministic HashMap placement (flaky acceptance).
       **Perf:** `board_tree` bench 11.8µs @ 1000+group; at-scale demo (`LENS_DEMO_N=125`) launches stable;
-      **Frame-budget E2E MET 2026-07-22** (user ran LENS_DEMO_N=125 ≈1000 cards on a display → smooth ~120fps; logs confirm no whole-board storm). Residual (new session, low-pri): verify off-screen animating cards drop timers at scale. Gate green (clippy -D warnings,
+      **Frame-budget E2E MET 2026-07-22** (user ran LENS_DEMO_N=125 ≈1000 cards on a display → smooth ~120fps; logs confirm no whole-board storm). **Cull-at-scale residual CLOSED 2026-07-22** (`5de3b93`): two sabotage-verified regression tests prove off-screen (culled) animating cards hold NO anim timer — `card::view::hidden_animating_card_holds_no_timer` (atomic drop transition) + `board::culled_animating_cards_hold_no_timer_at_scale` (150-card end-to-end: live-timer set == visible band exactly across a deep scroll). No production change; drop mechanism was already correct. Gate green (clippy -D warnings,
       fmt, lens-core 254 / lens-client 150 / lens-ui 83 lib + 5 acceptance). Memory [[board-b4a-plan-executed]].
       **MERGED + PUSHED 2026-07-22** (board-b4a FF→main, `4d31c9d..c189d4c`, incl. previously-unpushed B-2/B-3). NEXT interaction slices B-4b/c/d; **B-4d blocker:** non-idempotent-retry commit-phase tracking (design §8 seam). Original design spec:
       `docs/specs/2026-07-21-board-b4a-store-replica-write-path-design.md` — grilled + gpt-5.6 codex
