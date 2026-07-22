@@ -1669,7 +1669,11 @@ impl TerminalTab {
         self.adopt_in_flight = false;
         let reattach_available = matches!(detail, DetachedDetail::ClientDetached);
         self.clear_input_composition_state();
-        self.teardown_runtime_full(cx);
+        if reattach_available {
+            self.teardown_transport_off_foreground(cx); // keep the retained engine for Reattach
+        } else {
+            self.teardown_runtime_full(cx);
+        }
         self.set_detached_presentation(detail, reattach_available);
         cx.emit(TerminalEvent::PresentationChanged);
         cx.notify();
@@ -2140,6 +2144,20 @@ impl TerminalTab {
     }
 
     fn apply_bridge_event(&mut self, ev: BridgeEvent, cx: &mut Context<Self>) {
+        // Host-owned frozen states (Slice 4) have deliberately torn down the transport;
+        // any bridge event now is STALE residue from the old connection (the sampler still
+        // drains the retained policy_rx). Dropping it prevents a late/queued close — esp.
+        // 4404 on agent reset — from clobbering ReplacementWaiting→adopt or yanking Sleeping
+        // into Reconnecting. Detached/Ended are already terminal. (Whole-branch review C1.)
+        if matches!(
+            self.lifecycle,
+            Lifecycle::ReplacementWaiting
+                | Lifecycle::Sleeping
+                | Lifecycle::Detached
+                | Lifecycle::Ended
+        ) {
+            return;
+        }
         use lens_client::CloseCause;
 
         let action = match ev {
@@ -2166,15 +2184,15 @@ impl TerminalTab {
                 detail,
                 reattach_available,
             } => {
-                self.clear_input_composition_state();
-                if reattach_available {
-                    self.teardown_transport_off_foreground(cx);
-                } else {
-                    self.teardown_runtime_full(cx);
-                }
-                self.set_detached_presentation(detail, reattach_available);
-                cx.emit(TerminalEvent::PresentationChanged);
-                cx.notify();
+                debug_assert_eq!(
+                    reattach_available,
+                    matches!(detail, DetachedDetail::ClientDetached),
+                    "policy reattach_available must match ClientDetached detail"
+                );
+                // on_detach derives reattach_available from the detail (ClientDetached⇔true),
+                // which matches policy.rs (only TerminalDetached sets it), and now bumps the epoch
+                // + clears adopt_in_flight so an in-flight adopt/wake/reconnect cannot resurrect.
+                self.on_detach(detail, cx);
             }
             PolicyAction::DowngradeReadOnly => {
                 let was_write = matches!(self.presentation.access, AccessMode::Write);
@@ -2851,6 +2869,73 @@ mod tests {
         });
         // Background attach fails against the stub; must not panic.
         cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn late_bridge_close_does_not_clobber_replacement_waiting(cx: &mut gpui::TestAppContext) {
+        use lens_client::CloseCause;
+
+        let (_e, tab) = live_tab_for_test(cx, true, "t1", "main", "k");
+        tab.update(cx, |tab, cx| {
+            tab.on_host_event(
+                TerminalHostEvent::ResourceDeleted {
+                    terminal_id: TerminalId::new("t1"),
+                },
+                cx,
+            );
+            assert_eq!(tab.lifecycle, Lifecycle::ReplacementWaiting);
+            tab.apply_bridge_event(BridgeEvent::Closed(CloseCause::TerminalNotFound), cx);
+            assert_eq!(
+                tab.lifecycle,
+                Lifecycle::ReplacementWaiting,
+                "late 4404 close must not clobber ReplacementWaiting → Detached"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn late_bridge_close_does_not_wake_sleeping(cx: &mut gpui::TestAppContext) {
+        use lens_client::CloseCause;
+
+        let (_e, tab) = live_tab_for_test(cx, true, "t1", "main", "k");
+        tab.update(cx, |tab, cx| {
+            tab.on_host_event(TerminalHostEvent::Sleep, cx);
+            assert_eq!(tab.lifecycle, Lifecycle::Sleeping);
+            tab.apply_bridge_event(BridgeEvent::Closed(CloseCause::Network), cx);
+            assert_eq!(
+                tab.lifecycle,
+                Lifecycle::Sleeping,
+                "late network close must not yank Sleeping → Reconnecting"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn on_detach_client_detached_keeps_engine(cx: &mut gpui::TestAppContext) {
+        let (_e, tab) = live_tab_for_test(cx, true, "t1", "main", "k");
+        tab.update(cx, |tab, cx| {
+            tab.on_detach(DetachedDetail::ClientDetached, cx);
+            assert_eq!(tab.lifecycle, Lifecycle::Detached);
+            assert!(tab.presentation.reattach_available);
+            assert!(tab.runtime.is_some());
+            assert!(
+                tab.runtime.as_ref().and_then(|r| r.engine_ref()).is_some(),
+                "ClientDetached must retain engine (transport-only teardown)"
+            );
+        });
+        let (_e2, tab2) = live_tab_for_test(cx, true, "t1", "main", "k");
+        tab2.update(cx, |tab, cx| {
+            tab.on_detach(DetachedDetail::TerminalGone, cx);
+            assert_eq!(tab.lifecycle, Lifecycle::Detached);
+            assert!(!tab.presentation.reattach_available);
+        });
+        cx.run_until_parked();
+        tab2.update(cx, |tab, _| {
+            assert!(
+                tab.runtime.is_none(),
+                "TerminalGone must release runtime via full teardown"
+            );
+        });
     }
 
     #[gpui::test]
