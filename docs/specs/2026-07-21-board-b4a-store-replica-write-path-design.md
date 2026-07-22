@@ -1,7 +1,10 @@
 # Board B-4a — store→replica write-path foundation — design
 
 **Written:** 2026-07-21 · **Status:** LOCKED — grilled, gpt-5.6 codex spec-review folded,
-§3 re-grilled and settled. Ready for writing-plans. ·
+§3 re-grilled and settled, **residual pass 2026-07-22 folded** (write-failure contract §5:
+busy-timeout-on-writes + drop-queued + pump re-gate + optimistic-drag seam→B-4c; reconcile
+re-diffs on reply §2/§3.3/§7; perf E2E scope-labeled as B-2/B-3 debt §7). Ready for
+writing-plans. ·
 **Depends on:** B-1 (`SqliteBoardStore` + `BoardStore` trait, `8100cc8`),
 B-2 (packer + container, `14b474c`), B-3 (group chrome, `ac9d5ae`) ·
 **Feeds:** B-4b (collapse), B-4c (drag/move), B-4d (grouping menus), B-5
@@ -108,7 +111,10 @@ Interface:
 - `reconcile(&mut self, cx)` — diff `fleet.cards` keys vs placed `(conn, session)` keys; if
   any missing and writable, `run_op(PlaceSessions(missing))` — but **coalesced**: skip
   enqueuing if a reconcile is already pending/in-flight (idempotent; a redundant one is
-  safe to drop, unlike a write).
+  safe to drop, unlike a write). **Re-diff on reply:** when a `PlaceSessions` reply lands,
+  `reconcile` runs once more — a card that spawned *during* the in-flight place (its notify
+  coalesced away) would otherwise sit unplaced until the next unrelated fleet notify. Each
+  pass strictly shrinks the missing set, so it self-terminates at quiescence.
 - `BoardReplica::in_memory_for_test(fleet, cx)` — `:memory:` store + fixed conn.
 
 The UI thread only does `cx.update`/`cx.notify`; all SQLite is inside `background_spawn`.
@@ -167,6 +173,11 @@ On each `FleetStore` change (and once at construction), `reconcile`:
   `place_session` calls each persist the board → ~O(k·N); one batched transaction is O(N)).
   Skips entirely (no store traffic) when nothing is new — the frequent membership
   notifies stay cheap.
+- **Re-runs on its own `PlaceSessions` reply** (coalescing closes a gap, not a race). A card
+  that appears while a place is in-flight has its notify coalesced away; without a re-diff on
+  reply it would linger unplaced until the next unrelated notify — a silently-missing card,
+  the UX §5 forbids. The reply-triggered re-diff shrinks the missing set monotonically and
+  stops at quiescence (empty diff → no op).
 
 **Convergence (review #6, narrowed).** Two placement sources exist: this loop (from
 `fleet`, pinned conn) and `load_layout`'s built-in reconcile (from the `sessions` table,
@@ -235,6 +246,28 @@ coalesced, so at most one recovery attempt runs at a time even under frequent no
 min-interval throttle is a trivial add if a persistently-degraded store + chatty fleet ever
 makes reopen attempts noisy — noted, not built.)
 
+**Write-failure contract (settled — the "lost drag" question).** The op closure runs each
+write in a transaction; an `Err` on commit has exactly one *transient* source —
+`SQLITE_BUSY` from the ~dozen `SqliteControlStore` connections on `lens.db`
+(`fleet/live.rs:71`) — and several *persistent* ones (disk-full, I/O, `SQLITE_CORRUPT`;
+schema-degraded is refused up front, so it never reaches a mid-write `Err`). So:
+- **Absorb the transient case in the op:** write transactions run under a **bounded busy
+  timeout** (the same one §6 adds to `open`, extended to writes), so SQLite retries internally.
+- **Therefore any `Err` that reaches the replica is *persistent* by definition** — a replay
+  or a user "redo" would just fail again. On persistent `Err`: transition state (below),
+  **drop queued write ops** from `pending`, and **`pump` re-gates write ops on
+  `is_writable()`** (belt-and-suspenders over the enqueue-time gate — an op queued *before*
+  the failure must not spawn against a broken store). Recovery `Load` is still always allowed.
+- **"Never drop a user write" is refined to "never *silently* drop":** the banner names the
+  loss. B-4a itself ships no user writes (only `Load`/`PlaceSessions`/recovery — all
+  idempotent/coalescable), so this contract is only *exercised* from B-4b onward; it is fixed
+  here because the `run_op` seam is permanent.
+- **B-4c drag is optimistic (seam, §8).** The card moves in-memory *before* persistence, so a
+  persistent `Err` leaves `layout` diverged from disk; B-4c adds an **optimistic-apply +
+  rollback-snapshot** `run_op` variant (snap the card back + banner on failure). B-4a's
+  commit-gated shape (op returns the committed layout) is correct for `Load`/`PlaceSessions`
+  and must not *preclude* the optimistic variant — single-in-flight ordering already supports it.
+
 **Mechanics:** the banner is a small **non-blocking, dismissible** notice over the board
 area (never a modal; the rest of Lens stays usable), driven by `ReplicaState`, with a
 **"Retry"** affordance that triggers a recovery `Load`.
@@ -245,7 +278,9 @@ area (never a modal; the rest of Lens stays usable), driven by `ReplicaState`, w
 
 - **App (live):** open the board store on `data_dir/lens.db` **before the session
   actors start** (review #7 — minimizes `SQLITE_BUSY`), and give `open_db` a bounded
-  **busy timeout** so a transient lock retries rather than fails. conn = `"lens-app"`. Wire
+  **busy timeout** so a transient lock retries rather than fails. The **same busy timeout
+  applies to write transactions** (§5 write-failure contract) — it is what makes every `Err`
+  reaching the replica persistent. conn = `"lens-app"`. Wire
   `BoardReplica` into the `BoardView::mount` sites (`main.rs:110,165`).
 - **Demo (fake):** in-memory store (`:memory:`; `CONTROL_DDL` still makes the empty
   `sessions` table) + `"conn_demo"`. **Seed a group at construction** (before the first
@@ -286,6 +321,10 @@ Ops are async (`background_spawn`), so tests drive `run_until_parked` to settle 
 - **Tombstoned fleet key** stays absent with no reload/notify churn (review #9).
 - **Reconcile idempotent / batched** — two reconciles → one row per session; a k-session
   batch issues one `PlaceSessions`.
+- **Coalesced-then-late card** — add a card so a `PlaceSessions` is in-flight, add a second
+  card *before* the reply (its notify coalesces away), `run_until_parked` → **both** cards
+  end placed (the reply-triggered re-diff caught the late one), and it settles with no further
+  ops.
 
 **Perf — three distinct measures (§3.2):**
 1. **Frame-budget E2E (MANDATORY, lens-ui, on-device):** extend the [[wave-perf-fps-attribution]]
@@ -293,6 +332,12 @@ Ops are async (`background_spawn`), so tests drive `run_until_parked` to settle 
    demo) and sample FPS/CPU at realistic (~100) + stress (~1000+) N; hold 120fps/8.3ms target,
    90fps regression line. First runtime exercise of group render-time member reads at scale;
    closes B-2 Task 6's residual (at-scale cull CPU never measured on the real app).
+   **Scope label:** B-4a's own render-path change is a nil swap (`build_ephemeral_layout(fleet)`
+   → `replica.layout()`, same in-memory `BoardLayout`, same unchanged pack/cull/chrome walk) —
+   this measurement is **prior-slice (B-2/B-3) perf debt paid down here** because B-4a's
+   demo-seeding is the first thing that makes an at-scale group render measurable on the real
+   app. It is a **sizable task in its own right**, not part of the store→replica swap; size
+   B-4a accordingly and do not treat it as a cheap add-on.
 2. **`lens-core` pack/`board_tree` criterion bench (supporting, gate-automatable):** the pure
    packing math — a CI regression signal, not the frame-budget proof (matches the existing
    `persist_throughput`/`reduce_throughput` benches).
@@ -308,6 +353,12 @@ Full `xtask gate` green (incl. the lens-core pack bench building).
 
 - **B-4b/c/d** ← `write(cmd)` over collapse / move / group ops; B-4c drag hit-testing vs
   packer geometry (spike candidate).
+- **B-4c drag is optimistic (decided).** Apply the move to the in-memory `layout`
+  immediately, persist async; on a **persistent** write `Err` (§5) roll back / snap the card
+  back + banner. This is a new `run_op` variant (optimistic-apply + rollback-snapshot) layered
+  on B-4a's commit-gated path; single-in-flight ordering already supports it. Two quick
+  optimistic drags stack in enqueue order — if the first's persist fails, B-4c owns whether the
+  rollback also unwinds the second (composed atop the first's optimistic state).
 - **B-5** ← per-session `ConnectionId` + **conn-scoped reconcile/load** (review #6);
   multiple boards; externally-discovered-session landing policy.
 - **Session-archive handling → B-6 (decided).** Two `archived` flags: `board_items.archived`
