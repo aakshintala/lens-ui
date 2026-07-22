@@ -47,6 +47,17 @@ impl Item {
             fr,
         }
     }
+
+    /// A collapsed group: a 1×1 tile (§7) — the footprint is overridden to a single
+    /// cell regardless of member count (the collapsed body shows a status rollup, not
+    /// the members). `members` is retained for `Kind` symmetry.
+    pub fn group_collapsed(members: usize) -> Self {
+        Item {
+            kind: Kind::Group { members },
+            fc: 1,
+            fr: 1,
+        }
+    }
 }
 
 /// `foot(n)`: n≤3 → n×1; n≥4 → ⌈√n⌉ cols × ⌈n/c⌉ rows (§2.2).
@@ -222,6 +233,20 @@ mod tests {
         assert_eq!(p.tiles.len(), 1);
         assert_eq!((p.tiles[0].gx, p.tiles[0].gy), (0, 0));
         assert_eq!(p.content_height, CELL_H - GAP);
+    }
+
+    #[test]
+    fn collapsed_group_packs_one_by_one() {
+        // A collapsed group is a 1×1 tile no matter how many members it has (§7).
+        let items = [Item::group_collapsed(9)];
+        let packing = pack(&items, 3);
+        assert_eq!(packing.tiles.len(), 1);
+        let t = packing.tiles[0];
+        assert_eq!((t.item.fc, t.item.fr), (1, 1));
+        assert!(matches!(t.item.kind, Kind::Group { members: 9 }));
+        assert_eq!((t.gx, t.gy), (0, 0));
+        // one cell tall: CELL_H minus the trailing gap.
+        assert_eq!(packing.content_height, CELL_H - GAP);
     }
 
     #[test]
