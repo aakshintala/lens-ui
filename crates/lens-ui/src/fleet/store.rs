@@ -691,8 +691,12 @@ mod reader_factory_tests {
     }
 
     fn http_response(status: &str, content_type: &str, body: &str) -> String {
+        // Keep-alive + Content-Length: the client reads exactly `Content-Length`
+        // bytes and may reuse the socket for the next handshake request. The mock
+        // loops to serve each one (see handle_mock_conn), so a pooled reqwest
+        // connection never hits a mid-handshake close → no `IncompleteMessage`.
         format!(
-            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
             body.len()
         )
     }
@@ -709,59 +713,86 @@ mod reader_factory_tests {
         }
     }
 
+    /// Read one full HTTP request (headers terminated by CRLFCRLF) off a keep-alive
+    /// socket. Returns None on EOF/timeout/error — i.e. the client is done and the
+    /// connection can be dropped. GET requests carry no body, so header-end is
+    /// request-end. A single `read()` can return a partial request line; looping
+    /// until CRLFCRLF guarantees the matcher always sees the complete request.
+    fn read_http_request(stream: &mut TcpStream) -> Option<String> {
+        let mut acc = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => return None,
+                Ok(n) => {
+                    acc.extend_from_slice(&buf[..n]);
+                    if acc.windows(4).any(|w| w == b"\r\n\r\n") {
+                        return Some(String::from_utf8_lossy(&acc).into_owned());
+                    }
+                    if acc.len() > 64 * 1024 {
+                        return None; // malformed / never-terminated request
+                    }
+                }
+            }
+        }
+    }
+
+    fn write_response(stream: &mut TcpStream, body: &str) -> bool {
+        stream.write_all(body.as_bytes()).is_ok() && stream.flush().is_ok()
+    }
+
+    /// Keep-alive request loop: serve every request on the connection until the
+    /// client closes it. A one-request-then-close mock races reqwest's connection
+    /// pool (it reuses the socket for the 3-step /health→/api/version→/v1/info
+    /// handshake ladder) → mid-handshake close → `IncompleteMessage`. Looping here
+    /// makes the mock robust to reuse and deterministic.
     fn handle_mock_conn(stream: &mut TcpStream, session_id: &str) {
         stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
-        let mut buf = [0u8; 4096];
-        let n = match stream.read(&mut buf) {
-            Ok(0) | Err(_) => return,
-            Ok(n) => n,
-        };
-        let req = String::from_utf8_lossy(&buf[..n]);
-        let request_line = req.lines().next().unwrap_or("");
-        if request_line.contains("/health") {
-            let body = http_response("200 OK", "text/plain", "ok");
-            let _ = stream.write_all(body.as_bytes());
-            return;
-        }
-        if request_line.contains("/api/version") {
-            let body = http_response(
-                "200 OK",
-                "application/json",
-                &format!(r#"{{"version":"{PINNED_OMNIGENT_VERSION}"}}"#),
-            );
-            let _ = stream.write_all(body.as_bytes());
-            return;
-        }
-        if request_line.contains("/v1/info") {
-            let body = http_response("200 OK", "application/json", "{}");
-            let _ = stream.write_all(body.as_bytes());
-            return;
-        }
-        if request_line.contains("/stream") {
-            let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: keep-alive\r\n\r\n";
-            if stream.write_all(headers.as_bytes()).is_err() {
+        loop {
+            let Some(req) = read_http_request(stream) else {
+                return;
+            };
+            let request_line = req.lines().next().unwrap_or("");
+            if request_line.contains("/stream") {
+                // SSE: send headers then stream heartbeats until the client drops.
+                let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: keep-alive\r\n\r\n";
+                if stream.write_all(headers.as_bytes()).is_err() {
+                    return;
+                }
+                let heartbeat = b"event: session.heartbeat\ndata: {}\n\n";
+                loop {
+                    if stream.write_all(heartbeat).is_err() {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
+            let response = if request_line.contains("/health") {
+                http_response("200 OK", "text/plain", "ok")
+            } else if request_line.contains("/api/version") {
+                http_response(
+                    "200 OK",
+                    "application/json",
+                    &format!(r#"{{"version":"{PINNED_OMNIGENT_VERSION}"}}"#),
+                )
+            } else if request_line.contains("/v1/info") {
+                http_response("200 OK", "application/json", "{}")
+            } else if request_line.contains("/items") {
+                let json = r#"{"data":[{"id":"item_a","type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}],"has_more":false}"#;
+                http_response("200 OK", "application/json", json)
+            } else if request_line.contains("/v1/sessions/") {
+                let include_items = req.contains("include_items=true");
+                http_response(
+                    "200 OK",
+                    "application/json",
+                    &session_json(session_id, include_items),
+                )
+            } else {
+                http_response("404 Not Found", "text/plain", "not found")
+            };
+            if !write_response(stream, &response) {
                 return;
             }
-            let heartbeat = b"event: session.heartbeat\ndata: {}\n\n";
-            loop {
-                if stream.write_all(heartbeat).is_err() {
-                    break;
-                }
-                thread::sleep(Duration::from_millis(100));
-            }
-            return;
-        }
-        if request_line.contains("/items") {
-            let json = r#"{"data":[{"id":"item_a","type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}],"has_more":false}"#;
-            let body = http_response("200 OK", "application/json", json);
-            let _ = stream.write_all(body.as_bytes());
-            return;
-        }
-        if request_line.contains("/v1/sessions/") {
-            let include_items = req.contains("include_items=true");
-            let json = session_json(session_id, include_items);
-            let body = http_response("200 OK", "application/json", &json);
-            let _ = stream.write_all(body.as_bytes());
         }
     }
 
