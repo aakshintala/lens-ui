@@ -10,6 +10,8 @@ use lens_core::domain::item::{Item, ItemKind, MessageAcc, ReasoningAcc};
 use lens_core::domain::scalars::Role;
 use lens_core::reduce::ViewBlock;
 
+use super::Marker;
+
 /// Stable row identity — keyed store, not list index.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum RowId {
@@ -416,6 +418,54 @@ impl RowStore {
         self.structure.len()
     }
 
+    /// Re-insert reconnect markers into `structure` at their `after_ordinal` anchor,
+    /// then rebuild the flat order. Deterministic across full reprojections.
+    pub(crate) fn reinsert_markers(
+        &mut self,
+        markers: &[Marker],
+        item_ordinals: &HashMap<ItemId, i64>,
+        cx: &mut App,
+    ) {
+        if markers.is_empty() {
+            return;
+        }
+
+        self.structure
+            .retain(|e| !matches!(e, StructureEntry::Marker(_)));
+
+        let reconnect_pres = RowPresentation {
+            kind: RowKind::ReconnectBreak,
+            text: "reconnected".into(),
+            collapsed: false,
+            height_hint: None,
+        };
+
+        let mut sorted: Vec<_> = markers.iter().collect();
+        sorted.sort_by_key(|m| (m.after_ordinal, m.seq));
+
+        for marker in sorted {
+            let id = RowId::Marker(marker.seq);
+            self.upsert(id.clone(), reconnect_pres.clone(), cx);
+
+            let insert_at = self
+                .structure
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, entry)| {
+                    let repr = entry_repr(entry, &self.sections, item_ordinals);
+                    (repr != i64::MAX && repr <= marker.after_ordinal).then_some(idx)
+                })
+                .last()
+                .map(|idx| idx + 1)
+                .unwrap_or(0);
+
+            self.structure
+                .insert(insert_at, StructureEntry::Marker(id));
+        }
+
+        self.rebuild_flat_order();
+    }
+
     pub(crate) fn rebuild_flat_order(&mut self) {
         self.order.clear();
         for entry in &self.structure.clone() {
@@ -471,6 +521,37 @@ impl RowStore {
 impl Default for RowStore {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn child_ord(row_id: &RowId, item_ordinals: &HashMap<ItemId, i64>) -> i64 {
+    match row_id {
+        RowId::Work(id) | RowId::Sibling(id) => {
+            item_ordinals.get(id).copied().unwrap_or(i64::MAX)
+        }
+        RowId::StreamTail(_) => i64::MAX,
+        _ => i64::MIN,
+    }
+}
+
+fn entry_repr(
+    entry: &StructureEntry,
+    sections: &HashMap<SectionKey, SectionNode>,
+    item_ordinals: &HashMap<ItemId, i64>,
+) -> i64 {
+    match entry {
+        StructureEntry::Section(key) => sections
+            .get(key)
+            .map(|node| {
+                node.children
+                    .iter()
+                    .map(|c| child_ord(c, item_ordinals))
+                    .max()
+                    .unwrap_or(i64::MIN)
+            })
+            .unwrap_or(i64::MIN),
+        StructureEntry::Sibling(id) => child_ord(id, item_ordinals),
+        StructureEntry::Marker(_) => i64::MIN,
     }
 }
 

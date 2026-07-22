@@ -22,8 +22,17 @@ pub use rowsource::{
 
 const LIST_OVERDRAW: Pixels = gpui::px(200.);
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Marker; // stub — Task 14 fleshes out
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarkerKind {
+    ReconnectBreak,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Marker {
+    pub after_ordinal: i64,
+    pub seq: u64,
+    pub kind: MarkerKind,
+}
 
 pub struct FocusedTranscript {
     items: Vec<Item>,
@@ -35,8 +44,9 @@ pub struct FocusedTranscript {
     list_state: ListState,
     pending_finalize: HashMap<AccId, RowPresentation>,
     pending_item_ids: HashMap<ItemId, AccId>,
-    #[allow(dead_code)] // populated in Task 14 (ReconnectBreak markers)
     markers: Vec<Marker>,
+    marker_seq: u64,
+    item_ordinals: HashMap<ItemId, i64>,
     focus_generation: u64,
     reader: ReaderWorkerHandle,
     reader_error: Option<String>,
@@ -80,6 +90,8 @@ impl FocusedTranscript {
             pending_finalize: HashMap::new(),
             pending_item_ids: HashMap::new(),
             markers: Vec::new(),
+            marker_seq: 0,
+            item_ordinals: HashMap::new(),
             focus_generation,
             reader,
             reader_error: None,
@@ -113,6 +125,8 @@ impl FocusedTranscript {
             pending_finalize: HashMap::new(),
             pending_item_ids: HashMap::new(),
             markers: Vec::new(),
+            marker_seq: 0,
+            item_ordinals: HashMap::new(),
             focus_generation,
             reader,
             reader_error: None,
@@ -197,9 +211,20 @@ impl FocusedTranscript {
             | StreamUpdate::LastTokensChanged(_)
             | StreamUpdate::ContextWindowChanged(_)
             | StreamUpdate::Reconnecting { .. }
-            | StreamUpdate::Reconnected { .. }
             | StreamUpdate::Disconnected(_)
             | StreamUpdate::SnapshotRestored(_) => {}
+            StreamUpdate::Reconnected { gap } => {
+                if gap != Some(0) {
+                    let seq = self.next_marker_seq();
+                    self.markers.push(Marker {
+                        after_ordinal: self.last_rendered_ordinal,
+                        seq,
+                        kind: MarkerKind::ReconnectBreak,
+                    });
+                    self.reproject(false, cx);
+                    dirty = true;
+                }
+            }
         }
         if dirty {
             cx.notify();
@@ -487,6 +512,9 @@ impl FocusedTranscript {
             RowStore::materialize_live_tail(prefix, &blocks, &mut self.rows, cx);
         }
 
+        self.rows
+            .reinsert_markers(&self.markers, &self.item_ordinals, cx);
+
         self.overlay_pending_finalize(cx);
         self.rows.sync_list_count(&self.list_state, prev_len);
         let slice = &self.items[self.live_section_start..];
@@ -510,6 +538,10 @@ impl FocusedTranscript {
         let mut sorted: Vec<_> = rows.iter().collect();
         sorted.sort_by_key(|(ordinal, _)| *ordinal);
         self.items = sorted.into_iter().map(|(_, item)| item.clone()).collect();
+        self.item_ordinals.clear();
+        for (ordinal, item) in rows {
+            self.item_ordinals.insert(item.id.clone(), *ordinal);
+        }
     }
 
     fn upsert_read_rows(&mut self, rows: &[(i64, Item)]) {
@@ -521,7 +553,14 @@ impl FocusedTranscript {
             } else {
                 self.items.insert(ord, item.clone());
             }
+            self.item_ordinals.insert(item.id.clone(), *ordinal);
         }
+    }
+
+    fn next_marker_seq(&mut self) -> u64 {
+        let seq = self.marker_seq;
+        self.marker_seq = self.marker_seq.saturating_add(1);
+        seq
     }
 
     #[cfg(test)]
@@ -2125,5 +2164,228 @@ mod tests {
             assert_eq!(r.reader_error(), Some("disk write failed"));
         });
         assert!(rx.try_recv().is_err());
+    }
+
+    fn count_markers_in_order(order: &[RowId]) -> usize {
+        order
+            .iter()
+            .filter(|id| matches!(id, RowId::Marker(_)))
+            .count()
+    }
+
+    fn marker_row_id(seq: u64) -> RowId {
+        RowId::Marker(seq)
+    }
+
+    #[gpui::test]
+    async fn reconnected_gap_zero_injects_no_marker(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::All,
+                    range_read(vec![(0, message_item("m0", None))], 0),
+                    cx,
+                );
+                r.fold_detailed(StreamUpdate::Reconnected { gap: Some(0) }, cx);
+            });
+        });
+
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert!(r.markers.is_empty(), "gap=0 must not inject a marker");
+            assert_eq!(
+                count_markers_in_order(r.rows().order()),
+                0,
+                "no RowId::Marker in flat order"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn reconnected_gap_none_injects_one_marker(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::All,
+                    range_read(vec![(0, message_item("m0", None))], 0),
+                    cx,
+                );
+                r.last_rendered_ordinal = 0;
+                r.fold_detailed(StreamUpdate::Reconnected { gap: None }, cx);
+            });
+        });
+
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert_eq!(r.markers.len(), 1);
+            assert_eq!(r.markers[0].after_ordinal, 0);
+            assert_eq!(r.markers[0].kind, MarkerKind::ReconnectBreak);
+            assert_eq!(
+                count_markers_in_order(r.rows().order()),
+                1,
+                "exactly one marker in flat order"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn reconnected_gap_some_n_injects_one_marker(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::All,
+                    range_read(vec![(0, message_item("m0", None))], 0),
+                    cx,
+                );
+                r.last_rendered_ordinal = 0;
+                r.fold_detailed(StreamUpdate::Reconnected { gap: Some(3) }, cx);
+            });
+        });
+
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert_eq!(r.markers.len(), 1);
+            assert_eq!(r.markers[0].after_ordinal, 0);
+            assert_eq!(
+                count_markers_in_order(r.rows().order()),
+                1,
+                "exactly one marker in flat order"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn marker_survives_n_reprojections_at_anchor(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        let item_a = message_item("m_a", Some("resp_a"));
+        let item_b = message_item("m_b", Some("resp_b"));
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::All,
+                    range_read(vec![(0, item_a.clone()), (1, item_b.clone())], 1),
+                    cx,
+                );
+                r.last_rendered_ordinal = 0;
+                r.fold_detailed(StreamUpdate::Reconnected { gap: Some(5) }, cx);
+            });
+        });
+
+        let marker_seq = cx.read(|cx| replica.read(cx).markers[0].seq);
+        let marker_id = marker_row_id(marker_seq);
+        let sibling_a = RowId::Sibling(item_a.id.clone());
+
+        let expected_idx = cx.read(|cx| {
+            let r = replica.read(cx);
+            let order = r.rows().order();
+            let item_a_idx = order
+                .iter()
+                .position(|id| id == &sibling_a)
+                .expect("item at ordinal 0");
+            let marker_idx = order
+                .iter()
+                .position(|id| id == &marker_id)
+                .expect("marker present after inject");
+            assert!(
+                marker_idx > item_a_idx,
+                "marker must appear after the item at after_ordinal"
+            );
+            marker_idx
+        });
+
+        for i in 0..3 {
+            cx.update(|cx| {
+                replica.update(cx, |r, cx| {
+                    r.fold_detailed(
+                        StreamUpdate::ActiveResponseChanged(Some(ResponseId::new("resp_b"))),
+                        cx,
+                    );
+                });
+            });
+            cx.read(|cx| {
+                let r = replica.read(cx);
+                let order = r.rows().order();
+                assert_eq!(
+                    count_markers_in_order(order),
+                    1,
+                    "reprojection {i}: marker must not vanish"
+                );
+                let marker_idx = order
+                    .iter()
+                    .position(|id| id == &marker_id)
+                    .expect("reprojection {i}: marker must remain in order");
+                assert_eq!(
+                    marker_idx, expected_idx,
+                    "reprojection {i}: marker index must stay stable"
+                );
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn gap_while_unfocused_injects_nothing(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        let item = message_item("m0", None);
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(1, ReadRange::All, range_read(vec![(0, item.clone())], 0), cx);
+            });
+        });
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.fold_detailed(
+                    StreamUpdate::Rebased(Box::new(rebased_state(None, None))),
+                    cx,
+                );
+            });
+        });
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.fold_detailed(
+                    StreamUpdate::ScratchChanged(Arc::new(StreamScratch::default())),
+                    cx,
+                );
+            });
+        });
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::All,
+                    range_read(vec![(0, item.clone())], 0),
+                    cx,
+                );
+            });
+        });
+
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert!(
+                r.markers.is_empty(),
+                "markers must only be injected via Reconnected fold arm"
+            );
+            assert_eq!(count_markers_in_order(r.rows().order()), 0);
+        });
     }
 }
