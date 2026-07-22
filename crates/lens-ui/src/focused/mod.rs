@@ -2317,7 +2317,7 @@ mod tests {
         cx.read(|cx| {
             let r = replica.read(cx);
             assert!(
-                r.list_state().item_count() == r.rows().len() && r.rows().len() > 0,
+                r.list_state().item_count() == r.rows().len() && !r.rows().is_empty(),
                 "tail visible: list count must include stream tail"
             );
         });
@@ -2346,7 +2346,7 @@ mod tests {
                 r.rows().len(),
                 "after Retired Finalizing, ListState must not dip below RowStore count"
             );
-            assert!(r.rows().len() > 0, "staged tail must remain visible");
+            assert!(!r.rows().is_empty(), "staged tail must remain visible");
         });
     }
 

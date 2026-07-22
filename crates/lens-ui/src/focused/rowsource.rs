@@ -413,10 +413,10 @@ impl RowStore {
         }
         if as_sibling {
             for entry in &mut self.structure {
-                if let StructureEntry::Sibling(row) = entry {
-                    if *row == tail_id {
-                        *row = durable_id.clone();
-                    }
+                if let StructureEntry::Sibling(row) = entry
+                    && *row == tail_id
+                {
+                    *row = durable_id.clone();
                 }
             }
         }
