@@ -308,10 +308,11 @@ git commit -m "feat(persist): batch place_sessions (one txn, one persist per boa
 ## Task 3: `BoardReplica` types + pure helpers (no async yet)
 
 **Files:**
+- Modify: `crates/lens-core/src/persist/mod.rs` (add `impl PersistError { pub fn is_transient(&self) -> bool }` + its load-bearing test — rusqlite stays in lens-core)
 - Create: `crates/lens-ui/src/board/replica.rs`
 - Modify: `crates/lens-ui/src/board/mod.rs` (`pub mod replica;` + `pub use replica::{BoardReplica, ReplicaState, WriteDisposition};`)
 - Modify: `crates/lens-ui/Cargo.toml` (`tempfile` normal dep)
-- Test: `crates/lens-ui/src/board/replica.rs` (inline)
+- Test: `crates/lens-ui/src/board/replica.rs` (inline) + `crates/lens-core/src/persist/mod.rs` (is_transient)
 
 **Interfaces (canonical — every later task uses these exact names):**
 
@@ -348,9 +349,10 @@ pub struct BoardReplica {
 Pure helpers (produced here, used everywhere):
 - `state_is_writable(ReplicaState) -> bool` and method `is_writable(&self) -> bool`.
 - `load_state(mode: StoreMode, skipped_empty: bool) -> ReplicaState`.
-- `is_transient(err: &PersistError) -> bool`.
 - `default_board_layout() -> BoardLayout`.
 - `const MAX_RETRIES: u32 = 5;`
+
+**Error classification lives in `lens-core`, NOT here** (lens-ui must not depend on rusqlite): add `impl PersistError { pub fn is_transient(&self) -> bool }` to `crates/lens-core/src/persist/mod.rs`, matching `Sqlite(SqliteFailure(e,_))` with `e.code ∈ {DatabaseBusy, DatabaseLocked}`. lens-ui calls `err.is_transient()`. Its load-bearing test lives in lens-core (where `rusqlite` is in scope).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -369,15 +371,13 @@ fn load_state_maps_mode_and_skips() {
     assert_eq!(load_state(StoreMode::ReadOnlyDegraded, true), ReplicaState::Degraded); // future schema
 }
 
-#[test]
-fn is_transient_only_for_busy_or_locked() {
-    let busy = PersistError::Sqlite(rusqlite::Error::SqliteFailure(
-        rusqlite::ffi::Error { code: rusqlite::ErrorCode::DatabaseBusy, extended_code: 5 },
-        None,
-    ));
-    assert!(is_transient(&busy));
-    assert!(!is_transient(&PersistError::ReadOnly));
-}
+// is_transient's test lives in lens-core (rusqlite in scope):
+//   #[test] fn persist_error_is_transient_for_busy_locked() {
+//       let busy = PersistError::Sqlite(rusqlite::Error::SqliteFailure(
+//           rusqlite::ffi::Error::new(5 /* SQLITE_BUSY */), None));
+//       assert!(busy.is_transient());
+//       assert!(!PersistError::ReadOnly.is_transient());
+//   }
 
 #[test]
 fn is_writable_only_in_writable_state() {
@@ -426,16 +426,7 @@ pub(crate) fn load_state(mode: StoreMode, skipped_empty: bool) -> ReplicaState {
     }
 }
 
-/// Only SQLITE_BUSY/LOCKED are worth a bounded retry; everything else (corruption,
-/// IO, ReadOnly) is persistent — retrying would just fail again.
-pub(crate) fn is_transient(err: &PersistError) -> bool {
-    matches!(
-        err,
-        PersistError::Sqlite(rusqlite::Error::SqliteFailure(e, _))
-            if e.code == rusqlite::ErrorCode::DatabaseBusy
-                || e.code == rusqlite::ErrorCode::DatabaseLocked
-    )
-}
+// Transient classification lives in lens-core: `err.is_transient()` (see above).
 
 pub(crate) fn default_board_layout() -> BoardLayout {
     BoardLayout {
@@ -701,7 +692,7 @@ git commit -m "feat(board): serialized run_op pump + off-thread Load/Place (sing
 ```rust
 fn on_op_failed(&mut self, op: Op, err: PersistError, cx: &mut Context<Self>) {
     // Transient (SQLITE_BUSY/LOCKED beyond busy_timeout): keep the op, back off, retry.
-    if is_transient(&err) && self.op_retries < MAX_RETRIES {
+    if err.is_transient() && self.op_retries < MAX_RETRIES {
         self.op_retries += 1;
         let backoff = std::time::Duration::from_millis(50u64 << self.op_retries.min(6)); // 100,200,…,≤3200ms
         self.schedule_retry(op, backoff, cx);
