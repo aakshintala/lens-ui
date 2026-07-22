@@ -1,4 +1,5 @@
 use gpui::Action;
+use gpui::AppContext;
 use lens_core::actor::{ActorFeed, SessionCommand, SummaryUpdate};
 use lens_core::domain::ids::SessionId;
 use lens_core::domain::scalars::SessionStatusValue;
@@ -6,7 +7,7 @@ use lens_core::domain::usage::Cost;
 use lens_core::reduce::StreamUpdate;
 use lens_ui::PtyProbe;
 use lens_ui::actions::BackToBoard;
-use lens_ui::board::BoardView;
+use lens_ui::board::{BoardReplica, BoardView};
 use lens_ui::card::model::{READY_DECAY_MS, RepoRef, SessionCard};
 use lens_ui::card::wave::{Wave, derive_wave};
 use lens_ui::clock::{ManualUiClock, UiClock};
@@ -76,9 +77,16 @@ async fn card_offscreen_in_focus_rail_resumes_animating_on_return(cx: &mut gpui:
     });
 
     let fleet_for_window = fleet.clone();
+    let replica = cx.update(|cx| cx.new(|cx| BoardReplica::for_test(fleet_for_window.clone(), cx)));
+    cx.run_until_parked();
     let (board_handle, vcx) = cx.add_window_view(|_, cx| {
-        let working_tab = placeholder_tab(cx);
-        BoardView::mount(fleet_for_window, working_tab, None, cx)
+        BoardView::mount(
+            fleet_for_window,
+            replica.clone(),
+            placeholder_tab(cx),
+            None,
+            cx,
+        )
     });
     // Wide + short: board (multi-col) keeps all cards on-screen; the 1-col focus
     // rail overflows so the bottom cards cull.
@@ -189,9 +197,16 @@ async fn card_offscreen_resumes_when_board_mounts_focused(cx: &mut gpui::TestApp
     });
 
     let fleet_for_window = fleet.clone();
+    let replica = cx.update(|cx| cx.new(|cx| BoardReplica::for_test(fleet_for_window.clone(), cx)));
+    cx.run_until_parked();
     let (board_handle, vcx) = cx.add_window_view(|_, cx| {
-        let working_tab = placeholder_tab(cx);
-        BoardView::mount(fleet_for_window, working_tab, None, cx)
+        BoardView::mount(
+            fleet_for_window,
+            replica.clone(),
+            placeholder_tab(cx),
+            None,
+            cx,
+        )
     });
     vcx.simulate_resize(Size {
         width: px(3000.0),
@@ -287,9 +302,16 @@ async fn shell_skeleton_acceptance(cx: &mut gpui::TestAppContext) {
 
     let fleet_for_window = fleet.clone();
     let pty_for_window = pty.clone();
+    let replica = cx.update(|cx| cx.new(|cx| BoardReplica::for_test(fleet_for_window.clone(), cx)));
+    cx.run_until_parked();
     let (board_handle, vcx) = cx.add_window_view(|_, cx| {
-        let working_tab = placeholder_tab(cx);
-        BoardView::mount(fleet_for_window, working_tab, Some(pty_for_window), cx)
+        BoardView::mount(
+            fleet_for_window,
+            replica.clone(),
+            placeholder_tab(cx),
+            Some(pty_for_window),
+            cx,
+        )
     });
 
     // (1) Settle first frame — targeted notify only (never cx.refresh()).
@@ -638,9 +660,16 @@ async fn board_culls_offscreen_tiles(cx: &mut gpui::TestAppContext) {
     });
 
     let fleet_for_window = fleet.clone();
+    let replica = cx.update(|cx| cx.new(|cx| BoardReplica::for_test(fleet_for_window.clone(), cx)));
+    cx.run_until_parked();
     let (board_handle, vcx) = cx.add_window_view(|_, cx| {
-        let working_tab = placeholder_tab(cx);
-        BoardView::mount(fleet_for_window, working_tab, None, cx)
+        BoardView::mount(
+            fleet_for_window,
+            replica.clone(),
+            placeholder_tab(cx),
+            None,
+            cx,
+        )
     });
     // Normal-size window: only the top few rows fit; the rest overflow the band.
     vcx.simulate_resize(Size {
@@ -663,21 +692,21 @@ async fn board_culls_offscreen_tiles(cx: &mut gpui::TestAppContext) {
     );
 }
 
-/// B-3: a group tile renders ring/tint/header chrome and a rollup folded from its
-/// member cards. The group path is not runtime-reachable (no group is creatable
-/// until B-4), so the test injects a hand-built `BoardLayout` via the test seam.
+// B-4a migration of the retired B-3 `board_group_renders_chrome_and_rollup`: the group now
+// comes from a persisted store loaded through the real BoardReplica (not the test_layout
+// seam). Members are seeded under the group with the replica's conn so reconcile treats
+// them as already-placed. Proves the store→replica→group-render path end to end.
 #[gpui::test]
-async fn board_group_renders_chrome_and_rollup(cx: &mut gpui::TestAppContext) {
+async fn board_group_renders_chrome_and_rollup_via_replica(cx: &mut gpui::TestAppContext) {
     use gpui::{Size, px};
-    use lens_core::domain::board::{
-        Board, BoardLayout, DEFAULT_BOARD_ID, DEFAULT_BOARD_NAME, PlacementTarget,
-    };
-    use lens_core::domain::ids::{BoardId, BoardItemId, ConnectionId};
+    use lens_core::domain::board::{DEFAULT_BOARD_ID, PlacementTarget};
+    use lens_core::domain::ids::{BoardId, ConnectionId};
+    use lens_core::persist::{BoardStore, SqliteBoardStore};
 
-    // Clock at 2h past epoch so the oldest member (created_at=0s) ages to "2h".
-    let clock = Arc::new(ManualUiClock::new(7_200_000));
+    let clock = Arc::new(ManualUiClock::new(7_200_000)); // 2h past epoch → oldest member ages to "2h"
     let s1 = SessionId::new("s1");
     let s2 = SessionId::new("s2");
+    let conn = ConnectionId::new("c");
 
     let (fleet, c1, c2) = cx.update(|cx| {
         gpui_component::init(cx);
@@ -702,55 +731,50 @@ async fn board_group_renders_chrome_and_rollup(cx: &mut gpui::TestAppContext) {
         });
     });
 
-    // Hand-built layout: one blue group "Refactor" with members s1, s2.
+    // Seed the "Refactor" (blue) group + members into a REAL store, then load via BoardReplica.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("board.db");
+    let store = SqliteBoardStore::open(&path).unwrap();
     let board = BoardId::new(DEFAULT_BOARD_ID);
-    let g1 = BoardItemId::new("g1");
-    let mut layout = BoardLayout::default();
-    layout.boards.push(Board {
-        id: board.clone(),
-        name: DEFAULT_BOARD_NAME.into(),
-        ordinal: 0,
-        created_at: 0,
-        updated_at: 0,
-    });
-    layout
-        .create_group(&board, None, 0, "Refactor", g1.clone(), 0)
-        .unwrap();
-    layout.set_color(&g1, "blue").unwrap();
-    let conn = ConnectionId::new("c");
-    let under_group = |ordinal: i32| PlacementTarget {
-        board_id: None,
-        parent_item_id: Some(g1.clone()),
-        ordinal: Some(ordinal),
-    };
-    layout
-        .place_session(
-            conn.clone(),
-            s1.clone(),
-            &under_group(0),
-            BoardItemId::new("c1"),
-            0,
-        )
-        .unwrap();
-    layout
-        .place_session(
-            conn.clone(),
-            s2.clone(),
-            &under_group(1),
-            BoardItemId::new("c2"),
-            0,
-        )
-        .unwrap();
+    let g1 = store.create_group(&board, None, 0, "Refactor").unwrap();
+    store.set_color(&g1, "blue").unwrap();
+    for (i, s) in [&s1, &s2].into_iter().enumerate() {
+        store
+            .place_session(
+                &conn,
+                s,
+                &PlacementTarget {
+                    board_id: Some(board.clone()),
+                    parent_item_id: Some(g1.clone()),
+                    ordinal: Some(i as i32),
+                },
+            )
+            .unwrap();
+    }
+    let boxed: Box<dyn BoardStore + Send> = Box::new(store);
 
     let fleet_for_window = fleet.clone();
-    let (board_handle, vcx) = cx.add_window_view(|_, cx| {
-        let working_tab = placeholder_tab(cx);
-        BoardView::mount(fleet_for_window, working_tab, None, cx)
+    let replica = cx.update(|cx| {
+        cx.new(|cx| {
+            BoardReplica::new(
+                Some(boxed),
+                path.clone(),
+                conn.clone(),
+                fleet_for_window.clone(),
+                cx,
+            )
+        })
     });
-    vcx.update(|_, cx| {
-        board_handle.update(cx, |b, _| {
-            b.set_test_layout_for_test(layout);
-        });
+    cx.run_until_parked(); // load the seeded group + members
+
+    let (board_handle, vcx) = cx.add_window_view(|_, cx| {
+        BoardView::mount(
+            fleet_for_window,
+            replica.clone(),
+            placeholder_tab(cx),
+            None,
+            cx,
+        )
     });
     vcx.simulate_resize(Size {
         width: px(1200.0),
@@ -759,7 +783,11 @@ async fn board_group_renders_chrome_and_rollup(cx: &mut gpui::TestAppContext) {
     vcx.run_until_parked();
 
     let chrome = vcx.read(|cx| board_handle.read(cx).group_chrome_for_test());
-    assert_eq!(chrome.len(), 1, "exactly one group tile rendered");
+    assert_eq!(
+        chrome.len(),
+        1,
+        "exactly one group tile rendered via the store→replica path"
+    );
     let g = &chrome[0];
     assert_eq!(g.name, "Refactor");
     assert_eq!(
@@ -773,7 +801,115 @@ async fn board_group_renders_chrome_and_rollup(cx: &mut gpui::TestAppContext) {
     assert_eq!(g.header, "Refactor · ~$3.50 · 2h · ✓0");
     assert_eq!(g.session_ids, vec![s1.clone(), s2.clone()]);
 
-    // The member cards were built (in the visible band).
     let built = vcx.read(|cx| board_handle.read(cx).visible_session_ids_for_test());
     assert!(built.contains(&s1) && built.contains(&s2), "members built");
+    drop(dir);
+}
+
+// I5 (design §7 freshness): after mount, a member's cost change must refresh the group
+// rollup. Also proves the I2 narrow projection reads LIVE member data (not a stale snapshot)
+// and that the member-notify → board re-render dependency is intact.
+#[gpui::test]
+async fn group_rollup_refreshes_on_member_cost_change(cx: &mut gpui::TestAppContext) {
+    use gpui::{Size, px};
+    use lens_core::domain::board::{DEFAULT_BOARD_ID, PlacementTarget};
+    use lens_core::domain::ids::{BoardId, ConnectionId};
+    use lens_core::persist::{BoardStore, SqliteBoardStore};
+
+    let clock = Arc::new(ManualUiClock::new(7_200_000));
+    let s1 = SessionId::new("s1");
+    let s2 = SessionId::new("s2");
+    let conn = ConnectionId::new("c");
+
+    let (fleet, c1, _c2) = cx.update(|cx| {
+        gpui_component::init(cx);
+        lens_ui::theme::install_at_startup(cx);
+        let fleet = FleetStore::new(Arc::clone(&clock) as Arc<dyn UiClock>, cx);
+        let (c1, c2) = fleet.update(cx, |f, cx| {
+            (
+                f.spawn_fake_session(s1.clone(), cx),
+                f.spawn_fake_session(s2.clone(), cx),
+            )
+        });
+        (fleet, c1, c2)
+    });
+    cx.update(|cx| {
+        c1.update(cx, |card, _| {
+            card.cumulative_cost.total_cost_usd = Some(1.50)
+        });
+        _c2.update(cx, |card, _| {
+            card.cumulative_cost.total_cost_usd = Some(2.00)
+        });
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("board.db");
+    let store = SqliteBoardStore::open(&path).unwrap();
+    let board = BoardId::new(DEFAULT_BOARD_ID);
+    let g1 = store.create_group(&board, None, 0, "G").unwrap();
+    for (i, s) in [&s1, &s2].into_iter().enumerate() {
+        store
+            .place_session(
+                &conn,
+                s,
+                &PlacementTarget {
+                    board_id: Some(board.clone()),
+                    parent_item_id: Some(g1.clone()),
+                    ordinal: Some(i as i32),
+                },
+            )
+            .unwrap();
+    }
+    let boxed: Box<dyn BoardStore + Send> = Box::new(store);
+
+    let fleet_for_window = fleet.clone();
+    let replica = cx.update(|cx| {
+        cx.new(|cx| {
+            BoardReplica::new(
+                Some(boxed),
+                path.clone(),
+                conn.clone(),
+                fleet_for_window.clone(),
+                cx,
+            )
+        })
+    });
+    cx.run_until_parked();
+
+    let (board_handle, vcx) = cx.add_window_view(|_, cx| {
+        BoardView::mount(
+            fleet_for_window,
+            replica.clone(),
+            placeholder_tab(cx),
+            None,
+            cx,
+        )
+    });
+    vcx.simulate_resize(Size {
+        width: px(1200.0),
+        height: px(900.0),
+    });
+    vcx.run_until_parked();
+
+    // Initial rollup = $1.50 + $2.00.
+    let before = vcx.read(|cx| board_handle.read(cx).group_chrome_for_test());
+    assert_eq!(before[0].rollup.spend_usd, Some(3.50), "initial rollup");
+
+    // Change a member's cost AFTER mount + notify → board (which reads the member in render)
+    // must re-render and re-fold a FRESH rollup.
+    vcx.update(|_, cx| {
+        c1.update(cx, |card, cx| {
+            card.cumulative_cost.total_cost_usd = Some(5.00);
+            cx.notify();
+        });
+    });
+    vcx.run_until_parked();
+
+    let after = vcx.read(|cx| board_handle.read(cx).group_chrome_for_test());
+    assert_eq!(
+        after[0].rollup.spend_usd,
+        Some(7.00),
+        "rollup refreshed after member cost change (5.00 + 2.00)"
+    );
+    drop(dir);
 }

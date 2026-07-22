@@ -38,6 +38,12 @@ pub fn open_db(path: &Path, ddl: &str, current_version: u32) -> Result<(Connecti
         std::fs::create_dir_all(parent)?;
     }
     let conn = Connection::open(path)?;
+    // NOTE: rusqlite (0.32.1, inner_connection.rs) already sets a 5000ms busy_timeout
+    // on every open — before this line runs — so meta create/version read and every
+    // later write txn are covered against the ~dozen SqliteControlStore connections on
+    // lens.db (design §5/§6). We deliberately do NOT re-set it (redundant); the board
+    // replica's typed retry (Task 5) covers the rare >5s case. `open_db_yields_busy_timeout`
+    // guards this relied-upon default so a future rusqlite bump that changes it fails loudly.
     // The only pre-gate write — see the ordering invariant above.
     conn.execute_batch("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);")?;
 
@@ -92,10 +98,24 @@ pub fn read_schema_version(conn: &Connection) -> Result<VersionState> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::persist::schema::SCHEMA_VERSION;
+    use crate::persist::schema::{CONTROL_DDL, SCHEMA_VERSION};
     use tempfile::tempdir;
 
     const DDL: &str = "CREATE TABLE IF NOT EXISTS t (a INTEGER);";
+
+    // Guards rusqlite's relied-upon default busy_timeout (5000ms, set at open — raw
+    // SQLite defaults to 0). The board replica's retry logic (B-4a §5) assumes this
+    // 5s absorber exists; if a rusqlite bump changes/drops the default, this fails so
+    // we know to set it explicitly.
+    #[test]
+    fn open_db_yields_busy_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let (conn, _mode) = open_db(&dir.path().join("t.db"), CONTROL_DDL, SCHEMA_VERSION).unwrap();
+        let ms: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ms, 5000);
+    }
 
     #[test]
     fn fresh_file_opens_read_write_at_current_version() {

@@ -3316,6 +3316,7 @@ dependencies = [
  "lens-client",
  "lens-core",
  "lens-ui",
+ "tempfile",
  "url",
 ]
 
@@ -3427,9 +3428,11 @@ dependencies = [
  "gpui-component",
  "lens-client",
  "lens-core",
+ "rusqlite",
  "serde",
  "serde_json",
  "smallvec",
+ "tempfile",
 ]
 
 [[package]]

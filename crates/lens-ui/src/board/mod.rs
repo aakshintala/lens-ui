@@ -1,17 +1,17 @@
-mod layout_adapter;
+pub mod replica;
 mod rollup;
 
+pub use replica::{BoardReplica, ReplicaState, WriteDisposition};
+
 use crate::PtyProbe;
-use crate::card::model::SessionCard;
 use crate::card::view::{SessionCardView, mount_cached_card};
 use crate::fleet::store::FleetStore;
-use crate::slot::{TabHandle, placeholder_tab};
+use crate::slot::TabHandle;
 use gpui::{
     AnyElement, AnyView, App, AppContext, Bounds, ClickEvent, Context, Entity, IntoElement,
     ParentElement, Pixels, Render, ScrollHandle, Styled, Window, div, prelude::*, px,
 };
-use layout_adapter::build_ephemeral_layout;
-use lens_core::domain::board::{BoardLayout, BoardNode};
+use lens_core::domain::board::BoardNode;
 use lens_core::domain::ids::SessionId;
 use lens_core::pack::{self, CARD_H, CARD_W, CELL_H, CELL_W, GAP, HEADER, INSET, Item};
 use std::collections::{HashMap, HashSet};
@@ -60,6 +60,7 @@ pub struct GroupChromeSnapshot {
 
 pub struct BoardView {
     fleet: Entity<FleetStore>,
+    replica: Entity<BoardReplica>,
     card_views: HashMap<SessionId, Entity<SessionCardView>>,
     /// Stable `.cached()` wrappers — created once per card so layout recompose reuses cache.
     cached_tiles: HashMap<SessionId, AnyView>,
@@ -78,20 +79,19 @@ pub struct BoardView {
     /// B-3 render snapshot: the group chrome computed at the last render (test hook;
     /// also the eventual B-4 live-inspection point). Recomputed each frame.
     last_group_chrome: Vec<GroupChromeSnapshot>,
-    /// B-3 TEST SEAM: a hand-built layout injected in place of `build_ephemeral_layout`
-    /// so fixture tests can reach the group path (no group is runtime-creatable until
-    /// B-4). `None` in production. B-4's real store→replica seam supersedes this.
-    test_layout: Option<BoardLayout>,
 }
 
 impl BoardView {
     /// Builds a board view inside an existing entity context (window root or `cx.new`).
     pub fn mount(
         fleet: Entity<FleetStore>,
+        replica: Entity<BoardReplica>,
         working_tab: TabHandle,
         pty_probe: Option<PtyProbe>,
         cx: &mut Context<Self>,
     ) -> Self {
+        cx.observe(&replica, |_b: &mut BoardView, _, cx| cx.notify())
+            .detach();
         let cards: Vec<_> = fleet
             .read(cx)
             .cards
@@ -115,6 +115,7 @@ impl BoardView {
         .detach();
         Self {
             fleet: fleet_for_observe,
+            replica,
             card_views,
             cached_tiles,
             working_tab,
@@ -124,13 +125,7 @@ impl BoardView {
             rail_scroll: ScrollHandle::new(),
             last_built: Vec::new(),
             last_group_chrome: Vec::new(),
-            test_layout: None,
         }
-    }
-
-    pub fn new(fleet: Entity<FleetStore>, cx: &mut App) -> Entity<Self> {
-        let working_tab = placeholder_tab(cx);
-        cx.new(|cx| Self::mount(fleet, working_tab, None, cx))
     }
 
     fn make_card_view(
@@ -223,10 +218,7 @@ impl BoardView {
         scroll: ScrollHandle,
         cx: &mut Context<Self>,
     ) -> (AnyElement, Vec<SessionId>) {
-        let layout = self
-            .test_layout
-            .clone()
-            .unwrap_or_else(|| build_ephemeral_layout(self.fleet.read(cx)));
+        let layout = self.replica.read(cx).layout();
         let board_id = match layout.default_board_id() {
             Ok(id) => id.clone(),
             Err(_) => return (div().into_any_element(), Vec::new()),
@@ -381,16 +373,21 @@ impl BoardView {
         let completed = meta.map(|m| m.completed_count).unwrap_or(0);
         let accent = group_accent(meta.and_then(|m| m.color_token.as_deref()));
 
-        // Fold the rollup from member cards (snapshot the values we need — owned).
-        let members: Vec<SessionCard> = {
+        // Fold the rollup from member cards via a NARROW projection (cost + created_at
+        // only) — no full SessionCard clone per member per frame (codex final-review I2).
+        let members: Vec<rollup::MemberCost> = {
             let fleet = self.fleet.read(cx);
             sessions
                 .iter()
-                .filter_map(|s| fleet.cards.get(s).map(|e| e.read(cx).clone()))
+                .filter_map(|s| {
+                    fleet
+                        .cards
+                        .get(s)
+                        .map(|e| rollup::MemberCost::from_card(e.read(cx)))
+                })
                 .collect()
         };
-        let member_refs: Vec<&SessionCard> = members.iter().collect();
-        let rollup = rollup::group_rollup(&member_refs, completed);
+        let rollup = rollup::group_rollup(&members, completed);
         let header = rollup::group_header_text(&name, &rollup, now_ms);
 
         let snapshot = GroupChromeSnapshot {
@@ -477,12 +474,6 @@ impl BoardView {
         self.last_group_chrome.clone()
     }
 
-    /// Test hook (B-3): inject a hand-built layout so the group render path is
-    /// reachable. Production uses `build_ephemeral_layout` (no groups until B-4).
-    pub fn set_test_layout_for_test(&mut self, layout: BoardLayout) {
-        self.test_layout = Some(layout);
-    }
-
     /// Acceptance-test hook: map session id → cached card view entity.
     pub fn card_views_for_test(&self) -> &HashMap<SessionId, Entity<SessionCardView>> {
         &self.card_views
@@ -503,6 +494,84 @@ impl BoardView {
     /// Acceptance-test hook: focus the working-area placeholder tab (terminal stand-in).
     pub fn focus_working_tab_for_test(&self, window: &mut Window, _cx: &App) {
         window.focus(&self.working_tab.focus_handle);
+    }
+
+    /// Non-blocking banner copy from replica health (§5). `None` when healthy or dismissed.
+    pub fn banner_text(&self, cx: &App) -> Option<String> {
+        let replica = self.replica.read(cx);
+        if replica.banner_dismissed() {
+            return None;
+        }
+        match replica.state() {
+            ReplicaState::Loading | ReplicaState::Writable => None,
+            ReplicaState::Degraded => {
+                Some("Some board items couldn't be read — changes won't save.".into())
+            }
+            ReplicaState::LoadFailed => {
+                Some("Couldn't load your board — data on disk is untouched.".into())
+            }
+            ReplicaState::Stale => {
+                let mut text = "Couldn't save — reconnecting.".to_string();
+                let dropped = replica.dropped_writes();
+                if dropped > 0 {
+                    text.push_str(&format!(" ({dropped} change(s) not saved)."));
+                }
+                Some(text)
+            }
+        }
+    }
+
+    fn render_replica_banner(&self, text: String, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("replica-error-banner")
+            .absolute()
+            .top(px(8.0))
+            .left(px(NAV_RAIL_W + 8.0))
+            .right(px(8.0))
+            .p(px(10.0))
+            .rounded(px(8.0))
+            .bg(gpui::rgb(0x2a1f1f))
+            .border_1()
+            .border_color(gpui::rgb(0x8b3a3a))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .flex_grow()
+                    .text_color(gpui::rgb(0xf0d0d0))
+                    .child(text),
+            )
+            .child(
+                div()
+                    .id("replica-banner-retry")
+                    .px(px(8.0))
+                    .py(px(4.0))
+                    .rounded(px(4.0))
+                    .text_color(gpui::rgb(0xd6d6de))
+                    .cursor_pointer()
+                    .child("Retry")
+                    .on_click(cx.listener(|board, _, _, cx| {
+                        board.replica.update(cx, |r, cx| r.retry_recovery(cx));
+                    })),
+            )
+            .child(
+                div()
+                    .id("replica-banner-dismiss")
+                    .px(px(8.0))
+                    .py(px(4.0))
+                    .rounded(px(4.0))
+                    .text_color(gpui::rgb(0x8a8a94))
+                    .cursor_pointer()
+                    .child("Dismiss")
+                    .on_click(cx.listener(|board, _, _, cx| {
+                        board.replica.update(cx, |r, cx| {
+                            r.dismiss_banner();
+                            cx.notify();
+                        });
+                    })),
+            )
     }
 }
 
@@ -556,7 +625,12 @@ impl Render for BoardView {
             }
         };
         self.apply_visibility_gate(visible.into_iter().collect(), cx);
-        div().id("board-view").size_full().child(body)
+        let banner = self.banner_text(cx);
+        let mut root = div().id("board-view").size_full().relative().child(body);
+        if let Some(text) = banner {
+            root = root.child(self.render_replica_banner(text, cx));
+        }
+        root
     }
 }
 
@@ -577,7 +651,43 @@ fn group_accent(token: Option<&str>) -> gpui::Hsla {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use crate::clock::{ManualUiClock, UiClock};
+    use crate::slot::placeholder_tab;
+
     use super::*;
+
+    fn test_fleet(cx: &mut gpui::App) -> Entity<FleetStore> {
+        FleetStore::new(Arc::new(ManualUiClock::new(10_000)) as Arc<dyn UiClock>, cx)
+    }
+
+    #[gpui::test]
+    async fn banner_shows_for_load_failed(cx: &mut gpui::TestAppContext) {
+        let fleet = cx.update(test_fleet);
+        let replica = cx.update(|cx| {
+            cx.new(|cx| BoardReplica::for_test_file(fleet.clone(), "/dev/null/nope.db".into(), cx))
+        });
+        cx.run_until_parked();
+        let (board, vcx) = cx.add_window_view(|_, cx| {
+            BoardView::mount(
+                fleet.clone(),
+                replica.clone(),
+                placeholder_tab(cx),
+                None,
+                cx,
+            )
+        });
+        board.read_with(vcx, |b, cx| assert!(b.banner_text(cx).is_some()));
+
+        let fleet_ok = cx.update(test_fleet);
+        let writable = cx.update(|cx| cx.new(|cx| BoardReplica::for_test(fleet_ok.clone(), cx)));
+        cx.run_until_parked();
+        let (board_ok, vcx_ok) = cx.add_window_view(|_, cx| {
+            BoardView::mount(fleet_ok, writable, placeholder_tab(cx), None, cx)
+        });
+        board_ok.read_with(vcx_ok, |b, cx| assert!(b.banner_text(cx).is_none()));
+    }
 
     #[test]
     fn group_accent_maps_ssot_tokens() {

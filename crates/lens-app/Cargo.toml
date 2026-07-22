@@ -15,10 +15,11 @@ name = "lens-app"
 path = "src/main.rs"
 
 [features]
-demo = ["lens-ui/demo"]
+demo = ["lens-ui/demo", "dep:tempfile"]
 
 [dependencies]
 gpui = "0.2.2"
+tempfile = { version = "3", optional = true }
 gpui-component = "0.5.1"
 lens-client = { path = "../lens-client" }
 lens-core = { path = "../lens-core" }
