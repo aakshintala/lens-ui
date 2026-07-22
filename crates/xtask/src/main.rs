@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::process::Command;
 
 const SPEC: &str = "vendor/omnigent-0.5.1/openapi.json";
 const OUT: &str = "crates/lens-client/src/generated.rs";
@@ -100,13 +101,97 @@ fn diff_sse(vendored: &serde_json::Value, sibling: &serde_json::Value) -> SseDif
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct RssSample {
+    pub mode: String,
+    pub total_rows: usize,
+    pub estimate_bytes: usize,
+    pub rss_bytes: u64,
+}
+
+/// Parse one `RSS_PROBE key=value …` stdout line into a sample. Returns `None`
+/// for any line that is not a well-formed probe line.
+pub fn parse_rss_probe_line(line: &str) -> Option<RssSample> {
+    let line = line.trim();
+    let rest = line.strip_prefix("RSS_PROBE ")?;
+    let mut mode = None;
+    let mut total_rows = None;
+    let mut estimate_bytes = None;
+    let mut rss_bytes = None;
+    for tok in rest.split_whitespace() {
+        let (k, v) = tok.split_once('=')?;
+        match k {
+            "mode" => mode = Some(v.to_string()),
+            "total_rows" => total_rows = v.parse().ok(),
+            "estimate_bytes" => estimate_bytes = v.parse().ok(),
+            "rss_bytes" => rss_bytes = v.parse().ok(),
+            _ => {}
+        }
+    }
+    Some(RssSample {
+        mode: mode?,
+        total_rows: total_rows?,
+        estimate_bytes: estimate_bytes?,
+        rss_bytes: rss_bytes?,
+    })
+}
+
+#[derive(Debug)]
+pub struct FidelityVerdict {
+    /// (i, j) pairs where sample i has a strictly larger estimate than j but a
+    /// strictly SMALLER RSS beyond tolerance — an ordering flip that would
+    /// mislead LRV trimming.
+    pub inversions: Vec<(usize, usize)>,
+    pub ok: bool,
+}
+
+/// The estimate is ordinally reliable iff sorting tabs by `estimate_bytes`
+/// produces (weakly, within tolerance) the same ordering as sorting by
+/// `rss_bytes`. A *scale* difference between compressible/incompressible
+/// content is fine (the estimate ignores content); only an *ordering flip*
+/// — a larger-estimate tab that actually holds less memory — breaks LRV
+/// decisions and escalates to byte-accurate FFI.
+///
+/// Tolerance: RSS carries fixed process overhead + allocator slack, so we only
+/// flag a flip when the RSS gap exceeds 15% of the larger RSS. This avoids
+/// flagging near-ties as inversions.
+pub fn check_ordinal_fidelity(samples: &[RssSample]) -> FidelityVerdict {
+    const TOL: f64 = 0.15;
+    let mut inversions = Vec::new();
+    for i in 0..samples.len() {
+        for j in 0..samples.len() {
+            if i == j {
+                continue;
+            }
+            let a = &samples[i];
+            let b = &samples[j];
+            // a claims (by estimate) to be strictly bigger than b …
+            if a.estimate_bytes > b.estimate_bytes {
+                // … but actually holds meaningfully LESS resident memory.
+                let larger = a.rss_bytes.max(b.rss_bytes) as f64;
+                if larger > 0.0 {
+                    let gap = (b.rss_bytes as f64 - a.rss_bytes as f64) / larger;
+                    if gap > TOL {
+                        inversions.push((i, j));
+                    }
+                }
+            }
+        }
+    }
+    let ok = inversions.is_empty();
+    FidelityVerdict { inversions, ok }
+}
+
 fn main() -> Result<()> {
     let cmd = std::env::args().nth(1).unwrap_or_default();
     match cmd.as_str() {
         "codegen" => codegen(),
         "drift" => drift(std::env::args().skip(2)),
         "gate" => gate(),
-        other => bail!("unknown xtask command: {other:?} (expected: codegen | drift | gate)"),
+        "terminal-rss-sweep" => terminal_rss_sweep(),
+        other => bail!(
+            "unknown xtask command: {other:?} (expected: codegen | drift | gate | terminal-rss-sweep)"
+        ),
     }
 }
 
@@ -433,6 +518,84 @@ fn gate() -> Result<()> {
     Ok(())
 }
 
+/// Job-B estimate-fidelity gate: run `rss_probe` across sizes×modes in fresh
+/// processes and fail-close on an ordinal-fidelity flip. Heavyweight
+/// (multi-process, large allocations) — NOT part of the fast `gate`; run at
+/// slice acceptance and record the table as evidence.
+fn terminal_rss_sweep() -> Result<()> {
+    const COLS: u16 = 200;
+    const SIZES: [usize; 4] = [1_000, 5_000, 20_000, 50_000];
+    const MODES: [&str; 2] = ["compressible", "incompressible"];
+
+    let mut samples: Vec<RssSample> = Vec::new();
+    println!("terminal-rss-sweep: cols={COLS} sizes={SIZES:?} modes={MODES:?}");
+    for &rows in &SIZES {
+        for &mode in &MODES {
+            let out = Command::new(env!("CARGO"))
+                .args([
+                    "run",
+                    "-q",
+                    "-p",
+                    "lens-terminal-demo",
+                    "--bin",
+                    "rss_probe",
+                    "--release",
+                    "--",
+                    mode,
+                    &rows.to_string(),
+                    &COLS.to_string(),
+                ])
+                .output()
+                .context("spawn rss_probe")?;
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let sample = stdout
+                .lines()
+                .find_map(parse_rss_probe_line)
+                .with_context(|| {
+                    format!("no RSS_PROBE line from rows={rows} mode={mode}:\n{stdout}")
+                })?;
+            println!(
+                "  {mode:<14} rows={:<6} estimate={:>12} rss={:>12}",
+                sample.total_rows, sample.estimate_bytes, sample.rss_bytes
+            );
+            samples.push(sample);
+        }
+    }
+
+    // Empirically-calibrated per_cell = median(RSS/estimate) × current
+    // PER_CELL_BYTES. We print the raw ratio (xtask has no lens-terminal dep);
+    // multiply by the current constant (4) by hand when folding it back.
+    let mut ratios: Vec<f64> = samples
+        .iter()
+        .filter(|s| s.estimate_bytes > 0)
+        .map(|s| s.rss_bytes as f64 / s.estimate_bytes as f64)
+        .collect();
+    ratios.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    if let Some(median) = ratios.get(ratios.len() / 2) {
+        println!(
+            "terminal-rss-sweep: median rss/estimate ratio = {median:.2} \
+             (calibrated per_cell ~= this × current PER_CELL_BYTES)"
+        );
+    }
+
+    let verdict = check_ordinal_fidelity(&samples);
+    if verdict.ok {
+        println!(
+            "terminal-rss-sweep: OK — estimate is ordinally reliable (no RSS/estimate ordering flips)"
+        );
+        Ok(())
+    } else {
+        bail!(
+            "terminal-rss-sweep: FAIL — {} ordinal flip(s): {:?}\nESCALATE: the row-count \
+             estimate is ordinally unreliable — this trips the byte-accurate FFI fail-closed \
+             conditional (GHOSTTY_TERMINAL_DATA_* byte selector + re-vendor). See the Slice 3+ \
+             design spec.",
+            verdict.inversions.len(),
+            verdict.inversions
+        )
+    }
+}
+
 fn read_json(path: &std::path::Path) -> Result<serde_json::Value> {
     let raw = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))
@@ -530,5 +693,53 @@ mod tests {
         assert!(shape.removed.is_empty());
 
         assert!(diff_sse(&vendored, &vendored).is_empty());
+    }
+
+    use super::{RssSample, check_ordinal_fidelity, parse_rss_probe_line};
+
+    fn s(mode: &str, total_rows: usize, estimate_bytes: usize, rss_bytes: u64) -> RssSample {
+        RssSample {
+            mode: mode.to_string(),
+            total_rows,
+            estimate_bytes,
+            rss_bytes,
+        }
+    }
+
+    #[test]
+    fn parses_a_probe_line() {
+        let line = "RSS_PROBE mode=incompressible target_rows=5000 total_rows=5050 cols=200 estimate_bytes=4040000 rss_bytes=52428800";
+        let got = parse_rss_probe_line(line).expect("parse");
+        assert_eq!(got.mode, "incompressible");
+        assert_eq!(got.total_rows, 5050);
+        assert_eq!(got.estimate_bytes, 4_040_000);
+        assert_eq!(got.rss_bytes, 52_428_800);
+    }
+
+    #[test]
+    fn monotonic_estimate_and_rss_is_ordinally_ok() {
+        // estimate rank == rss rank across a growing sweep: no inversions.
+        let samples = vec![
+            s("compressible", 1000, 800_000, 10_000_000),
+            s("incompressible", 1000, 800_000, 12_000_000),
+            s("compressible", 5000, 4_000_000, 30_000_000),
+            s("incompressible", 5000, 4_000_000, 40_000_000),
+            s("compressible", 20000, 16_000_000, 120_000_000),
+        ];
+        let verdict = check_ordinal_fidelity(&samples);
+        assert!(verdict.ok, "inversions: {:?}", verdict.inversions);
+    }
+
+    #[test]
+    fn estimate_ordering_flip_vs_rss_is_flagged() {
+        // A LARGER-estimate tab uses MUCH LESS RSS than a smaller-estimate tab:
+        // trimming by estimate would free less than expected -> escalate.
+        let samples = vec![
+            s("compressible", 20000, 16_000_000, 20_000_000), // huge estimate, tiny RSS
+            s("incompressible", 1000, 800_000, 200_000_000),  // tiny estimate, huge RSS
+        ];
+        let verdict = check_ordinal_fidelity(&samples);
+        assert!(!verdict.ok, "expected a flagged inversion");
+        assert!(!verdict.inversions.is_empty());
     }
 }
