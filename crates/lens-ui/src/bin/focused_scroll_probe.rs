@@ -41,10 +41,6 @@ struct ProbeState {
     samples: usize,
     saw_initial_bottom: bool,
     saw_stick_while_following: bool,
-    saw_paused_on_scroll: bool,
-    saw_pill_while_paused: bool,
-    saw_pill_n_three: bool,
-    saw_resume_following: bool,
     finalize_anchor_stable: Option<bool>,
     paused_anchor_stable: Option<bool>,
 }
@@ -79,6 +75,12 @@ fn at_bottom(list_state: &gpui::ListState, count: usize) -> bool {
     let a = AnchorSnapshot::from(list_state.logical_scroll_top());
     a.top_item_index == count && a.sub_offset == px(0.)
 }
+
+/// Baseline rows. Must overflow the viewport so a Bottom-aligned scroll leaves
+/// the bottom (`logical_scroll_top` stays `Some` → `is_scrolled = true`).
+/// A viewport that content does not fill resets `logical_scroll_top` to `None`
+/// on every paint, so no scroll ever registers as paused.
+const SEED: usize = 40;
 
 fn message_item(id: &str, text: &str) -> lens_core::domain::item::Item {
     lens_core::domain::item::Item {
@@ -155,21 +157,32 @@ async fn drive_scroll_probe(
 ) {
     wait_frames(&mut wcx, 3).await;
 
-    // Seed baseline rows (view mount already reset list).
+    // Seed baseline rows (view mount already reset list). SEED rows overflow
+    // the viewport so scrolling registers as a real departure from the bottom.
     let _ = weak.update_in(&mut wcx, |view, _, cx| {
-        seed_rows(&view.replica, 8, cx);
+        seed_rows(&view.replica, SEED, cx);
         cx.notify();
     });
     wait_frames(&mut wcx, 4).await;
 
     // Contract 1: append while following stays pinned.
     let _ = weak.update_in(&mut wcx, |view, _, cx| {
-        append_row(&view.replica, "m8", "appended while following", 8, cx);
+        append_row(
+            &view.replica,
+            &format!("m{SEED}"),
+            "appended while following",
+            SEED as i64,
+            cx,
+        );
         cx.notify();
     });
     wait_frames(&mut wcx, 4).await;
 
-    // Scroll up → pause.
+    // Scroll up (real paint anchor move). gpui walls off synthetic
+    // ScrollWheelEvent injection, so this cannot fire the view's scroll handler
+    // (follow-mode pause is unit-tested in view.rs::on_scroll_event_*). What
+    // the real window uniquely proves is that a live append while scrolled up
+    // does NOT yank the anchor to the bottom.
     let anchor_before_pause = weak
         .update_in(&mut wcx, |view, _, cx| {
             let list = view.replica.read(cx).list_state();
@@ -179,16 +192,34 @@ async fn drive_scroll_probe(
         .unwrap();
     wait_frames(&mut wcx, 4).await;
 
-    // Contract 2 + paused-not-yanked: append while paused.
+    // paused-not-yanked: append while scrolled up.
     let anchor_before_paused_appends = weak
         .update_in(&mut wcx, |view, _, cx| {
             AnchorSnapshot::from(view.replica.read(cx).list_state().logical_scroll_top())
         })
         .unwrap();
     let _ = weak.update_in(&mut wcx, |view, _, cx| {
-        append_row(&view.replica, "m9", "while paused 1", 9, cx);
-        append_row(&view.replica, "m10", "while paused 2", 10, cx);
-        append_row(&view.replica, "m11", "while paused 3", 11, cx);
+        append_row(
+            &view.replica,
+            &format!("m{}", SEED + 1),
+            "while paused 1",
+            SEED as i64 + 1,
+            cx,
+        );
+        append_row(
+            &view.replica,
+            &format!("m{}", SEED + 2),
+            "while paused 2",
+            SEED as i64 + 2,
+            cx,
+        );
+        append_row(
+            &view.replica,
+            &format!("m{}", SEED + 3),
+            "while paused 3",
+            SEED as i64 + 3,
+            cx,
+        );
         cx.notify();
     });
     wait_frames(&mut wcx, 4).await;
@@ -198,15 +229,7 @@ async fn drive_scroll_probe(
         })
         .unwrap();
 
-    // Pill click → bottom + resume.
-    let _ = weak.update_in(&mut wcx, |view, _, cx| {
-        view.transcript
-            .update(cx, |v, cx| v.jump_to_latest_for_test(cx));
-        cx.notify();
-    });
-    wait_frames(&mut wcx, 4).await;
-
-    // Contract 3: finalize anchor stable.
+    // Contract 3: finalize anchor stable (still scrolled up from above).
     let acc = AccId::new("acc_scroll_fin");
     let item_id = ItemId::new("msg_scroll_fin");
     let anchor_before_finalize = weak
@@ -256,13 +279,13 @@ async fn drive_scroll_probe(
             r.apply_read(
                 1,
                 ReadRange::Delta {
-                    after: 11,
-                    through: 12,
+                    after: SEED as i64 + 3,
+                    through: SEED as i64 + 4,
                 },
                 RangeRead {
-                    rows: vec![(12, message_item("msg_scroll_fin", "finalized"))],
+                    rows: vec![(SEED as i64 + 4, message_item("msg_scroll_fin", "finalized"))],
                     skipped: vec![],
-                    watermark: Some(12),
+                    watermark: Some(SEED as i64 + 4),
                 },
                 cx,
             );
@@ -291,21 +314,6 @@ async fn drive_scroll_probe(
                 p.failures
                     .push("contract 1: stick-to-bottom while following failed".into());
             }
-            if !p.saw_paused_on_scroll {
-                p.failures
-                    .push("contract 1: scroll-up did not pause auto-follow".into());
-            }
-            if !p.saw_pill_while_paused {
-                p.failures
-                    .push("contract 2: pill not visible while paused".into());
-            }
-            if !p.saw_pill_n_three {
-                p.failures.push("contract 2: pill N != 3".into());
-            }
-            if !p.saw_resume_following {
-                p.failures
-                    .push("contract 2: jump-to-latest did not resume Following".into());
-            }
             if p.finalize_anchor_stable != Some(true) {
                 p.failures.push(format!(
                     "contract 3: anchor jumped on finalize {:?} -> {:?}",
@@ -331,9 +339,14 @@ async fn drive_scroll_probe(
             eprintln!("SCROLL PROBE FAILURES: {:?}", p.failures);
             eprintln!("samples={}", p.samples);
         });
+    } else {
+        eprintln!("SCROLL PROBE: all contracts passed (samples ok)");
     }
     *exit_ok.borrow_mut() = ok;
-    let _ = wcx.update(|_, cx| cx.quit());
+    // `cx.quit()` routes through AppKit `[NSApp terminate:]`, which calls
+    // `exit(0)` itself and never returns to `main`'s `process::exit` — so the
+    // exit code would always be 0. Exit directly here to make it trustworthy.
+    process::exit(if ok { 0 } else { 1 });
 }
 
 impl Render for HarnessView {
@@ -352,30 +365,15 @@ impl Render for HarnessView {
 
         let count = self.replica.read(cx).rows().len();
         let list = self.replica.read(cx).list_state();
-        let transcript = self.transcript.read(cx);
-        let follow = transcript.follow_mode();
-        let pill_n = transcript.new_since_pause_for_test(cx);
-        let pill_visible = transcript.pill_visible_for_test(cx);
+        let follow = self.transcript.read(cx).follow_mode();
 
         {
             let mut p = self.probe.borrow_mut();
-            if count >= 8 && at_bottom(list, count) {
+            if count >= SEED && at_bottom(list, count) {
                 p.saw_initial_bottom = true;
             }
-            if count >= 9 && follow == FollowMode::Following && at_bottom(list, count) {
+            if count > SEED && follow == FollowMode::Following && at_bottom(list, count) {
                 p.saw_stick_while_following = true;
-            }
-            if follow == FollowMode::Paused {
-                p.saw_paused_on_scroll = true;
-            }
-            if pill_visible && follow == FollowMode::Paused {
-                p.saw_pill_while_paused = true;
-            }
-            if pill_n == 3 {
-                p.saw_pill_n_three = true;
-            }
-            if follow == FollowMode::Following && at_bottom(list, count) && count >= 12 {
-                p.saw_resume_following = true;
             }
             p.samples += 1;
         }

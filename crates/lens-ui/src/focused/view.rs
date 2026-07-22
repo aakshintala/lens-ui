@@ -75,6 +75,30 @@ impl FocusedTranscriptView {
         }
     }
 
+    /// Follow-mode decision for a list scroll event (§16 contract 1).
+    ///
+    /// For a `ListAlignment::Bottom` list, `is_scrolled` (== `logical_scroll_top
+    /// .is_some()`) is the single source of truth: `false` ⟺ pinned to the
+    /// bottom ⟺ Following; `true` ⟺ scrolled up ⟺ Paused. `event.visible_range`
+    /// must NOT gate this — gpui computes it from the *pre-scroll* offset while
+    /// `is_scrolled` is *post-scroll* (list.rs `scroll()`), so a single wheel
+    /// delta that lands at the bottom yields a mid-list range + `is_scrolled =
+    /// false`; gating resume on the range would wrongly keep the reader paused.
+    ///
+    /// Extracted from the render closure so it is directly unit-testable: gpui
+    /// does not permit synthesizing a real `ScrollWheelEvent` outside its own
+    /// `test-support` (`Window::dispatch_event` returns a `pub(crate)` type), so
+    /// the real-window probe cannot fire this path. The render closure is
+    /// trivial glue over this method; branches are covered by `on_scroll_event_*`.
+    fn on_scroll_event(&mut self, event: &ListScrollEvent) {
+        let mode = if event.is_scrolled {
+            FollowMode::Paused
+        } else {
+            FollowMode::Following
+        };
+        self.set_follow_mode(mode, self.last_row_count);
+    }
+
     fn jump_to_latest(&mut self, cx: &mut Context<Self>) {
         let count = self.row_count(cx);
         self.replica.read(cx).list_state().scroll_to(ListOffset {
@@ -150,17 +174,7 @@ impl Render for FocusedTranscriptView {
         // Scroll events fire from input, outside the render/update pass, so a direct weak.update
         // is not re-entrant (the re-entrancy panic was the replica observer, fixed in `new`).
         list_state.set_scroll_handler(move |event: &ListScrollEvent, _, app| {
-            weak.update(app, |view, _| {
-                let count = view.last_row_count;
-                let at_bottom =
-                    event.visible_range.end >= count.saturating_sub(1) && !event.is_scrolled;
-                if at_bottom {
-                    view.set_follow_mode(FollowMode::Following, count);
-                } else if event.is_scrolled {
-                    view.set_follow_mode(FollowMode::Paused, count);
-                }
-            })
-            .ok();
+            weak.update(app, |view, _| view.on_scroll_event(event)).ok();
         });
 
         let replica = self.replica.clone();
@@ -552,6 +566,124 @@ mod tests {
             let offset = replica.read(cx).list_state().logical_scroll_top();
             let count = replica.read(cx).rows().len();
             assert_eq!(offset.item_ix, count);
+        });
+    }
+
+    /// Build a mounted view over a replica seeded with `n` message rows.
+    fn view_with_rows(
+        cx: &mut gpui::TestAppContext,
+        n: usize,
+    ) -> (
+        gpui::Entity<FocusedTranscript>,
+        gpui::Entity<FocusedTranscriptView>,
+    ) {
+        let replica = new_replica(cx);
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                for i in 0..n {
+                    let id = RowId::Sibling(ItemId::new(format!("m{i}")));
+                    r.rows_mut().upsert(
+                        id.clone(),
+                        RowPresentation {
+                            kind: RowKind::Message,
+                            text: format!("row {i}"),
+                            collapsed: false,
+                            height_hint: None,
+                        },
+                        cx,
+                    );
+                    r.rows_mut()
+                        .structure
+                        .push(crate::focused::rowsource::StructureEntry::Sibling(id));
+                }
+                r.rows_mut().rebuild_flat_order();
+            });
+        });
+        let view = cx.update(|cx| cx.new(|cx| FocusedTranscriptView::new(replica.clone(), cx)));
+        (replica, view)
+    }
+
+    fn scroll_event(visible_end: usize, count: usize, is_scrolled: bool) -> gpui::ListScrollEvent {
+        gpui::ListScrollEvent {
+            visible_range: 0..visible_end,
+            count,
+            is_scrolled,
+        }
+    }
+
+    // The four scroll contracts' follow-mode decisions live here because gpui
+    // walls off synthetic ScrollWheelEvent injection outside its own
+    // test-support (see `on_scroll_event`); the real-window probe covers only
+    // the paint-level anchor/overflow behavior.
+
+    #[gpui::test]
+    fn on_scroll_event_pauses_when_scrolled_up(cx: &mut gpui::TestAppContext) {
+        let (_replica, view) = view_with_rows(cx, 5);
+        cx.update(|cx| {
+            view.update(cx, |v, _| {
+                v.note_row_count(5);
+                // Scrolled up: visible window ends mid-list, is_scrolled = true.
+                v.on_scroll_event(&scroll_event(2, 5, true));
+            });
+        });
+        cx.read(|cx| {
+            let v = view.read(cx);
+            assert_eq!(v.follow_mode(), FollowMode::Paused);
+            // Pause captures the row count so the pill counts appends since.
+            assert_eq!(v.new_since_pause_for_test(cx), 0);
+        });
+    }
+
+    #[gpui::test]
+    fn on_scroll_event_resumes_when_back_at_bottom(cx: &mut gpui::TestAppContext) {
+        let (_replica, view) = view_with_rows(cx, 5);
+        cx.update(|cx| {
+            view.update(cx, |v, _| {
+                v.note_row_count(5);
+                v.on_scroll_event(&scroll_event(2, 5, true)); // pause
+                // Back at bottom: not scrolled (logical_scroll_top == None).
+                v.on_scroll_event(&scroll_event(5, 5, false));
+            });
+        });
+        cx.read(|cx| {
+            assert_eq!(view.read(cx).follow_mode(), FollowMode::Following);
+        });
+    }
+
+    #[gpui::test]
+    fn on_scroll_event_at_bottom_stays_following(cx: &mut gpui::TestAppContext) {
+        let (_replica, view) = view_with_rows(cx, 5);
+        cx.update(|cx| {
+            view.update(cx, |v, _| {
+                v.note_row_count(5);
+                v.on_scroll_event(&scroll_event(5, 5, false));
+            });
+        });
+        cx.read(|cx| {
+            assert_eq!(view.read(cx).follow_mode(), FollowMode::Following);
+        });
+    }
+
+    #[gpui::test]
+    fn on_scroll_event_bottom_landing_resumes_despite_prescroll_range(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // gpui reports `visible_range` PRE-scroll but `is_scrolled` POST-scroll.
+        // A single wheel delta that lands at the bottom therefore arrives as a
+        // mid-list range + is_scrolled=false. For a Bottom-aligned list that
+        // means "pinned to bottom" → MUST resume Following. Keying resume on the
+        // (stale) range would wrongly keep the reader paused. (Codex finding.)
+        let (_replica, view) = view_with_rows(cx, 5);
+        cx.update(|cx| {
+            view.update(cx, |v, _| {
+                v.note_row_count(5);
+                v.on_scroll_event(&scroll_event(2, 5, true)); // pause
+                // Pre-scroll range still mid-list (2), but not scrolled anymore.
+                v.on_scroll_event(&scroll_event(2, 5, false));
+            });
+        });
+        cx.read(|cx| {
+            assert_eq!(view.read(cx).follow_mode(), FollowMode::Following);
         });
     }
 

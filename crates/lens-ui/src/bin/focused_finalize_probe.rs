@@ -191,9 +191,14 @@ async fn drive_finalize_probe(
             eprintln!("REAL-WINDOW FAILURES: {:?}", p.failures);
             eprintln!("samples={} min_rows={}", p.samples, p.min_row_count);
         });
+    } else {
+        eprintln!("FINALIZE PROBE: staged finalize flash-free (real paint)");
     }
     *exit_ok.borrow_mut() = ok;
-    let _ = wcx.update(|_, cx| cx.quit());
+    // `cx.quit()` routes through AppKit `[NSApp terminate:]`, which calls
+    // `exit(0)` itself and never returns to `main`'s `process::exit` — so the
+    // exit code would always be 0. Exit directly here to make it trustworthy.
+    process::exit(if ok { 0 } else { 1 });
 }
 
 impl Render for HarnessView {
