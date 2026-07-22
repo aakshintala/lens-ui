@@ -5,8 +5,6 @@
 //! The `saw_delete`-before-`created` discriminator is the positive-reset test;
 //! see the plan design note for why a create without a prior delete is benign.
 
-#![cfg_attr(not(test), allow(dead_code))] // consumed by tab wiring in Task 3+
-
 use lens_client::ids::{SessionId, TerminalId};
 
 use crate::{DetachedDetail, TerminalKey};
@@ -59,6 +57,7 @@ impl GenerationGuard {
 
     /// True once a `resource.deleted` for our id has been observed — used by
     /// Sleep/Wake to test whether the same observed generation survived.
+    #[cfg_attr(not(test), expect(dead_code, reason = "Task 5 Sleep/Wake dirty check"))]
     pub fn is_dirty(&self) -> bool {
         self.saw_delete
     }
@@ -132,13 +131,13 @@ mod tests {
             GenerationVerdict::AwaitReplacement
         );
         assert!(g.is_dirty());
-        match g.on_signal(&created("sess", "t1", "bash", "s1")) {
+        match g.on_signal(&created("sess", "t2", "bash", "s1")) {
             GenerationVerdict::AdoptSuccessor {
                 session_id,
                 terminal_id,
             } => {
                 assert_eq!(session_id.as_str(), "sess");
-                assert_eq!(terminal_id.as_str(), "t1");
+                assert_eq!(terminal_id.as_str(), "t2");
             }
             other => panic!("expected AdoptSuccessor, got {other:?}"),
         }
@@ -166,6 +165,7 @@ mod tests {
             g.on_signal(&created("sess", "t9", "zsh", "s2")),
             GenerationVerdict::Unchanged
         );
+        assert!(g.is_dirty());
     }
 
     #[test]

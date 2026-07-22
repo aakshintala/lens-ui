@@ -456,6 +456,15 @@ pub struct TerminalTab {
     current_session: Option<SessionId>,
     current_tid: Option<TerminalId>,
 
+    /// Resource-generation correlation for the current attachment (None until first attach).
+    generation: Option<generation::GenerationGuard>,
+    /// Cancellation token for in-flight reconnect loops. Any transition OUT of the
+    /// reconnect path (adopt / replacement / sleep / detach) bumps this; a stale
+    /// `on_reconnect_success` whose captured epoch mismatches is dropped (attach closed off-thread).
+    reconnect_epoch: u64,
+    /// Set while an adopt-successor attach is in flight (Task 4).
+    adopt_in_flight: bool,
+
     /// Flipped by [`apply_newest_size_before_input`] on (re)connect; Slice 2 input
     /// gates on this.
     input_enabled: bool,
@@ -525,6 +534,9 @@ impl TerminalTab {
             policy_tx: None,
             current_session: None,
             current_tid: None,
+            generation: None,
+            reconnect_epoch: 0,
+            adopt_in_flight: false,
             input_enabled: false,
             inspect_enabled: false,
             ime_preedit: None,
@@ -581,6 +593,9 @@ impl TerminalTab {
             policy_tx: None,
             current_session: None,
             current_tid: None,
+            generation: None,
+            reconnect_epoch: 0,
+            adopt_in_flight: false,
             input_enabled: true,
             inspect_enabled: false,
             ime_preedit: None,
@@ -623,9 +638,24 @@ impl TerminalTab {
     pub fn on_host_event(&mut self, event: TerminalHostEvent, cx: &mut Context<Self>) {
         match event {
             TerminalHostEvent::Sleep | TerminalHostEvent::Wake => {}
-            TerminalHostEvent::ResourceCreated { .. }
-            | TerminalHostEvent::ResourceDeleted { .. } => {
-                // Wired in Task 3 (correlation). No-op until then.
+            TerminalHostEvent::ResourceCreated {
+                session_id,
+                terminal_id,
+                terminal_name,
+                session_key,
+            } => {
+                self.on_resource_signal(
+                    generation::ResourceSignal::Created {
+                        session_id,
+                        terminal_id,
+                        terminal_name,
+                        session_key,
+                    },
+                    cx,
+                );
+            }
+            TerminalHostEvent::ResourceDeleted { terminal_id } => {
+                self.on_resource_signal(generation::ResourceSignal::Deleted { terminal_id }, cx);
             }
             TerminalHostEvent::HostRequestResponse { id, decision } => {
                 let pos = self
@@ -1523,6 +1553,13 @@ impl TerminalTab {
 
         self.current_session = Some(resource.session_id.clone());
         self.current_tid = Some(resource.id.clone());
+        let key = match &self.target {
+            TerminalTarget::OpenOrCreate { key, .. } => Some(key.clone()),
+            TerminalTarget::Existing { .. } => None,
+        };
+        self.generation = Some(generation::GenerationGuard::new(resource.id.clone(), key));
+        self.presentation.output_gap = false;
+        self.adopt_in_flight = false;
         self.policy_tx = Some(policy_tx);
         self.runtime = Some(runtime);
         self.lifecycle = Lifecycle::Live;
@@ -1622,6 +1659,7 @@ impl TerminalTab {
     }
 
     fn on_detach(&mut self, detail: DetachedDetail, cx: &mut Context<Self>) {
+        self.reconnect_epoch = self.reconnect_epoch.wrapping_add(1);
         let reattach_available = matches!(detail, DetachedDetail::ClientDetached);
         self.clear_input_composition_state();
         self.teardown_runtime_full(cx);
@@ -1629,6 +1667,76 @@ impl TerminalTab {
         cx.emit(TerminalEvent::PresentationChanged);
         cx.notify();
     }
+
+    fn close_attach_off_foreground(
+        &self,
+        attach: lens_client::AttachHandle,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |_w, cx| {
+            cx.background_executor()
+                .spawn(async move {
+                    attach.close();
+                })
+                .await;
+        })
+        .detach();
+    }
+
+    // NB: compute the verdict in a scoped block so the `&mut self.generation` borrow
+    // is released BEFORE the self-mutating transition calls (holding it across
+    // `self.enter_replacement_waiting(...)` would not compile).
+    fn on_resource_signal(&mut self, signal: generation::ResourceSignal, cx: &mut Context<Self>) {
+        let verdict = {
+            let Some(guard) = self.generation.as_mut() else {
+                return;
+            };
+            match self.lifecycle {
+                Lifecycle::Live | Lifecycle::Reconnecting | Lifecycle::ReplacementWaiting => {
+                    Some(guard.on_signal(&signal))
+                }
+                Lifecycle::Sleeping => {
+                    let _ = guard.on_signal(&signal);
+                    None
+                }
+                _ => None,
+            }
+        };
+        match verdict {
+            Some(generation::GenerationVerdict::AwaitReplacement) => {
+                self.enter_replacement_waiting(cx);
+            }
+            Some(generation::GenerationVerdict::AdoptSuccessor {
+                session_id,
+                terminal_id,
+            }) => self.adopt_successor(session_id, terminal_id, cx),
+            Some(generation::GenerationVerdict::Detach(detail)) => self.on_detach(detail, cx),
+            Some(generation::GenerationVerdict::Unchanged) | None => {}
+        }
+    }
+
+    fn enter_replacement_waiting(&mut self, cx: &mut Context<Self>) {
+        self.reconnect_epoch = self.reconnect_epoch.wrapping_add(1);
+        self.clear_input_composition_state();
+        self.teardown_runtime_full(cx);
+        self.input_enabled = false;
+        self.presentation.output_gap = false;
+        self.lifecycle = Lifecycle::ReplacementWaiting;
+        self.presentation.lifecycle = Lifecycle::ReplacementWaiting;
+        self.arm_replacement_timeout(cx);
+        cx.emit(TerminalEvent::PresentationChanged);
+        cx.notify();
+    }
+
+    fn adopt_successor(
+        &mut self,
+        _session_id: SessionId,
+        _terminal_id: TerminalId,
+        _cx: &mut Context<Self>,
+    ) {
+    }
+
+    fn arm_replacement_timeout(&mut self, _cx: &mut Context<Self>) {}
 
     fn sample_latest_frame_from_engine(&mut self) {
         if let Some(rt) = &self.runtime
@@ -1849,6 +1957,7 @@ impl TerminalTab {
     }
 
     fn schedule_reconnect(&mut self, first_delay: Duration, cx: &mut Context<Self>) {
+        let epoch = self.reconnect_epoch;
         let client = Arc::clone(&self.client);
         let (session, tid) = self.reconnect_session_and_tid();
         let read_only = matches!(self.presentation.access, AccessMode::ReadOnly);
@@ -1856,6 +1965,13 @@ impl TerminalTab {
         cx.spawn(async move |weak, cx| {
             let mut first = Some(first_delay);
             loop {
+                if weak
+                    .update(cx, |tab, _| tab.reconnect_epoch != epoch)
+                    .unwrap_or(true)
+                {
+                    break;
+                }
+
                 let delay = if let Some(d) = first.take() {
                     d
                 } else {
@@ -1863,13 +1979,22 @@ impl TerminalTab {
                         Ok(Some(d)) => d,
                         Ok(None) => {
                             let _ = weak.update(cx, |tab, cx| {
-                                tab.on_detach(DetachedDetail::RetriesExhausted, cx);
+                                if tab.reconnect_epoch == epoch {
+                                    tab.on_detach(DetachedDetail::RetriesExhausted, cx);
+                                }
                             });
                             break;
                         }
                         Err(_) => break,
                     }
                 };
+
+                if weak
+                    .update(cx, |tab, _| tab.reconnect_epoch != epoch)
+                    .unwrap_or(true)
+                {
+                    break;
+                }
 
                 let attempt = cx
                     .background_executor()
@@ -1909,12 +2034,20 @@ impl TerminalTab {
                 match attempt {
                     Ok((resource, attach)) => {
                         let _ = weak.update(cx, |tab, cx| {
+                            if tab.reconnect_epoch != epoch {
+                                tab.close_attach_off_foreground(attach, cx);
+                                return;
+                            }
                             tab.on_reconnect_success(resource, attach, cx);
                         });
                         break;
                     }
                     Err(ReconnectOutcome::Fatal(detail)) => {
-                        let _ = weak.update(cx, |tab, cx| tab.on_detach(detail, cx));
+                        let _ = weak.update(cx, |tab, cx| {
+                            if tab.reconnect_epoch == epoch {
+                                tab.on_detach(detail, cx);
+                            }
+                        });
                         break;
                     }
                     Err(ReconnectOutcome::Retryable) => {}
@@ -1934,17 +2067,7 @@ impl TerminalTab {
         let write_allowed = !read_only;
 
         let Some(rt) = &mut self.runtime else {
-            // Unreachable in the current design (no events arrive during the reconnect
-            // window), but NEVER drop an AttachHandle on the gpui foreground — its Drop
-            // joins the I/O thread synchronously.
-            cx.spawn(async move |_w, cx| {
-                cx.background_executor()
-                    .spawn(async move {
-                        attach.close();
-                    })
-                    .await;
-            })
-            .detach();
+            self.close_attach_off_foreground(attach, cx);
             return;
         };
 
@@ -1953,14 +2076,7 @@ impl TerminalTab {
         let snap = engine.inspect();
         let (egress_tx, egress_rx) = crossbeam_channel::bounded(engine::worker::EGRESS_CHANNEL_CAP);
         if engine.attach_egress(egress_tx).is_err() {
-            cx.spawn(async move |_w, cx| {
-                cx.background_executor()
-                    .spawn(async move {
-                        attach.close();
-                    })
-                    .await;
-            })
-            .detach();
+            self.close_attach_off_foreground(attach, cx);
             // Near-unreachable cmd_tx-full defensive path; consumes retry budget.
             match self.policy.retry.next_delay(Instant::now()) {
                 Some(delay) => self.schedule_reconnect(delay, cx),
@@ -2337,6 +2453,181 @@ mod tests {
             cell_w_px: 8,
             cell_h_px: 16,
         }
+    }
+
+    fn live_tab_for_test(
+        cx: &mut gpui::TestAppContext,
+        open_or_create: bool,
+        tid: &str,
+        terminal_name: &str,
+        session_key: &str,
+    ) -> (Arc<EngineHandle>, Entity<TerminalTab>) {
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()).expect("spawn engine for test"));
+        let tab = cx.new(|cx| {
+            let mut tab = TerminalTab::with_engine_for_test(Arc::clone(&engine), cx);
+            tab.target = if open_or_create {
+                TerminalTarget::OpenOrCreate {
+                    session_id: SessionId::new("test_sess"),
+                    key: TerminalKey {
+                        terminal_name: terminal_name.into(),
+                        session_key: session_key.into(),
+                    },
+                }
+            } else {
+                TerminalTarget::Existing {
+                    session_id: SessionId::new("test_sess"),
+                    terminal_id: TerminalId::new(tid),
+                }
+            };
+            tab.current_session = Some(SessionId::new("test_sess"));
+            tab.current_tid = Some(TerminalId::new(tid));
+            let key = if open_or_create {
+                Some(TerminalKey {
+                    terminal_name: terminal_name.into(),
+                    session_key: session_key.into(),
+                })
+            } else {
+                None
+            };
+            tab.generation = Some(generation::GenerationGuard::new(TerminalId::new(tid), key));
+            tab
+        });
+        (engine, tab)
+    }
+
+    #[gpui::test]
+    async fn open_or_create_delete_enters_replacement_waiting(cx: &mut gpui::TestAppContext) {
+        let (engine, tab) = live_tab_for_test(cx, true, "t1", "main", "k");
+        tab.update(cx, |tab, cx| {
+            tab.on_host_event(
+                TerminalHostEvent::ResourceDeleted {
+                    terminal_id: TerminalId::new("t1"),
+                },
+                cx,
+            );
+            assert_eq!(tab.lifecycle, Lifecycle::ReplacementWaiting);
+            assert!(
+                tab.runtime.is_none(),
+                "dead engine must be released on reset"
+            );
+        });
+        let _ = engine;
+    }
+
+    #[gpui::test]
+    async fn existing_delete_detaches_terminal_gone(cx: &mut gpui::TestAppContext) {
+        let (_e, tab) = live_tab_for_test(cx, false, "t1", "main", "k");
+        tab.update(cx, |tab, cx| {
+            tab.on_host_event(
+                TerminalHostEvent::ResourceDeleted {
+                    terminal_id: TerminalId::new("t1"),
+                },
+                cx,
+            );
+            assert_eq!(tab.lifecycle, Lifecycle::Detached);
+            assert_eq!(
+                tab.presentation.detached_detail,
+                Some(DetachedDetail::TerminalGone)
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn create_echo_without_delete_keeps_live(cx: &mut gpui::TestAppContext) {
+        let (_e, tab) = live_tab_for_test(cx, true, "t1", "main", "k");
+        tab.update(cx, |tab, cx| {
+            tab.on_host_event(
+                TerminalHostEvent::ResourceCreated {
+                    session_id: SessionId::new("s"),
+                    terminal_id: TerminalId::new("t1"),
+                    terminal_name: "main".into(),
+                    session_key: "k".into(),
+                },
+                cx,
+            );
+            assert_eq!(tab.lifecycle, Lifecycle::Live);
+        });
+    }
+
+    #[gpui::test]
+    async fn stale_reconnect_after_delete_stays_replacement_waiting(cx: &mut gpui::TestAppContext) {
+        use lens_client::CloseCause;
+
+        let (_e, tab) = live_tab_for_test(cx, true, "t1", "main", "k");
+        let stale_epoch = tab.update(cx, |tab, cx| {
+            tab.apply_bridge_event(BridgeEvent::Closed(CloseCause::Network), cx);
+            assert_eq!(tab.lifecycle, Lifecycle::Reconnecting);
+            tab.reconnect_epoch
+        });
+        tab.update(cx, |tab, cx| {
+            tab.on_host_event(
+                TerminalHostEvent::ResourceDeleted {
+                    terminal_id: TerminalId::new("t1"),
+                },
+                cx,
+            );
+            assert_eq!(tab.lifecycle, Lifecycle::ReplacementWaiting);
+            assert_ne!(tab.reconnect_epoch, stale_epoch);
+        });
+        tab.update(cx, |tab, cx| {
+            if tab.reconnect_epoch == stale_epoch {
+                tab.on_detach(DetachedDetail::TerminalGone, cx);
+            }
+        });
+        tab.update(cx, |tab, _cx| {
+            assert_eq!(tab.lifecycle, Lifecycle::ReplacementWaiting);
+        });
+    }
+
+    #[gpui::test]
+    async fn resize_during_reconnect_preserves_geometry_before_input(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use lens_client::CloseCause;
+
+        let (engine, tab) = live_tab_for_test(cx, true, "t1", "main", "k");
+        tab.update(cx, |tab, cx| {
+            tab.apply_bridge_event(BridgeEvent::Closed(CloseCause::Network), cx);
+            assert_eq!(tab.lifecycle, Lifecycle::Reconnecting);
+            assert!(!tab.input_enabled);
+        });
+        engine.resize(120, 40).expect("resize during reconnect");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let snap = engine.inspect();
+            if snap.cols == 120 && snap.rows == 40 {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "engine resize not applied during reconnect: cols={} rows={}",
+                    snap.cols, snap.rows
+                );
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        let (outbound_tx, outbound_rx) = crossbeam_channel::bounded(4);
+        tab.update(cx, |tab, _cx| {
+            let snap = engine.inspect();
+            let mut input_enabled = tab.input_enabled;
+            apply_newest_size_before_input(
+                engine.as_ref(),
+                &outbound_tx,
+                snap.cols,
+                snap.rows,
+                true,
+                &mut input_enabled,
+            );
+            assert_eq!(
+                outbound_rx.try_recv().unwrap(),
+                WsOutbound::Resize {
+                    cols: 120,
+                    rows: 40
+                }
+            );
+            assert!(outbound_rx.try_recv().is_err(), "no Input before enable");
+            assert!(input_enabled);
+        });
     }
 
     #[test]
