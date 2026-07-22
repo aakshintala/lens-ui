@@ -1221,6 +1221,50 @@ CREATE TABLE IF NOT EXISTS cost_samples (
         );
     }
 
+    // Load-bearing for the batch's CENTRAL purpose (one persist per touched board vs k).
+    // `persist_board_items` upserts every item on the board, so ONE batched persist of k
+    // new cards writes k times; a naive per-session loop (k separate persists) re-writes the
+    // accumulating set 1+2+…+k times. A temp trigger counting board_items writes distinguishes
+    // them: this test FAILS if place_sessions regresses to a per-session persist loop.
+    #[test]
+    fn place_sessions_batch_persists_each_board_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteBoardStore::open(&dir.path().join("lens.db")).unwrap();
+        store
+            .conn
+            .execute_batch(
+                "CREATE TEMP TABLE _wc (n INTEGER NOT NULL);
+                 INSERT INTO _wc VALUES (0);
+                 CREATE TEMP TRIGGER _wc_ins AFTER INSERT ON board_items BEGIN UPDATE _wc SET n = n + 1; END;
+                 CREATE TEMP TRIGGER _wc_upd AFTER UPDATE ON board_items BEGIN UPDATE _wc SET n = n + 1; END;",
+            )
+            .unwrap();
+        let conn = ConnectionId::new("c1");
+        let target = PlacementTarget {
+            board_id: None,
+            parent_item_id: None,
+            ordinal: None,
+        };
+        store
+            .place_sessions(
+                &[
+                    (conn.clone(), SessionId::new("s1")),
+                    (conn.clone(), SessionId::new("s2")),
+                    (conn.clone(), SessionId::new("s3")),
+                ],
+                &target,
+            )
+            .unwrap();
+        let writes: i64 = store
+            .conn
+            .query_row("SELECT n FROM _wc", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            writes, 3,
+            "one persist of 3 new cards = 3 board_items writes; a per-session loop would be 1+2+3=6"
+        );
+    }
+
     #[test]
     fn place_sessions_skips_tombstoned_and_duplicates() {
         let dir = tempfile::tempdir().unwrap();
@@ -1247,19 +1291,30 @@ CREATE TABLE IF NOT EXISTS cost_samples (
             )
             .unwrap();
 
+        // Read the RAW persisted rows (load_layout_inner does NOT reconcile). Reading via
+        // load_layout() would prune tombstoned cards itself, masking whether the BATCH
+        // skipped s2 — this asserts the batch's own tombstone check (board.rs place_sessions).
         let layout = store
-            .load_layout()
+            .load_layout_inner()
             .unwrap()
             .rows
             .into_iter()
             .next()
             .unwrap();
-        let n = layout
+        let mut cards: Vec<String> = layout
             .items
             .iter()
-            .filter(|i| matches!(i.kind, BoardItemKind::Card { .. }))
-            .count();
-        assert_eq!(n, 2);
+            .filter_map(|i| match &i.kind {
+                BoardItemKind::Card { session, .. } => Some(session.as_str().to_string()),
+                _ => None,
+            })
+            .collect();
+        cards.sort();
+        assert_eq!(
+            cards,
+            vec!["s1".to_string(), "s3".to_string()],
+            "batch places s1 (dup no-op) + s3; tombstoned s2 skipped by the batch, not by load reconcile"
+        );
     }
 
     // Regression for the high-water-mark seed: after delete+reopen, a freshly minted
