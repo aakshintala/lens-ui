@@ -62,8 +62,7 @@ _Last curated 2026-07-22 (**B-4a store→replica write-path EXECUTED** on branch
       the C1 tombstone infinite-loop (self-introduced by re-diff-on-reply), a buggy `gate_epoch` composer
       over-reach for a non-existent race, and non-deterministic HashMap placement (flaky acceptance).
       **Perf:** `board_tree` bench 11.8µs @ 1000+group; at-scale demo (`LENS_DEMO_N=125`) launches stable;
-      **MANDATORY on-device FPS-at-120 confirmation OWED (headless can't measure — run
-      `LENS_DEMO_N=125 ./target/release/lens-app --demo` on a display).** Gate green (clippy -D warnings,
+      **Frame-budget E2E MET 2026-07-22** (user ran LENS_DEMO_N=125 ≈1000 cards on a display → smooth ~120fps; logs confirm no whole-board storm). Residual (new session, low-pri): verify off-screen animating cards drop timers at scale. Gate green (clippy -D warnings,
       fmt, lens-core 254 / lens-client 150 / lens-ui 83 lib + 5 acceptance). Memory [[board-b4a-plan-executed]].
       **MERGED + PUSHED 2026-07-22** (board-b4a FF→main, `4d31c9d..c189d4c`, incl. previously-unpushed B-2/B-3). NEXT interaction slices B-4b/c/d; **B-4d blocker:** non-idempotent-retry commit-phase tracking (design §8 seam). Original design spec:
       `docs/specs/2026-07-21-board-b4a-store-replica-write-path-design.md` — grilled + gpt-5.6 codex
