@@ -15,9 +15,7 @@ use gpui::{
 use lens_core::domain::board::BoardNode;
 use lens_core::domain::ids::SessionId;
 use lens_core::pack::{self, CARD_H, CARD_W, CELL_H, CELL_W, GAP, HEADER, INSET, Item};
-use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
 
 /// Width of the left nav rail (unchanged placeholder).
 const NAV_RAIL_W: f32 = 48.0;
@@ -72,9 +70,6 @@ pub struct BoardView {
     /// Session ids currently gated visible (their anim timers allowed to run).
     /// The container is the sole authority; diffed each render, applied via defer.
     gated_visible: HashSet<SessionId>,
-    /// Bumps on each gate apply so stale `defer` closures from an older `want`
-    /// cannot resurrect visibility after a newer gate (replica async re-notify path).
-    gate_epoch: Rc<Cell<u64>>,
     /// Scroll position of the board masonry surface (spec §4 unknown 1).
     board_scroll: ScrollHandle,
     /// Scroll position of the focused-mode rail (same container at 1 col, §5).
@@ -127,7 +122,6 @@ impl BoardView {
             working_tab,
             pty_probe,
             gated_visible: HashSet::new(),
-            gate_epoch: Rc::new(Cell::new(0)),
             board_scroll: ScrollHandle::new(),
             rail_scroll: ScrollHandle::new(),
             last_built: Vec::new(),
@@ -164,13 +158,7 @@ impl BoardView {
         let newly_hid: Vec<SessionId> = self.gated_visible.difference(&want).cloned().collect();
         let views = self.card_views.clone(); // Entity clones are cheap (Rc)
         self.gated_visible = want;
-        let epoch = self.gate_epoch.get().saturating_add(1);
-        self.gate_epoch.set(epoch);
-        let gate_epoch = self.gate_epoch.clone();
         cx.defer(move |app: &mut App| {
-            if gate_epoch.get() != epoch {
-                return;
-            }
             for id in newly_vis {
                 if let Some(v) = views.get(&id) {
                     v.update(app, |c, cx| c.set_visible(true, cx));

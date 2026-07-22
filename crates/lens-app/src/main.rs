@@ -139,25 +139,52 @@ fn main() {
         });
 }
 
+/// Open a temp board store and seed one "Demo group" over two preset demo session ids
+/// (conn `lens-app`, matching the replica) so the loaded board renders B-3 group chrome.
+/// Best-effort: any store failure just yields `None` → the demo board still renders loose.
+#[cfg(feature = "demo")]
+fn seed_demo_group(
+    db: &std::path::Path,
+    conn: &ConnectionId,
+) -> Option<Box<dyn BoardStore + Send>> {
+    use lens_core::domain::board::{DEFAULT_BOARD_ID, PlacementTarget};
+    use lens_core::domain::ids::{BoardId, SessionId};
+
+    let store = SqliteBoardStore::open(db).ok()?;
+    let board = BoardId::new(DEFAULT_BOARD_ID);
+    if let Ok(group) = store.create_group(&board, None, 0, "Demo group") {
+        for (i, sid) in ["demo-working", "demo-ready"].iter().enumerate() {
+            let _ = store.place_session(
+                conn,
+                &SessionId::new(*sid),
+                &PlacementTarget {
+                    board_id: Some(board.clone()),
+                    parent_item_id: Some(group.clone()),
+                    ordinal: Some(i as i32),
+                },
+            );
+        }
+    }
+    Some(Box::new(store) as _)
+}
+
 /// `--demo`: paint six cards in the six wave states (no live server needed) so the
 /// status language is visible at a glance. Cards carry no poller/commands — clicking
 /// one still toggles focus (and suppresses that card's glow while focused).
 #[cfg(feature = "demo")]
 fn run_demo() {
-    let demo_db = std::env::temp_dir()
-        .join(format!("lens-demo-{}", process::id()))
-        .join("board.db");
-    if let Some(parent) = demo_db.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let mut demo_store: Option<Box<dyn BoardStore + Send>> = SqliteBoardStore::open(&demo_db)
-        .ok()
-        .map(|s| Box::new(s) as _);
+    // A held TempDir (auto-cleaned on app exit; no PID-reuse stale data). Seed a group
+    // BEFORE Application::run (compliant — no cx.new SQLite) so B-3 group chrome renders
+    // live over two of the demo cards; the rest reconcile loose.
+    let demo_dir = tempfile::tempdir().expect("demo tempdir");
+    let demo_db = demo_dir.path().join("board.db");
     let demo_conn = ConnectionId::new("lens-app");
+    let mut demo_store = seed_demo_group(&demo_db, &demo_conn);
 
     Application::new()
         .with_assets(lens_ui::assets::LensAssets)
         .run(move |cx: &mut App| {
+            let _demo_dir = &demo_dir; // hold the TempDir for the app's lifetime
             gpui_component::init(cx);
             lens_ui::theme::install_at_startup(cx);
 

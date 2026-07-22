@@ -691,3 +691,117 @@ async fn board_culls_offscreen_tiles(cx: &mut gpui::TestAppContext) {
         "bottom card must be culled while scrolled to top"
     );
 }
+
+// B-4a migration of the retired B-3 `board_group_renders_chrome_and_rollup`: the group now
+// comes from a persisted store loaded through the real BoardReplica (not the test_layout
+// seam). Members are seeded under the group with the replica's conn so reconcile treats
+// them as already-placed. Proves the store→replica→group-render path end to end.
+#[gpui::test]
+async fn board_group_renders_chrome_and_rollup_via_replica(cx: &mut gpui::TestAppContext) {
+    use gpui::{Size, px};
+    use lens_core::domain::board::{DEFAULT_BOARD_ID, PlacementTarget};
+    use lens_core::domain::ids::{BoardId, ConnectionId};
+    use lens_core::persist::{BoardStore, SqliteBoardStore};
+
+    let clock = Arc::new(ManualUiClock::new(7_200_000)); // 2h past epoch → oldest member ages to "2h"
+    let s1 = SessionId::new("s1");
+    let s2 = SessionId::new("s2");
+    let conn = ConnectionId::new("c");
+
+    let (fleet, c1, c2) = cx.update(|cx| {
+        gpui_component::init(cx);
+        lens_ui::theme::install_at_startup(cx);
+        let fleet = FleetStore::new(Arc::clone(&clock) as Arc<dyn UiClock>, cx);
+        let (c1, c2) = fleet.update(cx, |f, cx| {
+            let c1 = f.spawn_fake_session(s1.clone(), cx);
+            let c2 = f.spawn_fake_session(s2.clone(), cx);
+            (c1, c2)
+        });
+        (fleet, c1, c2)
+    });
+    // Member card data: s1 = $1.50 @ 0s (oldest), s2 = $2.00 @ 100s.
+    cx.update(|cx| {
+        c1.update(cx, |card, _| {
+            card.cumulative_cost.total_cost_usd = Some(1.50);
+            card.created_at = Some(0);
+        });
+        c2.update(cx, |card, _| {
+            card.cumulative_cost.total_cost_usd = Some(2.00);
+            card.created_at = Some(100);
+        });
+    });
+
+    // Seed the "Refactor" (blue) group + members into a REAL store, then load via BoardReplica.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("board.db");
+    let store = SqliteBoardStore::open(&path).unwrap();
+    let board = BoardId::new(DEFAULT_BOARD_ID);
+    let g1 = store.create_group(&board, None, 0, "Refactor").unwrap();
+    store.set_color(&g1, "blue").unwrap();
+    for (i, s) in [&s1, &s2].into_iter().enumerate() {
+        store
+            .place_session(
+                &conn,
+                s,
+                &PlacementTarget {
+                    board_id: Some(board.clone()),
+                    parent_item_id: Some(g1.clone()),
+                    ordinal: Some(i as i32),
+                },
+            )
+            .unwrap();
+    }
+    let boxed: Box<dyn BoardStore + Send> = Box::new(store);
+
+    let fleet_for_window = fleet.clone();
+    let replica = cx.update(|cx| {
+        cx.new(|cx| {
+            BoardReplica::new(
+                Some(boxed),
+                path.clone(),
+                conn.clone(),
+                fleet_for_window.clone(),
+                cx,
+            )
+        })
+    });
+    cx.run_until_parked(); // load the seeded group + members
+
+    let (board_handle, vcx) = cx.add_window_view(|_, cx| {
+        BoardView::mount(
+            fleet_for_window,
+            replica.clone(),
+            placeholder_tab(cx),
+            None,
+            cx,
+        )
+    });
+    vcx.simulate_resize(Size {
+        width: px(1200.0),
+        height: px(900.0),
+    });
+    vcx.run_until_parked();
+
+    let chrome = vcx.read(|cx| board_handle.read(cx).group_chrome_for_test());
+    assert_eq!(
+        chrome.len(),
+        1,
+        "exactly one group tile rendered via the store→replica path"
+    );
+    let g = &chrome[0];
+    assert_eq!(g.name, "Refactor");
+    assert_eq!(
+        g.accent,
+        gpui::rgb(0x4c8dff).into(),
+        "blue token → SSOT blue"
+    );
+    assert_eq!(g.rollup.spend_usd, Some(3.50), "spend sums members");
+    assert_eq!(g.rollup.oldest_created_at, Some(0), "oldest member wins");
+    assert_eq!(g.rollup.completed_count, 0, "✓N is 0 until B-6");
+    assert_eq!(g.header, "Refactor · ~$3.50 · 2h · ✓0");
+    assert_eq!(g.session_ids, vec![s1.clone(), s2.clone()]);
+
+    let built = vcx.read(|cx| board_handle.read(cx).visible_session_ids_for_test());
+    assert!(built.contains(&s1) && built.contains(&s2), "members built");
+    drop(dir);
+}

@@ -298,7 +298,11 @@ impl BoardReplica {
     fn missing_keys(&self, cx: &Context<Self>) -> Vec<(ConnectionId, SessionId)> {
         let placed = self.placed_key_strings();
         // snapshot fleet keys, then diff (avoids holding the fleet borrow)
-        let live: Vec<SessionId> = self.fleet.read(cx).cards.keys().cloned().collect();
+        let mut live: Vec<SessionId> = self.fleet.read(cx).cards.keys().cloned().collect();
+        // Deterministic placement order: `cards` is a HashMap (random iteration), so sort by
+        // session id before placing — matches the retired build_ephemeral_layout's order and
+        // keeps board layout / tests stable across runs (codex Task-8 review).
+        live.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         live.into_iter()
             .filter_map(|s| {
                 let k = (self.conn.as_str().to_string(), s.as_str().to_string());
