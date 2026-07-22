@@ -152,19 +152,33 @@ pub fn reduce(state: &mut SessionState, event: &ServerStreamEvent, clock: &dyn C
                     // when it is the SAME message — match by message_id (None ⇒ untracked single
                     // preview for this turn, safe to clear). An unrelated keyed preview is preserved.
                     let mut cleared = false;
+                    let mut cleared_acc_id = None;
                     if let crate::domain::ItemKind::Message { .. } = &kind {
-                        cleared = state.stream.open_message.as_ref().is_some_and(|acc| {
-                            acc.message_id.is_none()
+                        cleared_acc_id = state.stream.open_message.as_ref().and_then(|acc| {
+                            if acc.message_id.is_none()
                                 || acc.message_id.as_deref() == Some(id.as_str())
+                            {
+                                Some(acc.acc_id.clone())
+                            } else {
+                                None
+                            }
                         });
+                        cleared = cleared_acc_id.is_some();
                         if cleared {
                             state.stream.open_message = None;
                         }
                     }
+                    let item_id = id.clone();
                     let response_id = crate::domain::ids::ResponseId::from_wire(item.response_id());
                     let mut u = items::push_item(state, id, kind, None, response_id, clock);
                     if cleared || state.stream.current_agent != prev_agent {
                         u.push(StreamUpdate::ScratchChanged(Arc::new(state.stream.clone())));
+                    }
+                    if let Some(acc_id) = cleared_acc_id {
+                        u.push(StreamUpdate::Retired {
+                            acc_id,
+                            disposition: RetireDisposition::Finalizing { item_id },
+                        });
                     }
                     u
                 }
@@ -455,6 +469,82 @@ mod tests {
                 "response.in_progress emitted {} updates; SmallVec inline cap is 2",
                 updates.len()
             );
+        }
+    }
+
+    mod output_item_done_message_supersede {
+        use super::*;
+        use crate::domain::ItemKind;
+        use crate::reduce::testutil::parse_response;
+        use lens_client::stream::{ResponseEvent, ServerStreamEvent};
+
+        fn resp_text(delta: &str, message_id: Option<&str>) -> ServerStreamEvent {
+            ServerStreamEvent::Response(ResponseEvent::OutputTextDelta {
+                delta: delta.into(),
+                message_id: message_id.map(str::to_string),
+                index: None,
+                last: None,
+            })
+        }
+
+        #[test]
+        fn supersedes_open_preview_emits_retired_finalizing_scratch_and_item() {
+            let mut s = empty_state();
+            let clock = ManualClock::new(1_700_000_000_000);
+            reduce(&mut s, &resp_text("streaming…", None), &clock);
+            let preview_acc_id = s.stream.open_message.as_ref().unwrap().acc_id.clone();
+            let done = parse_response(
+                "response.output_item.done",
+                r#"{"item":{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}"#,
+            );
+            let u = reduce(&mut s, &done, &clock);
+            assert!(s.stream.open_message.is_none());
+            assert_eq!(s.items.len(), 1);
+            assert_eq!(s.items[0].id.as_str(), "msg_1");
+            assert!(
+                u.iter()
+                    .any(|update| matches!(update, StreamUpdate::ScratchChanged(_))),
+                "supersede must still emit ScratchChanged"
+            );
+            assert!(
+                u.iter().any(|update| matches!(
+                    update,
+                    StreamUpdate::Retired {
+                        acc_id,
+                        disposition: RetireDisposition::Finalizing { item_id },
+                    } if *acc_id == preview_acc_id && item_id.as_str() == "msg_1"
+                )),
+                "supersede must emit Retired{{Finalizing}} for the preview acc_id"
+            );
+        }
+
+        #[test]
+        fn unrelated_keyed_preview_does_not_emit_retired_or_clear_scratch() {
+            let mut s = empty_state();
+            let clock = ManualClock::new(1_700_000_000_000);
+            reduce(&mut s, &resp_text("streaming…", Some("msg_A")), &clock);
+            let preview_acc_id = s.stream.open_message.as_ref().unwrap().acc_id.clone();
+            let done_other = parse_response(
+                "response.output_item.done",
+                r#"{"item":{"id":"msg_B","type":"message","role":"assistant","content":[{"type":"output_text","text":"other"}]}}"#,
+            );
+            let u = reduce(&mut s, &done_other, &clock);
+            assert!(
+                s.stream.open_message.is_some(),
+                "unrelated msg_B must not clear the msg_A preview"
+            );
+            assert_eq!(
+                s.stream.open_message.as_ref().unwrap().acc_id,
+                preview_acc_id
+            );
+            assert!(
+                !u.iter()
+                    .any(|update| matches!(update, StreamUpdate::Retired { .. })),
+                "non-matching keyed preview must not emit Retired"
+            );
+            assert_eq!(s.items.len(), 1);
+            assert_eq!(s.items[0].id.as_str(), "msg_B");
+            assert!(matches!(s.items[0].kind, ItemKind::Message { .. }));
         }
     }
 
