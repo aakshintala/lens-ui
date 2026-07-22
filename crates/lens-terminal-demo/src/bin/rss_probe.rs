@@ -82,13 +82,22 @@ fn main() {
         }
     };
 
-    // A viewport of 50 rows; scrollback sized to hold the target so total_rows
-    // can actually reach it. `+64` slack absorbs the viewport rows.
+    // `max_scrollback` is a BYTE budget (not a line count — the vendored doc
+    // comment is misleading; verified empirically). To let `total_rows` actually
+    // reach `target_rows` for BOTH content modes (incompressible compresses worse
+    // → costs more bytes/row), size the budget generously so the row count, not
+    // the byte cap, is the binding constraint: `target × cols × 16 + 4 MiB`
+    // headroom. This is the point of Job B — the estimate must stay ordinally
+    // reliable even though retention is byte-budgeted and content-dependent.
     let viewport_rows: u16 = 50;
+    let max_scrollback = target_rows
+        .saturating_mul(cols as usize)
+        .saturating_mul(16)
+        .saturating_add(4_000_000);
     let cfg = EngineConfig {
         cols,
         rows: viewport_rows,
-        max_scrollback: target_rows + 64,
+        max_scrollback,
         cell_w_px: 8,
         cell_h_px: 16,
     };
@@ -131,9 +140,20 @@ fn main() {
         }
         std::thread::sleep(Duration::from_millis(2));
     }
+    // `total_rows` is sampled only on a fresh frame build, and `build_now` is a
+    // no-op when the engine is not dirty (the last feed's frame was already
+    // built and cleared the dirty flag). Feed one final CRLF to re-dirty, then
+    // force a build so the sample reflects the fully-grown scrollback.
+    loop {
+        match handle.feed(b"\r\n".to_vec()) {
+            Ok(()) => break,
+            Err(_) => std::thread::sleep(Duration::from_millis(1)),
+        }
+    }
+    std::thread::sleep(Duration::from_millis(50));
     let _ = handle.build_now();
     // Give the build a beat to land the sample.
-    std::thread::sleep(Duration::from_millis(30));
+    std::thread::sleep(Duration::from_millis(80));
 
     let snap = handle.inspect();
     let rss = rss_bytes();
