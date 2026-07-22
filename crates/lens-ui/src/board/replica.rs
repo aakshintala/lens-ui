@@ -674,6 +674,7 @@ mod tests {
     struct FlakyStore {
         inner: SqliteBoardStore,
         fail_loads: Cell<u32>,
+        fail_places: Cell<u32>, // leading place_sessions calls that fail with `err`
         err: fn() -> PersistError,
         mode: StoreMode,  // what mode() reports (simulate a Degraded handle)
         place_noop: bool, // place_sessions succeeds but places nothing (simulate a tombstoned/unplaceable key)
@@ -720,6 +721,11 @@ mod tests {
         ) -> lens_core::persist::Result<()> {
             if self.place_noop {
                 return Ok(()); // "committed" but placed nothing → the key stays missing
+            }
+            let n = self.fail_places.get();
+            if n > 0 {
+                self.fail_places.set(n - 1);
+                return Err((self.err)());
             }
             self.inner.place_sessions(placements, target)
         }
@@ -780,7 +786,8 @@ mod tests {
         let inner = SqliteBoardStore::open(&path).unwrap();
         let flaky: Box<dyn BoardStore + Send> = Box::new(FlakyStore {
             inner,
-            fail_loads: Cell::new(0), // load succeeds…
+            fail_loads: Cell::new(0),
+            fail_places: Cell::new(0), // load succeeds…
             err: || PersistError::ReadOnly,
             mode: StoreMode::ReadOnlyDegraded, // …but reported Degraded → handle retained
             place_noop: false,
@@ -808,6 +815,7 @@ mod tests {
         let flaky: Box<dyn BoardStore + Send> = Box::new(FlakyStore {
             inner,
             fail_loads: Cell::new(u32::MAX), // always BUSY
+            fail_places: Cell::new(0),
             err: busy_err,
             mode: StoreMode::ReadWrite,
             place_noop: false,
@@ -852,6 +860,7 @@ mod tests {
         let flaky: Box<dyn BoardStore + Send> = Box::new(FlakyStore {
             inner,
             fail_loads: Cell::new(2),
+            fail_places: Cell::new(0),
             err: busy_err,
             mode: StoreMode::ReadWrite,
             place_noop: false,
@@ -941,6 +950,7 @@ mod tests {
         let flaky: Box<dyn BoardStore + Send> = Box::new(FlakyStore {
             inner,
             fail_loads: Cell::new(0),
+            fail_places: Cell::new(0),
             err: || PersistError::ReadOnly,
             mode: StoreMode::ReadWrite,
             place_noop: true, // reconcile's place "succeeds" but never actually places the key
@@ -964,6 +974,67 @@ mod tests {
                     .contains(&("conn_test".to_string(), "s_dead".to_string())),
                 "the unplaceable key was suppressed after one attempt"
             );
+        });
+        drop(dir);
+    }
+
+    // A card arriving WHILE a reconcile place is in-flight coalesces; the reply's re-diff
+    // must catch it. Held in-flight by failing s1's first place transiently (backoff window).
+    // Load-bearing for re-diff-on-reply: without it, s2 is stranded and this fails.
+    #[gpui::test]
+    async fn coalesced_late_card_caught_by_re_diff(cx: &mut gpui::TestAppContext) {
+        let fleet = cx.update(|cx| test_fleet(cx));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.db");
+        let inner = SqliteBoardStore::open(&path).unwrap();
+        let flaky: Box<dyn BoardStore + Send> = Box::new(FlakyStore {
+            inner,
+            fail_loads: Cell::new(0),
+            fail_places: Cell::new(1), // s1's first place fails (BUSY) → held in backoff
+            err: busy_err,
+            mode: StoreMode::ReadWrite,
+            place_noop: false,
+        });
+        let replica = cx.update(|cx| {
+            cx.new(|cx| BoardReplica::for_test_store(fleet.clone(), flaky, path.clone(), cx))
+        });
+        cx.run_until_parked(); // Load → Writable
+
+        fleet.update(cx, |f, cx| {
+            f.spawn_fake_session(SessionId::new("s1"), cx);
+        });
+        cx.run_until_parked(); // reconcile → place([s1]) → BUSY → backoff (in-flight, reconcile_in_flight held)
+        replica.read_with(cx, |r, _| {
+            assert!(r.in_flight, "s1's place is held in backoff");
+            assert!(r.reconcile_in_flight, "coalescing gate is up");
+        });
+
+        // s2 arrives DURING the in-flight place → its reconcile coalesces (does not enqueue).
+        fleet.update(cx, |f, cx| {
+            f.spawn_fake_session(SessionId::new("s2"), cx);
+        });
+        cx.run_until_parked();
+
+        // release the backoff: s1 place retries + succeeds → Placed re-diff catches s2.
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(500));
+        cx.run_until_parked();
+
+        replica.read_with(cx, |r, _| {
+            let placed: HashSet<String> = r
+                .layout()
+                .items
+                .iter()
+                .filter_map(|i| match &i.kind {
+                    BoardItemKind::Card { session, .. } => Some(session.as_str().to_string()),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                placed.contains("s1") && placed.contains("s2"),
+                "re-diff on reply caught the coalesced late card s2 (placed: {placed:?})"
+            );
+            assert!(!r.in_flight && !r.reconcile_in_flight && r.pending.is_empty());
         });
         drop(dir);
     }
