@@ -142,7 +142,7 @@ fn main() {
 /// The preset demo session-id stems (one per wave state). MUST stay in sync with
 /// `demo_preset_cards`' ids — the group seed and the fleet cards key on the same values.
 #[cfg(feature = "demo")]
-const DEMO_BASE_IDS: [&str; 7] = [
+const DEMO_BASE_IDS: [&str; 8] = [
     "demo-needs-input",
     "demo-ready",
     "demo-working",
@@ -150,6 +150,7 @@ const DEMO_BASE_IDS: [&str; 7] = [
     "demo-slept",
     "demo-neutral",
     "demo-scheduled",
+    "demo-awaiting-review",
 ];
 
 /// Every demo session id that `demo_cards` will create (7 stems × `LENS_DEMO_N` replicas,
