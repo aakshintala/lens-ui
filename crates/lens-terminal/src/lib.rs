@@ -1956,6 +1956,37 @@ impl TerminalTab {
         }
     }
 
+    fn on_reconnect_exit_success(
+        &mut self,
+        epoch: u64,
+        resource: TerminalResource,
+        attach: lens_client::AttachHandle,
+        cx: &mut Context<Self>,
+    ) {
+        if self.reconnect_epoch != epoch {
+            self.close_attach_off_foreground(attach, cx);
+            return;
+        }
+        self.on_reconnect_success(resource, attach, cx);
+    }
+
+    fn on_reconnect_exit_fatal(
+        &mut self,
+        epoch: u64,
+        detail: DetachedDetail,
+        cx: &mut Context<Self>,
+    ) {
+        if self.reconnect_epoch == epoch {
+            self.on_detach(detail, cx);
+        }
+    }
+
+    fn on_reconnect_exit_exhausted(&mut self, epoch: u64, cx: &mut Context<Self>) {
+        if self.reconnect_epoch == epoch {
+            self.on_detach(DetachedDetail::RetriesExhausted, cx);
+        }
+    }
+
     fn schedule_reconnect(&mut self, first_delay: Duration, cx: &mut Context<Self>) {
         let epoch = self.reconnect_epoch;
         let client = Arc::clone(&self.client);
@@ -1979,9 +2010,7 @@ impl TerminalTab {
                         Ok(Some(d)) => d,
                         Ok(None) => {
                             let _ = weak.update(cx, |tab, cx| {
-                                if tab.reconnect_epoch == epoch {
-                                    tab.on_detach(DetachedDetail::RetriesExhausted, cx);
-                                }
+                                tab.on_reconnect_exit_exhausted(epoch, cx);
                             });
                             break;
                         }
@@ -2034,19 +2063,13 @@ impl TerminalTab {
                 match attempt {
                     Ok((resource, attach)) => {
                         let _ = weak.update(cx, |tab, cx| {
-                            if tab.reconnect_epoch != epoch {
-                                tab.close_attach_off_foreground(attach, cx);
-                                return;
-                            }
-                            tab.on_reconnect_success(resource, attach, cx);
+                            tab.on_reconnect_exit_success(epoch, resource, attach, cx);
                         });
                         break;
                     }
                     Err(ReconnectOutcome::Fatal(detail)) => {
                         let _ = weak.update(cx, |tab, cx| {
-                            if tab.reconnect_epoch == epoch {
-                                tab.on_detach(detail, cx);
-                            }
+                            tab.on_reconnect_exit_fatal(epoch, detail, cx);
                         });
                         break;
                     }
@@ -2529,6 +2552,7 @@ mod tests {
                 tab.presentation.detached_detail,
                 Some(DetachedDetail::TerminalGone)
             );
+            assert!(tab.runtime.is_none());
         });
     }
 
@@ -2546,19 +2570,14 @@ mod tests {
                 cx,
             );
             assert_eq!(tab.lifecycle, Lifecycle::Live);
+            assert!(tab.runtime.is_some());
         });
     }
 
     #[gpui::test]
-    async fn stale_reconnect_after_delete_stays_replacement_waiting(cx: &mut gpui::TestAppContext) {
-        use lens_client::CloseCause;
-
+    async fn stale_reconnect_exit_fatal_suppressed_after_delete(cx: &mut gpui::TestAppContext) {
         let (_e, tab) = live_tab_for_test(cx, true, "t1", "main", "k");
-        let stale_epoch = tab.update(cx, |tab, cx| {
-            tab.apply_bridge_event(BridgeEvent::Closed(CloseCause::Network), cx);
-            assert_eq!(tab.lifecycle, Lifecycle::Reconnecting);
-            tab.reconnect_epoch
-        });
+        let stale_epoch = tab.update(cx, |tab, _cx| tab.reconnect_epoch);
         tab.update(cx, |tab, cx| {
             tab.on_host_event(
                 TerminalHostEvent::ResourceDeleted {
@@ -2567,18 +2586,62 @@ mod tests {
                 cx,
             );
             assert_eq!(tab.lifecycle, Lifecycle::ReplacementWaiting);
+            assert!(tab.runtime.is_none());
             assert_ne!(tab.reconnect_epoch, stale_epoch);
         });
         tab.update(cx, |tab, cx| {
-            if tab.reconnect_epoch == stale_epoch {
-                tab.on_detach(DetachedDetail::TerminalGone, cx);
-            }
-        });
-        tab.update(cx, |tab, _cx| {
+            tab.on_reconnect_exit_fatal(stale_epoch, DetachedDetail::TerminalGone, cx);
             assert_eq!(tab.lifecycle, Lifecycle::ReplacementWaiting);
+            assert!(tab.runtime.is_none());
         });
     }
 
+    #[gpui::test]
+    async fn stale_reconnect_exit_exhausted_suppressed_after_delete(cx: &mut gpui::TestAppContext) {
+        let (_e, tab) = live_tab_for_test(cx, true, "t1", "main", "k");
+        let stale_epoch = tab.update(cx, |tab, _cx| tab.reconnect_epoch);
+        tab.update(cx, |tab, cx| {
+            tab.on_host_event(
+                TerminalHostEvent::ResourceDeleted {
+                    terminal_id: TerminalId::new("t1"),
+                },
+                cx,
+            );
+            assert_eq!(tab.lifecycle, Lifecycle::ReplacementWaiting);
+            assert!(tab.runtime.is_none());
+            assert_ne!(tab.reconnect_epoch, stale_epoch);
+        });
+        tab.update(cx, |tab, cx| {
+            tab.on_reconnect_exit_exhausted(stale_epoch, cx);
+            assert_eq!(tab.lifecycle, Lifecycle::ReplacementWaiting);
+            assert!(tab.runtime.is_none());
+        });
+    }
+
+    #[gpui::test]
+    async fn current_epoch_reconnect_exit_fatal_detaches(cx: &mut gpui::TestAppContext) {
+        use lens_client::CloseCause;
+
+        let (_e, tab) = live_tab_for_test(cx, true, "t1", "main", "k");
+        let current_epoch = tab.update(cx, |tab, cx| {
+            tab.apply_bridge_event(BridgeEvent::Closed(CloseCause::Network), cx);
+            assert_eq!(tab.lifecycle, Lifecycle::Reconnecting);
+            tab.reconnect_epoch
+        });
+        tab.update(cx, |tab, cx| {
+            tab.on_reconnect_exit_fatal(current_epoch, DetachedDetail::TerminalGone, cx);
+            assert_eq!(tab.lifecycle, Lifecycle::Detached);
+            assert_eq!(
+                tab.presentation.detached_detail,
+                Some(DetachedDetail::TerminalGone)
+            );
+            assert!(tab.runtime.is_none());
+        });
+    }
+
+    /// Re-confirms Slice-1d retained-engine resize + `apply_newest_size_before_input`
+    /// ordering while the tab is in `Reconnecting`; does not enter `on_reconnect_success`
+    /// or the reconnect epoch guard.
     #[gpui::test]
     async fn resize_during_reconnect_preserves_geometry_before_input(
         cx: &mut gpui::TestAppContext,
