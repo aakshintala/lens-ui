@@ -1381,6 +1381,273 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn staged_reasoning_finalize_stays_under_own_section_when_interleaved(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        let acc = AccId::new("acc_r_interleaved");
+        let item_id = ItemId::new("r_local_interleaved");
+        let resp_a = ResponseId::new("resp_a");
+        let resp_b = ResponseId::new("resp_b");
+        // StreamingReasoning is spliced after settled items, so with
+        // [r_a, r_b] + stream(active=resp_a) the tail opens a new resp_a run
+        // (run_index 1) that is NOT the last section (resp_b is).
+        let key_a = SectionKey {
+            response_id: resp_a.clone(),
+            run_index: 1,
+        };
+        let key_b = SectionKey {
+            response_id: resp_b.clone(),
+            run_index: 0,
+        };
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::All,
+                    range_read(
+                        vec![
+                            (0, reasoning_item("r_a0", "resp_a")),
+                            (1, reasoning_item("r_b0", "resp_b")),
+                        ],
+                        1,
+                    ),
+                    cx,
+                );
+            });
+            replica.update(cx, |r, cx| {
+                r.fold_detailed(
+                    StreamUpdate::ActiveResponseChanged(Some(resp_a.clone())),
+                    cx,
+                );
+            });
+        });
+
+        let entity_before = cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.fold_detailed(
+                    StreamUpdate::ScratchChanged(Arc::new(StreamScratch {
+                        open_reasoning: Some(lens_core::domain::item::ReasoningAcc {
+                            acc_id: acc.clone(),
+                            full_text: "streaming under resp_a".into(),
+                            summary_text: String::new(),
+                            encrypted: false,
+                        }),
+                        ..Default::default()
+                    })),
+                    cx,
+                );
+            });
+            let tail = RowId::StreamTail(acc.clone());
+            let r = replica.read(cx);
+            assert_eq!(
+                r.rows().section_containing_child(&tail),
+                Some(&key_a),
+                "precondition: live reasoning tail under resp_a run 1 (not last)"
+            );
+            assert!(
+                r.rows()
+                    .order()
+                    .iter()
+                    .any(|id| matches!(id, RowId::SectionRail(r, 0) | RowId::Section(r, 0) if r == &resp_b)),
+                "precondition: resp_b section exists after resp_a's stream run"
+            );
+            r.rows().entity_id(&tail, cx)
+        });
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.fold_detailed(
+                    StreamUpdate::Retired {
+                        acc_id: acc.clone(),
+                        disposition: RetireDisposition::Finalizing {
+                            item_id: item_id.clone(),
+                        },
+                    },
+                    cx,
+                );
+                r.fold_detailed(
+                    StreamUpdate::ScratchChanged(Arc::new(StreamScratch::default())),
+                    cx,
+                );
+            });
+        });
+
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            let tail = RowId::StreamTail(acc.clone());
+            assert_eq!(
+                r.rows().section_containing_child(&tail),
+                Some(&key_a),
+                "staged reasoning tail must stay under resp_a run 1, not last section"
+            );
+            assert_ne!(
+                r.rows().section_containing_child(&tail),
+                Some(&key_b),
+                "staged reasoning must not attach to later resp_b section"
+            );
+            assert_eq!(
+                count_in_order(r.rows().order(), &tail),
+                1,
+                "staged reasoning tail must remain visible once"
+            );
+        });
+
+        let finalized = reasoning_item("r_local_interleaved", "resp_a");
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Delta {
+                        after: 1,
+                        through: 2,
+                    },
+                    range_read(vec![(2, finalized)], 2),
+                    cx,
+                );
+            });
+        });
+
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            let work = RowId::Work(item_id.clone());
+            let tail = RowId::StreamTail(acc.clone());
+            assert_eq!(r.pending_finalize_len(), 0);
+            assert_eq!(
+                r.rows().entity_id(&work, cx),
+                entity_before,
+                "finalize must preserve EntityId under resp_a"
+            );
+            assert_eq!(count_in_order(r.rows().order(), &tail), 0);
+            assert_eq!(
+                r.rows().section_containing_child(&work),
+                Some(&key_a),
+                "disk work row must swap in place under resp_a run 1"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn staged_reasoning_finalize_recreates_vanished_reasoning_only_section(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        let acc = AccId::new("acc_r_vanish");
+        let item_id = ItemId::new("r_local_vanish");
+        let resp_a = ResponseId::new("resp_a");
+        let key_a = SectionKey {
+            response_id: resp_a.clone(),
+            run_index: 0,
+        };
+
+        let entity_before = cx.update(|cx| {
+            replica.update(cx, |r, _| {
+                r.active_response = Some(resp_a.clone());
+                r.live_section_start = 0;
+            });
+            replica.update(cx, |r, cx| {
+                r.fold_detailed(
+                    StreamUpdate::ScratchChanged(Arc::new(StreamScratch {
+                        open_reasoning: Some(lens_core::domain::item::ReasoningAcc {
+                            acc_id: acc.clone(),
+                            full_text: "reasoning-only section".into(),
+                            summary_text: String::new(),
+                            encrypted: false,
+                        }),
+                        ..Default::default()
+                    })),
+                    cx,
+                );
+            });
+            let tail = RowId::StreamTail(acc.clone());
+            let r = replica.read(cx);
+            assert_eq!(
+                r.rows().section_containing_child(&tail),
+                Some(&key_a),
+                "precondition: reasoning-only section owns the live tail"
+            );
+            r.rows().entity_id(&tail, cx)
+        });
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.fold_detailed(
+                    StreamUpdate::Retired {
+                        acc_id: acc.clone(),
+                        disposition: RetireDisposition::Finalizing {
+                            item_id: item_id.clone(),
+                        },
+                    },
+                    cx,
+                );
+                // Scratch clear drops the reasoning-only section from projection.
+                r.fold_detailed(
+                    StreamUpdate::ScratchChanged(Arc::new(StreamScratch::default())),
+                    cx,
+                );
+            });
+        });
+
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            let tail = RowId::StreamTail(acc.clone());
+            assert_eq!(
+                r.rows().section_containing_child(&tail),
+                Some(&key_a),
+                "staged tail must stay under its own section after reasoning-only vanish"
+            );
+            assert_eq!(
+                count_in_order(r.rows().order(), &tail),
+                1,
+                "staged tail must remain visible (section recreated if needed)"
+            );
+            assert_eq!(
+                count_section_visible(r.rows().order(), &resp_a),
+                1,
+                "resp_a section marker must be present for the staged tail"
+            );
+        });
+
+        let finalized = reasoning_item("r_local_vanish", "resp_a");
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Delta {
+                        after: -1,
+                        through: 0,
+                    },
+                    range_read(vec![(0, finalized)], 0),
+                    cx,
+                );
+            });
+        });
+
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            let work = RowId::Work(item_id.clone());
+            let tail = RowId::StreamTail(acc.clone());
+            assert_eq!(r.pending_finalize_len(), 0);
+            assert_eq!(
+                r.rows().entity_id(&work, cx),
+                entity_before,
+                "finalize must preserve EntityId after section recreate"
+            );
+            assert_eq!(count_in_order(r.rows().order(), &tail), 0);
+            assert_eq!(
+                r.rows().section_containing_child(&work),
+                Some(&key_a),
+                "disk work row must swap in place under recreated resp_a section"
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn reconcile_all_then_scratch_live_tail_no_structure_dup(cx: &mut gpui::TestAppContext) {
         let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
         let _ = rx.try_recv().expect("baseline");

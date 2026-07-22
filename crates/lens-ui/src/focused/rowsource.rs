@@ -106,6 +106,9 @@ pub struct RowStore {
     structure: Vec<StructureEntry>,
     /// Per-`response_id` derived expand flag (all runs of a turn fold together).
     response_expanded: HashMap<ResponseId, bool>,
+    /// Section a staged reasoning tail belonged to at `stage_stream_finalize` time —
+    /// survives scratch-clear reprojection that drops reasoning-only sections.
+    pending_tail_section: HashMap<AccId, SectionKey>,
 }
 
 impl RowStore {
@@ -116,6 +119,7 @@ impl RowStore {
             sections: HashMap::new(),
             structure: Vec::new(),
             response_expanded: HashMap::new(),
+            pending_tail_section: HashMap::new(),
         }
     }
 
@@ -277,8 +281,15 @@ impl RowStore {
         pres: RowPresentation,
         cx: &mut App,
     ) -> Option<EntityId> {
+        let id = RowId::StreamTail(acc_id.clone());
+        // Capture the tail's own section before any reproject can drop it.
+        if matches!(pres.kind, RowKind::StreamingReasoning)
+            && let Some(key) = self.section_containing_child(&id).cloned()
+        {
+            self.pending_tail_section.insert(acc_id.clone(), key);
+        }
         self.ensure_stream_tail_visible(acc_id, pres, cx);
-        self.entity_id(&RowId::StreamTail(acc_id.clone()), cx)
+        self.entity_id(&id, cx)
     }
 
     /// Keep a pending-finalize tail visible after scratch clears (structure + entity).
@@ -313,8 +324,16 @@ impl RowStore {
                     changed = true;
                 }
                 if self.section_containing_child(&id).is_none()
-                    && let Some(key) = self.last_section_key()
+                    && let Some(key) = self.pending_tail_section.get(acc_id).cloned()
                 {
+                    if !self
+                        .structure
+                        .iter()
+                        .any(|e| matches!(e, StructureEntry::Section(k) if k == &key))
+                    {
+                        self.structure.push(StructureEntry::Section(key.clone()));
+                        changed = true;
+                    }
                     let node = self.ensure_section_node(&key, cx);
                     if !node.children.contains(&id) {
                         node.children.push(id);
@@ -331,6 +350,7 @@ impl RowStore {
 
     /// Drop a streaming tail immediately (`Discarded`).
     pub fn discard_stream_tail(&mut self, acc_id: &AccId, list: Option<&ListState>, cx: &mut App) {
+        self.pending_tail_section.remove(acc_id);
         let id = RowId::StreamTail(acc_id.clone());
         for section in self.sections.values_mut() {
             section.children.retain(|c| c != &id);
@@ -358,6 +378,7 @@ impl RowStore {
         list: Option<&ListState>,
         cx: &mut App,
     ) -> Option<EntityId> {
+        self.pending_tail_section.remove(acc_id);
         let tail_id = RowId::StreamTail(acc_id.clone());
         let durable_id = if as_sibling {
             RowId::Sibling(item_id.clone())
@@ -407,17 +428,10 @@ impl RowStore {
         }
     }
 
-    fn section_containing_child(&self, child: &RowId) -> Option<&SectionKey> {
+    pub(crate) fn section_containing_child(&self, child: &RowId) -> Option<&SectionKey> {
         self.sections
             .iter()
             .find_map(|(key, node)| node.children.contains(child).then_some(key))
-    }
-
-    fn last_section_key(&self) -> Option<SectionKey> {
-        self.structure.iter().rev().find_map(|e| match e {
-            StructureEntry::Section(key) => Some(key.clone()),
-            _ => None,
-        })
     }
 
     fn push_section_flat(&mut self, key: &SectionKey) {
