@@ -1247,9 +1247,19 @@ fn commit_terminal_prefix(
 }
 
 /// Drop superseded deltas within one batch (keep the last of each discriminant).
+/// Keyed/additive signals (`Retired`, `TranscriptRewritten`) are exempt — each
+/// instance carries a distinct key and must all reach the consumer.
 fn coalesce(batch: Updates) -> Updates {
     let mut last: Vec<(std::mem::Discriminant<StreamUpdate>, usize)> = Vec::new();
+    let mut always_keep: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for (i, u) in batch.iter().enumerate() {
+        if matches!(
+            u,
+            StreamUpdate::Retired { .. } | StreamUpdate::TranscriptRewritten { .. }
+        ) {
+            always_keep.insert(i);
+            continue;
+        }
         let d = std::mem::discriminant(u);
         if let Some(entry) = last.iter_mut().find(|(k, _)| *k == d) {
             entry.1 = i;
@@ -1257,7 +1267,8 @@ fn coalesce(batch: Updates) -> Updates {
             last.push((d, i));
         }
     }
-    let keep: std::collections::HashSet<usize> = last.into_iter().map(|(_, i)| i).collect();
+    let mut keep: std::collections::HashSet<usize> = last.into_iter().map(|(_, i)| i).collect();
+    keep.extend(always_keep);
     batch
         .into_iter()
         .enumerate()
@@ -5199,6 +5210,84 @@ mod tests {
             serde_json::from_value(v.clone()).unwrap()
         };
         (mk(hist), mk(delta))
+    }
+
+    #[test]
+    fn coalesce_keeps_every_retired_and_transcript_rewritten() {
+        use crate::domain::ids::{AccId, ItemId};
+        use crate::domain::scalars::SessionStatusValue;
+        use crate::reduce::RetireDisposition;
+
+        let acc_1 = AccId::new("acc_1");
+        let acc_2 = AccId::new("acc_2");
+        let batch: Updates = smallvec![
+            StreamUpdate::StatusChanged(SessionStatusValue::Idle),
+            StreamUpdate::Retired {
+                acc_id: acc_1.clone(),
+                disposition: RetireDisposition::Finalizing {
+                    item_id: ItemId::new("item_1"),
+                },
+            },
+            StreamUpdate::StatusChanged(SessionStatusValue::Running),
+            StreamUpdate::Retired {
+                acc_id: acc_2.clone(),
+                disposition: RetireDisposition::Discarded,
+            },
+            StreamUpdate::TranscriptRewritten { ordinal: 0 },
+            StreamUpdate::TranscriptRewritten { ordinal: 5 },
+        ];
+
+        let out = coalesce(batch);
+
+        assert_eq!(
+            out.len(),
+            5,
+            "2 Retired + 2 TranscriptRewritten + 1 StatusChanged"
+        );
+
+        let retired: Vec<_> = out
+            .iter()
+            .filter_map(|u| match u {
+                StreamUpdate::Retired { acc_id, .. } => Some(acc_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(retired, vec![acc_1, acc_2], "both Retired survive");
+
+        let rewritten: Vec<_> = out
+            .iter()
+            .filter_map(|u| match u {
+                StreamUpdate::TranscriptRewritten { ordinal } => Some(*ordinal),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rewritten, vec![0, 5], "both TranscriptRewritten survive");
+
+        assert!(
+            out.iter()
+                .any(|u| matches!(u, StreamUpdate::StatusChanged(SessionStatusValue::Running))),
+            "last StatusChanged wins"
+        );
+        assert!(
+            !out.iter()
+                .any(|u| matches!(u, StreamUpdate::StatusChanged(SessionStatusValue::Idle))),
+            "earlier StatusChanged dropped"
+        );
+
+        let kinds: Vec<&str> = out
+            .iter()
+            .map(|u| match u {
+                StreamUpdate::StatusChanged(_) => "status",
+                StreamUpdate::Retired { .. } => "retired",
+                StreamUpdate::TranscriptRewritten { .. } => "rewritten",
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["retired", "status", "retired", "rewritten", "rewritten"],
+            "relative order preserved"
+        );
     }
 
     /// Shared D30 fold assertion: exactly one function_call (= /items canonical id,
