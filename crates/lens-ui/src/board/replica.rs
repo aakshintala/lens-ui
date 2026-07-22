@@ -207,6 +207,18 @@ impl BoardReplica {
         self.state
     }
 
+    pub fn banner_dismissed(&self) -> bool {
+        self.banner_dismissed
+    }
+
+    pub fn dropped_writes(&self) -> u32 {
+        self.dropped_writes
+    }
+
+    pub fn dismiss_banner(&mut self) {
+        self.banner_dismissed = true;
+    }
+
     pub fn is_writable(&self) -> bool {
         state_is_writable(self.state)
     }

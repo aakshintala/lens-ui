@@ -491,6 +491,84 @@ impl BoardView {
     pub fn focus_working_tab_for_test(&self, window: &mut Window, _cx: &App) {
         window.focus(&self.working_tab.focus_handle);
     }
+
+    /// Non-blocking banner copy from replica health (§5). `None` when healthy or dismissed.
+    pub fn banner_text(&self, cx: &App) -> Option<String> {
+        let replica = self.replica.read(cx);
+        if replica.banner_dismissed() {
+            return None;
+        }
+        match replica.state() {
+            ReplicaState::Loading | ReplicaState::Writable => None,
+            ReplicaState::Degraded => {
+                Some("Some board items couldn't be read — changes won't save.".into())
+            }
+            ReplicaState::LoadFailed => {
+                Some("Couldn't load your board — data on disk is untouched.".into())
+            }
+            ReplicaState::Stale => {
+                let mut text = "Couldn't save — reconnecting.".to_string();
+                let dropped = replica.dropped_writes();
+                if dropped > 0 {
+                    text.push_str(&format!(" ({dropped} change(s) not saved)."));
+                }
+                Some(text)
+            }
+        }
+    }
+
+    fn render_replica_banner(&self, text: String, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("replica-error-banner")
+            .absolute()
+            .top(px(8.0))
+            .left(px(NAV_RAIL_W + 8.0))
+            .right(px(8.0))
+            .p(px(10.0))
+            .rounded(px(8.0))
+            .bg(gpui::rgb(0x2a1f1f))
+            .border_1()
+            .border_color(gpui::rgb(0x8b3a3a))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .flex_grow()
+                    .text_color(gpui::rgb(0xf0d0d0))
+                    .child(text),
+            )
+            .child(
+                div()
+                    .id("replica-banner-retry")
+                    .px(px(8.0))
+                    .py(px(4.0))
+                    .rounded(px(4.0))
+                    .text_color(gpui::rgb(0xd6d6de))
+                    .cursor_pointer()
+                    .child("Retry")
+                    .on_click(cx.listener(|board, _, _, cx| {
+                        board.replica.update(cx, |r, cx| r.retry_recovery(cx));
+                    })),
+            )
+            .child(
+                div()
+                    .id("replica-banner-dismiss")
+                    .px(px(8.0))
+                    .py(px(4.0))
+                    .rounded(px(4.0))
+                    .text_color(gpui::rgb(0x8a8a94))
+                    .cursor_pointer()
+                    .child("Dismiss")
+                    .on_click(cx.listener(|board, _, _, cx| {
+                        board.replica.update(cx, |r, cx| {
+                            r.dismiss_banner();
+                            cx.notify();
+                        });
+                    })),
+            )
+    }
 }
 
 impl Render for BoardView {
@@ -543,7 +621,12 @@ impl Render for BoardView {
             }
         };
         self.apply_visibility_gate(visible.into_iter().collect(), cx);
-        div().id("board-view").size_full().child(body)
+        let banner = self.banner_text(cx);
+        let mut root = div().id("board-view").size_full().relative().child(body);
+        if let Some(text) = banner {
+            root = root.child(self.render_replica_banner(text, cx));
+        }
+        root
     }
 }
 
@@ -564,7 +647,43 @@ fn group_accent(token: Option<&str>) -> gpui::Hsla {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use crate::clock::{ManualUiClock, UiClock};
+    use crate::slot::placeholder_tab;
+
     use super::*;
+
+    fn test_fleet(cx: &mut gpui::App) -> Entity<FleetStore> {
+        FleetStore::new(Arc::new(ManualUiClock::new(10_000)) as Arc<dyn UiClock>, cx)
+    }
+
+    #[gpui::test]
+    async fn banner_shows_for_load_failed(cx: &mut gpui::TestAppContext) {
+        let fleet = cx.update(|cx| test_fleet(cx));
+        let replica = cx.update(|cx| {
+            cx.new(|cx| BoardReplica::for_test_file(fleet.clone(), "/dev/null/nope.db".into(), cx))
+        });
+        cx.run_until_parked();
+        let (board, vcx) = cx.add_window_view(|_, cx| {
+            BoardView::mount(
+                fleet.clone(),
+                replica.clone(),
+                placeholder_tab(cx),
+                None,
+                cx,
+            )
+        });
+        board.read_with(vcx, |b, cx| assert!(b.banner_text(cx).is_some()));
+
+        let fleet_ok = cx.update(|cx| test_fleet(cx));
+        let writable = cx.update(|cx| cx.new(|cx| BoardReplica::for_test(fleet_ok.clone(), cx)));
+        cx.run_until_parked();
+        let (board_ok, vcx_ok) = cx.add_window_view(|_, cx| {
+            BoardView::mount(fleet_ok, writable, placeholder_tab(cx), None, cx)
+        });
+        board_ok.read_with(vcx_ok, |b, cx| assert!(b.banner_text(cx).is_none()));
+    }
 
     #[test]
     fn group_accent_maps_ssot_tokens() {
