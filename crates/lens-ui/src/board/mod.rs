@@ -396,7 +396,10 @@ impl BoardView {
             rollup::format_group_spend(rollup.spend_usd),
             rollup::format_age(rollup.oldest_created_at, now_ms),
         );
-        let shows_completed = rollup.completed_count > 0;
+        // One source for the ✓N badge: the painted string AND the snapshot bool both
+        // derive from `badge` (the "render ✓N iff N>0" rule lives in `completed_badge`).
+        let badge = completed_badge(rollup.completed_count);
+        let shows_completed = badge.is_some();
 
         let snapshot = GroupChromeSnapshot {
             session_ids: sessions.to_vec(),
@@ -445,11 +448,11 @@ impl BoardView {
                         .text_color(gpui::rgb(0x8a8a94))
                         .child(spend_age.clone()),
                 )
-                .children(shows_completed.then(|| {
-                    div()
-                        .text_color(gpui::rgb(0x8a8a94))
-                        .child(format!("✓{}", rollup.completed_count))
-                }))
+                .children(
+                    badge
+                        .clone()
+                        .map(|t| div().text_color(gpui::rgb(0x8a8a94)).child(t)),
+                )
                 .child(div().text_color(gpui::rgb(0x8a8a94)).child("⌄"))
                 .into_any_element(),
         );
@@ -639,6 +642,14 @@ impl Render for BoardView {
     }
 }
 
+/// The `✓N` completed-badge text for group chrome (§5). `Some("✓{n}")` iff `n > 0`
+/// (the unified "render ✓N iff N>0" rule — one source for both the painted string and
+/// the snapshot bool); `None` suppresses the element. `completed_count` is Archive-side
+/// (B-6), structurally 0 until then — this locks the rule for when B-6 makes it non-zero.
+fn completed_badge(count: u32) -> Option<String> {
+    (count > 0).then(|| format!("✓{count}"))
+}
+
 /// Group accent color from its persisted `color_token` (spec §3, SSOT palette
 /// `docs/design/renders/board-home.html:8-12`). Unknown / `None` → neutral slate.
 /// B-3-local resolver; promoting these to `LensTheme` tokens is a documented
@@ -815,7 +826,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn expanded_group_shows_completed_only_when_positive(cx: &mut gpui::TestAppContext) {
+    async fn expanded_group_snapshot_suppresses_completed_when_zero(cx: &mut gpui::TestAppContext) {
         use lens_core::domain::board::{DEFAULT_BOARD_ID, PlacementTarget};
         use lens_core::domain::ids::{BoardId, ConnectionId};
         use lens_core::persist::{BoardStore, SqliteBoardStore};
@@ -865,6 +876,15 @@ mod tests {
             assert_eq!(chrome[0].rollup.completed_count, 0);
             assert!(!chrome[0].shows_completed, "✓N hidden when count is 0");
         });
+    }
+
+    #[test]
+    fn completed_badge_renders_only_when_positive() {
+        // The unified "✓N iff N>0" rule, both sides (closes the N>0 coverage the
+        // retired `group_header_text` test used to hold — Grok T4 review Important #2).
+        assert_eq!(completed_badge(0), None);
+        assert_eq!(completed_badge(2), Some("✓2".to_string()));
+        assert_eq!(completed_badge(1), Some("✓1".to_string()));
     }
 
     #[test]
