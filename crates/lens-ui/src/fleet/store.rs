@@ -1,13 +1,17 @@
-use crate::card::model::SessionCard;
+use crate::card::model::{ConnectionOverlay, SessionCard};
 use crate::clock::UiClock;
 use crate::fleet::fake::{FEED_CAPACITY, FakeFleet};
 use crate::fleet::live::{self, StreamBridge, WallClock};
 use crate::fleet::poller::spawn_session_poller;
 use gpui::{App, AppContext, Context, Entity, Task};
 use lens_client::{Client, Connection};
-use lens_core::actor::{ClientSessionApi, FleetScheduler, OutputMode, SessionCommand};
+use lens_core::actor::{
+    ActorFeed, ActorTransport, ClientSessionApi, FleetScheduler, OutputMode, SessionCommand,
+};
 use lens_core::domain::ids::{ConnectionId, SessionId};
 use lens_core::persist::{PersistError, SqliteTranscriptReader};
+use lens_core::reduce::StreamUpdate;
+use smallvec::SmallVec;
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -49,6 +53,10 @@ pub struct FleetStore {
     stream_bridges: HashMap<SessionId, StreamBridge>,
     reader_factories: HashMap<SessionId, ReaderFactory>,
     reconcile_epochs: HashMap<SessionId, ReconcileEpoch>,
+    // Task 9: `focused_replica: Option<(SessionId, Entity<FocusedTranscript>)>` — installed
+    // on focus before Promote, dropped on Demote.
+    #[cfg(test)]
+    focused_detailed_fanout_count: Cell<u64>,
 }
 
 impl FleetStore {
@@ -65,6 +73,8 @@ impl FleetStore {
             stream_bridges: HashMap::new(),
             reader_factories: HashMap::new(),
             reconcile_epochs: HashMap::new(),
+            #[cfg(test)]
+            focused_detailed_fanout_count: Cell::new(0),
         })
     }
 
@@ -81,6 +91,8 @@ impl FleetStore {
             stream_bridges: HashMap::new(),
             reader_factories: HashMap::new(),
             reconcile_epochs: HashMap::new(),
+            #[cfg(test)]
+            focused_detailed_fanout_count: Cell::new(0),
         })
     }
 
@@ -124,6 +136,83 @@ impl FleetStore {
 
     pub fn reconcile_epoch(&self, id: &SessionId) -> ReconcileEpoch {
         self.reconcile_epochs.get(id).cloned().unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub fn focused_detailed_fanout_count(&self) -> u64 {
+        self.focused_detailed_fanout_count.get()
+    }
+
+    /// Drain a coalesced feed batch: Summary→card, Detailed→card-chrome and (when focused)
+    /// the Task-9 replica hook.
+    pub fn fold_session_feed(
+        &mut self,
+        id: &SessionId,
+        mut batch: SmallVec<[ActorFeed; 8]>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(card) = self.cards.get(id).cloned() else {
+            return;
+        };
+        let route_replica = self.focused.as_ref() == Some(id);
+        let detailed_for_replica: SmallVec<[StreamUpdate; 8]> = if route_replica {
+            batch
+                .iter()
+                .filter_map(|frame| match frame {
+                    ActorFeed::Detailed(u) => Some(u.clone()),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            SmallVec::new()
+        };
+        let clock = Arc::clone(&self.clock);
+        card.update(cx, |card, _| {
+            for frame in batch.drain(..) {
+                match frame {
+                    ActorFeed::Summary(u) => card.fold_summary(&u, clock.as_ref()),
+                    ActorFeed::Detailed(u) => card.fold_detailed(u),
+                }
+            }
+        });
+        if route_replica && !detailed_for_replica.is_empty() {
+            // Task 9: when `focused_replica` is installed, forward the whole batch atomically:
+            // `replica.update(cx, |r, cx| r.fold_detailed_batch(detailed_for_replica, cx))`
+            #[cfg(test)]
+            self.focused_detailed_fanout_count
+                .set(self.focused_detailed_fanout_count.get().saturating_add(1));
+        }
+    }
+
+    pub fn apply_transport(
+        &mut self,
+        id: &SessionId,
+        transport: ActorTransport,
+        reconcile_in_flight: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(card) = self.cards.get(id) {
+            card.update(cx, |card, cx| {
+                card.connection_overlay = match transport {
+                    ActorTransport::Connected => ConnectionOverlay::Connected,
+                    ActorTransport::Reconnecting => ConnectionOverlay::Reconnecting,
+                };
+                card.notify_count = card.notify_count.saturating_add(1);
+                cx.notify();
+            });
+        }
+        let entry = self.reconcile_epochs.entry(id.clone()).or_default();
+        let was_in_flight = entry.in_flight;
+        if reconcile_in_flight && !was_in_flight {
+            entry.epoch = entry.epoch.saturating_add(1);
+            entry.in_flight = true;
+        } else if !reconcile_in_flight && was_in_flight {
+            entry.in_flight = false;
+            let _epoch = entry.epoch;
+            // Task 9: `replica.update(cx, |r, cx| r.on_reconcile_epoch_settled(_epoch, cx))`
+        } else if reconcile_in_flight {
+            entry.in_flight = true;
+        }
     }
 
     pub fn focus_session(&mut self, id: SessionId, cx: &mut Context<Self>) {
@@ -177,10 +266,12 @@ impl FleetStore {
         let handles = fake.spawn_session(id.clone());
         self.command_txs.insert(id.clone(), handles.commands_tx);
         let card = cx.new(|_| SessionCard::new(id.clone()));
+        let store = cx.entity().downgrade();
         self.pollers.insert(
             id.clone(),
             spawn_session_poller(
-                card.clone(),
+                id.clone(),
+                store,
                 handles.feed_rx,
                 handles.outcomes_rx,
                 Arc::clone(&self.clock),
@@ -249,10 +340,12 @@ impl FleetStore {
         self.command_txs.insert(session_id.clone(), commands);
 
         let card = cx.new(|_| SessionCard::new(session_id.clone()));
+        let store = cx.entity().downgrade();
         self.pollers.insert(
             session_id.clone(),
             spawn_session_poller(
-                card.clone(),
+                session_id.clone(),
+                store,
                 feed_rx,
                 outcomes_rx,
                 Arc::clone(&self.clock),
@@ -265,6 +358,104 @@ impl FleetStore {
             .set(self.store_notify_count.get().saturating_add(1));
         cx.notify();
         Ok(card)
+    }
+}
+
+#[cfg(test)]
+mod fold_session_feed_tests {
+    use super::*;
+    use crate::clock::ManualUiClock;
+    use lens_core::actor::ActorFeed;
+    use lens_core::domain::scalars::SessionStatusValue;
+    use lens_core::reduce::StreamUpdate;
+    use std::sync::Arc;
+
+    #[gpui::test]
+    async fn focused_detailed_batch_reaches_card_unfocused_skips_replica_hook(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let clock = Arc::new(ManualUiClock::new(1_000));
+        let sid = SessionId::new("s1");
+        let sid2 = SessionId::new("s2");
+        let fleet = cx.update(|cx| {
+            let f = FleetStore::new(clock, cx);
+            f.update(cx, |f, cx| {
+                f.spawn_fake_session(sid.clone(), cx);
+                f.spawn_fake_session(sid2.clone(), cx);
+            });
+            f
+        });
+
+        cx.update(|cx| {
+            let f = fleet.read(cx);
+            let fake = f.fake.as_ref().expect("fake mode");
+            fake.push_feed(
+                &sid,
+                ActorFeed::Detailed(StreamUpdate::StatusChanged(SessionStatusValue::Running)),
+            );
+        });
+        cx.run_until_parked();
+
+        cx.read(|cx| {
+            let f = fleet.read(cx);
+            assert_eq!(f.focused_detailed_fanout_count(), 0);
+            let card = f.card(&sid).unwrap().read(cx);
+            assert_eq!(card.status, SessionStatusValue::Running);
+        });
+
+        cx.update(|cx| {
+            fleet.update(cx, |f, cx| f.focus_session(sid2.clone(), cx));
+            let f = fleet.read(cx);
+            f.fake.as_ref().expect("fake mode").push_feed(
+                &sid2,
+                ActorFeed::Detailed(StreamUpdate::StatusChanged(SessionStatusValue::Failed)),
+            );
+        });
+        cx.run_until_parked();
+
+        cx.read(|cx| {
+            let f = fleet.read(cx);
+            assert_eq!(f.focused_detailed_fanout_count(), 1);
+            let card = f.card(&sid2).unwrap().read(cx);
+            assert_eq!(card.status, SessionStatusValue::Failed);
+        });
+
+        cx.update(|cx| {
+            let f = fleet.read(cx);
+            f.fake.as_ref().expect("fake mode").push_feed(
+                &sid,
+                ActorFeed::Detailed(StreamUpdate::StatusChanged(SessionStatusValue::Idle)),
+            );
+        });
+        cx.run_until_parked();
+
+        cx.read(|cx| {
+            let f = fleet.read(cx);
+            assert_eq!(f.focused_detailed_fanout_count(), 1);
+            let card = f.card(&sid).unwrap().read(cx);
+            assert_eq!(card.status, SessionStatusValue::Idle);
+        });
+    }
+
+    #[gpui::test]
+    async fn apply_transport_reconcile_edges_bump_epoch(cx: &mut gpui::TestAppContext) {
+        let clock = Arc::new(ManualUiClock::new(0));
+        let sid = SessionId::new("s1");
+        let fleet = cx.update(|cx| FleetStore::new(clock, cx));
+
+        cx.update(|cx| {
+            fleet.update(cx, |f, cx| {
+                f.apply_transport(&sid, ActorTransport::Connected, true, cx);
+                let ep = f.reconcile_epoch(&sid);
+                assert!(ep.in_flight);
+                assert_eq!(ep.epoch, 1);
+
+                f.apply_transport(&sid, ActorTransport::Connected, false, cx);
+                let ep = f.reconcile_epoch(&sid);
+                assert!(!ep.in_flight);
+                assert_eq!(ep.epoch, 1);
+            });
+        });
     }
 }
 

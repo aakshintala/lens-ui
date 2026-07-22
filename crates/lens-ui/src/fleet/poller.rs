@@ -1,14 +1,17 @@
 use crate::card::model::{ConnectionOverlay, READY_DECAY_MS, SessionCard};
 use crate::clock::UiClock;
+use crate::fleet::store::FleetStore;
 use futures::future::{Either, select};
 use futures::pin_mut;
-use gpui::{App, Entity, Task};
-use lens_core::actor::{ActorFeed, ActorOutcome};
+use gpui::{App, Task, WeakEntity};
+use lens_core::actor::{ActorFeed, ActorOutcome, ActorTransport};
+use lens_core::domain::ids::SessionId;
 use std::sync::Arc;
 use std::time::Duration;
 
 pub fn spawn_session_poller(
-    card: Entity<SessionCard>,
+    session_id: SessionId,
+    store: WeakEntity<FleetStore>,
     feed_rx: async_channel::Receiver<ActorFeed>,
     outcomes_rx: async_channel::Receiver<ActorOutcome>,
     clock: Arc<dyn UiClock>,
@@ -31,36 +34,43 @@ pub fn spawn_session_poller(
                         batch.push(more);
                     }
                     let clock = Arc::clone(&clock);
-                    match card.update(cx, |card, cx| {
-                        for frame in batch.drain(..) {
-                            card.fold_feed(frame, clock.as_ref());
-                        }
-                        card.notify_count = card.notify_count.saturating_add(1);
-                        cx.notify();
-                        let stamp_at = if card.ready_reschedule {
-                            card.last_completed_at
-                        } else {
-                            None
-                        };
-                        card.ready_reschedule = false;
-                        stamp_at
-                    }) {
+                    let fold = store.update(cx, |store, cx| {
+                        store.fold_session_feed(&session_id, batch, cx);
+                        let card = store.cards.get(&session_id)?.clone();
+                        card.update(cx, |card, cx| {
+                            card.notify_count = card.notify_count.saturating_add(1);
+                            cx.notify();
+                            let stamp_at = if card.ready_reschedule {
+                                card.last_completed_at
+                            } else {
+                                None
+                            };
+                            card.ready_reschedule = false;
+                            stamp_at
+                        })
+                    });
+                    match fold {
                         Ok(Some(stamp_at)) => {
-                            let delay = stamp_at
-                                .saturating_add(READY_DECAY_MS)
-                                .saturating_sub(clock.now_millis())
-                                .max(0) as u64;
-                            let card_t = card.clone();
-                            // replace cancels any prior timer (Task cancels on drop).
-                            drop(decay_timer.replace(cx.spawn(async move |cx| {
-                                cx.background_executor()
-                                    .timer(Duration::from_millis(delay))
-                                    .await;
-                                let _ = card_t.update(cx, |card, cx| {
-                                    card.notify_count = card.notify_count.saturating_add(1);
-                                    cx.notify();
-                                });
-                            })));
+                            let card_t = store
+                                .read_with(cx, |s, _| s.cards.get(&session_id).cloned())
+                                .ok()
+                                .flatten();
+                            if let Some(card_t) = card_t {
+                                let delay = stamp_at
+                                    .saturating_add(READY_DECAY_MS)
+                                    .saturating_sub(clock.now_millis())
+                                    .max(0) as u64;
+                                // replace cancels any prior timer (Task cancels on drop).
+                                drop(decay_timer.replace(cx.spawn(async move |cx| {
+                                    cx.background_executor()
+                                        .timer(Duration::from_millis(delay))
+                                        .await;
+                                    let _ = card_t.update(cx, |card, cx| {
+                                        card.notify_count = card.notify_count.saturating_add(1);
+                                        cx.notify();
+                                    });
+                                })));
+                            }
                         }
                         Ok(None) => {}
                         Err(_) => break,
@@ -72,13 +82,31 @@ pub fn spawn_session_poller(
                     while let Ok(more) = outcomes_rx.try_recv() {
                         batch.push(more);
                     }
-                    if card
-                        .update(cx, |card, cx| {
+                    if store
+                        .update(cx, |store, cx| {
                             for o in batch.drain(..) {
-                                apply_outcome(card, o);
+                                match o {
+                                    ActorOutcome::TransportChanged {
+                                        transport,
+                                        reconcile_in_flight,
+                                    } => store.apply_transport(
+                                        &session_id,
+                                        transport,
+                                        reconcile_in_flight,
+                                        cx,
+                                    ),
+                                    other => {
+                                        if let Some(card) = store.cards.get(&session_id) {
+                                            card.update(cx, |card, cx| {
+                                                apply_outcome(card, other);
+                                                card.notify_count =
+                                                    card.notify_count.saturating_add(1);
+                                                cx.notify();
+                                            });
+                                        }
+                                    }
+                                }
                             }
-                            card.notify_count = card.notify_count.saturating_add(1);
-                            cx.notify();
                         })
                         .is_err()
                     {
@@ -97,7 +125,6 @@ fn apply_outcome(card: &mut SessionCard, outcome: ActorOutcome) {
             card.connection_overlay = ConnectionOverlay::Disconnected;
         }
         ActorOutcome::TransportChanged { transport, .. } => {
-            use lens_core::actor::ActorTransport;
             card.connection_overlay = match transport {
                 ActorTransport::Connected => ConnectionOverlay::Connected,
                 ActorTransport::Reconnecting => ConnectionOverlay::Reconnecting,
