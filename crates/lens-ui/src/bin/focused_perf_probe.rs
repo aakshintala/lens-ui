@@ -1,4 +1,4 @@
-//! Real-window O(visible) perf probe — list render calls ≪ resident rows; frame time reported.
+//! Real-window O(visible) perf probe — small vs large resident render-call parity.
 //! `Application::new().run()`; not invokable from `#[gpui::test]` worker threads.
 
 use std::cell::{Cell, RefCell};
@@ -19,18 +19,22 @@ use lens_core::reduce::StreamUpdate;
 use lens_ui::fleet::store::ReconcileEpoch;
 use lens_ui::focused::{FocusedTranscript, ReaderWorkerHandle, RowKind};
 
+const SMALL_RESIDENT: usize = 30;
 const LARGE_RESIDENT: usize = 2000;
 /// Generous cap: visible rows + overdraw, independent of resident count.
 const RENDER_CALL_CAP: usize = 80;
-const TARGET_FRAME_MS: f64 = 8.3;
-const REGRESSION_FRAME_MS: f64 = 11.1;
+/// Small vs large per-frame render calls must agree within this band.
+const RENDER_CALL_TOLERANCE: usize = 8;
+const TARGET_COMPUTE_MS: f64 = 8.3;
+const REGRESSION_COMPUTE_MS: f64 = 11.1;
+const DELTA_FRAMES_PER_RUN: usize = 4;
 
 #[derive(Default)]
-struct FrameTimer {
+struct DurationSamples {
     samples_us: Vec<u128>,
 }
 
-impl FrameTimer {
+impl DurationSamples {
     fn record(&mut self, d: Duration) {
         self.samples_us.push(d.as_micros());
     }
@@ -45,14 +49,20 @@ impl FrameTimer {
     }
 }
 
+#[derive(Clone, Default)]
+struct ResidentRunResult {
+    resident: usize,
+    max_render_calls: usize,
+    mean_compute_ms: f64,
+    delta_frames: usize,
+}
+
 #[derive(Default)]
 struct ProbeState {
     failures: Vec<String>,
-    frame_timer: FrameTimer,
-    last_frame_start: Option<Instant>,
-    max_render_calls: usize,
-    resident_count: usize,
-    delta_frames: usize,
+    compute_samples: DurationSamples,
+    small: Option<ResidentRunResult>,
+    large: Option<ResidentRunResult>,
 }
 
 struct HarnessView {
@@ -134,7 +144,8 @@ fn seed_rows(replica: &Entity<FocusedTranscript>, count: usize, cx: &mut App) {
     });
 }
 
-fn drive_live_delta(replica: &Entity<FocusedTranscript>, tag: &str, cx: &mut App) {
+fn drive_live_delta(replica: &Entity<FocusedTranscript>, tag: &str, cx: &mut App) -> Duration {
+    let start = Instant::now();
     replica.update(cx, |r, cx| {
         r.fold_detailed(
             StreamUpdate::ScratchChanged(std::sync::Arc::new(StreamScratch {
@@ -149,76 +160,153 @@ fn drive_live_delta(replica: &Entity<FocusedTranscript>, tag: &str, cx: &mut App
             cx,
         );
     });
+    start.elapsed()
+}
+
+async fn run_resident_probe(
+    weak: &WeakEntity<HarnessView>,
+    wcx: &mut AsyncWindowContext,
+    resident: usize,
+) -> (ResidentRunResult, Vec<String>) {
+    let _ = weak.update_in(wcx, |view, _, cx| {
+        seed_rows(&view.replica, resident, cx);
+        cx.notify();
+    });
+    wait_frames(wcx, 4).await;
+
+    let mut max_render_calls = 0usize;
+    let mut delta_frames = 0usize;
+    let mut compute_samples = DurationSamples::default();
+    let mut failures = Vec::new();
+
+    for i in 0..DELTA_FRAMES_PER_RUN {
+        let tag = format!("delta_{resident}_{i}");
+        let compute = weak
+            .update_in(wcx, |view, _, cx| {
+                view.frame_render_calls.set(0);
+                let elapsed = drive_live_delta(&view.replica, &tag, cx);
+                cx.notify();
+                elapsed
+            })
+            .unwrap_or(Duration::ZERO);
+        compute_samples.record(compute);
+        let _ = weak.update_in(wcx, |view, _, _| {
+            view.probe.borrow_mut().compute_samples.record(compute);
+        });
+        wait_frames(wcx, 3).await;
+
+        let calls = weak
+            .update_in(wcx, |view, _, _| view.frame_render_calls.get())
+            .unwrap_or(0);
+        max_render_calls = max_render_calls.max(calls);
+        delta_frames += 1;
+
+        if calls == 0 {
+            failures.push(format!(
+                "resident={resident} delta {i}: zero list render calls (vacuous pass)"
+            ));
+        }
+        if calls >= RENDER_CALL_CAP {
+            failures.push(format!(
+                "resident={resident} delta {i}: render_calls {calls} >= cap {RENDER_CALL_CAP}"
+            ));
+        }
+        if calls >= resident {
+            failures.push(format!(
+                "resident={resident} delta {i}: render_calls {calls} scaled with resident count"
+            ));
+        }
+    }
+
+    (
+        ResidentRunResult {
+            resident,
+            max_render_calls,
+            mean_compute_ms: compute_samples.mean_ms(),
+            delta_frames,
+        },
+        failures,
+    )
+}
+
+fn assert_render_parity(
+    small: &ResidentRunResult,
+    large: &ResidentRunResult,
+    failures: &mut Vec<String>,
+) {
+    if small.max_render_calls == 0 || large.max_render_calls == 0 {
+        failures.push(format!(
+            "render parity requires >0 calls on both runs (small={}, large={})",
+            small.max_render_calls, large.max_render_calls
+        ));
+        return;
+    }
+    let diff = small.max_render_calls.abs_diff(large.max_render_calls);
+    if diff > RENDER_CALL_TOLERANCE {
+        failures.push(format!(
+            "render calls must not scale with resident: small={} large={} diff={diff} tolerance={RENDER_CALL_TOLERANCE}",
+            small.max_render_calls,
+            large.max_render_calls,
+        ));
+    }
 }
 
 async fn drive_perf_probe(
     weak: WeakEntity<HarnessView>,
     mut wcx: AsyncWindowContext,
-    resident: usize,
     exit_ok: Rc<RefCell<bool>>,
 ) {
     wait_frames(&mut wcx, 3).await;
 
-    let _ = weak.update_in(&mut wcx, |view, _, cx| {
-        seed_rows(&view.replica, resident, cx);
-        view.probe.borrow_mut().resident_count = resident;
-        cx.notify();
-    });
-    wait_frames(&mut wcx, 4).await;
-
-    for i in 0..4 {
-        let tag = format!("delta_{resident}_{i}");
-        let _ = weak.update_in(&mut wcx, |view, _, cx| {
-            view.frame_render_calls.set(0);
-            drive_live_delta(&view.replica, &tag, cx);
-            cx.notify();
-        });
-        wait_frames(&mut wcx, 3).await;
-
-        let _ = weak.update_in(&mut wcx, |view, _, _| {
-            let calls = view.frame_render_calls.get();
-            let mut p = view.probe.borrow_mut();
-            p.delta_frames += 1;
-            p.max_render_calls = p.max_render_calls.max(calls);
-            if calls >= RENDER_CALL_CAP {
-                p.failures.push(format!(
-                    "render_calls {calls} >= cap {RENDER_CALL_CAP} with resident={resident}"
-                ));
-            }
-            if calls >= resident {
-                p.failures.push(format!(
-                    "render_calls {calls} scaled with resident count {resident}"
-                ));
-            }
-        });
-    }
+    let (small, small_failures) = run_resident_probe(&weak, &mut wcx, SMALL_RESIDENT).await;
+    let (large, large_failures) = run_resident_probe(&weak, &mut wcx, LARGE_RESIDENT).await;
 
     let ok = weak
         .update_in(&mut wcx, |view, _, _| {
-            let p = view.probe.borrow();
-            let mean_ms = p.frame_timer.mean_ms();
+            let mut p = view.probe.borrow_mut();
+            p.failures.extend(small_failures);
+            p.failures.extend(large_failures);
+            p.small = Some(small.clone());
+            p.large = Some(large.clone());
+            assert_render_parity(&small, &large, &mut p.failures);
+            if small.delta_frames < DELTA_FRAMES_PER_RUN || large.delta_frames < DELTA_FRAMES_PER_RUN
+            {
+                p.failures.push(format!(
+                    "insufficient delta frames (small={}, large={})",
+                    small.delta_frames, large.delta_frames
+                ));
+            }
+
+            let mean_compute_ms = p.compute_samples.mean_ms();
             eprintln!(
-                "PERF PROBE resident={} max_render_calls={} cap={RENDER_CALL_CAP} \
-                 delta_frames={} mean_frame_ms={mean_ms:.2} (target {TARGET_FRAME_MS} / regression {REGRESSION_FRAME_MS})",
-                p.resident_count,
-                p.max_render_calls,
-                p.delta_frames,
+                "PERF PROBE small(resident={}) max_render_calls={} mean_compute_ms={:.2} | \
+                 large(resident={}) max_render_calls={} | parity_tol={RENDER_CALL_TOLERANCE} cap={RENDER_CALL_CAP}",
+                small.resident,
+                small.max_render_calls,
+                small.mean_compute_ms,
+                large.resident,
+                large.max_render_calls,
             );
-            if mean_ms > REGRESSION_FRAME_MS {
+            eprintln!(
+                "PERF PROBE mean per-delta COMPUTE ms={mean_compute_ms:.2} \
+                 (target {TARGET_COMPUTE_MS} / regression {REGRESSION_COMPUTE_MS})"
+            );
+            if mean_compute_ms > REGRESSION_COMPUTE_MS {
                 eprintln!(
-                    "PERF PROBE NOTE: mean frame time {mean_ms:.2}ms exceeds {REGRESSION_FRAME_MS}ms regression line (soft check)"
+                    "PERF PROBE NOTE: mean compute {mean_compute_ms:.2}ms exceeds {REGRESSION_COMPUTE_MS}ms regression line (soft check)"
                 );
-            } else if mean_ms > TARGET_FRAME_MS {
+            } else if mean_compute_ms > TARGET_COMPUTE_MS {
                 eprintln!(
-                    "PERF PROBE NOTE: mean frame time {mean_ms:.2}ms above {TARGET_FRAME_MS}ms target (soft check)"
+                    "PERF PROBE NOTE: mean compute {mean_compute_ms:.2}ms above {TARGET_COMPUTE_MS}ms target (soft check)"
                 );
             }
+
             if p.failures.is_empty() {
-                eprintln!("PERF PROBE: O(visible) render-call gate passed");
+                eprintln!("PERF PROBE: O(visible) render-call parity gate passed");
             } else {
                 eprintln!("PERF PROBE FAILURES: {:?}", p.failures);
             }
-            p.failures.is_empty() && p.delta_frames >= 4
+            p.failures.is_empty()
         })
         .unwrap_or(false);
 
@@ -263,23 +351,13 @@ impl Render for HarnessView {
         if !self.spawned {
             self.spawned = true;
             let exit_ok = Rc::clone(&self.exit_ok);
-            let resident = LARGE_RESIDENT;
             cx.spawn_in(window, move |weak, wcx: &mut AsyncWindowContext| {
                 let wcx = wcx.clone();
                 async move {
-                    drive_perf_probe(weak, wcx, resident, exit_ok).await;
+                    drive_perf_probe(weak, wcx, exit_ok).await;
                 }
             })
             .detach();
-        }
-
-        {
-            let now = Instant::now();
-            let mut p = self.probe.borrow_mut();
-            if let Some(start) = p.last_frame_start.take() {
-                p.frame_timer.record(now.duration_since(start));
-            }
-            p.last_frame_start = Some(now);
         }
 
         self.frame_render_calls.set(0);

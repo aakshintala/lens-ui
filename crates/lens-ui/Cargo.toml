@@ -35,6 +35,10 @@ path = "src/bin/focused_finalize_probe.rs"
 name = "focused_scroll_probe"
 path = "src/bin/focused_scroll_probe.rs"
 
+[[bin]]
+name = "focused_perf_probe"
+path = "src/bin/focused_perf_probe.rs"
+
 [dev-dependencies]
 gpui = { version = "0.2.2", features = ["test-support"] }
 rusqlite = { version = "0.32", features = ["bundled"] }

@@ -276,7 +276,11 @@ impl FleetStore {
         let generation = self.focus_generation;
         if let Some(factory) = self.reader_factories.get(&id).cloned() {
             let epoch = self.reconcile_epochs.get(&id).cloned().unwrap_or_default();
+            let reconcile_in_flight = epoch.in_flight;
             let replica = cx.new(|cx| FocusedTranscript::new(factory, epoch, generation, cx));
+            if reconcile_in_flight {
+                replica.update(cx, |r, cx| r.set_reconcile_in_flight(true, cx));
+            }
             self.focused_replica = Some((id.clone(), replica));
         }
         self.send_command(&id, SessionCommand::Promote);

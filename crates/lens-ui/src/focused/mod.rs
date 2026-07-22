@@ -187,10 +187,18 @@ impl FocusedTranscript {
     }
 
     #[cfg(test)]
-    pub(crate) fn live_section_block_count_for_test(&self) -> usize {
-        let slice = &self.items[self.live_section_start..];
-        let refs: Vec<&Item> = slice.iter().collect();
-        project(&refs, self.scratch.as_ref(), self.active_response.as_ref()).len()
+    pub(crate) fn live_section_start_for_test(&self) -> usize {
+        self.live_section_start
+    }
+
+    #[cfg(test)]
+    pub(crate) fn items_len_for_test(&self) -> usize {
+        self.items.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn live_slice_len_for_test(&self) -> usize {
+        self.items.len().saturating_sub(self.live_section_start)
     }
 
     pub fn fold_detailed(&mut self, u: StreamUpdate, cx: &mut Context<Self>) {
@@ -2569,6 +2577,40 @@ mod tests {
         );
     }
 
+    #[gpui::test]
+    async fn focus_seed_reconcile_in_flight_arms_syncing_after_debounce(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // Mirrors `FleetStore::focus_session`: after creating a replica whose seed
+        // epoch is in-flight, call `set_reconcile_in_flight(true)` to arm debounce.
+        let (replica, rx) = new_replica(
+            cx,
+            ReconcileEpoch {
+                epoch: 1,
+                in_flight: true,
+            },
+            1,
+        );
+        let _ = rx.try_recv().expect("baseline");
+
+        {
+            let (_board, vcx) = cx.add_window_view(|_, _| ReplicaBoard {
+                _replica: replica.clone(),
+            });
+            vcx.run_until_parked();
+            vcx.update(|_, cx| {
+                replica.update(cx, |r, cx| r.set_reconcile_in_flight(true, cx));
+            });
+            vcx.executor().advance_clock(Duration::from_millis(200));
+            vcx.run_until_parked();
+        }
+
+        assert!(
+            replica.read_with(cx, |r, _| r.syncing()),
+            "focus into in-flight reconcile must arm debounce and show syncing after 150 ms"
+        );
+    }
+
     fn settled_turn_rows(turns: usize) -> Vec<(i64, Item)> {
         let mut rows = Vec::with_capacity(turns * 2 + 1);
         for i in 0..turns {
@@ -2594,9 +2636,13 @@ mod tests {
         let resp_live = ResponseId::new("resp_live");
         replica.update(cx, |r, cx| {
             r.apply_read(1, ReadRange::All, range_read(rows, watermark), cx);
-            r.active_response = Some(resp_live);
+            r.fold_detailed(StreamUpdate::ActiveResponseChanged(Some(resp_live)), cx);
         });
     }
+
+    /// Live slice is one settled `reasoning_item("live_seed", "resp_live")`; scratch
+    /// adds one streaming message block → `project` yields two blocks.
+    const EXPECTED_LIVE_PROJECTION_AFTER_SCRATCH: usize = 2;
 
     fn drive_live_scratch_delta(replica: &Entity<FocusedTranscript>, cx: &mut gpui::App) {
         let scratch = StreamScratch {
@@ -2625,6 +2671,24 @@ mod tests {
             seed_resident_replica(&large, 400, cx);
         });
 
+        cx.read(|cx| {
+            let small_r = small.read(cx);
+            let large_r = large.read(cx);
+            assert!(
+                small_r.live_section_start_for_test() < small_r.items_len_for_test(),
+                "small: live section must not be empty"
+            );
+            assert!(
+                large_r.live_section_start_for_test() < large_r.items_len_for_test(),
+                "large: live section must not be empty"
+            );
+            assert_eq!(
+                small_r.live_slice_len_for_test(),
+                large_r.live_slice_len_for_test(),
+                "small and large must share the same live-slice length"
+            );
+        });
+
         cx.update(|cx| {
             drive_live_scratch_delta(&small, cx);
             drive_live_scratch_delta(&large, cx);
@@ -2635,17 +2699,17 @@ mod tests {
             let large_r = large.read(cx);
             let small_count = small_r.live_section_projection_count();
             let large_count = large_r.live_section_projection_count();
-            let expected = small_r.live_section_block_count_for_test();
             assert_eq!(
                 small_count, large_count,
                 "live delta projection must not scale with resident size (small={small_count}, large={large_count})"
             );
             assert_eq!(
-                small_count, expected,
-                "projection count must equal live-section block count (got {small_count}, expected {expected})"
+                small_count,
+                EXPECTED_LIVE_PROJECTION_AFTER_SCRATCH,
+                "projection count must match known live-section block count"
             );
             assert!(
-                small_r.items.len() < large_r.items.len(),
+                small_r.items_len_for_test() < large_r.items_len_for_test(),
                 "precondition: large resident has more items than small"
             );
         });
