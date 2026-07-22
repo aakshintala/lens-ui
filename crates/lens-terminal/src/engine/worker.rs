@@ -233,7 +233,7 @@ pub(crate) fn spawn_worker(
     access_epoch: Arc<AtomicU64>,
     presentation_tx: Sender<EnginePresentationEvent>,
     latest_title_slot: Arc<ArcSwapOption<super::presentation::TitleUpdate>>,
-) -> JoinHandle<()> {
+) -> std::io::Result<JoinHandle<()>> {
     // libghostty's scrollback page operations (invoked from `vt_write` as history
     // grows) recurse/consume stack proportional to scrollback depth, and overflow
     // the ~2 MiB default thread stack once retained history gets large (empirically
@@ -393,7 +393,6 @@ pub(crate) fn spawn_worker(
                 }
             }
         })
-        .expect("spawn engine worker thread")
 }
 
 #[expect(

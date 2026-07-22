@@ -91,7 +91,7 @@ impl HarnessView {
             cell_w_px: 8,
             cell_h_px: 16,
         };
-        let engine = Arc::new(EngineHandle::spawn(cfg));
+        let engine = Arc::new(EngineHandle::spawn(cfg).expect("spawn engine for test"));
         // Ensure the engine publishes frames, then feed the OSC-8 so the
         // engine-built frame (the one the render sampler hands to on_mouse_down)
         // carries the hyperlink.

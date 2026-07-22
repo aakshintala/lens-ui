@@ -98,7 +98,7 @@ fn main() {
         cell_h_px: 16,
     };
     let engines: Vec<Arc<EngineHandle>> = (0..TAB_COUNT)
-        .map(|_| Arc::new(EngineHandle::spawn(cfg)))
+        .map(|_| Arc::new(EngineHandle::spawn(cfg).expect("spawn engine for test")))
         .collect();
     for (i, e) in engines.iter().enumerate() {
         e.set_inspect_enabled(true);

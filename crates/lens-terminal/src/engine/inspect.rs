@@ -514,7 +514,7 @@ mod tests {
 
     #[test]
     fn inspect_mouse_copy_counters_default_zero() {
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let snap = h.inspect();
         assert_eq!(snap.mouse_encoded, 0);
         assert_eq!(snap.mouse_reports_coalesced, 0);
@@ -537,7 +537,7 @@ mod tests {
             cell_w_px: 8,
             cell_h_px: 16,
         };
-        let h = EngineHandle::spawn(cfg);
+        let h = EngineHandle::spawn(cfg).expect("spawn engine for test");
         for i in 0..200 {
             let _ = h.feed(format!("streaming line {i}\r\n").into_bytes());
         }

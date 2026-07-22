@@ -25,6 +25,25 @@ pub enum FeedError {
     Stopped,
 }
 
+/// Opaque error when the engine worker or input-forwarder thread cannot be spawned.
+#[derive(Debug)]
+pub struct EngineSpawnError(std::io::Error);
+
+impl std::fmt::Display for EngineSpawnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "failed to spawn engine thread: {}", self.0)
+    }
+}
+
+impl std::error::Error for EngineSpawnError {}
+
+impl EngineSpawnError {
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn from_io_for_test(e: std::io::Error) -> Self {
+        Self(e)
+    }
+}
+
 /// Send-safe facade over the pinned engine worker thread.
 pub struct EngineHandle {
     cmd_tx: Sender<EngineCommand>,
@@ -59,7 +78,7 @@ impl std::fmt::Debug for EngineHandle {
 }
 
 impl EngineHandle {
-    pub fn spawn(cfg: EngineConfig) -> Self {
+    pub fn spawn(cfg: EngineConfig) -> Result<Self, EngineSpawnError> {
         let worker::WorkerChannels {
             cmd_tx,
             cmd_rx,
@@ -75,6 +94,7 @@ impl EngineHandle {
         let (presentation_tx, presentation_rx) =
             crossbeam_channel::bounded(super::presentation::PRESENTATION_CHANNEL_CAP);
         Self::spawn_from_parts(cfg, cmd_tx, cmd_rx, presentation_tx, presentation_rx)
+            .expect("spawn")
     }
 
     fn spawn_from_parts(
@@ -83,7 +103,7 @@ impl EngineHandle {
         cmd_rx: Receiver<EngineCommand>,
         presentation_tx: crossbeam_channel::Sender<EnginePresentationEvent>,
         presentation_rx: Receiver<EnginePresentationEvent>,
-    ) -> Self {
+    ) -> Result<Self, EngineSpawnError> {
         let frame_slot = Arc::new(ArcSwapOption::from(None));
         let frame_ready = Arc::new(AtomicBool::new(false));
         let waker: WakerSlot = Arc::new(Mutex::new(None));
@@ -94,9 +114,10 @@ impl EngineHandle {
         let latest_title_slot = Arc::new(ArcSwapOption::from(None));
         #[cfg(any(test, feature = "test-util"))]
         let worker_stall_gate = Arc::new(AtomicBool::new(false));
-        let input_forwarder = InputForwarder::spawn(cmd_tx.clone(), Arc::clone(&access_epoch));
+        let input_forwarder = InputForwarder::spawn(cmd_tx.clone(), Arc::clone(&access_epoch))
+            .map_err(EngineSpawnError)?;
 
-        let join = worker::spawn_worker(
+        let join = match worker::spawn_worker(
             cfg,
             cmd_rx,
             Arc::clone(&frame_slot),
@@ -110,9 +131,16 @@ impl EngineHandle {
             Arc::clone(&access_epoch),
             presentation_tx.clone(),
             Arc::clone(&latest_title_slot),
-        );
+        ) {
+            Ok(join) => join,
+            Err(e) => {
+                let mut forwarder = input_forwarder;
+                forwarder.sever_and_join();
+                return Err(EngineSpawnError(e));
+            }
+        };
 
-        Self {
+        Ok(Self {
             cmd_tx,
             input_forwarder: Some(input_forwarder),
             access_epoch,
@@ -130,7 +158,7 @@ impl EngineHandle {
             test_build_failures,
             #[cfg(test)]
             chunk_barrier,
-        }
+        })
     }
 
     /// Enqueue a user-input command via the off-fg forwarder (never blocks the caller).
@@ -497,7 +525,7 @@ mod tests {
             cell_w_px: 8,
             cell_h_px: 16,
         };
-        let h = EngineHandle::spawn(cfg);
+        let h = EngineHandle::spawn(cfg).expect("spawn engine for test");
         let rows = 2500usize;
         let mut fed_bytes: u64 = 0;
         for _ in 0..rows {
@@ -549,7 +577,7 @@ mod tests {
             cell_w_px: 8,
             cell_h_px: 16,
         };
-        let h = EngineHandle::spawn(cfg);
+        let h = EngineHandle::spawn(cfg).expect("spawn engine for test");
         h.set_visible(false).expect("hide");
         let mut fed_bytes: u64 = 0;
         for i in 0..600 {
@@ -607,7 +635,7 @@ mod tests {
 
     #[test]
     fn wheel_report_under_tracking_emits_sgr_wheel_up() {
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         h.set_inspect_enabled(true);
         let rx = h.attach_test_egress();
         h.feed(TRACKING_BUTTON_SGR.to_vec()).expect("feed tracking");
@@ -627,7 +655,7 @@ mod tests {
 
     #[test]
     fn wheel_no_tracking_local_scrolls_without_egress() {
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let rx = h.attach_test_egress();
         for i in 0..30 {
             h.feed(format!("L{i:02}\r\n").into_bytes()).expect("feed");
@@ -674,7 +702,7 @@ mod tests {
 
     #[test]
     fn wheel_read_only_under_tracking_local_scrolls_without_egress() {
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let rx = h.attach_test_egress();
         h.feed(TRACKING_BUTTON_SGR.to_vec()).expect("feed tracking");
         for i in 0..30 {
@@ -718,7 +746,7 @@ mod tests {
 
     #[test]
     fn request_copy_returns_selection_text() {
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         h.set_inspect_enabled(true);
         h.feed(b"copyme".to_vec()).expect("feed");
         let _ = send_mouse(
@@ -747,7 +775,7 @@ mod tests {
 
     #[test]
     fn request_copy_empty_selection_returns_none() {
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         h.set_inspect_enabled(true);
         let rx = h.request_copy().expect("request copy");
         let result = rx
@@ -762,7 +790,7 @@ mod tests {
 
     #[test]
     fn request_copy_dropped_rx_does_not_panic() {
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let rx = h.request_copy().expect("request copy");
         drop(rx);
         h.build_now().expect("barrier");
@@ -801,7 +829,7 @@ mod tests {
 
     #[test]
     fn mouse_report_down_under_tracking_ack_reported_with_sgr_bytes() {
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let rx = h.attach_test_egress();
         h.feed(TRACKING_SGR.to_vec()).expect("feed tracking");
         let ack = send_mouse(
@@ -820,7 +848,7 @@ mod tests {
 
     #[test]
     fn mouse_no_tracking_left_down_selects_without_egress() {
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let rx = h.attach_test_egress();
         h.feed(b"copyme".to_vec()).expect("feed");
         h.build_now().expect("feed build");
@@ -862,7 +890,7 @@ mod tests {
 
     #[test]
     fn mouse_read_only_under_tracking_selects_without_egress() {
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let rx = h.attach_test_egress();
         h.feed(TRACKING_SGR.to_vec()).expect("feed tracking");
         enqueue_set_access(&h, false);
@@ -877,7 +905,7 @@ mod tests {
 
     #[test]
     fn mouse_shift_under_tracking_selects_without_egress() {
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let rx = h.attach_test_egress();
         h.feed(TRACKING_SGR.to_vec()).expect("feed tracking");
         let mut gesture = base_mouse_gesture(MouseEventKind::Down, Some(MouseButtonKind::Left));
@@ -890,7 +918,7 @@ mod tests {
 
     #[test]
     fn mouse_force_local_policy_under_tracking_selects_without_egress() {
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let rx = h.attach_test_egress();
         h.feed(TRACKING_SGR.to_vec()).expect("feed tracking");
         enqueue_set_access(&h, true);
@@ -908,7 +936,7 @@ mod tests {
 
     #[test]
     fn mouse_local_toggle_under_tracking_selects_without_egress() {
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let rx = h.attach_test_egress();
         h.feed(TRACKING_SGR.to_vec()).expect("feed tracking");
         enqueue_set_access(&h, true);
@@ -926,7 +954,7 @@ mod tests {
 
     #[test]
     fn mouse_latch_epoch_bump_suppresses_move_without_egress() {
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let rx = h.attach_test_egress();
         h.feed(TRACKING_BUTTON_SGR.to_vec()).expect("feed tracking");
         let down_ack = send_mouse(
@@ -962,7 +990,7 @@ mod tests {
 
     #[test]
     fn mouse_latch_epoch_bump_suppresses_up_without_move_egress() {
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let rx = h.attach_test_egress();
         h.feed(TRACKING_BUTTON_SGR.to_vec()).expect("feed tracking");
         let down_ack = send_mouse(
@@ -986,7 +1014,7 @@ mod tests {
 
     #[test]
     fn mouse_set_access_false_before_down_selects_without_egress() {
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let rx = h.attach_test_egress();
         h.feed(TRACKING_SGR.to_vec()).expect("feed tracking");
         enqueue_set_access(&h, false);
@@ -1001,7 +1029,7 @@ mod tests {
 
     #[test]
     fn mouse_set_access_false_closes_stale_writable_attack() {
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let rx = h.attach_test_egress();
         h.feed(TRACKING_SGR.to_vec()).expect("feed tracking");
         enqueue_set_access(&h, false);
@@ -1023,7 +1051,7 @@ mod tests {
 
     #[test]
     fn mouse_any_mode_buttonless_move_suppressed_when_read_only() {
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let rx = h.attach_test_egress();
         h.feed(TRACKING_ANY_SGR.to_vec()).expect("feed tracking");
         enqueue_set_access(&h, false);
@@ -1037,7 +1065,7 @@ mod tests {
     fn mouse_button_mode_buttonless_move_reports_with_latched_button() {
         // codex whole-slice F5: in Button mode a motion that omits the button but has an
         // authoritative Report latch reports using the LATCHED button (not Ignored).
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let rx = h.attach_test_egress();
         h.feed(TRACKING_BUTTON_SGR.to_vec()).expect("feed tracking");
         let down_ack = send_mouse(
@@ -1065,7 +1093,7 @@ mod tests {
 
     #[test]
     fn mouse_normal_mode_latched_move_ignored_up_reports() {
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let rx = h.attach_test_egress();
         h.feed(TRACKING_SGR.to_vec()).expect("feed tracking");
         let down_ack = send_mouse(
@@ -1098,7 +1126,7 @@ mod tests {
 
     #[test]
     fn mouse_button_mode_latched_move_with_button_reports() {
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let rx = h.attach_test_egress();
         h.feed(TRACKING_BUTTON_SGR.to_vec()).expect("feed tracking");
         let down_ack = send_mouse(
@@ -1123,7 +1151,7 @@ mod tests {
 
     #[test]
     fn mouse_any_mode_buttonless_move_reports_when_writable() {
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let rx = h.attach_test_egress();
         h.feed(TRACKING_ANY_SGR.to_vec()).expect("feed tracking");
         let ack = send_mouse(&h, base_mouse_gesture(MouseEventKind::Move, None));
@@ -1138,7 +1166,7 @@ mod tests {
 
     #[test]
     fn mouse_x10_mode_latched_move_ignored() {
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let rx = h.attach_test_egress();
         h.feed(TRACKING_X10_SGR.to_vec()).expect("feed tracking");
         let down_ack = send_mouse(
@@ -1166,7 +1194,7 @@ mod tests {
     fn mouse_second_button_down_preserves_first_latch() {
         // codex whole-slice F7: a second button-down while a gesture is latched must not
         // clobber it; the original gesture still resolves on its Up.
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let rx = h.attach_test_egress();
         h.feed(TRACKING_BUTTON_SGR.to_vec()).expect("feed tracking");
         let d1 = send_mouse(
@@ -1204,7 +1232,7 @@ mod tests {
         // scope, so a same-cell hover after re-enable re-emits instead of coalescing. This
         // covers the case where a Move arrives WHILE tracking is off (the realistic path);
         // the no-intervening-Move toggle is a documented residual (see the F6 fix comment).
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let rx = h.attach_test_egress();
         h.feed(TRACKING_ANY_SGR.to_vec()).expect("feed tracking");
         let mut m1 = base_mouse_gesture(MouseEventKind::Move, None);
@@ -1240,7 +1268,7 @@ mod tests {
     fn mouse_any_buttonless_move_with_mouse_local_not_reported() {
         // codex whole-slice F4: unlatched Any-mode hover motion must honor the local
         // override (mouse_local/Shift/ForceLocal), not leak to the PTY.
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let rx = h.attach_test_egress();
         h.feed(TRACKING_ANY_SGR.to_vec()).expect("feed tracking");
         let mut g = base_mouse_gesture(MouseEventKind::Move, None);
@@ -1258,7 +1286,7 @@ mod tests {
     fn mouse_select_subthreshold_jitter_still_local_clicks() {
         // codex whole-slice F8: a sub-threshold jitter move during a click must not be
         // promoted to a drag (which would suppress the hyperlink LocalClick).
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let _rx = h.attach_test_egress();
         h.feed(b"hello".to_vec()).expect("feed"); // no tracking -> Left selects
         let down = send_mouse(
@@ -1288,7 +1316,7 @@ mod tests {
         // codex whole-slice F3: a pathological delta is bounded to MAX_WHEEL_NOTCHES (32),
         // strictly below the egress channel cap (64), so the count is the cap, not the
         // channel limit.
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let rx = h.attach_test_egress();
         h.feed(TRACKING_BUTTON_SGR.to_vec()).expect("feed tracking");
         enqueue_set_access(&h, true);
@@ -1307,7 +1335,7 @@ mod tests {
 
     #[test]
     fn mouse_set_access_false_suppresses_latched_move_and_up() {
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let rx = h.attach_test_egress();
         h.feed(TRACKING_BUTTON_SGR.to_vec()).expect("feed tracking");
         let down_ack = send_mouse(
@@ -1338,7 +1366,7 @@ mod tests {
 
     #[test]
     fn mouse_non_matching_up_retains_latch_and_acks_ignored() {
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let down_ack = send_mouse(
             &h,
             base_mouse_gesture(MouseEventKind::Down, Some(MouseButtonKind::Left)),
@@ -1361,7 +1389,7 @@ mod tests {
 
     #[test]
     fn mouse_local_click_on_no_tracking_tap() {
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let _ = send_mouse(
             &h,
             base_mouse_gesture(MouseEventKind::Down, Some(MouseButtonKind::Left)),
@@ -1390,7 +1418,7 @@ mod tests {
     fn mouse_local_click_echoes_down_click_seq() {
         // codex F2 re-review: the LocalClick carries the token from its originating Down so
         // the foreground correlates the click-time frame.
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         h.feed(b"hello".to_vec()).expect("feed"); // no tracking -> Left selects
         let mut down = base_mouse_gesture(MouseEventKind::Down, Some(MouseButtonKind::Left));
         down.click_seq = 42;
@@ -1420,7 +1448,7 @@ mod tests {
 
     #[test]
     fn mouse_no_tracking_right_down_ignored_without_selection() {
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         h.feed(b"hello".to_vec()).expect("feed");
         let ack = send_mouse(
             &h,
@@ -1438,7 +1466,7 @@ mod tests {
 
     #[test]
     fn mouse_report_egress_full_parity_with_key() {
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let rx = h.attach_test_egress();
         h.feed(TRACKING_SGR.to_vec()).expect("feed tracking");
 
@@ -1526,7 +1554,7 @@ mod tests {
 
     #[test]
     fn egress_goes_to_the_currently_attached_channel() {
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let rx1 = h.attach_test_egress();
         h.feed(b"\x1b[c".to_vec()).unwrap(); // Primary DA → reply (kind Other)
         h.build_now().ok();
@@ -1586,7 +1614,8 @@ mod tests {
             .send(EngineCommand::BuildNow)
             .expect("fill cmd channel");
 
-        let mut forwarder = InputForwarder::spawn(cmd_tx, Arc::new(AtomicU64::new(0)));
+        let mut forwarder = InputForwarder::spawn(cmd_tx, Arc::new(AtomicU64::new(0)))
+            .expect("spawn input forwarder for test");
         let key = KeyInput {
             action: KeyAction::Press,
             key: LensKey::A,
@@ -1633,7 +1662,7 @@ mod tests {
 
     #[test]
     fn forwarder_delivers_key_via_enqueue_input() {
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let _egress = h.attach_test_egress();
         let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
         h.enqueue_input(EngineCommand::Key(KeyInput {
@@ -1653,7 +1682,7 @@ mod tests {
 
     #[test]
     fn inspect_records_events_when_enabled_and_ring_empty_when_disabled() {
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         h.set_inspect_enabled(true);
         h.feed(b"inspect-me".to_vec()).expect("feed");
         h.build_now().expect("build_now");
@@ -1678,7 +1707,7 @@ mod tests {
 
     #[test]
     fn feed_publishes_a_coalesced_frame_and_wakes() {
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let woke = Arc::new(AtomicUsize::new(0));
         {
             let w = Arc::clone(&woke);
@@ -1702,7 +1731,7 @@ mod tests {
 
     #[test]
     fn primary_da_query_emits_reply_on_egress_channel() {
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let rx = h.attach_test_egress();
         h.feed(b"\x1b[c".to_vec()).expect("feed");
         h.build_now().expect("build_now");
@@ -1713,7 +1742,7 @@ mod tests {
 
     #[test]
     fn hidden_tab_suppresses_publish_until_visible() {
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let woke = Arc::new(AtomicUsize::new(0));
         {
             let w = Arc::clone(&woke);
@@ -1753,7 +1782,7 @@ mod tests {
 
     #[test]
     fn build_failure_retries_on_next_pump() {
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         h.set_inspect_enabled(true);
         let woke = Arc::new(AtomicUsize::new(0));
         {
@@ -1801,7 +1830,7 @@ mod tests {
 
     #[test]
     fn stop_publishes_final_frame_before_join() {
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let slot = h.frame_slot();
         h.feed(b"warm".to_vec()).expect("feed");
         h.build_now().expect("build_now");
@@ -1815,7 +1844,7 @@ mod tests {
 
     #[test]
     fn drop_signals_stop_without_blocking_join() {
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         h.feed(b"Z".to_vec()).expect("feed");
         let start = Instant::now();
         drop(h);
@@ -1827,7 +1856,7 @@ mod tests {
 
     #[test]
     fn stop_joins_worker_and_feed_returns_stopped() {
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let tx = h.cmd_sender();
         h.feed(b"Z".to_vec()).expect("feed");
         h.stop();
@@ -1839,7 +1868,7 @@ mod tests {
 
     #[test]
     fn key_encodes_against_live_modes_via_ordered_feed_then_ack() {
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let _egress = h.attach_test_egress();
         h.feed(b"\x1b[?1h".to_vec()).expect("feed");
 
@@ -1866,7 +1895,7 @@ mod tests {
 
     #[test]
     fn paste_encodes_bracketed_against_live_mode_via_enqueue_and_egress() {
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let rx = h.attach_test_egress();
         while rx.try_recv().is_ok() {}
         h.feed(b"\x1b[?2004h".to_vec()).expect("feed");
@@ -1892,7 +1921,7 @@ mod tests {
 
     #[test]
     fn feed_is_atomic_key_after_feed_sees_post_feed_modes() {
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         h.feed(b"\x1b[?1h".to_vec()).unwrap();
         let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
         h.enqueue_input(EngineCommand::Key(KeyInput {
@@ -1915,7 +1944,7 @@ mod tests {
         // Input-vs-feed cross-path ordering is inherently concurrent (different
         // threads) — this test pins the worker-level cmd_tx ordering contract,
         // not the forwarder path.
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
         h.cmd_sender()
             .send(EngineCommand::Key(KeyInput {
@@ -1941,7 +1970,7 @@ mod tests {
     fn stop_preempts_feed_between_chunks_deterministically() {
         use crate::engine::worker::MAX_FEED_CHUNK;
 
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         h.set_inspect_enabled(true);
         h.test_arm_chunk_barrier();
         h.feed(vec![b'X'; 64 * 1024]).unwrap();
@@ -1969,7 +1998,7 @@ mod tests {
     fn mid_feed_key_defers_until_after_feed() {
         use crate::engine::worker::MAX_FEED_CHUNK;
 
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let _egress = h.attach_test_egress();
         let mut feed = vec![b' '; MAX_FEED_CHUNK];
         feed.extend_from_slice(b"\x1b[?1h");
@@ -2006,7 +2035,7 @@ mod tests {
         use crate::engine::worker::MAX_FEED_CHUNK;
 
         assert_eq!(MAX_FEED_CHUNK, 4096);
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let mut buf = vec![b' '; 4094];
         buf.extend_from_slice(b"\x1b[?1h");
         h.feed(buf).unwrap();
@@ -2028,7 +2057,7 @@ mod tests {
 
     #[test]
     fn focus_report_suppressed_when_report_false_with_ack_barrier() {
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let rx = h.attach_test_egress();
         while rx.try_recv().is_ok() {}
         h.feed(b"\x1b[?1004h".to_vec()).expect("feed");
@@ -2065,7 +2094,7 @@ mod tests {
 
     #[test]
     fn focus_report_emits_csi_i_when_mode_on_and_report_true() {
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let rx = h.attach_test_egress();
         while rx.try_recv().is_ok() {}
         h.feed(b"\x1b[?1004h".to_vec()).expect("feed");
@@ -2085,7 +2114,7 @@ mod tests {
 
     #[test]
     fn focus_report_suppressed_when_mode_1004_off() {
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let rx = h.attach_test_egress();
         while rx.try_recv().is_ok() {}
         h.cmd_sender()
@@ -2125,7 +2154,7 @@ mod tests {
     /// FIFO order), so `rx1` would be non-empty — this test fails without the bump.
     #[test]
     fn upstream_key_revoked_by_epoch_bump_reaches_no_channel() {
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let rx1 = h.attach_test_egress();
         h.test_stall_worker();
         h.enqueue_input(EngineCommand::Key(KeyInput {
@@ -2157,7 +2186,7 @@ mod tests {
 
     #[test]
     fn downgrade_revokes_queued_key_before_egress() {
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let rx = h.attach_test_egress();
         h.test_stall_worker();
         let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
@@ -2190,7 +2219,7 @@ mod tests {
     fn local_scroll_allowed_in_read_only_without_egress() {
         use crate::engine::command::ScrollDelta;
 
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         for i in 0..30 {
             h.feed(format!("L{i:02}\r\n").into_bytes()).expect("feed");
         }
@@ -2221,7 +2250,7 @@ mod tests {
 
     #[test]
     fn user_input_egress_full_does_not_drop_or_false_ack() {
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let rx = h.attach_test_egress();
         let first_key = KeyInput {
             action: KeyAction::Press,
@@ -2293,7 +2322,8 @@ mod tests {
             max_scrollback: 32,
             cell_w_px: 8,
             cell_h_px: 16,
-        });
+        })
+        .expect("spawn engine for test");
         h.feed(b"\x1b]2;ViaHandle\x1b\\".to_vec()).unwrap();
         let title = h
             .take_latest_title()
@@ -2360,7 +2390,7 @@ mod tests {
 
         use crate::engine::presentation::EnginePresentationEvent;
 
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         h.set_inspect_enabled(true);
         h.feed(b"\x1b]2;First\x1b\\".to_vec()).unwrap();
         let first = h
@@ -2388,7 +2418,7 @@ mod tests {
 
         use crate::engine::presentation::{EnginePresentationEvent, PRESENTATION_CHANNEL_CAP};
 
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         h.set_inspect_enabled(true);
         while h.presentation_rx().try_recv().is_ok() {}
         for i in 0..PRESENTATION_CHANNEL_CAP {
@@ -2411,7 +2441,7 @@ mod tests {
     fn presentation_inspect_counters_zero_when_disabled() {
         use std::time::Duration;
 
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         h.feed(b"\x1b]2;First\x1b\\".to_vec()).unwrap();
         let _ = h
             .presentation_rx()
@@ -2432,7 +2462,7 @@ mod tests {
 
     #[test]
     fn reply_egress_full_does_not_evict_user_input() {
-        let h = EngineHandle::spawn(test_config());
+        let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let rx = h.attach_test_egress();
 
         for i in 0..64u8 {

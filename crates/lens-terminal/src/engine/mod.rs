@@ -12,7 +12,7 @@ pub mod worker;
 mod reconnect_seed;
 
 pub use frame::CursorPos;
-pub use handle::{EngineHandle, FeedError};
+pub use handle::{EngineHandle, EngineSpawnError, FeedError};
 pub use inspect::{EngineInspect, PER_CELL_BYTES};
 #[expect(
     unused_imports,

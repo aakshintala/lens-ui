@@ -269,7 +269,7 @@ mod tests {
 
     #[test]
     fn vt_inbound_feeds_engine_after_ack() {
-        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()).expect("spawn engine for test"));
         let (inbound_tx, inbound_rx) = crossbeam_channel::bounded(8);
         let (outbound_tx, outbound_rx) = crossbeam_channel::bounded(8);
         let (policy_tx, _policy_rx) = async_channel::bounded(8);
@@ -323,7 +323,7 @@ mod tests {
 
     #[test]
     fn outbound_saturation_emits_event_and_joins() {
-        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()).expect("spawn engine for test"));
         let (_inbound_tx, inbound_rx) = crossbeam_channel::bounded(1);
         // Cap 1, pre-fill so DA/DSR forward cannot enqueue.
         let (outbound_tx, _outbound_rx) = crossbeam_channel::bounded(1);
@@ -355,7 +355,7 @@ mod tests {
 
     #[test]
     fn outbound_disconnect_emits_attach_disconnected_and_joins() {
-        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()).expect("spawn engine for test"));
         let (_inbound_tx, inbound_rx) = crossbeam_channel::bounded(8);
         let (outbound_tx, outbound_rx) = crossbeam_channel::bounded(8);
         drop(outbound_rx);
@@ -385,7 +385,7 @@ mod tests {
 
     #[test]
     fn stopped_bridge_drops_input_residue_and_surfaces_once() {
-        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()).expect("spawn engine for test"));
         let (egress_tx, egress_rx) = crossbeam_channel::bounded(EGRESS_CHANNEL_CAP);
         egress_tx
             .send(EgressFrame {
@@ -436,7 +436,7 @@ mod tests {
 
     #[test]
     fn stopped_bridge_with_only_other_residue_is_silent() {
-        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()).expect("spawn engine for test"));
         let (egress_tx, egress_rx) = crossbeam_channel::bounded(EGRESS_CHANNEL_CAP);
         egress_tx
             .send(EgressFrame {
@@ -477,7 +477,7 @@ mod tests {
     // `stop_rx`, forcing the wake to come through the egress-`Disconnected` arm alone.
     #[test]
     fn dropped_egress_after_stop_flag_suppresses_engine_stopped() {
-        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()).expect("spawn engine for test"));
         let (_inbound_tx, inbound_rx) = crossbeam_channel::bounded::<WsInbound>(1);
         let (outbound_tx, _outbound_rx) = crossbeam_channel::bounded::<WsOutbound>(1);
         let (egress_tx, egress_rx) = crossbeam_channel::bounded::<EgressFrame>(EGRESS_CHANNEL_CAP);
@@ -525,7 +525,7 @@ mod tests {
     // live path, not silencing a dead one.
     #[test]
     fn dropped_egress_without_stop_emits_engine_stopped() {
-        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()).expect("spawn engine for test"));
         let (_inbound_tx, inbound_rx) = crossbeam_channel::bounded::<WsInbound>(1);
         let (outbound_tx, _outbound_rx) = crossbeam_channel::bounded::<WsOutbound>(8);
         let (egress_tx, egress_rx) = crossbeam_channel::bounded::<EgressFrame>(EGRESS_CHANNEL_CAP);
@@ -559,7 +559,7 @@ mod tests {
     // Removing the `stop.load()` guard makes `bytes_fed` advance and this assertion fail.
     #[test]
     fn stopped_bridge_does_not_feed_inbound_vt() {
-        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()).expect("spawn engine for test"));
         let (inbound_tx, inbound_rx) = crossbeam_channel::bounded::<WsInbound>(1);
         let (outbound_tx, _outbound_rx) = crossbeam_channel::bounded::<WsOutbound>(1);
         // Held (not dropped) so the egress arm never wakes the select ahead of inbound.

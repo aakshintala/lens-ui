@@ -38,7 +38,10 @@ pub(crate) struct InputForwarder {
 }
 
 impl InputForwarder {
-    pub(crate) fn spawn(cmd_tx: Sender<EngineCommand>, access_epoch: Arc<AtomicU64>) -> Self {
+    pub(crate) fn spawn(
+        cmd_tx: Sender<EngineCommand>,
+        access_epoch: Arc<AtomicU64>,
+    ) -> std::io::Result<Self> {
         let (local_tx, local_rx) = crossbeam_channel::unbounded();
         let stop = Arc::new(AtomicBool::new(false));
         let blocked_in_retry = Arc::new(AtomicBool::new(false));
@@ -54,17 +57,16 @@ impl InputForwarder {
                 forward_loop(local_rx, cmd_tx, stop_t, blocked_t, epoch_t);
                 #[cfg(test)]
                 let _ = sever_done_tx.send(());
-            })
-            .expect("spawn input forwarder");
+            })?;
 
-        Self {
+        Ok(Self {
             local_tx,
             stop,
             join: Some(join),
             blocked_in_retry,
             #[cfg(test)]
             sever_done_rx: Some(sever_done_rx),
-        }
+        })
     }
 
     /// Never blocks the caller — pushes into the unbounded local queue.

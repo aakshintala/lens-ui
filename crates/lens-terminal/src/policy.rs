@@ -145,7 +145,7 @@ pub(crate) fn discover_and_attach(
         .map_err(|_| DetachedDetail::DiscoveryFailed)?;
 
     let cfg = engine_config_for(&resource, &options);
-    let engine = Arc::new(EngineHandle::spawn(cfg));
+    let engine = Arc::new(EngineHandle::spawn(cfg).map_err(DetachedDetail::from)?);
     let (egress_tx, egress_rx) =
         crossbeam_channel::bounded(crate::engine::worker::EGRESS_CHANNEL_CAP);
     engine
@@ -414,5 +414,15 @@ mod tests {
         let now = Instant::now();
         assert!(maps_to_retry(CloseCause::Internal, now));
         assert!(maps_to_retry(CloseCause::Network, now));
+    }
+
+    #[test]
+    fn engine_spawn_error_converts_to_engine_spawn_failed() {
+        let err = crate::engine::EngineSpawnError::from_io_for_test(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "no threads",
+        ));
+        let detail: DetachedDetail = err.into();
+        assert_eq!(detail, DetachedDetail::EngineSpawnFailed);
     }
 }

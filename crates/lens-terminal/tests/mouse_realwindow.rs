@@ -115,7 +115,7 @@ impl HarnessView {
             cell_w_px: CELL_W,
             cell_h_px: CELL_H,
         };
-        let engine = Arc::new(EngineHandle::spawn(cfg));
+        let engine = Arc::new(EngineHandle::spawn(cfg).expect("spawn engine for test"));
         let egress = engine.attach_test_egress();
         let _ = engine.set_visible(true);
         let _ = engine.feed(content_feed());

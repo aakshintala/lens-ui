@@ -129,7 +129,7 @@ mod tests {
 
     #[test]
     fn teardown_blocking_unwraps_unique_arc_and_stops() {
-        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()).expect("spawn engine for test"));
         let weak = Arc::downgrade(&engine);
         let (inbound_tx, inbound_rx) = crossbeam_channel::bounded::<WsInbound>(1);
         let (outbound_tx, _) = crossbeam_channel::bounded::<WsOutbound>(1);
@@ -157,7 +157,7 @@ mod tests {
 
     #[test]
     fn drop_runtime_does_not_join_on_calling_thread() {
-        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()).expect("spawn engine for test"));
         let (_t, inbound_rx) = crossbeam_channel::bounded::<WsInbound>(1);
         let (outbound_tx, _) = crossbeam_channel::bounded::<WsOutbound>(1);
         let (policy_tx, _) = async_channel::bounded(1);

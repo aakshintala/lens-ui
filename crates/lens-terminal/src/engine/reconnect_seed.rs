@@ -118,7 +118,7 @@ fn retained_reconnect_seed_viewport_matches_fresh_engine() {
     let legs = split_reconnect_legs(&lines);
 
     let cfg = reconnect_config();
-    let retained = Arc::new(EngineHandle::spawn(cfg));
+    let retained = Arc::new(EngineHandle::spawn(cfg).expect("spawn engine for test"));
     retained.feed(legs.leg1_seed).expect("feed leg1");
     retained.build_now().expect("build after leg1");
     let gen0 = retained.inspect().frames_built;
@@ -126,7 +126,7 @@ fn retained_reconnect_seed_viewport_matches_fresh_engine() {
     retained.build_now().expect("build after leg2");
     let retained_frame = wait_new_frame(&retained, gen0);
 
-    let fresh = Arc::new(EngineHandle::spawn(cfg));
+    let fresh = Arc::new(EngineHandle::spawn(cfg).expect("spawn engine for test"));
     fresh.feed(legs.leg2_seed).expect("feed leg2 only");
     fresh.build_now().expect("build");
     let fresh_frame = wait_new_frame(&fresh, 0);

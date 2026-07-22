@@ -295,6 +295,12 @@ pub enum DetachedDetail {
     EngineSpawnFailed,
 }
 
+impl From<engine::EngineSpawnError> for DetachedDetail {
+    fn from(_: engine::EngineSpawnError) -> Self {
+        DetachedDetail::EngineSpawnFailed
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Presentation snapshot (returned by `TerminalTab::presentation`).
 // ---------------------------------------------------------------------------
@@ -340,7 +346,7 @@ pub use engine::frame::{CellStyle, Frame, FrameCell, FrameRow, Rgb, UnderlineSty
 pub use engine::presentation::{ClipboardLocation, ClipboardMimePart};
 pub use engine::{
     CursorPos, EgressFrame, EgressKind, EngineConfig, EngineError, EngineHandle, EngineInspect,
-    FeedError, PER_CELL_BYTES, VtEngine,
+    EngineSpawnError, FeedError, PER_CELL_BYTES, VtEngine,
 };
 pub use inspect::TerminalInspect;
 pub use render::inspect::{RenderInspect, RenderInspectEvent, RenderInspectEventKind};
@@ -2374,7 +2380,7 @@ mod tests {
 
     #[gpui::test]
     async fn sample_updates_tab_latest_frame(cx: &mut gpui::TestAppContext) {
-        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()).expect("spawn engine for test"));
         engine.feed(b"Hi".to_vec()).expect("feed");
         engine.build_now().expect("build_now");
         let _ = wait_for_engine_frame(engine.as_ref());
@@ -2395,7 +2401,7 @@ mod tests {
 
     #[test]
     fn resize_before_input_orders_engine_and_outbound() {
-        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()).expect("spawn engine for test"));
         let (outbound_tx, outbound_rx) = crossbeam_channel::bounded(4);
         let mut input_enabled = false;
         apply_newest_size_before_input(
@@ -2438,7 +2444,7 @@ mod tests {
 
     #[gpui::test]
     async fn tab_set_visible_forwards_to_engine(cx: &mut gpui::TestAppContext) {
-        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()).expect("spawn engine for test"));
         let wake_count = Arc::new(AtomicUsize::new(0));
         {
             let n = Arc::clone(&wake_count);
@@ -2469,7 +2475,7 @@ mod tests {
 
     #[gpui::test]
     async fn teardown_transport_bumps_access_epoch(cx: &mut gpui::TestAppContext) {
-        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()).expect("spawn engine for test"));
         let before = engine.access_epoch();
         let tab = cx.new(|cx| TerminalTab::with_engine_for_test(Arc::clone(&engine), cx));
         tab.update(cx, |tab, cx| tab.teardown_transport_off_foreground(cx));
@@ -2478,7 +2484,7 @@ mod tests {
 
     #[gpui::test]
     async fn toggle_mouse_local_flips_carried_flag(cx: &mut gpui::TestAppContext) {
-        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()).expect("spawn engine for test"));
         let tab = cx.new(|cx| TerminalTab::with_engine_for_test(Arc::clone(&engine), cx));
         tab.update(cx, |tab, _cx| assert!(!tab.debug_mouse_local_for_test()));
         tab.update(cx, |tab, cx| tab.toggle_mouse_local(cx));
@@ -2497,7 +2503,7 @@ mod tests {
     async fn teardown_revokes_engine_report_authority(cx: &mut gpui::TestAppContext) {
         use crate::engine::command::{GestureDisposition, KeyMods, MouseAck};
 
-        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()).expect("spawn engine for test"));
         // Button-event tracking + SGR: a wheel would report while writable.
         engine
             .feed(b"\x1b[?1002h\x1b[?1006h".to_vec())
@@ -2535,7 +2541,7 @@ mod tests {
 
     #[gpui::test]
     async fn inspect_disabled_child_rings_cheap(cx: &mut gpui::TestAppContext) {
-        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()).expect("spawn engine for test"));
         engine.feed(b"cheap".to_vec()).expect("feed");
         engine.build_now().expect("build_now");
         let _ = wait_for_engine_frame(engine.as_ref());
@@ -2558,7 +2564,7 @@ mod tests {
 
     #[gpui::test]
     async fn inspect_enabled_populates_engine(cx: &mut gpui::TestAppContext) {
-        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()).expect("spawn engine for test"));
         let tab = cx.new(|cx| TerminalTab::with_engine_for_test(Arc::clone(&engine), cx));
 
         tab.update(cx, |tab, _cx| tab.set_inspect_enabled(true));
@@ -2668,7 +2674,7 @@ mod tests {
     ) {
         use gpui::{KeyDownEvent, KeyUpEvent, Keystroke};
 
-        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()).expect("spawn engine for test"));
         let tab = cx.new(|cx| TerminalTab::with_engine_for_test(Arc::clone(&engine), cx));
 
         tab.update(cx, |tab, cx| {
@@ -2723,7 +2729,7 @@ mod tests {
     ) {
         use gpui::Keystroke;
 
-        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()).expect("spawn engine for test"));
         let egress = engine.attach_test_egress();
         let tab = cx.new(|cx| TerminalTab::with_engine_for_test(Arc::clone(&engine), cx));
         while egress.try_recv().is_ok() {}
@@ -2757,7 +2763,7 @@ mod tests {
 
     #[gpui::test]
     async fn ime_commit_hook_returns_receiver_without_blocking(cx: &mut gpui::TestAppContext) {
-        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()).expect("spawn engine for test"));
         let _egress = engine.attach_test_egress();
         let tab = cx.new(|cx| TerminalTab::with_engine_for_test(Arc::clone(&engine), cx));
         let rx = tab.update(cx, |tab, _cx| {
@@ -2810,7 +2816,7 @@ mod tests {
 
     #[gpui::test]
     async fn clipboard_write_with_no_session_decision_emits_request(cx: &mut gpui::TestAppContext) {
-        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()).expect("spawn engine for test"));
         let tab = cx.new(|cx| TerminalTab::with_engine_for_test(Arc::clone(&engine), cx));
         let (events, _sub) = subscribe_terminal_events(cx, &tab);
 
@@ -2842,7 +2848,7 @@ mod tests {
 
     #[gpui::test]
     async fn remembered_deny_suppresses_request_and_records_denied(cx: &mut gpui::TestAppContext) {
-        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()).expect("spawn engine for test"));
         let tab = cx.new(|cx| TerminalTab::with_engine_for_test(Arc::clone(&engine), cx));
         tab.update(cx, |tab, _cx| tab.set_inspect_enabled(true));
         tab.update(cx, |tab, _cx| {
@@ -2877,7 +2883,7 @@ mod tests {
 
     #[gpui::test]
     async fn host_allow_writes_clipboard_and_evicts_pending(cx: &mut gpui::TestAppContext) {
-        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()).expect("spawn engine for test"));
         let tab = cx.new(|cx| TerminalTab::with_engine_for_test(Arc::clone(&engine), cx));
         let (events, _sub) = subscribe_terminal_events(cx, &tab);
 
@@ -2921,7 +2927,7 @@ mod tests {
 
     #[gpui::test]
     async fn pending_clipboard_writes_are_bounded_drop_oldest(cx: &mut gpui::TestAppContext) {
-        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()).expect("spawn engine for test"));
         let tab = cx.new(|cx| TerminalTab::with_engine_for_test(Arc::clone(&engine), cx));
         let (_events, _sub) = subscribe_terminal_events(cx, &tab);
 
@@ -2956,7 +2962,7 @@ mod tests {
     async fn real_cmd_v_keystroke_routes_to_paste_not_key_encoder(cx: &mut gpui::TestAppContext) {
         use gpui::{ClipboardItem, KeyDownEvent, Keystroke};
 
-        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()).expect("spawn engine for test"));
         let egress = engine.attach_test_egress();
         let tab = cx.new(|cx| TerminalTab::with_engine_for_test(Arc::clone(&engine), cx));
         tab.update(cx, |tab, _cx| tab.set_inspect_enabled(true));
@@ -3030,7 +3036,7 @@ mod tests {
     async fn cmd_v_single_line_dispatches_paste(cx: &mut gpui::TestAppContext) {
         use gpui::ClipboardItem;
 
-        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()).expect("spawn engine for test"));
         let tab = cx.new(|cx| TerminalTab::with_engine_for_test(Arc::clone(&engine), cx));
         tab.update(cx, |tab, _cx| tab.set_inspect_enabled(true));
         let (events, _sub) = subscribe_terminal_events(cx, &tab);
@@ -3055,7 +3061,7 @@ mod tests {
     async fn cmd_v_multiline_unsuppressed_emits_warn_no_dispatch(cx: &mut gpui::TestAppContext) {
         use gpui::ClipboardItem;
 
-        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()).expect("spawn engine for test"));
         let tab = cx.new(|cx| TerminalTab::with_engine_for_test(Arc::clone(&engine), cx));
         tab.update(cx, |tab, _cx| tab.set_inspect_enabled(true));
         let (events, _sub) = subscribe_terminal_events(cx, &tab);
@@ -3087,7 +3093,7 @@ mod tests {
     async fn paste_warn_allow_session_suppresses_and_dispatches(cx: &mut gpui::TestAppContext) {
         use gpui::ClipboardItem;
 
-        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()).expect("spawn engine for test"));
         let tab = cx.new(|cx| TerminalTab::with_engine_for_test(Arc::clone(&engine), cx));
         tab.update(cx, |tab, _cx| tab.set_inspect_enabled(true));
         let (events, _sub) = subscribe_terminal_events(cx, &tab);
@@ -3119,7 +3125,7 @@ mod tests {
     async fn over_cap_paste_rejected_before_pending(cx: &mut gpui::TestAppContext) {
         use gpui::ClipboardItem;
 
-        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()).expect("spawn engine for test"));
         let tab = cx.new(|cx| TerminalTab::with_engine_for_test(Arc::clone(&engine), cx));
         tab.update(cx, |tab, _cx| tab.set_inspect_enabled(true));
         let (events, _sub) = subscribe_terminal_events(cx, &tab);
@@ -3160,7 +3166,7 @@ mod tests {
     ) {
         use gpui::ClipboardItem;
 
-        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()).expect("spawn engine for test"));
         let egress = engine.attach_test_egress();
         let tab = cx.new(|cx| TerminalTab::with_engine_for_test(Arc::clone(&engine), cx));
         tab.update(cx, |tab, _cx| tab.set_inspect_enabled(true));
@@ -3209,7 +3215,7 @@ mod tests {
     async fn read_only_tab_ignores_cmd_v(cx: &mut gpui::TestAppContext) {
         use gpui::ClipboardItem;
 
-        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()).expect("spawn engine for test"));
         let egress = engine.attach_test_egress();
         let tab = cx.new(|cx| TerminalTab::with_engine_for_test(Arc::clone(&engine), cx));
         tab.update(cx, |tab, _cx| tab.set_inspect_enabled(true));
@@ -3250,7 +3256,7 @@ mod tests {
 
         use crate::engine::presentation::{ClipboardLocation, EnginePresentationEvent};
 
-        let engine = Arc::new(EngineHandle::spawn(test_cfg()));
+        let engine = Arc::new(EngineHandle::spawn(test_cfg()).expect("spawn engine for test"));
         let egress = engine.attach_test_egress();
         let tab = cx.new(|cx| TerminalTab::with_engine_for_test(Arc::clone(&engine), cx));
         tab.update(cx, |tab, _cx| tab.set_inspect_enabled(true));

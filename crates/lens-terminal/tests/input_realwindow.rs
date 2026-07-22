@@ -109,7 +109,7 @@ impl HarnessView {
             cell_w_px: 8,
             cell_h_px: 16,
         };
-        let engine = Arc::new(EngineHandle::spawn(cfg));
+        let engine = Arc::new(EngineHandle::spawn(cfg).expect("spawn engine for test"));
         let egress = engine.attach_test_egress();
         let tab = TerminalTab::open_with_engine_for_test(Arc::clone(&engine), cx);
         let mut frame = ascii_frame(40, 10, ' ');

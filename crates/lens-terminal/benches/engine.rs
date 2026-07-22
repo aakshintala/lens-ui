@@ -115,7 +115,7 @@ fn bench_key_encode_arrow_up(c: &mut Criterion) {
 fn bench_ordered_stream_feed_then_key_throughput(c: &mut Criterion) {
     c.bench_function("ordered_stream_feed_then_key_throughput", |b| {
         b.iter_batched(
-            || Arc::new(EngineHandle::spawn(bench_config())),
+            || Arc::new(EngineHandle::spawn(bench_config()).expect("spawn engine for test")),
             |handle| black_box(feed_app_cursor_mode_then_arrow_up(&handle).expect("throughput")),
             BatchSize::SmallInput,
         );
