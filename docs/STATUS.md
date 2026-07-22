@@ -5,7 +5,7 @@ the current forward-looking state only. **Full dated session entries live in
 [`STATUS-ARCHIVE.md`](./STATUS-ARCHIVE.md)** — write each session's detail there
 and roll older "Recent" pointers off this page as they age.
 
-_Last curated 2026-07-22 (transcript **T-0 + T-1 executed**, **T-2 PLAN-COMPLETE** on `lens-transript` — 15-task plan `docs/plans/2026-07-22-transcript-t2-focused-view-scaffold.md`, 4 spec-deferred mechanism items resolved, **D-3 refined to per-run sections** `(response_id, run_index)` + per-response collapse flag (supersedes merge-and-hoist); **next = execute via subagent-driven-development in a fresh session**, handoff `docs/handoffs/2026-07-22-transcript-t2-plan-complete.md`. **Reorg:** disk-scale → **T-2b** (next-not-deferred); live tool-tail → **T-4**; polymorphic `ContentTab` → terminal-UI-integration, SPEC-GAPS)._
+_Last curated 2026-07-22 (transcript **T-0 + T-1 executed**, **T-2 EXECUTING 12/15 tasks** on `lens-transript` c53179f..84043e5 UNMERGED — subagent-driven; Phase A done, Phase B 7–12 done + 13 impl/mounted; resume ledger `.superpowers/sdd/progress.md`, handoff `docs/handoffs/2026-07-22-transcript-t2-executing.md`. Open: Task-13 scroll contracts (real-window debug), Tasks 14–15, flaky Task-7 test. **Reorg:** disk-scale → **T-2b** (next-not-deferred); live tool-tail → **T-4**; polymorphic `ContentTab` → terminal-UI-integration, SPEC-GAPS)._
 
 ---
 
@@ -85,7 +85,9 @@ _Last curated 2026-07-22 (transcript **T-0 + T-1 executed**, **T-2 PLAN-COMPLETE
     per-turn data → **T-6**); streaming variants carry `&MessageAcc`/`&ReasoningAcc` (stable identity);
     **`OptimisticUser` dropped** (pending is composer-owned → T-7); **`SubAgentSpan` dropped**
     (child-session model → T-5); `ReconnectBreak` emission → T-2.
-  - **T-2 — Focused view scaffold + live disk-sourced surface. ▶ PLAN-COMPLETE 2026-07-22, → EXECUTE (subagent-driven)**
+  - **T-2 — Focused view scaffold + live disk-sourced surface. ▶ EXECUTING 2026-07-22 (12/15 tasks done, gate-green, on `lens-transript` c53179f..84043e5, UNMERGED).**
+    Subagent-driven (cursor composer-2.5 impl · codex gpt-5.6 + grok-4.5 + Opus reviews). **Phase A (Tasks 1–6) DONE.** **Phase B: 7–12 DONE, 13 impl+mounted (scroll contracts open), 14–15 not started.** Progress ledger + full per-task detail: `.superpowers/sdd/progress.md` (RESUME THERE). Reviews caught & fixed real defects: 2 Criticals (OutputItemDone-supersede orphan; reader-worker channel-drop/foreground-open), coalesce-drops-keyed-signals (Tasks 4/5), latent lens-store break, staged-finalize crux bugs (Task 12, 3 rounds). **Crux real-window proof PASSES** (probe run sandbox-disabled — see [[t2-real-window-probe-sandbox]]). **OPEN:** Task-13 scroll contracts fail under probe (real-window debug), Tasks 14–15, flaky Task-7 mock-handshake test, Task-12 collapse nuance.
+    _(orig plan context below)_ PLAN-COMPLETE 2026-07-22
     (plan `docs/plans/2026-07-22-transcript-t2-focused-view-scaffold.md` — 15 tasks, Phase A lens-core
     (Tasks 1–6, exact code) + Phase B lens-ui (7–15, spike-referenced); handoff
     `docs/handoffs/2026-07-22-transcript-t2-plan-complete.md`; spec rev 4
