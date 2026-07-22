@@ -108,16 +108,32 @@ pub fn reduce(state: &mut SessionState, event: &ServerStreamEvent, clock: &dyn C
                 }
                 smallvec![StreamUpdate::ScratchChanged(Arc::new(state.stream.clone()))]
             }
-            ResponseEvent::ReasoningTextDelta { delta } => scratch::accumulate_reasoning(
-                &mut state.stream,
-                scratch::ReasoningKind::Full,
-                delta,
-            ),
-            ResponseEvent::ReasoningSummaryTextDelta { delta } => scratch::accumulate_reasoning(
-                &mut state.stream,
-                scratch::ReasoningKind::Summary,
-                delta,
-            ),
+            ResponseEvent::ReasoningTextDelta { delta } => {
+                let new_acc_id = if state.stream.open_reasoning.is_none() {
+                    Some(state.mint_acc_id())
+                } else {
+                    None
+                };
+                scratch::accumulate_reasoning(
+                    &mut state.stream,
+                    scratch::ReasoningKind::Full,
+                    delta,
+                    new_acc_id,
+                )
+            }
+            ResponseEvent::ReasoningSummaryTextDelta { delta } => {
+                let new_acc_id = if state.stream.open_reasoning.is_none() {
+                    Some(state.mint_acc_id())
+                } else {
+                    None
+                };
+                scratch::accumulate_reasoning(
+                    &mut state.stream,
+                    scratch::ReasoningKind::Summary,
+                    delta,
+                    new_acc_id,
+                )
+            }
             ResponseEvent::OutputItemDone { item } => match items::map_item(item) {
                 // D-P1-4 / REVIEW#3: resource items produce no transcript item.
                 None => smallvec![StreamUpdate::ResourcesChanged],

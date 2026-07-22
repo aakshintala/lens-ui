@@ -1,7 +1,7 @@
 //! Text + reasoning accumulation over `StreamScratch` (§4.2).
 
 use crate::domain::ids::AccId;
-use crate::domain::item::{MessageAcc, StreamScratch};
+use crate::domain::item::{MessageAcc, ReasoningAcc, StreamScratch};
 use crate::reduce::{StreamUpdate, Updates};
 use smallvec::smallvec;
 use std::sync::Arc;
@@ -15,8 +15,12 @@ pub(crate) fn accumulate_reasoning(
     scratch: &mut StreamScratch,
     kind: ReasoningKind,
     delta: &str,
+    new_acc_id: Option<AccId>,
 ) -> Updates {
-    let acc = scratch.open_reasoning.get_or_insert_with(Default::default);
+    let acc = scratch.open_reasoning.get_or_insert_with(|| ReasoningAcc {
+        acc_id: new_acc_id.expect("pre-minted acc_id required when opening reasoning acc"),
+        ..Default::default()
+    });
     match kind {
         ReasoningKind::Full => acc.full_text.push_str(delta),
         ReasoningKind::Summary => acc.summary_text.push_str(delta),
@@ -95,6 +99,70 @@ mod tests {
         assert_eq!(
             s.stream.open_reasoning.as_ref().unwrap().full_text,
             "because"
+        );
+    }
+
+    #[test]
+    fn bare_reasoning_text_delta_mints_non_empty_acc_id() {
+        let mut s = st();
+        reduce(
+            &mut s,
+            &ServerStreamEvent::Response(ResponseEvent::ReasoningTextDelta { delta: "be".into() }),
+            &clock(),
+        );
+        let first = s.stream.open_reasoning.as_ref().unwrap().acc_id.clone();
+        assert!(
+            !first.as_str().is_empty(),
+            "acc_id must be non-empty when opened by bare ReasoningTextDelta"
+        );
+        reduce(
+            &mut s,
+            &ServerStreamEvent::Response(ResponseEvent::ReasoningTextDelta {
+                delta: "cause".into(),
+            }),
+            &clock(),
+        );
+        let second = s.stream.open_reasoning.as_ref().unwrap().acc_id.clone();
+        assert_eq!(
+            first, second,
+            "acc_id must be stable across reasoning deltas"
+        );
+        assert_eq!(
+            s.stream.open_reasoning.as_ref().unwrap().full_text,
+            "because"
+        );
+    }
+
+    #[test]
+    fn bare_reasoning_summary_text_delta_mints_non_empty_acc_id() {
+        let mut s = st();
+        reduce(
+            &mut s,
+            &ServerStreamEvent::Response(ResponseEvent::ReasoningSummaryTextDelta {
+                delta: "sum".into(),
+            }),
+            &clock(),
+        );
+        let first = s.stream.open_reasoning.as_ref().unwrap().acc_id.clone();
+        assert!(
+            !first.as_str().is_empty(),
+            "acc_id must be non-empty when opened by bare ReasoningSummaryTextDelta"
+        );
+        reduce(
+            &mut s,
+            &ServerStreamEvent::Response(ResponseEvent::ReasoningSummaryTextDelta {
+                delta: "mary".into(),
+            }),
+            &clock(),
+        );
+        let second = s.stream.open_reasoning.as_ref().unwrap().acc_id.clone();
+        assert_eq!(
+            first, second,
+            "acc_id must be stable across reasoning summary deltas"
+        );
+        assert_eq!(
+            s.stream.open_reasoning.as_ref().unwrap().summary_text,
+            "summary"
         );
     }
 
