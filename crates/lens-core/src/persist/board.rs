@@ -29,6 +29,16 @@ pub trait BoardStore {
 
     fn remove_session(&self, conn: &ConnectionId, session: &SessionId) -> Result<()>;
 
+    /// Batch placement (§3.3): place each non-tombstoned, not-already-present session,
+    /// persisting each touched board ONCE inside ONE transaction (one persist vs k).
+    /// Tombstoned/duplicate entries are skipped. Callers re-read via `load_layout` for
+    /// the reconciled view (read-time lazy-place + tombstone-prune).
+    fn place_sessions(
+        &self,
+        placements: &[(ConnectionId, SessionId)],
+        target: &PlacementTarget,
+    ) -> Result<()>;
+
     fn create_group(
         &self,
         board_id: &BoardId,
@@ -464,6 +474,54 @@ impl BoardStore for SqliteBoardStore {
         let tx = self.conn.unchecked_transaction()?;
         self.persist_board_items(&layout, &board_id)?;
         self.touch_board(&board_id)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn place_sessions(
+        &self,
+        placements: &[(ConnectionId, SessionId)],
+        target: &PlacementTarget,
+    ) -> Result<()> {
+        self.guard_write()?;
+        let mut loaded = self.load_layout_inner()?;
+        let mut layout = loaded.rows.pop().unwrap_or_default();
+        if layout.boards.is_empty() {
+            self.ensure_default_board()?;
+            layout.boards = self.load_boards()?.rows;
+        }
+        let mut touched: std::collections::HashSet<BoardId> = std::collections::HashSet::new();
+        for (conn, session) in placements {
+            if self.is_tombstoned(conn, session)? {
+                continue;
+            }
+            if layout.find_card(conn, session).is_some() {
+                continue;
+            }
+            let item_id = self.new_item_id("card");
+            let created_at = self.now_ms();
+            layout.place_session(
+                conn.clone(),
+                session.clone(),
+                target,
+                item_id.clone(),
+                created_at,
+            )?;
+            let board_id = layout
+                .item(&item_id)
+                .expect("just inserted")
+                .board_id
+                .clone();
+            touched.insert(board_id);
+        }
+        if touched.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        for board_id in &touched {
+            self.persist_board_items(&layout, board_id)?;
+            self.touch_board(board_id)?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -1100,6 +1158,108 @@ CREATE TABLE IF NOT EXISTS cost_samples (
             .query_row("SELECT COUNT(*) FROM board_items", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0, "no card created for a tombstoned session");
+    }
+
+    fn tombstone_session(store: &SqliteBoardStore, conn: &ConnectionId, session: &SessionId) {
+        let path = store.conn.path().expect("db path");
+        let control = SqliteControlStore::open(Path::new(path)).unwrap();
+        seed_session(&control, conn.as_str(), session.as_str());
+        control
+            .conn
+            .execute(
+                &format!(
+                    "UPDATE sessions SET tombstoned_at = 1 WHERE connection_id = '{}' AND id = '{}'",
+                    conn.as_str(),
+                    session.as_str()
+                ),
+                [],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn place_sessions_batch_places_all_in_one_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteBoardStore::open(&dir.path().join("lens.db")).unwrap();
+        let conn = ConnectionId::new("c1");
+        let target = PlacementTarget {
+            board_id: None,
+            parent_item_id: None,
+            ordinal: None,
+        };
+        store
+            .place_sessions(
+                &[
+                    (conn.clone(), SessionId::new("s1")),
+                    (conn.clone(), SessionId::new("s2")),
+                    (conn.clone(), SessionId::new("s3")),
+                ],
+                &target,
+            )
+            .unwrap();
+
+        let layout = store
+            .load_layout()
+            .unwrap()
+            .rows
+            .into_iter()
+            .next()
+            .unwrap();
+        let cards: Vec<_> = layout
+            .items
+            .iter()
+            .filter_map(|i| match &i.kind {
+                BoardItemKind::Card { session, .. } => Some(session.as_str().to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cards.len(), 3);
+        assert!(
+            ["s1", "s2", "s3"]
+                .iter()
+                .all(|s| cards.iter().any(|c| c == s))
+        );
+    }
+
+    #[test]
+    fn place_sessions_skips_tombstoned_and_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteBoardStore::open(&dir.path().join("lens.db")).unwrap();
+        let conn = ConnectionId::new("c1");
+        let target = PlacementTarget {
+            board_id: None,
+            parent_item_id: None,
+            ordinal: None,
+        };
+        store
+            .place_session(&conn, &SessionId::new("s1"), &target)
+            .unwrap();
+        tombstone_session(&store, &conn, &SessionId::new("s2"));
+
+        store
+            .place_sessions(
+                &[
+                    (conn.clone(), SessionId::new("s1")),
+                    (conn.clone(), SessionId::new("s2")),
+                    (conn.clone(), SessionId::new("s3")),
+                ],
+                &target,
+            )
+            .unwrap();
+
+        let layout = store
+            .load_layout()
+            .unwrap()
+            .rows
+            .into_iter()
+            .next()
+            .unwrap();
+        let n = layout
+            .items
+            .iter()
+            .filter(|i| matches!(i.kind, BoardItemKind::Card { .. }))
+            .count();
+        assert_eq!(n, 2);
     }
 
     // Regression for the high-water-mark seed: after delete+reopen, a freshly minted
