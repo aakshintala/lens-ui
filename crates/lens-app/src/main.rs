@@ -139,8 +139,45 @@ fn main() {
         });
 }
 
-/// Open a temp board store and seed one "Demo group" over two preset demo session ids
-/// (conn `lens-app`, matching the replica) so the loaded board renders B-3 group chrome.
+/// The preset demo session-id stems (one per wave state). MUST stay in sync with
+/// `demo_preset_cards`' ids — the group seed and the fleet cards key on the same values.
+#[cfg(feature = "demo")]
+const DEMO_BASE_IDS: [&str; 7] = [
+    "demo-needs-input",
+    "demo-ready",
+    "demo-working",
+    "demo-failed",
+    "demo-slept",
+    "demo-neutral",
+    "demo-scheduled",
+];
+
+/// Every demo session id that `demo_cards` will create (7 stems × `LENS_DEMO_N` replicas,
+/// same scheme: rep 0 = stem, rep>0 = `{stem}-r{rep}`).
+#[cfg(feature = "demo")]
+fn demo_session_ids() -> Vec<String> {
+    let n = std::env::var("LENS_DEMO_N")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(1);
+    let mut ids = Vec::with_capacity(DEMO_BASE_IDS.len() * n);
+    for rep in 0..n {
+        for stem in DEMO_BASE_IDS {
+            ids.push(if rep == 0 {
+                stem.to_string()
+            } else {
+                format!("{stem}-r{rep}")
+            });
+        }
+    }
+    ids
+}
+
+/// Open a temp board store and seed a "Demo group" over HALF the demo session ids (conn
+/// `lens-app`, matching the replica) so the loaded board renders B-3 group chrome — and,
+/// crucially, exercises group member-reads AT SCALE under `LENS_DEMO_N` (the other half
+/// reconciles loose; half-group/half-loose matches the criterion fixture — codex I3).
 /// Best-effort: any store failure just yields `None` → the demo board still renders loose.
 #[cfg(feature = "demo")]
 fn seed_demo_group(
@@ -153,10 +190,12 @@ fn seed_demo_group(
     let store = SqliteBoardStore::open(db).ok()?;
     let board = BoardId::new(DEFAULT_BOARD_ID);
     if let Ok(group) = store.create_group(&board, None, 0, "Demo group") {
-        for (i, sid) in ["demo-working", "demo-ready"].iter().enumerate() {
+        let ids = demo_session_ids();
+        let half = (ids.len() / 2).max(1);
+        for (i, sid) in ids.iter().take(half).enumerate() {
             let _ = store.place_session(
                 conn,
-                &SessionId::new(*sid),
+                &SessionId::new(sid.clone()),
                 &PlacementTarget {
                     board_id: Some(board.clone()),
                     parent_item_id: Some(group.clone()),

@@ -4,7 +4,6 @@ mod rollup;
 pub use replica::{BoardReplica, ReplicaState, WriteDisposition};
 
 use crate::PtyProbe;
-use crate::card::model::SessionCard;
 use crate::card::view::{SessionCardView, mount_cached_card};
 use crate::fleet::store::FleetStore;
 use crate::slot::TabHandle;
@@ -219,7 +218,7 @@ impl BoardView {
         scroll: ScrollHandle,
         cx: &mut Context<Self>,
     ) -> (AnyElement, Vec<SessionId>) {
-        let layout = self.replica.read(cx).layout().clone();
+        let layout = self.replica.read(cx).layout();
         let board_id = match layout.default_board_id() {
             Ok(id) => id.clone(),
             Err(_) => return (div().into_any_element(), Vec::new()),
@@ -374,16 +373,21 @@ impl BoardView {
         let completed = meta.map(|m| m.completed_count).unwrap_or(0);
         let accent = group_accent(meta.and_then(|m| m.color_token.as_deref()));
 
-        // Fold the rollup from member cards (snapshot the values we need — owned).
-        let members: Vec<SessionCard> = {
+        // Fold the rollup from member cards via a NARROW projection (cost + created_at
+        // only) — no full SessionCard clone per member per frame (codex final-review I2).
+        let members: Vec<rollup::MemberCost> = {
             let fleet = self.fleet.read(cx);
             sessions
                 .iter()
-                .filter_map(|s| fleet.cards.get(s).map(|e| e.read(cx).clone()))
+                .filter_map(|s| {
+                    fleet
+                        .cards
+                        .get(s)
+                        .map(|e| rollup::MemberCost::from_card(e.read(cx)))
+                })
                 .collect()
         };
-        let member_refs: Vec<&SessionCard> = members.iter().collect();
-        let rollup = rollup::group_rollup(&member_refs, completed);
+        let rollup = rollup::group_rollup(&members, completed);
         let header = rollup::group_header_text(&name, &rollup, now_ms);
 
         let snapshot = GroupChromeSnapshot {

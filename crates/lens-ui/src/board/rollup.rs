@@ -17,11 +17,30 @@ pub struct GroupRollup {
     pub completed_count: u32,
 }
 
-pub fn group_rollup(members: &[&SessionCard], completed_count: u32) -> GroupRollup {
+/// The only two member fields a group rollup needs. Projecting to this at the read
+/// site avoids cloning the entire `SessionCard` (strings/vecs/todos/usage) per member
+/// per frame just to fold cost + age (codex final-review I2).
+#[derive(Clone, Copy, Debug)]
+pub struct MemberCost {
+    pub spend_usd: Option<f64>,
+    pub created_at: Option<i64>,
+}
+
+impl MemberCost {
+    /// Narrow projection from a member card (read only the two fields we fold).
+    pub fn from_card(card: &SessionCard) -> Self {
+        Self {
+            spend_usd: card.cumulative_cost.total_cost_usd,
+            created_at: card.created_at,
+        }
+    }
+}
+
+pub fn group_rollup(members: &[MemberCost], completed_count: u32) -> GroupRollup {
     let mut spend_usd: Option<f64> = None;
     let mut oldest_created_at: Option<i64> = None;
     for m in members {
-        if let Some(c) = m.cumulative_cost.total_cost_usd {
+        if let Some(c) = m.spend_usd {
             spend_usd = Some(spend_usd.unwrap_or(0.0) + c);
         }
         if let Some(ca) = m.created_at {
@@ -93,7 +112,7 @@ mod tests {
     fn rollup_sums_spend_and_takes_oldest_created_at() {
         let a = card("s1", Some(1.50), Some(2000));
         let b = card("s2", Some(2.00), Some(1000));
-        let members = [&a, &b];
+        let members = [MemberCost::from_card(&a), MemberCost::from_card(&b)];
         let r = group_rollup(&members, 3);
         assert_eq!(r.spend_usd, Some(3.50));
         assert_eq!(r.oldest_created_at, Some(1000)); // min, not max
@@ -105,7 +124,7 @@ mod tests {
         // one member has cost, neither the other; one has created_at, not the other.
         let a = card("s1", Some(0.75), None);
         let b = card("s2", None, Some(5000));
-        let members = [&a, &b];
+        let members = [MemberCost::from_card(&a), MemberCost::from_card(&b)];
         let r = group_rollup(&members, 0);
         assert_eq!(r.spend_usd, Some(0.75));
         assert_eq!(r.oldest_created_at, Some(5000));
@@ -114,7 +133,7 @@ mod tests {
     #[test]
     fn rollup_all_absent_is_none() {
         let a = card("s1", None, None);
-        let members = [&a];
+        let members = [MemberCost::from_card(&a)];
         let r = group_rollup(&members, 0);
         assert_eq!(r.spend_usd, None);
         assert_eq!(r.oldest_created_at, None);

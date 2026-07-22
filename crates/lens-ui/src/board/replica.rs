@@ -59,7 +59,7 @@ pub(crate) struct StoreSlot {
 pub struct BoardReplica {
     pub(crate) store: Arc<Mutex<StoreSlot>>,
     pub(crate) conn: ConnectionId,
-    pub(crate) layout: BoardLayout,
+    pub(crate) layout: Arc<BoardLayout>,
     pub(crate) state: ReplicaState,
     pub(crate) fleet: Entity<FleetStore>,
     pub(crate) in_flight: bool,
@@ -112,7 +112,7 @@ impl BoardReplica {
         let mut this = Self {
             store: Arc::new(Mutex::new(StoreSlot { path, store })),
             conn,
-            layout: default_board_layout(),
+            layout: Arc::new(default_board_layout()),
             state: ReplicaState::Loading,
             fleet,
             in_flight: false,
@@ -199,8 +199,8 @@ impl BoardReplica {
         self.pump(cx);
     }
 
-    pub fn layout(&self) -> &BoardLayout {
-        &self.layout
+    pub fn layout(&self) -> Arc<BoardLayout> {
+        Arc::clone(&self.layout)
     }
 
     pub fn state(&self) -> ReplicaState {
@@ -267,7 +267,11 @@ impl BoardReplica {
             } => {
                 self.op_retries = 0;
                 self.recovery_in_flight = false;
-                self.layout = layout;
+                // A fresh load is a fresh health assessment — un-dismiss so a NEW incident
+                // (recover→Writable→later Degraded, or a fresh Degraded) surfaces its banner
+                // instead of being hidden by an earlier dismissal (codex final-review #6).
+                self.banner_dismissed = false;
+                self.layout = Arc::new(layout);
                 self.state = load_state(mode, skipped_empty);
                 if self.is_writable() {
                     self.reconcile(cx); // initial/post-recovery reconcile (Task 6)
@@ -279,7 +283,7 @@ impl BoardReplica {
                 mode,
             } => {
                 self.op_retries = 0;
-                self.layout = layout;
+                self.layout = Arc::new(layout);
                 self.state = load_state(mode, skipped_empty); // ~always Writable; consistent
                 self.reconcile_in_flight = false;
                 self.note_place_result(); // suppress stuck keys (Task 6, C1)
@@ -355,6 +359,13 @@ impl BoardReplica {
 
     fn on_op_failed(&mut self, op: Op, err: PersistError, cx: &mut Context<Self>) {
         // Transient (SQLITE_BUSY/LOCKED beyond busy_timeout): keep the op, back off, retry.
+        // SEAM (B-4d): this re-enqueues the WHOLE op. Safe here because B-4a's ops are
+        // idempotent (Load; PlaceSessions skips already-present) — a `place then compose-reload`
+        // whose *post-commit read* fails transiently just re-runs the place as a no-op. B-4d's
+        // CreateGroup is NOT idempotent: a commit followed by a SQLITE_BUSY in the reload would
+        // double-create on retry. Before B-4d adds non-idempotent write ops, run_op_inner must
+        // signal commit phase (e.g. OpFailure { committed }) so a *post-commit* failure goes
+        // Stale (recover by reload) instead of replaying. (Design §8 seam; reconciles M5.)
         if err.is_transient() && self.op_retries < MAX_RETRIES {
             self.op_retries += 1;
             let backoff = Duration::from_millis(50u64 << self.op_retries.min(6)); // 100,200,…,≤3200ms
@@ -369,7 +380,7 @@ impl BoardReplica {
         match op {
             Op::Load { initial: true } => {
                 self.state = ReplicaState::LoadFailed;
-                self.layout = default_board_layout(); // never loaded → render empty default, no panic
+                self.layout = Arc::new(default_board_layout()); // never loaded → render empty default, no panic
             }
             Op::Load { initial: false } => {
                 // Failed RECOVERY: preserve visible data; a writable store just lost writability.
@@ -1089,6 +1100,45 @@ mod tests {
                 "re-diff on reply caught the coalesced late card s2 (placed: {placed:?})"
             );
             assert!(!r.in_flight && !r.reconcile_in_flight && r.pending.is_empty());
+        });
+        drop(dir);
+    }
+
+    // A PERSISTENT place failure (reconcile's PlaceSessions) → Stale, and the last loaded
+    // layout is PRESERVED (not blanked) — codex final-review I4.
+    #[gpui::test]
+    async fn persistent_place_failure_goes_stale_preserving_layout(cx: &mut gpui::TestAppContext) {
+        let fleet = cx.update(test_fleet);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.db");
+        let inner = SqliteBoardStore::open(&path).unwrap();
+        let flaky: Box<dyn BoardStore + Send> = Box::new(FlakyStore {
+            inner,
+            fail_loads: Cell::new(0),
+            fail_places: Cell::new(1), // the reconcile place fails once…
+            err: || PersistError::ReadOnly, // …persistently (non-transient)
+            mode: StoreMode::ReadWrite,
+            place_noop: false,
+        });
+        let replica = cx.update(|cx| {
+            cx.new(|cx| BoardReplica::for_test_store(fleet.clone(), flaky, path.clone(), cx))
+        });
+        cx.run_until_parked(); // Load → Writable
+        replica.read_with(cx, |r, _| assert_eq!(r.state(), ReplicaState::Writable));
+
+        fleet.update(cx, |f, cx| {
+            f.spawn_fake_session(SessionId::new("s1"), cx);
+        });
+        cx.run_until_parked(); // reconcile → place fails persistently → Stale
+
+        replica.read_with(cx, |r, _| {
+            assert_eq!(r.state(), ReplicaState::Stale);
+            assert!(!r.is_writable());
+            // layout preserved (default board still there), not blanked:
+            assert_eq!(
+                r.layout().default_board_id().unwrap().as_str(),
+                DEFAULT_BOARD_ID
+            );
         });
         drop(dir);
     }

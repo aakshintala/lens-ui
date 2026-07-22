@@ -375,6 +375,21 @@ Full `xtask gate` green (incl. the lens-core pack bench building).
 
 - **B-4b/c/d** ← `write(cmd)` over collapse / move / group ops; B-4c drag hit-testing vs
   packer geometry (spike candidate).
+- **B-4d — non-idempotent retry (codex final-review I1, blocker for `CreateGroup`).** B-4a's
+  `on_op_failed` re-enqueues the *whole* op on a transient error, and `PlaceSessions` is a
+  `place then compose-reload` (M5). This is safe **only** because B-4a's ops are idempotent — a
+  post-commit reload that hits `SQLITE_BUSY` just replays an idempotent place. `CreateGroup` is
+  NOT idempotent: commit-then-`BUSY`-in-reload would double-create on retry. **Before B-4d adds
+  non-idempotent writes, `run_op_inner` must signal commit phase** (e.g. `OpFailure { committed }`)
+  so a *post-commit* failure → `Stale` (recover by reload), and only *pre-commit* failures replay.
+  This realigns the code with M5's "no fallible post-commit reload / non-idempotent not blindly
+  retried" (the M5 note describes the *target*; B-4a ships the idempotent-safe simplification).
+- **Render perf follow-up (codex final-review I2, partial).** B-4a fixed the per-frame clone costs
+  (layout is `Arc<BoardLayout>`; group rollup reads a narrow `MemberCost` projection, no full
+  `SessionCard` clone). **Remaining:** reading member cards in `render` makes the board depend on
+  every member, so a member notify invalidates the *whole* board (full pack/tree rebuild). This is
+  correct for rollup *freshness* (tested) but O(N) per member-update at scale. A selectively-updated
+  per-group rollup entity would localize it — deferred, gated on the owed on-device FPS measurement.
 - **B-4c drag is optimistic (decided).** Apply the move to the in-memory `layout`
   immediately, persist async; on a **persistent** write `Err` (§5) roll back / snap the card
   back + banner. This is a new `run_op` variant (optimistic-apply + rollback-snapshot) layered

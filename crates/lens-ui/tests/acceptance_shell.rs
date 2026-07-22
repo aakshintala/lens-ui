@@ -805,3 +805,111 @@ async fn board_group_renders_chrome_and_rollup_via_replica(cx: &mut gpui::TestAp
     assert!(built.contains(&s1) && built.contains(&s2), "members built");
     drop(dir);
 }
+
+// I5 (design §7 freshness): after mount, a member's cost change must refresh the group
+// rollup. Also proves the I2 narrow projection reads LIVE member data (not a stale snapshot)
+// and that the member-notify → board re-render dependency is intact.
+#[gpui::test]
+async fn group_rollup_refreshes_on_member_cost_change(cx: &mut gpui::TestAppContext) {
+    use gpui::{Size, px};
+    use lens_core::domain::board::{DEFAULT_BOARD_ID, PlacementTarget};
+    use lens_core::domain::ids::{BoardId, ConnectionId};
+    use lens_core::persist::{BoardStore, SqliteBoardStore};
+
+    let clock = Arc::new(ManualUiClock::new(7_200_000));
+    let s1 = SessionId::new("s1");
+    let s2 = SessionId::new("s2");
+    let conn = ConnectionId::new("c");
+
+    let (fleet, c1, _c2) = cx.update(|cx| {
+        gpui_component::init(cx);
+        lens_ui::theme::install_at_startup(cx);
+        let fleet = FleetStore::new(Arc::clone(&clock) as Arc<dyn UiClock>, cx);
+        let (c1, c2) = fleet.update(cx, |f, cx| {
+            (
+                f.spawn_fake_session(s1.clone(), cx),
+                f.spawn_fake_session(s2.clone(), cx),
+            )
+        });
+        (fleet, c1, c2)
+    });
+    cx.update(|cx| {
+        c1.update(cx, |card, _| {
+            card.cumulative_cost.total_cost_usd = Some(1.50)
+        });
+        _c2.update(cx, |card, _| {
+            card.cumulative_cost.total_cost_usd = Some(2.00)
+        });
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("board.db");
+    let store = SqliteBoardStore::open(&path).unwrap();
+    let board = BoardId::new(DEFAULT_BOARD_ID);
+    let g1 = store.create_group(&board, None, 0, "G").unwrap();
+    for (i, s) in [&s1, &s2].into_iter().enumerate() {
+        store
+            .place_session(
+                &conn,
+                s,
+                &PlacementTarget {
+                    board_id: Some(board.clone()),
+                    parent_item_id: Some(g1.clone()),
+                    ordinal: Some(i as i32),
+                },
+            )
+            .unwrap();
+    }
+    let boxed: Box<dyn BoardStore + Send> = Box::new(store);
+
+    let fleet_for_window = fleet.clone();
+    let replica = cx.update(|cx| {
+        cx.new(|cx| {
+            BoardReplica::new(
+                Some(boxed),
+                path.clone(),
+                conn.clone(),
+                fleet_for_window.clone(),
+                cx,
+            )
+        })
+    });
+    cx.run_until_parked();
+
+    let (board_handle, vcx) = cx.add_window_view(|_, cx| {
+        BoardView::mount(
+            fleet_for_window,
+            replica.clone(),
+            placeholder_tab(cx),
+            None,
+            cx,
+        )
+    });
+    vcx.simulate_resize(Size {
+        width: px(1200.0),
+        height: px(900.0),
+    });
+    vcx.run_until_parked();
+
+    // Initial rollup = $1.50 + $2.00.
+    let before = vcx.read(|cx| board_handle.read(cx).group_chrome_for_test());
+    assert_eq!(before[0].rollup.spend_usd, Some(3.50), "initial rollup");
+
+    // Change a member's cost AFTER mount + notify → board (which reads the member in render)
+    // must re-render and re-fold a FRESH rollup.
+    vcx.update(|_, cx| {
+        c1.update(cx, |card, cx| {
+            card.cumulative_cost.total_cost_usd = Some(5.00);
+            cx.notify();
+        });
+    });
+    vcx.run_until_parked();
+
+    let after = vcx.read(|cx| board_handle.read(cx).group_chrome_for_test());
+    assert_eq!(
+        after[0].rollup.spend_usd,
+        Some(7.00),
+        "rollup refreshed after member cost change (5.00 + 2.00)"
+    );
+    drop(dir);
+}
