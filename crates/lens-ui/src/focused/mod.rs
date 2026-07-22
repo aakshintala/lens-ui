@@ -2,6 +2,7 @@
 //! rendering (Task 13) and staged finalize (Task 12) land later.
 
 pub mod reader;
+mod rowsource;
 
 use crate::fleet::store::{ReaderFactory, ReconcileEpoch};
 use gpui::Context;
@@ -13,14 +14,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 pub use reader::{Priority, ReadTarget, ReaderWorkerHandle};
+pub use rowsource::{RowId, RowKind, RowPresentation, RowState, RowStore, UpsertEffect};
 
 // ── stubs — later tasks flesh these out ──
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct RowStore; // stub — Task 11 fleshes out
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct RowPresentation; // stub — Task 11 fleshes out
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Marker; // stub — Task 14 fleshes out
@@ -33,7 +29,7 @@ pub struct FocusedTranscript {
     active_response: Option<ResponseId>,
     last_rendered_ordinal: i64,
     live_section_start: usize,
-    #[allow(dead_code)] // Task 11
+    #[allow(dead_code)] // Task 12 wires projection → rows
     rows: RowStore,
     #[allow(dead_code)] // Task 12
     pending_finalize: HashMap<AccId, RowPresentation>,
@@ -76,7 +72,7 @@ impl FocusedTranscript {
             active_response: None,
             last_rendered_ordinal: -1,
             live_section_start: 0,
-            rows: RowStore,
+            rows: RowStore::new(),
             pending_finalize: HashMap::new(),
             markers: Vec::new(),
             focus_generation,
@@ -106,7 +102,7 @@ impl FocusedTranscript {
             active_response: None,
             last_rendered_ordinal: -1,
             live_section_start: 0,
-            rows: RowStore,
+            rows: RowStore::new(),
             pending_finalize: HashMap::new(),
             markers: Vec::new(),
             focus_generation,
