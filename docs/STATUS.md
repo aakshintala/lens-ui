@@ -304,8 +304,20 @@ _Last curated 2026-07-22 (**terminal workstream LANDED ON `main`** — `terminal
       time); MANDATORY frame-budget benchmark = E2E lens-ui on-device measurement (not just the pure lens-core
       pack bench). Verifies the B-3 `.cached()` member-read-during-render carryforward now that groups render
       for real. Memory [[board-b4a-design]]; handoff `docs/handoffs/2026-07-21-board-b4a-design-locked.md`.
-    - **B-4b/c/d** — collapse (+§7 collapsed-tile), drag/move (spike candidate: gpui `on_drag`/`on_drop` vs
-      packer geometry), context-menu grouping. Each adds `write()` op variants via B-4a's `run_op` seam.
+    - **B-4b — collapse toggle (+§7 collapsed-tile) — EXECUTED 2026-07-22** on branch `board-b4b`
+      (has `main`/terminal merged in; **NOT merged — held for a board visual pass**). Subagent-driven
+      (composer + grok-4.5 per-task + codex final), all reviews clean. Caret-only `⌄`/`▸`, commit-gated
+      `SetCollapsed` op, collapsed 1×1 rollup tile, unified `✓N iff N>0`, deadline-wake for stale
+      collapsed time-waves. Plus an on-device **ring-gutter fix** (`62c8951`,`3801ce1`): the NeedsInput/
+      Failed expanding attention ring leaked past the group border; trimmed `RING_REACH_PX 12→6` +
+      `board::GUTTER = reach+1 = 7`, pinned by two compile-time `const _` asserts (`GUTTER>=reach`,
+      `2*GUTTER<=GAP`). Demo now seeds two adjacent colored groups + dark default. Gate green
+      (98 lens-ui lib tests, clippy, fmt). **⏳ NEXT: a full board visual pass** (on `board-b4b`) then
+      foreground gate → merge. **Two seed issues + branch state:** handoff
+      `docs/handoffs/2026-07-22-board-visual-pass.md` — (1) group bg fill 7%→maybe 10–12%; (2) groups
+      don't reflow in the focused rail (`pack.rs:102/111` stores unclamped `fc`; pre-existing).
+    - **B-4c/d** — drag/move (spike candidate: gpui `on_drag`/`on_drop` vs packer geometry),
+      context-menu grouping. Each adds `write()` op variants via B-4a's `run_op` seam.
   - **B-5 — multiple boards + rail switcher** — board CRUD (B-1 seeds only the default board), the
     externally-discovered-session landing policy, and `FleetStore` connection-scoping.
   - **B-6 — archive-as-board surface.**
