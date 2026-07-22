@@ -674,7 +674,9 @@ fn apply_reduced_batch(
     let saw_reconnecting = batch
         .iter()
         .any(|u| matches!(u, StreamUpdate::Reconnecting { .. }));
-    let saw_reconnected = batch.iter().any(|u| matches!(u, StreamUpdate::Reconnected));
+    let saw_reconnected = batch
+        .iter()
+        .any(|u| matches!(u, StreamUpdate::Reconnected { .. }));
     if saw_reconnecting {
         ctx.snapshot_pending_inputs.clear();
         ctx.catchup_accum.clear();
@@ -763,7 +765,9 @@ fn reconnected_defer_commit(batch: &Updates) -> bool {
     let has_disconnect = batch
         .iter()
         .any(|u| matches!(u, StreamUpdate::Disconnected(_)));
-    let saw_reconnected = batch.iter().any(|u| matches!(u, StreamUpdate::Reconnected));
+    let saw_reconnected = batch
+        .iter()
+        .any(|u| matches!(u, StreamUpdate::Reconnected { .. }));
     saw_reconnected && !has_disconnect
 }
 
@@ -1161,7 +1165,7 @@ fn persist_scalars(
             | StreamUpdate::ResourcesChanged
             | StreamUpdate::PendingUserChanged(_)
             | StreamUpdate::Reconnecting { .. }
-            | StreamUpdate::Reconnected
+            | StreamUpdate::Reconnected { .. }
             | StreamUpdate::TranscriptAdvanced { .. } => {}
             StreamUpdate::Disconnected(_) => {}
             _ => touched_scalar = true,
@@ -1402,7 +1406,7 @@ mod tests {
             match feed_rx.recv_blocking().unwrap() {
                 ActorFeed::Detailed(StreamUpdate::PendingUserChanged(v)) => return Some(v),
                 ActorFeed::Detailed(
-                    StreamUpdate::Reconnected
+                    StreamUpdate::Reconnected { .. }
                     | StreamUpdate::Reconnecting { .. }
                     | StreamUpdate::TranscriptAdvanced { .. }
                     | StreamUpdate::SnapshotRestored(_)

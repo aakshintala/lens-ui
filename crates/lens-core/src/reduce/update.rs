@@ -63,7 +63,9 @@ pub enum StreamUpdate {
     Reconnecting {
         attempt: u32,
     },
-    Reconnected,
+    Reconnected {
+        gap: Option<u64>,
+    },
     Disconnected(lens_client::stream::DisconnectReason),
     /// D28: snapshot `pending_inputs` plumbed for held-bubble path-1 stamping on reconnect.
     SnapshotRestored(Vec<PendingInput>),

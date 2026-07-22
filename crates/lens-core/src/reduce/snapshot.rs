@@ -96,7 +96,7 @@ pub(crate) fn fold_snapshot(state: &mut SessionState, snap: &SessionSnapshot) ->
 }
 
 pub(crate) fn on_reconnected(state: &mut SessionState, gap: Option<u64>) -> Updates {
-    let mut u: Updates = smallvec![StreamUpdate::Reconnected];
+    let mut u: Updates = smallvec![StreamUpdate::Reconnected { gap }];
     if gap != Some(0) {
         // D-P1-16: clear transient scratch; KEEP pending_user (user intent, spec P3b).
         let had = state.stream.open_message.is_some()
@@ -189,7 +189,25 @@ mod tests {
         );
         assert!(s.stream.open_message.is_none());
         assert_eq!(s.pending_user.len(), 1);
-        assert!(u.contains(&StreamUpdate::Reconnected));
+        assert!(
+            u.iter()
+                .any(|x| matches!(x, StreamUpdate::Reconnected { gap: None }))
+        );
+    }
+
+    #[test]
+    fn reconnected_update_carries_gap() {
+        let mut s = st();
+        reduce(&mut s, &resp_text("partial", None, None), &clock());
+        let u = reduce(
+            &mut s,
+            &ServerStreamEvent::Reconnected { gap: Some(3) },
+            &clock(),
+        );
+        assert!(
+            u.iter()
+                .any(|x| matches!(x, StreamUpdate::Reconnected { gap: Some(3) }))
+        );
     }
 
     #[test]

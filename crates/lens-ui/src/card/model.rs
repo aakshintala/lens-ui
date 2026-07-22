@@ -222,7 +222,7 @@ impl SessionCard {
             StreamUpdate::Reconnecting { .. } => {
                 self.connection_overlay = ConnectionOverlay::Reconnecting;
             }
-            StreamUpdate::Reconnected => {
+            StreamUpdate::Reconnected { .. } => {
                 self.connection_overlay = ConnectionOverlay::Connected;
             }
             StreamUpdate::Disconnected(_) => {
