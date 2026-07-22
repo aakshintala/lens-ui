@@ -221,6 +221,15 @@ Groups each **response's** work blocks into one `WorkSection`, keyed by the shar
   authoritative live signal, not `scratch.turn` — so it survives wake, disk paint,
   and failed/incomplete/cancelled turns (a new `response_id` is simply a new section).
 
+  > **⚠ SUPERSEDED 2026-07-22 by T-2 design decision D-3 (A′)** — this "leave the live
+  > response flat" special-case is being removed. T-2's retained-entity render model needs
+  > **every** response grouped into a `WorkSection` from birth (live included) so that
+  > finalize is a render-flag flip (expanded→collapsed), never a structural remount; the
+  > live `StreamingReasoning` splices **under** the live section. `group_work_section` then
+  > no longer takes `active_response` (the live/expanded choice moves to the T-2 renderer).
+  > The amendment + test updates land as the first task of T-2. See
+  > `docs/specs/2026-07-21-transcript-t2-focused-view-scaffold-design.md` §6/§11/§13.
+
 > Note on §4 collapse *timing*: T-1 folds a completed response into a `WorkSection`
 > immediately; keeping the **latest** settled section rendered *expanded* until the
 > next user message is render default-open state (T-6), not structure. T-1 emits no
