@@ -220,9 +220,25 @@ impl FleetStore {
             // so `load` is invoked with no active entity update. gpui entity
             // updates are not re-entrant — invoking `load` inline from
             // `on_supersede` would panic for any loader that touches the store.
+            // The loader's `Err(String)` is the ONLY diagnostic a failed
+            // supersede produces — the terminal simply stays under A, which is
+            // indistinguishable from "the server never superseded". Surface it
+            // rather than discarding it with `is_ok()`.
             let loaded = match cx.update(|cx| loader.load(to.clone(), store.clone(), cx)) {
-                Ok(task) => task.await.is_ok(),
-                Err(_) => false,
+                Ok(task) => match task.await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        eprintln!(
+                            "lens-ui: supersede load {from} -> {to} failed: {e}; \
+                             terminal stays under {from}"
+                        );
+                        false
+                    }
+                },
+                Err(e) => {
+                    eprintln!("lens-ui: supersede {from} -> {to} lost the app context: {e:?}");
+                    false
+                }
             };
             let _ = store.update(cx, |store, cx| {
                 store.supersede_in_flight.remove(&to);
