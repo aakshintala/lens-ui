@@ -21,7 +21,10 @@ pub const TERMINAL_IDLE_SLEEP_THRESHOLD_MS: u64 = 10 * 60 * 1000;
 pub(crate) enum SessionControl {
     Superseded {
         target: SessionId,
-        #[allow(dead_code)] // Slice 6 view auto-follow consumes `reason`.
+        /// Carried but unused at the store layer; Slice 6's view auto-follow
+        /// consumes it. Discarded explicitly at the match site rather than
+        /// silenced with `allow(dead_code)`, so a future genuine deadness of
+        /// this field still warns.
         reason: String,
     },
     TerminalResource(TerminalResourceSignal),
@@ -177,7 +180,11 @@ impl FleetStore {
             SessionControl::TerminalResource(signal) => {
                 self.forward_terminal_resource(session_id, signal, cx);
             }
-            SessionControl::Superseded { target, reason: _ } => {
+            SessionControl::Superseded { target, reason } => {
+                // Slice 6's view auto-follow is what consumes `reason`; a real
+                // discard here keeps the field honestly "read" without an
+                // `allow(dead_code)` that would mask later genuine deadness.
+                let _ = reason;
                 self.on_supersede(session_id, target, cx);
             }
         }
