@@ -13,9 +13,39 @@ contention (3 cargo gates oversubscribe one box), merge reconciliation, and
 divides attention on the one slice least tolerant of it (A). Reviews/merges
 serialize on me regardless.
 
-**Order:** `B` (done) → `A` (grilling) → `C` → `D` (+ live riders).
-The one cheap overlap taken: B was fired to composer in the background while we
-started grilling A.
+**Order:** `B` (done) → `C` (done) → `A` (grilling) → `D` (+ live riders).
+B and C were both delegated to composer and committed while A stays blocked on
+the grill. **A and D remain — A needs the grill (Q1 below) + your input.**
+
+## Sub-slice C — DONE, committed, PENDING review
+
+- **Commit:** `2c12a91`. Composer-2.5 authored; **Opus fixed a flaky test** (below).
+- **Gate green:** fmt + clippy `-D warnings` (lens-ui + lens-terminal) + `cargo test
+  -p lens-ui` (173 unit + 6 acceptance). Verified deterministic: 40× single + 5×
+  full parallel suite.
+- **Files:** new `lens-ui/src/fleet/terminal.rs` (membership/policy + 11 tests);
+  `fleet/{store.rs,mod.rs}`, `lens-ui/src/lib.rs`, `lens-ui/Cargo.toml` (deps
+  lens-terminal + test-util dev-dep); `lens-terminal/{src/lib.rs,Cargo.toml}`
+  (`retained_bytes_estimate` accessor + `test-util` feature).
+- **API:** `FleetStore::{open_terminal, set_terminal_visible, close_terminal,
+  cascade_sleep, cascade_wake, cascade_end, on_memory_pressure, idle_tick}`;
+  `MemoryPressure::{Warning{free_fraction}, Critical}`; `TerminalMember`;
+  `TerminalTab::retained_bytes_estimate() -> usize`.
+- **Flaky-test fix (Opus):** the pressure tests read `retained_bytes_estimate`,
+  which the worker samples ASYNC on build. It raced to 0 → `total_estimate==0` →
+  nothing slept (~60% failure). `spawn_tab_with_rows` now barriers on a post-feed
+  build (`frames_built` advance), gated on `feed_newlines > 0` because `build_now`
+  is a no-op when the engine isn't dirty (would else hang the zero-feed tests).
+- **⚠️ Composer judgment calls to validate in review:** (1) inner-map key is
+  `TerminalKeyId` (fields of TerminalKey) because `TerminalKey` lacks `Hash`; (2)
+  `open_terminal` on an `Existing` target maps `terminal_id → terminal_name` with
+  empty `session_key`; (3) `test-util` wires `lens-client/test-util` for
+  `Client::stub_for_test`.
+- **Compile-unblock (`9b5c541`, separate commit):** B's new `ActorOutcome`/
+  `StreamUpdate` variants broke exhaustive matches in lens-ui (card/model, focused,
+  poller) + lens-drive. Added arms — no-op where control-path carries no card/replica
+  delta; **poller.rs arm is interim — D replaces it with real routing**; lens-drive
+  gets real JSON. Workspace compiles green.
 
 ## Sub-slice B — DONE, committed, PENDING review
 
@@ -146,7 +176,14 @@ as an unchecked invariant. **I favor unified.**
 
 ## Tomorrow, in order
 1. Answer Q1 → finish A grill (Q2–Q6) → write A plan (TDD tasks).
-2. Cross-family review of B via codex (see B section) — can run in background
-   while grilling A resumes.
+2. Cross-family review of **B + C together** via codex (`codex exec -s read-only`,
+   gpt-5.6) — batched per spend policy; both composer-authored lens-* changes.
+   Validate B's 4 + C's 3 judgment calls (listed in each section). Can run in
+   background while grilling A resumes.
 3. Execute A (composer author + Opus supervision on the frozen seam) → whole-branch
-   review → live rider → land.
+   review → live rider → land. Then D (needs A + B + C).
+
+## Commits on branch this session (all on `terminal-slice-5-fleetstore`)
+- `1bbcdef` B (core-surface) · `c4d25e7` docs · `9b5c541` compile-unblock ·
+  `2c12a91` C (fleet-membership). Nothing pushed. **B + C owe cross-family review
+  before any merge to main.**
