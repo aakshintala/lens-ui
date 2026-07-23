@@ -6,6 +6,7 @@ pub mod clock;
 pub mod fleet;
 pub mod focused;
 pub mod md;
+pub mod security;
 pub mod shortcuts;
 pub mod slot;
 pub mod theme;
