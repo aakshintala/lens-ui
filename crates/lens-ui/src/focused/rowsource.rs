@@ -249,7 +249,7 @@ impl RowStore {
         if let Some(entity) = self.entities.get_mut(&id) {
             entity.update(cx, |state, _| {
                 state.id = id.clone();
-                state.presentation = pres;
+                state.presentation = preserve_content_key(&state.presentation, pres);
             });
             UpsertEffect::UpdatedInPlace {
                 entity_id_stable: true,
@@ -958,17 +958,16 @@ pub(crate) fn presentation_for_work_item(item: &Item) -> RowPresentation {
 
 /// D11: streaming→finalize keeps the stream `content_key`; never retarget to item id.
 fn preserve_content_key(stream_pres: &RowPresentation, mut pres: RowPresentation) -> RowPresentation {
-    let stream_key = match &stream_pres.content {
-        RowContent::AssistantMarkdown { content_key, .. }
-        | RowContent::Reasoning { content_key, .. } => Some(content_key.clone()),
-        _ => None,
-    };
-    if let Some(key) = stream_key {
-        match &mut pres.content {
-            RowContent::AssistantMarkdown { content_key, .. }
-            | RowContent::Reasoning { content_key, .. } => *content_key = key,
-            _ => {}
-        }
+    match (&stream_pres.content, &mut pres.content) {
+        (
+            RowContent::AssistantMarkdown { content_key: src, .. },
+            RowContent::AssistantMarkdown { content_key: dst, .. },
+        ) => *dst = src.clone(),
+        (
+            RowContent::Reasoning { content_key: src, .. },
+            RowContent::Reasoning { content_key: dst, .. },
+        ) => *dst = src.clone(),
+        _ => {}
     }
     pres
 }
@@ -1496,6 +1495,143 @@ mod tests {
                     assert_eq!(source, "hello world");
                     assert_eq!(content_key, &key, "D11: content_key must stay the stream key");
                 }
+                other => panic!("unexpected {other:?}"),
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn finalize_preserves_content_key_reasoning(cx: &mut gpui::TestAppContext) {
+        let acc = AccId::new("acc_reason_1");
+        let key = ContentKey::from_acc(&acc);
+        let item_id = ItemId::new("reason_1");
+        let mut store = RowStore::new();
+        cx.update(|cx| {
+            store.stage_stream_finalize(
+                &acc,
+                RowPresentation {
+                    kind: RowKind::StreamingReasoning,
+                    content: RowContent::Reasoning {
+                        summary: "thinking".into(),
+                        full: "thinking aloud".into(),
+                        encrypted: false,
+                        duration_secs: None,
+                        content_key: key.clone(),
+                        live: true,
+                    },
+                    collapsed: false,
+                    height_hint: None,
+                },
+                None,
+                None,
+                cx,
+            );
+            store.commit_stream_finalize(
+                &acc,
+                &item_id,
+                RowPresentation {
+                    kind: RowKind::WorkChild,
+                    content: RowContent::Reasoning {
+                        summary: "done".into(),
+                        full: "thinking aloud, finalized".into(),
+                        encrypted: false,
+                        duration_secs: Some(4),
+                        content_key: ContentKey::from_acc(&AccId::new(item_id.as_str())),
+                        live: false,
+                    },
+                    collapsed: false,
+                    height_hint: None,
+                },
+                false,
+                None,
+                cx,
+            );
+        });
+        cx.read(|cx| {
+            let id = RowId::Work(item_id);
+            let final_pres = &store.entity(&id).unwrap().read(cx).presentation;
+            match &final_pres.content {
+                RowContent::Reasoning {
+                    content_key,
+                    live,
+                    duration_secs,
+                    ..
+                } => {
+                    assert_eq!(content_key, &key, "D11: reasoning content_key must stay the stream key");
+                    assert!(!live);
+                    assert_eq!(*duration_secs, Some(4));
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn upsert_preserves_content_key_across_reproject(cx: &mut gpui::TestAppContext) {
+        let acc = AccId::new("acc_stream_1");
+        let stream_key = ContentKey::from_acc(&acc);
+        let item_id = ItemId::new("item_1");
+        let mut store = RowStore::new();
+        cx.update(|cx| {
+            store.stage_stream_finalize(
+                &acc,
+                RowPresentation {
+                    kind: RowKind::StreamingMessage,
+                    content: RowContent::AssistantMarkdown {
+                        source: "hi".into(),
+                        content_key: stream_key.clone(),
+                    },
+                    collapsed: false,
+                    height_hint: None,
+                },
+                None,
+                None,
+                cx,
+            );
+            store.commit_stream_finalize(
+                &acc,
+                &item_id,
+                RowPresentation {
+                    kind: RowKind::Message,
+                    content: RowContent::AssistantMarkdown {
+                        source: "hi there".into(),
+                        content_key: ContentKey::from_acc(&AccId::new(item_id.as_str())),
+                    },
+                    collapsed: false,
+                    height_hint: None,
+                },
+                true,
+                None,
+                cx,
+            );
+            // Simulate the post-commit reproject re-materializing the durable row with an item-id key.
+            store.upsert(
+                RowId::Sibling(item_id.clone()),
+                RowPresentation {
+                    kind: RowKind::Message,
+                    content: RowContent::AssistantMarkdown {
+                        source: "hi there".into(),
+                        content_key: ContentKey::from_acc(&AccId::new(item_id.as_str())),
+                    },
+                    collapsed: false,
+                    height_hint: None,
+                },
+                cx,
+            );
+        });
+        cx.read(|cx| {
+            let content = store
+                .entity(&RowId::Sibling(item_id))
+                .unwrap()
+                .read(cx)
+                .presentation
+                .content
+                .clone();
+            match content {
+                RowContent::AssistantMarkdown { content_key, .. } => assert_eq!(
+                    content_key, stream_key,
+                    "D11: reproject upsert must not clobber the stream key"
+                ),
                 other => panic!("unexpected {other:?}"),
             }
         });
