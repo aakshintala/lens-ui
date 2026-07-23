@@ -142,10 +142,14 @@ pub(crate) fn finalize_reasoning(state: &mut SessionState, clock: &dyn Clock) ->
     };
     let acc_id = acc.acc_id.clone();
     let id = local_id("reasoning", state);
+    let duration_ms = acc
+        .started_at_ms
+        .map(|start| (clock.now_millis() - start).max(0));
     let kind = ItemKind::Reasoning {
         full_text: acc.full_text,
         summary_text: acc.summary_text,
         encrypted: acc.encrypted,
+        duration_ms,
     };
     let response_id = state.active_response.clone();
     let mut u = push_item(state, id.clone(), kind, None, response_id, clock);
@@ -674,5 +678,62 @@ mod tests {
             ItemKind::NativeTool { tool_type, .. } => assert_eq!(tool_type, "native_tool"), // D-P1-3
             other => panic!("{other:?}"),
         }
+    }
+
+    fn empty_state() -> SessionState {
+        SessionState::new(
+            ConnectionId::new("conn_1"),
+            SessionId::new("conv_1"),
+            AgentId::new("ag_1"),
+        )
+    }
+
+    #[test]
+    fn reasoning_duration_secs_from_started_to_finalize() {
+        use crate::clock::ManualClock;
+        use crate::reduce::reduce;
+        use lens_client::stream::{ResponseEvent, ServerStreamEvent};
+
+        let mut s = empty_state();
+        let clock = ManualClock::new(1_000_000);
+        reduce(
+            &mut s,
+            &ServerStreamEvent::Response(ResponseEvent::ReasoningStarted),
+            &clock,
+        );
+        let started = s
+            .stream
+            .open_reasoning
+            .as_ref()
+            .and_then(|a| a.started_at_ms)
+            .expect("started_at_ms stamped on ReasoningStarted");
+        assert_eq!(started, 1_000_000);
+        clock.set(1_004_500);
+        reduce(
+            &mut s,
+            &ServerStreamEvent::Response(ResponseEvent::ReasoningTextDelta {
+                delta: "thought".into(),
+            }),
+            &clock,
+        );
+        reduce(
+            &mut s,
+            &ServerStreamEvent::Response(ResponseEvent::ReasoningClosed {
+                full_text: "thought".into(),
+                summary_text: "t".into(),
+            }),
+            &clock,
+        );
+        assert!(s.stream.open_reasoning.is_none());
+        let item = s.items.last().expect("reasoning item");
+        let ItemKind::Reasoning { duration_ms, .. } = &item.kind else {
+            panic!("expected reasoning, got {:?}", item.kind);
+        };
+        // The acc (and its started_at_ms) is CONSUMED by finalize_reasoning, so a
+        // finalized/collapsed row has no acc to read. Duration MUST be persisted on
+        // the durable Item at close = created_at - started_at_ms.
+        assert_eq!(item.created_at, 1_004_500);
+        assert_eq!(*duration_ms, Some(4_500));
+        let _ = started;
     }
 }

@@ -317,6 +317,7 @@ mod tests {
             full_text: "thinking".into(),
             summary_text: String::new(),
             encrypted: false,
+            started_at_ms: None,
         }
     }
 
@@ -475,6 +476,7 @@ mod tests {
                 full_text: "think".into(),
                 summary_text: String::new(),
                 encrypted: false,
+                duration_ms: None,
             },
         )
     }

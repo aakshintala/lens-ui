@@ -230,6 +230,7 @@ mod tests {
                 full_text: String::new(),
                 summary_text: String::new(),
                 encrypted: false,
+                duration_ms: None,
             }),
             "reasoning"
         );

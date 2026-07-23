@@ -104,6 +104,7 @@ pub fn reduce(state: &mut SessionState, event: &ServerStreamEvent, clock: &dyn C
                     let acc_id = state.mint_acc_id();
                     state.stream.open_reasoning = Some(ReasoningAcc {
                         acc_id,
+                        started_at_ms: Some(clock.now_millis()),
                         ..Default::default()
                     });
                 }
@@ -120,6 +121,7 @@ pub fn reduce(state: &mut SessionState, event: &ServerStreamEvent, clock: &dyn C
                     scratch::ReasoningKind::Full,
                     delta,
                     new_acc_id,
+                    clock,
                 )
             }
             ResponseEvent::ReasoningSummaryTextDelta { delta } => {
@@ -133,6 +135,7 @@ pub fn reduce(state: &mut SessionState, event: &ServerStreamEvent, clock: &dyn C
                     scratch::ReasoningKind::Summary,
                     delta,
                     new_acc_id,
+                    clock,
                 )
             }
             ResponseEvent::OutputItemDone { item } => match items::map_item(item) {
