@@ -28,7 +28,7 @@ exclude = [
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.91"
+rust-version = "1.95"
 license = "MIT"
 authors = ["Amogh Akshintala"]
 

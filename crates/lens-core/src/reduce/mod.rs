@@ -504,7 +504,7 @@ mod tests {
         ) -> SmallVec<[StreamUpdate; 16]> {
             let mut all = SmallVec::new();
             for ev in events {
-                all.extend(reduce(state, ev, clock).into_iter());
+                all.extend(reduce(state, ev, clock));
             }
             all
         }

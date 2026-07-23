@@ -335,11 +335,10 @@ impl RowStore {
         let mut changed = false;
         match pres.kind {
             RowKind::StreamingMessage => {
-                if !self
-                    .structure
-                    .iter()
-                    .any(|e| matches!(e, StructureEntry::Sibling(row) if row == &id))
-                {
+                let absent = !self.structure.iter().any(|e| {
+                    matches!(e, StructureEntry::Sibling(row) if row == &id)
+                });
+                if absent {
                     self.structure.push(StructureEntry::Sibling(id));
                     changed = true;
                 }

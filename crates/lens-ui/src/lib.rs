@@ -5,6 +5,7 @@ pub mod card;
 pub mod clock;
 pub mod fleet;
 pub mod focused;
+pub mod md;
 pub mod shortcuts;
 pub mod slot;
 pub mod theme;
