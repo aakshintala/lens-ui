@@ -27,6 +27,8 @@ const TAIL_BUDGET_BYTES: usize = 8 * 1024 * 1024;
 #[cfg_attr(not(test), allow(dead_code))]
 const PAGE_BUDGET_BYTES: usize = 4 * 1024 * 1024;
 const RESIDENT_CAP_BYTES: usize = 24 * 1024 * 1024;
+/// Max committed ordinals pulled per forward `Delta` read while following (§4.2).
+const FORWARD_DELTA_PAGE_ORDINALS: i64 = 512;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MarkerKind {
@@ -289,14 +291,17 @@ impl FocusedTranscript {
                     self.known_committed = self.known_committed.max(ord);
                     dirty = true;
                 } else if ord > self.last_rendered_ordinal {
+                    self.known_committed = self.known_committed.max(ord);
+                    let through = (self.resident_hi + FORWARD_DELTA_PAGE_ORDINALS).min(ord);
                     self.enqueue_read(
                         ReadRange::Delta {
                             after: self.resident_hi,
-                            through: ord,
+                            through,
                         },
                         Priority::Delta,
                         self.focus_generation,
                     );
+                    dirty = true;
                 }
             }
             StreamUpdate::TranscriptRewritten { ordinal: ord } => {
@@ -392,6 +397,16 @@ impl FocusedTranscript {
             return;
         }
         self.reader_error = None;
+        if matches!(range, ReadRange::Delta { .. }) && !self.following {
+            if let ReadRange::Delta { through, .. } = range {
+                self.known_committed = self.known_committed.max(through);
+                if let Some(watermark) = read.watermark {
+                    self.known_committed = self.known_committed.max(watermark);
+                }
+            }
+            cx.notify();
+            return;
+        }
         let full_replace = matches!(
             range,
             ReadRange::All
@@ -456,16 +471,32 @@ impl FocusedTranscript {
                 }
             }
         }
+        self.commit_pending_disk_rows(&read.rows, cx);
+        let evicted_any = self.evict_if_over_cap(cx);
         self.recompute_live_section_lo();
         self.recompute_settled_prefix();
-        self.commit_pending_disk_rows(&read.rows, cx);
-        self.evict_if_over_cap(cx);
-        if full_replace {
+        let full = full_replace || evicted_any;
+        if full {
             self.settled_structure_len = 0;
             self.reproject(true, cx);
         } else {
             self.apply_expansion_flags(cx);
             self.reproject(false, cx);
+        }
+        if matches!(range, ReadRange::Delta { .. })
+            && self.following
+            && self.resident_hi < self.known_committed
+        {
+            let through =
+                (self.resident_hi + FORWARD_DELTA_PAGE_ORDINALS).min(self.known_committed);
+            self.enqueue_read(
+                ReadRange::Delta {
+                    after: self.resident_hi,
+                    through,
+                },
+                Priority::Delta,
+                self.focus_generation,
+            );
         }
         cx.notify();
     }
@@ -780,7 +811,8 @@ impl FocusedTranscript {
         }
     }
 
-    fn evict_if_over_cap(&mut self, _cx: &mut Context<Self>) {
+    fn evict_if_over_cap(&mut self, _cx: &mut Context<Self>) -> bool {
+        let mut evicted_any = false;
         while self.resident_bytes > RESIDENT_CAP_BYTES
             && self.resident_lo >= 0
             && self.resident_lo <= self.resident_hi
@@ -793,6 +825,7 @@ impl FocusedTranscript {
             let Some((_, item)) = evicted else {
                 break;
             };
+            evicted_any = true;
             self.remove_item_accounting(&item.id);
             if self.items.is_empty() {
                 self.resident_lo = -1;
@@ -803,6 +836,7 @@ impl FocusedTranscript {
                 self.resident_hi = *self.items.keys().next_back().expect("non-empty band");
             }
         }
+        evicted_any
     }
 
     fn purge_orphan_section_anchors(&mut self, member_ids: &HashSet<ItemId>) {
@@ -3142,7 +3176,7 @@ mod tests {
                             message_item("m1", Some("resp_a")),
                         )],
                         skipped: vec![],
-                        watermark: Some(5),
+                        watermark: Some(1),
                     },
                     cx,
                 );
@@ -3811,6 +3845,196 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn delta_eviction_frees_ghost_row_entities(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.set_following(true);
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    oversized_read(vec![(0, "m0"), (1, "m1"), (2, "m2")]),
+                    cx,
+                );
+            });
+        });
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Delta {
+                        after: 2,
+                        through: 3,
+                    },
+                    oversized_read(vec![(3, "m3")]),
+                    cx,
+                );
+            });
+        });
+
+        let evicted_m1 = RowId::Sibling(ItemId::new("m1"));
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert!(
+                !r.has_item_ordinal_for_test(1),
+                "m1 ordinal must be evicted from items"
+            );
+            assert!(
+                !r.rows().order().contains(&evicted_m1),
+                "evicted row must not appear in order"
+            );
+            assert!(
+                r.rows().entity_id(&evicted_m1, cx).is_none(),
+                "evicted row entity must be freed from RowStore"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn forward_delta_discarded_when_not_following(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    tail_read(
+                        vec![(0, message_item("m0", None)), (5, message_item("m5", None))],
+                        5,
+                    ),
+                    cx,
+                );
+            });
+        });
+
+        let hi_before = cx.read(|cx| replica.read(cx).resident_hi_for_test());
+
+        cx.update(|cx| {
+            replica.update(cx, |r, _| {
+                r.set_following(false);
+            });
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Delta {
+                        after: hi_before,
+                        through: hi_before + 5,
+                    },
+                    tail_read(
+                        vec![
+                            (hi_before + 1, message_item("n1", None)),
+                            (hi_before + 2, message_item("n2", None)),
+                        ],
+                        hi_before + 5,
+                    ),
+                    cx,
+                );
+            });
+        });
+
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert_eq!(r.resident_hi_for_test(), hi_before);
+            assert_eq!(r.known_committed_for_test(), hi_before + 5);
+            assert!(!r.has_item_ordinal_for_test(hi_before + 1));
+            assert!(!r.has_item_ordinal_for_test(hi_before + 2));
+        });
+    }
+
+    #[gpui::test]
+    async fn transcript_advanced_page_clamps_delta_and_catchup_enqueues(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        const GAP: i64 = 1000;
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    tail_read(
+                        vec![(0, message_item("m0", None)), (2, message_item("m2", None))],
+                        2,
+                    ),
+                    cx,
+                );
+            });
+        });
+
+        let hi = cx.read(|cx| replica.read(cx).resident_hi_for_test());
+        let target = hi + GAP;
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.fold_detailed(
+                    StreamUpdate::TranscriptAdvanced {
+                        committed_ordinal: target,
+                    },
+                    cx,
+                );
+            });
+        });
+
+        let delta = rx.try_recv().expect("first page delta");
+        assert_eq!(
+            delta.range,
+            ReadRange::Delta {
+                after: hi,
+                through: hi + FORWARD_DELTA_PAGE_ORDINALS,
+            }
+        );
+        cx.read(|cx| {
+            assert_eq!(replica.read(cx).known_committed_for_test(), target);
+        });
+
+        let page_end = hi + FORWARD_DELTA_PAGE_ORDINALS;
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    delta.range,
+                    RangeRead {
+                        rows: vec![(page_end, 1, message_item("page_end", None))],
+                        skipped: vec![],
+                        watermark: Some(target),
+                    },
+                    cx,
+                );
+            });
+        });
+
+        let catchup = rx.try_recv().expect("catch-up delta after partial page");
+        assert_eq!(
+            catchup.range,
+            ReadRange::Delta {
+                after: page_end,
+                through: target,
+            }
+        );
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert!(
+                r.resident_hi_for_test() <= page_end,
+                "first page must not load the full gap"
+            );
+            assert_eq!(r.known_committed_for_test(), target);
+        });
+    }
+
+    #[gpui::test]
     async fn transcript_advanced_gated_when_not_following(cx: &mut gpui::TestAppContext) {
         let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
         let _ = rx.try_recv().expect("baseline");
@@ -3907,8 +4131,12 @@ mod tests {
         });
     }
 
+    /// Proves `pending_finalize` / `live_stream_tails` retain-set completeness for
+    /// mid-finalize `StreamTail` entities across `reproject` + `gc_entities`.
+    /// GC-after-`overlay_pending_finalize` ordering is a structural invariant in
+    /// `reproject` but is **not** exercised here — the retain set alone covers this path.
     #[gpui::test]
-    async fn mid_finalize_staged_tail_survives_reproject_gc(cx: &mut gpui::TestAppContext) {
+    async fn pending_finalize_tail_survives_gc_via_retain_set(cx: &mut gpui::TestAppContext) {
         let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
         let _ = rx.try_recv().expect("baseline");
 
