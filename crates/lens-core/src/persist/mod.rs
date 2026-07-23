@@ -166,8 +166,8 @@ pub enum ReconcileOutcome {
 /// Read/query-only transcript role — one read-only handle per replica (T-2 §3.3).
 pub trait TranscriptReader {
     fn mode(&self) -> StoreMode;
-    /// One transaction: the requested `(ordinal, Item)` rows + the snapshot's
-    /// non-provisional watermark.
+    /// One transaction: the requested `(ordinal, payload_len_bytes, Item)` rows +
+    /// the snapshot's non-provisional watermark.
     fn read_range(&self, range: ReadRange) -> Result<RangeRead>;
 }
 
