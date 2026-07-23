@@ -648,9 +648,8 @@ impl TerminalTab {
 
     /// Ordinal retained-bytes estimate for fleet LRV (0 when no engine).
     pub fn retained_bytes_estimate(&self) -> usize {
-        // TODO: lightweight 2-atomic fast path (defer full `EngineInspect` clone).
         self.engine_handle()
-            .map(|engine| engine.inspect().retained_bytes_estimate)
+            .map(EngineHandle::retained_bytes_estimate)
             .unwrap_or(0)
     }
 
