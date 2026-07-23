@@ -44,8 +44,13 @@ const _: () = assert!(
 
 /// Width of the left nav rail (unchanged placeholder).
 const NAV_RAIL_W: f32 = 48.0;
-/// Width of the focused-mode session rail (spec §5; `.boards` strip = 286px).
-const RAIL_W: f32 = 286.0;
+/// Horizontal + vertical breathing room around the masonry content, inside a pane (so cards
+/// and group boxes never sit flush against the pane/rail edges).
+const PAD: f32 = 16.0;
+/// Width of the focused-mode session rail. Sized to hold a 1-col group's box (a card plus its
+/// `2·GUTTER` ring overhang) with `PAD` breathing room each side, so the group tile fits
+/// without horizontal scroll (was a flat 286 that clipped the 294px group box).
+const RAIL_W: f32 = CARD_W + 2.0 * GUTTER + 2.0 * PAD;
 
 /// Shell layout mode derived from `FleetStore::focused`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -454,8 +459,8 @@ impl BoardView {
         // reach also clipped loose top-left cards). `content` stays a positioning context.
         let mut content = div()
             .absolute()
-            .left(px(GUTTER))
-            .top(px(GUTTER))
+            .left(px(PAD + GUTTER))
+            .top(px(PAD + GUTTER))
             .w(px(cols as f32 * CELL_W))
             .h(px(packing.content_height));
 
@@ -471,7 +476,7 @@ impl BoardView {
                     if let Some(tile) = self.absolute_card(
                         &sessions[0],
                         placed.cell_left(),
-                        placed.cell_top() + HEADER,
+                        placed.cell_top(), // pixel-masonry top; a loose card carries no header lane
                         cx,
                     ) {
                         content = content.child(tile);
@@ -504,25 +509,27 @@ impl BoardView {
         self.last_built = visible.clone();
         self.last_group_chrome = group_chrome;
 
-        // Reserve the GUTTER margin the offset grid needs (2×GUTTER total: the grid sits at
-        // +GUTTER, and rings overhang +GUTTER past the bottom-right tile).
+        // Content extent = PAD breathing room + GUTTER ring overhang on each side, around the
+        // tile block (`cols·CELL_W − GAP`, the last column has no trailing gap) and the masonry
+        // height. Sizing padded to exactly this keeps the horizontal extent within the pane, so
+        // the vertical-only scroll never clips or scrolls sideways.
         let padded = div()
             .relative()
-            .w(px(cols as f32 * CELL_W + 2.0 * GUTTER))
-            .h(px(packing.content_height + 2.0 * GUTTER))
+            .w(px(2.0 * PAD + 2.0 * GUTTER + cols as f32 * CELL_W - GAP))
+            .h(px(2.0 * PAD + 2.0 * GUTTER + packing.content_height))
             .child(content);
         let el = div()
             .id("board-scroll")
             .size_full()
-            .overflow_scroll()
+            .overflow_y_scroll()
             .track_scroll(&scroll)
             .child(padded)
             .into_any_element();
         (el, visible)
     }
 
-    /// One loose card absolutely positioned at its body-zone (`top` already offset
-    /// by HEADER by the caller). Clickable (focus the session).
+    /// One loose card absolutely positioned at its pixel-masonry top-left (`top` is the tile
+    /// top — a loose card has no header lane). Clickable (focus the session).
     fn absolute_card(
         &self,
         session_id: &SessionId,
@@ -571,7 +578,12 @@ impl BoardView {
         let x = placed.cell_left();
         let y = placed.cell_top();
         let block_w = fc as f32 * CELL_W - GAP;
-        let block_h = fr as f32 * CELL_H - GAP;
+        // Tight box: header lane + fr member rows separated by GAP. The grid reserves fr full
+        // CELL_H rows (a per-row header lane for masonry alignment), but a group has ONE header
+        // — stacking members at CELL_H stride left a phantom HEADER-tall gap between every row
+        // (glaring in a 1×N reflow). Wrap members tightly; the reserved-cell slack falls BELOW
+        // the box, reading as clean separation before the next tile.
+        let block_h = HEADER + fr as f32 * CARD_H + (fr as f32 - 1.0) * GAP;
 
         let name = meta.map(|m| m.name.clone()).unwrap_or_default();
         let completed = meta.map(|m| m.completed_count).unwrap_or(0);
@@ -681,7 +693,9 @@ impl BoardView {
             let cc = i % fc;
             let rr = i / fc;
             let mx = INSET + cc as f32 * CELL_W;
-            let my = INSET + HEADER + rr as f32 * CELL_H;
+            // Tight vertical stride (CARD_H + GAP), not CELL_H — members share the group's one
+            // header, so no phantom header lane between stacked rows (matches the horizontal GAP).
+            let my = INSET + HEADER + rr as f32 * (CARD_H + GAP);
             if let Some(tile) = self.absolute_card(session, x - INSET + mx, y - INSET + my, cx) {
                 out.push(tile);
             }
@@ -969,7 +983,7 @@ impl Render for BoardView {
 
         let (body, visible): (_, Vec<SessionId>) = match &mode {
             ShellMode::Board => {
-                let avail = (viewport_w - NAV_RAIL_W).max(CELL_W);
+                let avail = (viewport_w - NAV_RAIL_W - 2.0 * PAD - 2.0 * GUTTER).max(CELL_W);
                 let (surface, visible) =
                     self.pack_and_render(avail, viewport_h, self.board_scroll.clone(), cx);
                 let el = div()
@@ -982,8 +996,12 @@ impl Render for BoardView {
                 (el.into_any_element(), visible)
             }
             ShellMode::Focused { .. } => {
-                let (rail, visible) =
-                    self.pack_and_render(RAIL_W, viewport_h, self.rail_scroll.clone(), cx);
+                let (rail, visible) = self.pack_and_render(
+                    RAIL_W - 2.0 * PAD - 2.0 * GUTTER,
+                    viewport_h,
+                    self.rail_scroll.clone(),
+                    cx,
+                );
                 // Real focused-transcript tab (T-2). `pack_and_render` above already took
                 // `&mut self`, so build the chat slot after it to avoid a borrow overlap.
                 let chat_slot = if let Some(tab) = &self.chat_tab {

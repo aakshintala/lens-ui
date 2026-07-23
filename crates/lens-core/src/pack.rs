@@ -88,13 +88,16 @@ pub fn foot(n: usize) -> (usize, usize) {
     (c, n.div_ceil(c))
 }
 
-/// A packed tile: the source item + its top-left grid cell.
+/// A packed tile: the source item, its column (`gx`, horizontal grid) and pixel top (`py`).
+/// Vertical placement is pixel-masonry (variable tile heights, uniform GAP between every tile),
+/// NOT a snapped row grid — a group is simply a taller tile (header + members), so its extra
+/// header height never inflates the gaps around it.
 #[derive(Clone, Copy, Debug)]
 pub struct Placed {
     pub item: Item,
     pub item_index: usize,
     pub gx: usize,
-    pub gy: usize,
+    pub py: f32,
 }
 
 pub struct Packing {
@@ -102,77 +105,63 @@ pub struct Packing {
     pub content_height: f32,
 }
 
-/// Grid-snap first-fit, ordinal order, hole-backfill (§2.3). Direct port of the
-/// SSOT `pack()` — scan rows top→bottom, cols left→right, place at first free
-/// `fc × fr` block, mark occupied.
-pub fn pack(items: &[Item], cols: usize) -> Packing {
-    let cols = cols.max(1);
-    let mut occ: Vec<Vec<bool>> = Vec::new();
-    let mut out = Vec::with_capacity(items.len());
-    let mut max_r = 0usize;
-
-    let ensure = |occ: &mut Vec<Vec<bool>>, r: usize| {
-        while occ.len() <= r {
-            occ.push(vec![false; cols]);
-        }
-    };
-
-    for (item_index, it) in items.iter().enumerate() {
-        // Reshape a group wider than the container: clamp columns to `cols` and re-derive
-        // rows from member count so a 2×2 becomes a 1×N stack instead of rendering at full
-        // width and spilling/clipping past the container (Issue 2 — narrow rail + shrunk
-        // window). The reshaped footprint is stored so the renderer places members into it.
-        let it = reshape_to_cols(it, cols);
-        let (fc, fr) = (it.fc.max(1).min(cols), it.fr.max(1));
-        let mut placed = false;
-        let mut r = 0usize;
-        while !placed {
-            ensure(&mut occ, r + fr - 1);
-            for c in 0..=(cols - fc) {
-                if free(&occ, r, c, fc, fr) {
-                    mark(&mut occ, r, c, fc, fr);
-                    out.push(Placed {
-                        item: it,
-                        item_index,
-                        gx: c,
-                        gy: r,
-                    });
-                    max_r = max_r.max(r + fr);
-                    placed = true;
-                    break;
-                }
-            }
-            r += 1;
+/// Rendered pixel height of a tile: a loose card is `CARD_H`; a group is its one header lane
+/// plus `fr` member rows separated by GAP (`HEADER + fr·CARD_H + (fr−1)·GAP`); a collapsed
+/// group (fr = 1) is `HEADER + CARD_H`. SINGLE source of tile height — pack() stacks by it and
+/// `absolute_group`'s box height must match it.
+pub fn item_height(it: &Item) -> f32 {
+    match it.kind {
+        Kind::Card => CARD_H,
+        Kind::Group { .. } => {
+            let fr = it.fr.max(1) as f32;
+            HEADER + fr * CARD_H + (fr - 1.0) * GAP
         }
     }
+}
 
-    let content_height = if max_r == 0 {
-        0.0
-    } else {
-        max_r as f32 * CELL_H - GAP
-    };
+/// Pixel-masonry packer: keep the horizontal column grid (`fc` consecutive columns; groups may
+/// span 2×2 etc.), but place each tile at the lowest pixel top across its columns (+ GAP), so
+/// loose tiles backfill the short columns beside a tall group and every vertical gap is exactly
+/// GAP. Leftmost column wins on ties → ordinal-stable placement.
+pub fn pack(items: &[Item], cols: usize) -> Packing {
+    let cols = cols.max(1);
+    let mut col_bottom = vec![0.0f32; cols];
+    let mut out = Vec::with_capacity(items.len());
+
+    for (item_index, it) in items.iter().enumerate() {
+        // Reshape a group wider than the container: clamp columns to `cols` and re-derive rows
+        // from member count so a 2×2 becomes a 1×N stack instead of spilling past the container
+        // (narrow rail / shrunk window). The reshaped footprint is stored for the renderer.
+        let it = reshape_to_cols(it, cols);
+        let fc = it.fc.max(1).min(cols);
+        let h = item_height(&it);
+
+        let mut best_gx = 0usize;
+        let mut best_top = f32::INFINITY;
+        for gx in 0..=(cols - fc) {
+            let bottom = (gx..gx + fc).map(|c| col_bottom[c]).fold(0.0, f32::max);
+            let top = if bottom > 0.0 { bottom + GAP } else { 0.0 };
+            if top < best_top {
+                best_top = top;
+                best_gx = gx;
+            }
+        }
+        let py = best_top;
+        for bottom in &mut col_bottom[best_gx..best_gx + fc] {
+            *bottom = py + h;
+        }
+        out.push(Placed {
+            item: it,
+            item_index,
+            gx: best_gx,
+            py,
+        });
+    }
+
+    let content_height = col_bottom.iter().copied().fold(0.0, f32::max);
     Packing {
         tiles: out,
         content_height,
-    }
-}
-
-fn free(occ: &[Vec<bool>], r: usize, c: usize, w: usize, h: usize) -> bool {
-    for i in 0..h {
-        for j in 0..w {
-            if occ.get(r + i).and_then(|row| row.get(c + j)).copied() == Some(true) {
-                return false;
-            }
-        }
-    }
-    true
-}
-
-fn mark(occ: &mut [Vec<bool>], r: usize, c: usize, w: usize, h: usize) {
-    for i in 0..h {
-        for j in 0..w {
-            occ[r + i][c + j] = true;
-        }
     }
 }
 
@@ -182,17 +171,17 @@ pub fn cols_for_width(avail_width: f32) -> usize {
 }
 
 impl Placed {
-    /// Pixel top of the tile's **cell** (header-lane top), pre-inset.
+    /// Pixel top of the tile (group box top / loose card top).
     pub fn cell_top(&self) -> f32 {
-        self.gy as f32 * CELL_H
+        self.py
     }
 
-    /// Pixel bottom of the tile's occupied cells (for culling y-intersection).
+    /// Pixel bottom of the tile (top + rendered height) — for culling y-intersection.
     pub fn cell_bottom(&self) -> f32 {
-        (self.gy + self.item.fr) as f32 * CELL_H - GAP
+        self.py + item_height(&self.item)
     }
 
-    /// Left of the tile's cell block.
+    /// Left of the tile's column block.
     pub fn cell_left(&self) -> f32 {
         self.gx as f32 * CELL_W
     }
@@ -219,23 +208,31 @@ mod tests {
         assert_eq!(foot(9), (3, 3));
     }
 
-    #[test]
-    fn hole_backfill() {
-        // A 2×2 group then two 1×1 cards in 3 cols: the cards backfill the holes
-        // beside the group (col 2, rows 0 and 1) — ordinal order kept.
-        let items = [Item::group(4), Item::card(), Item::card()];
-        let p = pack(&items, 3);
-        assert_eq!((p.tiles[0].gx, p.tiles[0].gy), (0, 0)); // group top-left
-        assert_eq!((p.tiles[1].gx, p.tiles[1].gy), (2, 0)); // card fills hole
-        assert_eq!((p.tiles[2].gx, p.tiles[2].gy), (2, 1)); // card fills hole
-        assert_eq!(p.content_height, 2.0 * CELL_H - GAP);
+    fn group_h(fr: usize) -> f32 {
+        HEADER + fr as f32 * CARD_H + (fr as f32 - 1.0) * GAP
     }
 
     #[test]
-    fn single_col_stacks() {
-        let items = [Item::card(), Item::card(), Item::card()];
-        let p = pack(&items, 1);
-        assert_eq!((p.tiles[0].gy, p.tiles[1].gy, p.tiles[2].gy), (0, 1, 2));
+    fn masonry_backfill() {
+        // A 2×2 group then two loose cards in 3 cols: the cards backfill the short 3rd
+        // column beside the group, stacked with a uniform GAP; the tall group sets height.
+        let p = pack(&[Item::group(4), Item::card(), Item::card()], 3);
+        assert_eq!(p.tiles[0].gx, 0); // group top-left
+        assert_eq!(p.tiles[0].py, 0.0);
+        assert_eq!(p.tiles[1].gx, 2); // card fills col 2
+        assert_eq!(p.tiles[1].py, 0.0);
+        assert_eq!(p.tiles[2].gx, 2); // stacked one GAP below the first card
+        assert_eq!(p.tiles[2].py, CARD_H + GAP);
+        assert_eq!(p.content_height, group_h(2));
+    }
+
+    #[test]
+    fn single_col_stacks_by_pixel_height() {
+        let p = pack(&[Item::card(), Item::card(), Item::card()], 1);
+        assert_eq!(p.tiles[0].py, 0.0);
+        assert_eq!(p.tiles[1].py, CARD_H + GAP);
+        assert_eq!(p.tiles[2].py, 2.0 * (CARD_H + GAP));
+        assert_eq!(p.content_height, 3.0 * CARD_H + 2.0 * GAP);
     }
 
     #[test]
@@ -255,8 +252,9 @@ mod tests {
         }];
         let p = pack(&items, 3);
         assert_eq!(p.tiles.len(), 1);
-        assert_eq!((p.tiles[0].gx, p.tiles[0].gy), (0, 0));
-        assert_eq!(p.content_height, CELL_H - GAP);
+        assert_eq!(p.tiles[0].gx, 0);
+        assert_eq!(p.tiles[0].py, 0.0);
+        assert_eq!(p.content_height, CARD_H);
     }
 
     #[test]
@@ -268,8 +266,9 @@ mod tests {
         let p = pack(&[Item::group(4)], 1);
         let t = p.tiles[0];
         assert_eq!((t.item.fc, t.item.fr), (1, 4));
-        assert_eq!((t.gx, t.gy), (0, 0));
-        assert_eq!(p.content_height, 4.0 * CELL_H - GAP);
+        assert_eq!(t.gx, 0);
+        assert_eq!(t.py, 0.0);
+        assert_eq!(p.content_height, group_h(4)); // 1×4 tight stack
     }
 
     #[test]
@@ -298,17 +297,18 @@ mod tests {
         let t = packing.tiles[0];
         assert_eq!((t.item.fc, t.item.fr), (1, 1));
         assert!(matches!(t.item.kind, Kind::Group { members: 9 }));
-        assert_eq!((t.gx, t.gy), (0, 0));
-        // one cell tall: CELL_H minus the trailing gap.
-        assert_eq!(packing.content_height, CELL_H - GAP);
+        assert_eq!(t.gx, 0);
+        assert_eq!(t.py, 0.0);
+        // header lane + one card body.
+        assert_eq!(packing.content_height, HEADER + CARD_H);
     }
 
     #[test]
     fn intersects_band_culls_outside() {
-        // Row-0 loose card occupies cells [0, CELL_H-GAP]; a band far below misses.
+        // A loose card spans [0, CARD_H]; a band far below misses it.
         let p = pack(&[Item::card()], 3);
         let t = p.tiles[0];
-        assert!(t.intersects_band(0.0, CELL_H)); // visible band covers row 0
-        assert!(!t.intersects_band(CELL_H * 5.0, CELL_H * 6.0)); // far below → culled
+        assert!(t.intersects_band(0.0, CARD_H)); // visible band covers it
+        assert!(!t.intersects_band(CARD_H * 5.0, CARD_H * 6.0)); // far below → culled
     }
 }
