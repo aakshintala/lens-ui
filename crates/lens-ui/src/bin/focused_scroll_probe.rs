@@ -1,4 +1,5 @@
-//! Real-window scroll-contract probe — four §16 contracts + paused-not-yanked.
+//! Real-window scroll-contract probe — initial-bottom, stick-to-bottom-while-following,
+//! finalize-anchor-stable, backward-prepend-anchor, and C2 prepend-with-eviction anchor.
 //! `Application::new().run()`; not invokable from `#[gpui::test]` worker threads.
 
 use std::cell::RefCell;
@@ -42,7 +43,6 @@ struct ProbeState {
     saw_initial_bottom: bool,
     saw_stick_while_following: bool,
     finalize_anchor_stable: Option<bool>,
-    paused_anchor_stable: Option<bool>,
     prepend_anchor_stable: Option<bool>,
 }
 
@@ -77,11 +77,12 @@ fn at_bottom(list_state: &gpui::ListState, count: usize) -> bool {
     a.top_item_index == count && a.sub_offset == px(0.)
 }
 
-/// Baseline rows. Must overflow the viewport so a Bottom-aligned scroll leaves
-/// the bottom (`logical_scroll_top` stays `Some` → `is_scrolled = true`).
-/// A viewport that content does not fill resets `logical_scroll_top` to `None`
-/// on every paint, so no scroll ever registers as paused.
-const SEED: usize = 40;
+/// Baseline rows. Must overflow the viewport by a wide margin so a Bottom-aligned scroll
+/// leaves the bottom AND lands genuinely mid-list (item_ix strictly between 0 and count) —
+/// not at the bottom sentinel. A list that only just overflows leaves `scroll_by` pinned at
+/// or near the bottom, so a live append then correctly follows the bottom and the
+/// paused-not-yanked contract cannot distinguish "held" from "followed".
+const SEED: usize = 200;
 
 fn message_item(id: &str, text: &str) -> lens_core::domain::item::Item {
     lens_core::domain::item::Item {
@@ -196,58 +197,32 @@ async fn drive_scroll_probe(
     });
     wait_frames(&mut wcx, 4).await;
 
-    // Scroll up (real paint anchor move). gpui walls off synthetic
-    // ScrollWheelEvent injection, so this cannot fire the view's scroll handler
-    // (follow-mode pause is unit-tested in view.rs::on_scroll_event_*). What
-    // the real window uniquely proves is that a live append while scrolled up
-    // does NOT yank the anchor to the bottom.
-    let anchor_before_pause = weak
-        .update_in(&mut wcx, |view, _, cx| {
-            let list = view.replica.read(cx).list_state();
-            list.scroll_by(px(-400.));
-            AnchorSnapshot::from(list.logical_scroll_top())
-        })
-        .unwrap();
-    wait_frames(&mut wcx, 4).await;
-
-    // paused-not-yanked: append while scrolled up.
-    let anchor_before_paused_appends = weak
-        .update_in(&mut wcx, |view, _, cx| {
-            AnchorSnapshot::from(view.replica.read(cx).list_state().logical_scroll_top())
-        })
-        .unwrap();
+    // Smoke: a live scroll + a burst of appends while mounted must not panic. The
+    // paused-not-yanked contract (an append while following=false must not yank the anchor)
+    // cannot be established here: gpui walls off synthetic ScrollWheelEvent injection, so the
+    // probe cannot fire the view's scroll handler that sets following=false, and with
+    // following=true the view correctly follows to the bottom every frame. That contract is
+    // covered by the headless `append_while_scrolled_up_preserves_anchor` test, which drives
+    // the replica's scroll anchor directly.
     let _ = weak.update_in(&mut wcx, |view, _, cx| {
-        append_row(
-            &view.replica,
-            &format!("m{}", SEED + 1),
-            "while paused 1",
-            SEED as i64 + 1,
-            cx,
-        );
-        append_row(
-            &view.replica,
-            &format!("m{}", SEED + 2),
-            "while paused 2",
-            SEED as i64 + 2,
-            cx,
-        );
-        append_row(
-            &view.replica,
-            &format!("m{}", SEED + 3),
-            "while paused 3",
-            SEED as i64 + 3,
-            cx,
-        );
+        view.replica.read(cx).list_state().scroll_by(px(-400.));
+    });
+    wait_frames(&mut wcx, 4).await;
+    let _ = weak.update_in(&mut wcx, |view, _, cx| {
+        for k in 1..=3 {
+            append_row(
+                &view.replica,
+                &format!("m{}", SEED as i64 + k),
+                "while paused",
+                SEED as i64 + k,
+                cx,
+            );
+        }
         cx.notify();
     });
     wait_frames(&mut wcx, 4).await;
-    let anchor_after_paused_appends = weak
-        .update_in(&mut wcx, |view, _, cx| {
-            AnchorSnapshot::from(view.replica.read(cx).list_state().logical_scroll_top())
-        })
-        .unwrap();
 
-    // Contract 3: finalize anchor stable (still scrolled up from above).
+    // Contract 3: finalize anchor stable.
     let acc = AccId::new("acc_scroll_fin");
     let item_id = ItemId::new("msg_scroll_fin");
     let anchor_before_finalize = weak
@@ -532,8 +507,6 @@ async fn drive_scroll_probe(
         .update_in(&mut wcx, |view, _, _| {
             let mut p = view.probe.borrow_mut();
             p.finalize_anchor_stable = Some(anchor_before_finalize == anchor_after_finalize);
-            p.paused_anchor_stable =
-                Some(anchor_before_paused_appends == anchor_after_paused_appends);
             p.prepend_anchor_stable = Some(prepend_identity_ok);
             if !p.saw_initial_bottom {
                 p.failures
@@ -547,12 +520,6 @@ async fn drive_scroll_probe(
                 p.failures.push(format!(
                     "contract 3: anchor jumped on finalize {:?} -> {:?}",
                     anchor_before_finalize, anchor_after_finalize
-                ));
-            }
-            if p.paused_anchor_stable != Some(true) {
-                p.failures.push(format!(
-                    "paused-not-yanked: anchor shifted {:?} -> {:?}",
-                    anchor_before_paused_appends, anchor_after_paused_appends
                 ));
             }
             if !scrolled_up_before {
@@ -584,9 +551,6 @@ async fn drive_scroll_probe(
                     "C2 prepend+eviction yanked visible content: top row {:?} -> {:?}",
                     c2_top_before, c2_top_after
                 ));
-            }
-            if anchor_before_pause == anchor_after_paused_appends {
-                p.failures.push("scroll-up had no effect on anchor".into());
             }
             p.failures.is_empty() && p.samples >= 8
         })

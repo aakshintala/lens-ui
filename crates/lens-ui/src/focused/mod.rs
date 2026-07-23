@@ -342,7 +342,7 @@ impl FocusedTranscript {
             StreamUpdate::Rebased(state) => {
                 self.active_response = state.active_response.clone();
                 self.recompute_live_section_lo();
-                self.reproject(true, false, cx);
+                self.reproject(true, cx);
                 dirty = true;
             }
             StreamUpdate::TranscriptAdvanced {
@@ -377,12 +377,12 @@ impl FocusedTranscript {
                 self.recompute_live_section_lo();
                 self.recompute_settled_prefix();
                 self.apply_expansion_flags(cx);
-                self.reproject(false, false, cx);
+                self.reproject(false, cx);
                 dirty = true;
             }
             StreamUpdate::ScratchChanged(scratch) => {
                 self.scratch = scratch;
-                self.reproject(false, false, cx);
+                self.reproject(false, cx);
                 dirty = true;
             }
             StreamUpdate::Retired {
@@ -423,7 +423,7 @@ impl FocusedTranscript {
                         seq,
                         kind: MarkerKind::ReconnectBreak,
                     });
-                    self.reproject(false, false, cx);
+                    self.reproject(false, cx);
                     dirty = true;
                 }
             }
@@ -561,13 +561,12 @@ impl FocusedTranscript {
                     None => true,
                 });
         let full = full_replace || evicted_any || touched_settled;
-        let prepend_sync = matches!(range, ReadRange::Backward { .. });
         if full {
             self.settled_structure_len = 0;
-            self.reproject(true, prepend_sync, cx);
+            self.reproject(true, cx);
         } else {
             self.apply_expansion_flags(cx);
-            self.reproject(false, false, cx);
+            self.reproject(false, cx);
         }
         if matches!(range, ReadRange::Delta { .. })
             && self.is_following()
@@ -820,29 +819,27 @@ impl FocusedTranscript {
         self.settled_structure_len = blocks.len();
     }
 
-    fn reproject(&mut self, full: bool, prepend_sync: bool, cx: &mut Context<Self>) {
+    fn reproject(&mut self, full: bool, cx: &mut Context<Self>) {
         let expansion = self.compute_expansion_flags();
         let prev_len = self.rows.len();
-        // For a prepend (Backward page, possibly with hi-side eviction), capture the
-        // exact row the scroll anchor references so we can re-pin it after the full
-        // rebuild — wherever it lands. This is robust to a non-uniform shift: the
-        // number of rows inserted ABOVE the anchor depends on where the anchor sits
-        // (e.g. anchored at the LoadOlder sentinel → shift 0; anchored at content →
-        // shift = inserted). Arithmetic on the insert count gets this wrong.
-        // (anchor RowId, sub-offset, fallback successor RowId). The fallback pins the row that
-        // was just below the anchor when the anchor itself vanishes after the rebuild — e.g. the
-        // viewport sits on the `LoadOlder` sentinel and a backward page reaches ordinal 0, which
-        // removes the sentinel; without a fallback the re-pin is skipped and the list yanks to the
-        // bottom (F7).
-        let prepend_anchor: Option<(RowId, Pixels, Option<RowId>)> = if prepend_sync {
+        // Capture the exact row the scroll anchor references, so we can re-pin it after the
+        // rebuild WHEREVER it lands. This preserves the viewport across ANY reproject that moves
+        // rows — a backward-page prepend (± hi eviction), a forward append that goes through a
+        // full reproject, or a settled-band change — instead of resetting the scroll. It is
+        // robust to a non-uniform shift (anchor at the LoadOlder sentinel shifts 0; anchor at
+        // content shifts by the rows inserted above it), which insert-count arithmetic gets
+        // wrong. When the viewport is at the bottom (follow mode) the anchor is `item_ix == count`
+        // → `order.get` is None → no re-pin → the list stays pinned to the bottom. `anchor_at` is
+        // (RowId, sub-offset, fallback successor RowId); the fallback pins the row just below the
+        // anchor when the anchor itself vanishes after the rebuild (e.g. the sentinel at ordinal
+        // 0, F7).
+        let anchor_at: Option<(RowId, Pixels, Option<RowId>)> = {
             let a = self.list_state.logical_scroll_top();
             let order = self.rows.order();
             order.get(a.item_ix).map(|r| {
                 let fallback = order.get(a.item_ix + 1).cloned();
                 (r.clone(), a.offset_in_item, fallback)
             })
-        } else {
-            None
         };
         self.rows.set_all_response_expansion(&expansion, None);
 
@@ -898,7 +895,7 @@ impl FocusedTranscript {
         self.overlay_pending_finalize(cx);
         let pending_accs: HashSet<AccId> = self.pending_finalize.keys().cloned().collect();
         self.rows.gc_entities(&pending_accs);
-        if let Some((anchor_row, offset, fallback)) = &prepend_anchor {
+        if let Some((anchor_row, offset, fallback)) = &anchor_at {
             // Fix the total count first (this may reset the scroll), then re-pin the
             // anchor to the captured row's new index. Correct whether or not hi-side
             // eviction co-occurred, and regardless of how many rows landed above it.
@@ -1850,7 +1847,7 @@ mod tests {
                 r.live_section_lo = Some(0);
             });
             replica.update(cx, |r, cx| {
-                r.reproject(false, false, cx);
+                r.reproject(false, cx);
             });
         });
         let before = cx.read(|cx| replica.read(cx).live_section_projection_count);
@@ -4444,7 +4441,7 @@ mod tests {
 
         cx.update(|cx| {
             replica.update(cx, |r, cx| {
-                r.reproject(false, false, cx);
+                r.reproject(false, cx);
             });
         });
 
@@ -5123,6 +5120,67 @@ mod tests {
             100,
             "known_committed must not regress from 100 to 90"
         );
+    }
+
+    /// Codex F1 follow-up: a forward append that routes through a FULL reproject (no live section)
+    /// must not yank a genuinely scrolled-up viewport — the universal anchor re-pin holds it.
+    #[gpui::test]
+    async fn append_while_scrolled_up_preserves_anchor(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    tail_read(
+                        (0..20)
+                            .map(|o| (o, message_item(&format!("m{o}"), None)))
+                            .collect(),
+                        19,
+                    ),
+                    cx,
+                );
+                assert!(r.live_section_lo_for_test().is_none());
+                // Genuinely scrolled up: item_ix 5 of a 20-row list (count 20, not at bottom).
+                r.list_state.scroll_to(gpui::ListOffset {
+                    item_ix: 5,
+                    offset_in_item: gpui::px(0.),
+                });
+            });
+        });
+        let anchor_row = cx
+            .read(|cx| replica.read(cx).rows().order().get(5).cloned())
+            .expect("row at 5");
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Delta {
+                        after: 19,
+                        through: 20,
+                    },
+                    range_read(vec![(20, message_item("m20", None))], 20),
+                    cx,
+                );
+            });
+        });
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert!(
+                r.rows()
+                    .order()
+                    .contains(&RowId::Sibling(ItemId::new("m20")))
+            );
+            let top = r.list_state().logical_scroll_top().item_ix;
+            assert_eq!(
+                top, 5,
+                "append below the anchor must not shift a scrolled-up viewport"
+            );
+            assert_eq!(r.rows().order().get(top), Some(&anchor_row));
+        });
     }
 
     /// Codex F7: viewport anchored on the LoadOlder sentinel, a backward page reaching ordinal 0
