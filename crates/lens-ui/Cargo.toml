@@ -39,6 +39,10 @@ path = "src/bin/focused_scroll_probe.rs"
 name = "focused_perf_probe"
 path = "src/bin/focused_perf_probe.rs"
 
+[[bin]]
+name = "focused_sweep_probe"
+path = "src/bin/focused_sweep_probe.rs"
+
 [dev-dependencies]
 gpui = { version = "0.2.2", features = ["test-support"] }
 lens-core = { path = "../lens-core", features = ["test-util"] }

@@ -111,6 +111,15 @@ pub struct RssSample {
     pub rss_bytes: u64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct FocusedSweepSample {
+    pub count: usize,
+    pub cold_ms: f64,
+    pub backward_ms: f64,
+    pub resident_bytes: usize,
+    pub cap: usize,
+}
+
 /// Parse one `RSS_PROBE key=value …` stdout line into a sample. Returns `None`
 /// for any line that is not a well-formed probe line.
 pub fn parse_rss_probe_line(line: &str) -> Option<RssSample> {
@@ -135,6 +144,36 @@ pub fn parse_rss_probe_line(line: &str) -> Option<RssSample> {
         total_rows: total_rows?,
         estimate_bytes: estimate_bytes?,
         rss_bytes: rss_bytes?,
+    })
+}
+
+/// Parse one `FOCUSED_SWEEP key=value …` stdout line into a sample. Returns `None`
+/// for any line that is not a well-formed probe line.
+pub fn parse_focused_sweep_line(line: &str) -> Option<FocusedSweepSample> {
+    let line = line.trim();
+    let rest = line.strip_prefix("FOCUSED_SWEEP ")?;
+    let mut count = None;
+    let mut cold_ms = None;
+    let mut backward_ms = None;
+    let mut resident_bytes = None;
+    let mut cap = None;
+    for tok in rest.split_whitespace() {
+        let (k, v) = tok.split_once('=')?;
+        match k {
+            "count" => count = v.parse().ok(),
+            "cold_ms" => cold_ms = v.parse().ok(),
+            "backward_ms" => backward_ms = v.parse().ok(),
+            "resident_bytes" => resident_bytes = v.parse().ok(),
+            "cap" => cap = v.parse().ok(),
+            _ => {}
+        }
+    }
+    Some(FocusedSweepSample {
+        count: count?,
+        cold_ms: cold_ms?,
+        backward_ms: backward_ms?,
+        resident_bytes: resident_bytes?,
+        cap: cap?,
     })
 }
 
@@ -191,9 +230,10 @@ fn main() -> Result<()> {
         "drift" => drift(std::env::args().skip(2)),
         "gate" => gate(),
         "focused-seed" => focused_seed::focused_seed(&std::env::args().skip(2).collect::<Vec<_>>()),
+        "focused-sweep" => focused_sweep(),
         "terminal-rss-sweep" => terminal_rss_sweep(),
         other => bail!(
-            "unknown xtask command: {other:?} (expected: codegen | drift | gate | focused-seed | terminal-rss-sweep)"
+            "unknown xtask command: {other:?} (expected: codegen | drift | gate | focused-seed | focused-sweep | terminal-rss-sweep)"
         ),
     }
 }
@@ -533,6 +573,56 @@ fn gate() -> Result<()> {
     Ok(())
 }
 
+/// Out-of-gate latency/RAM sweep for disk-windowing focused transcript. Spawns
+/// `focused_sweep_probe` per size and asserts `resident_bytes <= cap`.
+fn focused_sweep() -> Result<()> {
+    const SIZES: [usize; 3] = [1_000, 10_000, 50_000];
+
+    println!("focused-sweep: sizes={SIZES:?}");
+    for &size in &SIZES {
+        let out = Command::new(env!("CARGO"))
+            .args([
+                "run",
+                "-q",
+                "-p",
+                "lens-ui",
+                "--bin",
+                "focused_sweep_probe",
+                "--release",
+                "--",
+                &size.to_string(),
+            ])
+            .output()
+            .context("spawn focused_sweep_probe")?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            bail!(
+                "focused_sweep_probe failed (count={size}, exit {:?}):\n{stderr}",
+                out.status.code()
+            );
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let sample = stdout
+            .lines()
+            .find_map(parse_focused_sweep_line)
+            .with_context(|| format!("no FOCUSED_SWEEP line from count={size}:\n{stdout}"))?;
+        if sample.resident_bytes > sample.cap {
+            bail!(
+                "resident_bytes {} exceeds cap {} at count={size}",
+                sample.resident_bytes,
+                sample.cap
+            );
+        }
+        println!(
+            "  count={:<6} cold_ms={:>10.3} backward_ms={:>10.3} resident_bytes={:>12} cap={}",
+            sample.count, sample.cold_ms, sample.backward_ms, sample.resident_bytes, sample.cap
+        );
+    }
+
+    println!("focused-sweep: OK — resident_bytes <= cap for all sizes");
+    Ok(())
+}
+
 /// Job-B estimate-fidelity gate: run `rss_probe` across sizes×modes in fresh
 /// processes and fail-close on an ordinal-fidelity flip. Heavyweight
 /// (multi-process, large allocations) — NOT part of the fast `gate`; run at
@@ -720,7 +810,10 @@ mod tests {
         assert!(diff_sse(&vendored, &vendored).is_empty());
     }
 
-    use super::{RssSample, check_ordinal_fidelity, parse_rss_probe_line};
+    use super::{
+        FocusedSweepSample, RssSample, check_ordinal_fidelity, parse_focused_sweep_line,
+        parse_rss_probe_line,
+    };
 
     fn s(mode: &str, total_rows: usize, estimate_bytes: usize, rss_bytes: u64) -> RssSample {
         RssSample {
@@ -739,6 +832,22 @@ mod tests {
         assert_eq!(got.total_rows, 5050);
         assert_eq!(got.estimate_bytes, 4_040_000);
         assert_eq!(got.rss_bytes, 52_428_800);
+    }
+
+    #[test]
+    fn parses_focused_sweep_line() {
+        let line = "FOCUSED_SWEEP count=10000 cold_ms=42.500 backward_ms=12.300 resident_bytes=8388608 cap=25165824";
+        let got = parse_focused_sweep_line(line).expect("parse");
+        assert_eq!(
+            got,
+            FocusedSweepSample {
+                count: 10_000,
+                cold_ms: 42.5,
+                backward_ms: 12.3,
+                resident_bytes: 8_388_608,
+                cap: 25_165_824,
+            }
+        );
     }
 
     #[test]

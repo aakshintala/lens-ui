@@ -263,6 +263,10 @@ impl FocusedTranscript {
         self.known_committed
     }
 
+    pub fn resident_bytes(&self) -> usize {
+        self.resident_bytes
+    }
+
     #[cfg(test)]
     pub(crate) fn resident_bytes_for_test(&self) -> usize {
         self.resident_bytes
@@ -311,7 +315,7 @@ impl FocusedTranscript {
     }
 
     /// Scroll-near-top trigger — one `Backward` page in flight at a time (§5).
-    pub(crate) fn page_older_if_near_top(&mut self, visible_start: usize, cx: &mut Context<Self>) {
+    pub fn page_older_if_near_top(&mut self, visible_start: usize, cx: &mut Context<Self>) {
         if !should_page_older(visible_start, self.resident_lo, self.page_in_flight) {
             return;
         }
