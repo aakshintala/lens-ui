@@ -593,7 +593,10 @@ impl TerminalTab {
                 attach: None,
                 engine: Some(engine),
             }),
-            policy: PolicyState::new(),
+            // 1ms retry window: the reconnect loop clamps each backoff delay to
+            // the remaining window, so a failing attach against the stub exhausts
+            // near-instantly under `run_until_parked` instead of sleeping 30s.
+            policy: PolicyState::with_retry_window(Duration::from_millis(1)),
             policy_tx: None,
             current_session: None,
             current_tid: None,
