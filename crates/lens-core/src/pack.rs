@@ -105,6 +105,22 @@ pub struct Packing {
     pub content_height: f32,
 }
 
+impl Packing {
+    /// Number of columns actually occupied by placed tiles (`max(gx + fc)`), ≥ 1.
+    /// May be less than the pack `cols` when few tiles were placed — centering keys
+    /// on this so a MAX_COLS-capped board with a handful of sessions centers on the
+    /// occupied width instead of reserving empty trailing columns. `fc` is guarded to
+    /// ≥ 1 against a degenerate hand-built zero footprint.
+    pub fn used_cols(&self) -> usize {
+        self.tiles
+            .iter()
+            .map(|t| t.gx + t.item.fc.max(1))
+            .max()
+            .unwrap_or(1)
+            .max(1)
+    }
+}
+
 /// Rendered pixel height of a tile: a loose card is `CARD_H`; a group is its one header lane
 /// plus `fr` member rows separated by GAP (`HEADER + fr·CARD_H + (fr−1)·GAP`); a collapsed
 /// group (fr = 1) is `HEADER + CARD_H`. SINGLE source of tile height — pack() stacks by it and
@@ -168,6 +184,27 @@ pub fn pack(items: &[Item], cols: usize) -> Packing {
 /// Cols that fit in `avail_width` (§2.3: `floor((avail+GAP)/CELL_W)`).
 pub fn cols_for_width(avail_width: f32) -> usize {
     (((avail_width + GAP) / CELL_W).floor() as usize).max(1)
+}
+
+/// Content-width cap as a max column count that grows in steps with the viewport's
+/// logical width, then plateaus. Cards are a fixed `CARD_W`, so "max columns" is
+/// equivalently a max content px-width (`max_cols·CELL_W − GAP`); this damps it so a
+/// wide/ultrawide screen earns *some* extra columns but never fans a handful of
+/// sessions edge-to-edge — the packed block is centered in the leftover width (§8).
+/// `logical_w` is the full viewport width in gpui logical points; breakpoints are
+/// tuned on-device against 1800/2056/3840-wide screens. The `6` plateau is the
+/// deliberate ultrawide ceiling. Callers apply it via
+/// `cols_for_width(avail).min(max_cols_for_width(viewport_w))`.
+pub fn max_cols_for_width(logical_w: f32) -> usize {
+    if logical_w >= 3400.0 {
+        6
+    } else if logical_w >= 2000.0 {
+        5
+    } else if logical_w >= 1400.0 {
+        4
+    } else {
+        3
+    }
 }
 
 impl Placed {
@@ -240,6 +277,32 @@ mod tests {
         assert_eq!(cols_for_width(0.0), 1); // clamped to ≥1
         assert_eq!(cols_for_width(940.0), 3); // SSOT window
         assert_eq!(cols_for_width(CELL_W - GAP), 1); // exactly one card wide
+    }
+
+    #[test]
+    fn max_cols_for_width_breakpoints() {
+        // The three on-device screens (logical points) + the plateau/floor.
+        assert_eq!(max_cols_for_width(1800.0), 4); // 14" MBP "More Space"
+        assert_eq!(max_cols_for_width(2056.0), 5); // 16" MBP "More Space"
+        assert_eq!(max_cols_for_width(3840.0), 6); // 4K external
+        assert_eq!(max_cols_for_width(1399.0), 3); // below first step → floor
+        assert_eq!(max_cols_for_width(6000.0), 6); // ultrawide plateaus at the ceiling
+        // Exact breakpoint edges are inclusive (>=).
+        assert_eq!(max_cols_for_width(1400.0), 4);
+        assert_eq!(max_cols_for_width(2000.0), 5);
+        assert_eq!(max_cols_for_width(3400.0), 6);
+    }
+
+    #[test]
+    fn used_cols_reflects_occupancy_not_capacity() {
+        // Three loose cards in a 6-col pack occupy only 3 columns → centering keys on 3.
+        let p = pack(&[Item::card(), Item::card(), Item::card()], 6);
+        assert_eq!(p.used_cols(), 3);
+        // A 2×2 group + one backfill card spans through column 2 (gx 2 + fc 1).
+        let g = pack(&[Item::group(4), Item::card()], 6);
+        assert_eq!(g.used_cols(), 3);
+        // Empty packing is a safe 1.
+        assert_eq!(pack(&[], 4).used_cols(), 1);
     }
 
     #[test]

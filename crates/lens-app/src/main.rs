@@ -281,10 +281,12 @@ fn run_demo() {
             let fleet = FleetStore::new_live(clock, cx);
             lens_ui::shortcuts::register(&fleet, cx);
 
-            // Size the demo window so the 8 cards land as a centered 4×2 grid
-            // (4×280 card + 3×28 gap + 56 padding + 48 nav rail ≈ 1300px wide).
+            // Size the demo window just above the 4-column breakpoint
+            // (`max_cols_for_width` ≥ 1400 → 4 cols) so the demo cards land as a
+            // centered 4-wide masonry. Below 1400 the board caps to 3 cols (still
+            // centered); on the real screens it steps 1800→4, 2056→5, 3840→6.
             let mut bounds =
-                gpui::Bounds::centered(None, gpui::size(gpui::px(1340.0), gpui::px(860.0)), cx);
+                gpui::Bounds::centered(None, gpui::size(gpui::px(1440.0), gpui::px(900.0)), cx);
             // Stagger + title so two demo windows can be told apart in an A/B (LENS_DEMO_LABEL).
             if let Some(dx) = std::env::var("LENS_DEMO_DX")
                 .ok()

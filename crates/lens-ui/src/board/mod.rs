@@ -392,6 +392,7 @@ impl BoardView {
         &mut self,
         avail_width: f32,
         viewport_h: f32,
+        max_cols: usize,
         scroll: ScrollHandle,
         cx: &mut Context<Self>,
     ) -> (AnyElement, Vec<SessionId>) {
@@ -440,7 +441,9 @@ impl BoardView {
             tile_groups.push(meta);
         }
 
-        let cols = pack::cols_for_width(avail_width);
+        // Cap the natural column count so a wide/ultrawide viewport packs into a bounded
+        // block (centered below) instead of fanning a handful of sessions edge-to-edge.
+        let cols = pack::cols_for_width(avail_width).min(max_cols);
         let packing = pack::pack(&items, cols);
 
         // Last frame's painted offset (one-frame lag → overdraw covers it, §8).
@@ -452,6 +455,17 @@ impl BoardView {
         let now_ms = self.fleet.read(cx).clock().now_millis();
         let mut group_chrome: Vec<GroupChromeSnapshot> = Vec::new();
 
+        // Center the packed block in the pane on wider screens. Cards are fixed-size, so the
+        // occupied width is `used_cols` (≤ cols — a capped board with few sessions leaves
+        // trailing columns empty) times CELL_W less the last column's absent trailing GAP,
+        // plus the PAD/GUTTER frame. `pane_width` is the scroll container's width (both modes:
+        // avail + the frame). The offset is purely horizontal and slides the absolutely-placed
+        // tiles as a block; vertical culling (`intersects_band` on `py`) is untouched.
+        let used_cols = packing.used_cols();
+        let content_extent = 2.0 * PAD + 2.0 * GUTTER + used_cols as f32 * CELL_W - GAP;
+        let pane_width = avail_width + 2.0 * PAD + 2.0 * GUTTER;
+        let center_offset = ((pane_width - content_extent) / 2.0).max(0.0);
+
         // Grid offset by GUTTER inside `padded` (below): group rings/tints — and loose
         // cards' expanding attention rings — overhang their tile by up to GUTTER on every
         // side, so a tile at cell (0,0) would paint at (-GUTTER, -GUTTER) and clip against
@@ -459,9 +473,9 @@ impl BoardView {
         // reach also clipped loose top-left cards). `content` stays a positioning context.
         let mut content = div()
             .absolute()
-            .left(px(PAD + GUTTER))
+            .left(px(PAD + GUTTER + center_offset))
             .top(px(PAD + GUTTER))
-            .w(px(cols as f32 * CELL_W))
+            .w(px(used_cols as f32 * CELL_W))
             .h(px(packing.content_height));
 
         let mut visible: Vec<SessionId> = Vec::new();
@@ -510,12 +524,13 @@ impl BoardView {
         self.last_group_chrome = group_chrome;
 
         // Content extent = PAD breathing room + GUTTER ring overhang on each side, around the
-        // tile block (`cols·CELL_W − GAP`, the last column has no trailing gap) and the masonry
-        // height. Sizing padded to exactly this keeps the horizontal extent within the pane, so
-        // the vertical-only scroll never clips or scrolls sideways.
+        // occupied tile block (`used_cols·CELL_W − GAP`, the last column has no trailing gap)
+        // and the masonry height. When the pane is wider (centered), span the full pane so the
+        // block sits at `center_offset` without horizontal-scroll slack; when narrower, the
+        // extent governs and the vertical-only scroll clips the horizontal overflow as before.
         let padded = div()
             .relative()
-            .w(px(2.0 * PAD + 2.0 * GUTTER + cols as f32 * CELL_W - GAP))
+            .w(px(content_extent.max(pane_width)))
             .h(px(2.0 * PAD + 2.0 * GUTTER + packing.content_height))
             .child(content);
         let el = div()
@@ -983,9 +998,20 @@ impl Render for BoardView {
 
         let (body, visible): (_, Vec<SessionId>) = match &mode {
             ShellMode::Board => {
-                let avail = (viewport_w - NAV_RAIL_W - 2.0 * PAD - 2.0 * GUTTER).max(CELL_W);
-                let (surface, visible) =
-                    self.pack_and_render(avail, viewport_h, self.board_scroll.clone(), cx);
+                // True pane width, NOT clamped to CELL_W: `pane_width` inside pack_and_render
+                // derives from this to center the block, so a floor here would lie about the
+                // pane on a narrow window and apply a spurious rightward offset (right ring
+                // then clips under the vertical-only scroll). `cols_for_width` already self-
+                // clamps to ≥1 col, so no floor is needed for packing. (codex P2, 2026-07-22)
+                let avail = viewport_w - NAV_RAIL_W - 2.0 * PAD - 2.0 * GUTTER;
+                let max_cols = pack::max_cols_for_width(viewport_w);
+                let (surface, visible) = self.pack_and_render(
+                    avail,
+                    viewport_h,
+                    max_cols,
+                    self.board_scroll.clone(),
+                    cx,
+                );
                 let el = div()
                     .id("shell-board")
                     .flex()
@@ -999,6 +1025,9 @@ impl Render for BoardView {
                 let (rail, visible) = self.pack_and_render(
                     RAIL_W - 2.0 * PAD - 2.0 * GUTTER,
                     viewport_h,
+                    // The rail is a single fixed column; the cap is a no-op (never narrows
+                    // 1 col, never centers since content_extent == RAIL_W == pane_width).
+                    usize::MAX,
                     self.rail_scroll.clone(),
                     cx,
                 );
