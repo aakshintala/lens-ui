@@ -11,7 +11,7 @@ use lens_core::domain::ids::{AccId, ItemId, ResponseId, SessionId};
 use lens_core::domain::item::{Item, ItemKind, StreamScratch};
 use lens_core::domain::scalars::Role;
 use lens_core::persist::{RangeRead, ReadRange};
-use lens_core::reduce::{RetireDisposition, StreamUpdate, group_work_section, project};
+use lens_core::reduce::{RetireDisposition, StreamUpdate, ViewBlock, group_work_section, project};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -73,6 +73,8 @@ pub struct FocusedTranscript {
     live_section_projection_count: usize,
     /// Top-level structure entries materialized from settled prefix (D-1 cache index).
     settled_structure_len: usize,
+    /// Run-member item id → sticky section `run_anchor` (window-invariant across Backward prepend).
+    section_anchor: HashMap<ItemId, ItemId>,
 }
 
 impl FocusedTranscript {
@@ -125,6 +127,7 @@ impl FocusedTranscript {
             sync_debounce_task: None,
             live_section_projection_count: 0,
             settled_structure_len: 0,
+            section_anchor: HashMap::new(),
         };
         replica.enqueue_read(
             ReadRange::Tail {
@@ -175,6 +178,7 @@ impl FocusedTranscript {
             sync_debounce_task: None,
             live_section_projection_count: 0,
             settled_structure_len: 0,
+            section_anchor: HashMap::new(),
         };
         cx.notify();
         replica
@@ -393,10 +397,6 @@ impl FocusedTranscript {
                     self.resident_lo = min_ord;
                     self.resident_hi = max_ord;
                 }
-                ReadRange::Span { .. } => {
-                    self.resident_lo = self.resident_lo.min(min_ord);
-                    self.resident_hi = self.resident_hi.max(max_ord);
-                }
                 ReadRange::Backward { .. } => {
                     self.resident_lo = self.resident_lo.min(min_ord);
                 }
@@ -406,13 +406,25 @@ impl FocusedTranscript {
                 ReadRange::One { ordinal } => {
                     self.resident_hi = self.resident_hi.max(ordinal);
                 }
+                ReadRange::Span { .. } => {}
             }
         }
+        if matches!(range, ReadRange::Span { .. }) {
+            self.recompute_resident_bounds_from_items();
+        }
         match range {
-            ReadRange::All | ReadRange::Tail { .. } | ReadRange::Span { .. } => {
+            ReadRange::All | ReadRange::Tail { .. } => {
                 if let Some(watermark) = read.watermark {
                     self.known_committed = watermark;
                     self.last_rendered_ordinal = watermark;
+                }
+            }
+            ReadRange::Span { .. } => {
+                if let Some(watermark) = read.watermark {
+                    self.known_committed = watermark;
+                }
+                if let Some((_, max_ord)) = read_ordinal_bounds(&read.rows) {
+                    self.last_rendered_ordinal = self.last_rendered_ordinal.max(max_ord);
                 }
             }
             ReadRange::Delta { through, .. } => {
@@ -542,6 +554,8 @@ impl FocusedTranscript {
                             height_hint: None,
                         });
                 self.pending_finalize.insert(acc_id.clone(), pres.clone());
+                let provisional = ItemId::new(acc_id.as_str());
+                self.migrate_provisional_member(&provisional, &item_id);
                 self.rows.stage_stream_finalize(
                     &acc_id,
                     pres,
@@ -678,11 +692,18 @@ impl FocusedTranscript {
 
         if full {
             let refs: Vec<&Item> = self.items.values().collect();
-            let blocks = group_work_section(
+            let mut blocks = group_work_section(
                 project(&refs, self.scratch.as_ref(), self.active_response.as_ref()),
                 self.active_response.as_ref(),
             );
+            let updates = collect_sticky_updates(&self.section_anchor, &blocks);
+            apply_sticky_to_blocks(&updates, &mut blocks);
             RowStore::materialize_full(&blocks, &mut self.rows, cx);
+            for update in updates {
+                for member in update.members {
+                    self.section_anchor.insert(member, update.sticky.clone());
+                }
+            }
             self.recompute_settled_prefix();
         } else {
             let prefix = self.settled_structure_len;
@@ -690,7 +711,7 @@ impl FocusedTranscript {
                 Some(lo) => self.items.range(lo..).map(|(_, item)| item).collect(),
                 None => Vec::new(),
             };
-            let blocks = group_work_section(
+            let mut blocks = group_work_section(
                 project(
                     &live_refs,
                     self.scratch.as_ref(),
@@ -698,7 +719,14 @@ impl FocusedTranscript {
                 ),
                 self.active_response.as_ref(),
             );
+            let updates = collect_sticky_updates(&self.section_anchor, &blocks);
+            apply_sticky_to_blocks(&updates, &mut blocks);
             RowStore::materialize_live_tail(prefix, &blocks, &mut self.rows, cx);
+            for update in updates {
+                for member in update.members {
+                    self.section_anchor.insert(member, update.sticky.clone());
+                }
+            }
         }
 
         self.rows
@@ -734,9 +762,50 @@ impl FocusedTranscript {
             self.resident_bytes = self.resident_bytes.saturating_sub(bytes);
         }
         self.item_ordinals.remove(item_id);
+        self.section_anchor.remove(item_id);
+    }
+
+    fn recompute_resident_bounds_from_items(&mut self) {
+        if let (Some(&lo), Some(&hi)) = (self.items.keys().next(), self.items.keys().next_back()) {
+            self.resident_lo = lo;
+            self.resident_hi = hi;
+        } else {
+            self.resident_lo = -1;
+            self.resident_hi = -1;
+        }
+    }
+
+    /// Re-register a stream-only member under its durable `ItemId`, preserving the
+    /// run's sticky anchor. When the provisional id was the anchor itself, retarget
+    /// all members to the durable id.
+    fn migrate_provisional_member(&mut self, provisional: &ItemId, durable: &ItemId) {
+        if provisional == durable {
+            return;
+        }
+        let Some(sticky) = self.section_anchor.remove(provisional) else {
+            self.section_anchor.insert(durable.clone(), durable.clone());
+            return;
+        };
+        let provisional_was_anchor = sticky == *provisional;
+        let new_sticky = if provisional_was_anchor {
+            durable.clone()
+        } else {
+            sticky
+        };
+        self.section_anchor
+            .insert(durable.clone(), new_sticky.clone());
+        if provisional_was_anchor {
+            let keys: Vec<_> = self.section_anchor.keys().cloned().collect();
+            for key in keys {
+                if self.section_anchor.get(&key) == Some(provisional) {
+                    self.section_anchor.insert(key, new_sticky.clone());
+                }
+            }
+        }
     }
 
     fn replace_read_rows(&mut self, rows: &[(i64, usize, Item)]) {
+        self.section_anchor.clear();
         self.items.clear();
         self.item_ordinals.clear();
         self.item_bytes.clear();
@@ -816,6 +885,82 @@ fn read_ordinal_bounds(rows: &[(i64, usize, Item)]) -> Option<(i64, i64)> {
         .map(|(ord, _, _)| *ord)
         .min()
         .zip(rows.iter().map(|(ord, _, _)| *ord).max())
+}
+
+fn collect_sticky_updates(
+    section_anchor: &HashMap<ItemId, ItemId>,
+    blocks: &[ViewBlock<'_>],
+) -> Vec<StickyAnchorUpdate> {
+    let mut out = Vec::new();
+    for block in blocks {
+        let ViewBlock::WorkSection {
+            run_anchor,
+            blocks: inner,
+            ..
+        } = block
+        else {
+            continue;
+        };
+        let members = work_section_member_ids(inner);
+        let sticky = members
+            .iter()
+            .find_map(|id| section_anchor.get(id))
+            .cloned()
+            .unwrap_or_else(|| run_anchor.clone());
+        out.push(StickyAnchorUpdate { members, sticky });
+    }
+    out
+}
+
+fn apply_sticky_to_blocks(updates: &[StickyAnchorUpdate], blocks: &mut [ViewBlock<'_>]) {
+    let mut update_ix = 0;
+    for block in blocks.iter_mut() {
+        let ViewBlock::WorkSection { run_anchor, .. } = block else {
+            continue;
+        };
+        if let Some(update) = updates.get(update_ix) {
+            *run_anchor = update.sticky.clone();
+            update_ix += 1;
+        }
+    }
+}
+
+struct StickyAnchorUpdate {
+    members: Vec<ItemId>,
+    sticky: ItemId,
+}
+
+fn work_section_member_ids(blocks: &[ViewBlock<'_>]) -> Vec<ItemId> {
+    let mut out = Vec::new();
+    collect_work_section_member_ids(blocks, &mut out);
+    out
+}
+
+fn collect_work_section_member_ids(blocks: &[ViewBlock<'_>], out: &mut Vec<ItemId>) {
+    for block in blocks {
+        match block {
+            ViewBlock::Item(item) => out.push(item.id.clone()),
+            ViewBlock::ToolSpan { call, output } => {
+                out.push(call.id.clone());
+                if let Some(out_item) = output {
+                    out.push(out_item.id.clone());
+                }
+            }
+            ViewBlock::WorkSection { blocks: inner, .. } => {
+                collect_work_section_member_ids(inner, out);
+            }
+            ViewBlock::StreamingReasoning { acc, .. } => {
+                out.push(ItemId::new(acc.acc_id.as_str()));
+            }
+            ViewBlock::StreamingMessage(acc) => {
+                if let Some(id) = &acc.message_id {
+                    out.push(ItemId::new(id.as_str()));
+                } else {
+                    out.push(ItemId::new(acc.acc_id.as_str()));
+                }
+            }
+        }
+    }
 }
 
 fn is_user_message(item: &Item) -> bool {
@@ -1032,6 +1177,105 @@ mod tests {
                     .any(|id| matches!(id, RowId::Work(id) if id.as_str() == "fc_live")),
                 "no ghost Work row for fc_live"
             );
+            assert_eq!(
+                r.resident_hi_for_test(),
+                0,
+                "Span de-ghost must recompute resident_hi from items"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn section_chrome_entity_id_stable_across_stream_finalize(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        let acc = AccId::new("acc_chrome_fin");
+        let item_id = ItemId::new("r_chrome_fin");
+        let resp = ResponseId::new("resp_a");
+        let stream_key = SectionKey {
+            response_id: resp.clone(),
+            run_anchor: ItemId::new(acc.as_str()),
+        };
+
+        cx.update(|cx| {
+            replica.update(cx, |r, _| {
+                r.active_response = Some(resp.clone());
+                r.recompute_live_section_lo();
+                r.recompute_settled_prefix();
+                r.live_section_lo = Some(0);
+            });
+            replica.update(cx, |r, cx| {
+                r.fold_detailed(
+                    StreamUpdate::ScratchChanged(Arc::new(StreamScratch {
+                        open_reasoning: Some(lens_core::domain::item::ReasoningAcc {
+                            acc_id: acc.clone(),
+                            full_text: "streaming chrome".into(),
+                            summary_text: String::new(),
+                            encrypted: false,
+                        }),
+                        ..Default::default()
+                    })),
+                    cx,
+                );
+            });
+        });
+
+        let (chip_before, rail_before) = cx.read(|cx| {
+            let r = replica.read(cx);
+            (
+                r.rows()
+                    .entity_id(&stream_key.chip_id(), cx)
+                    .or_else(|| r.rows().entity_id(&stream_key.rail_id(), cx))
+                    .expect("section chrome before finalize"),
+                r.rows()
+                    .entity_id(&stream_key.rail_id(), cx)
+                    .expect("section rail before finalize"),
+            )
+        });
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.fold_detailed(
+                    StreamUpdate::Retired {
+                        acc_id: acc.clone(),
+                        disposition: RetireDisposition::Finalizing {
+                            item_id: item_id.clone(),
+                        },
+                    },
+                    cx,
+                );
+                r.fold_detailed(
+                    StreamUpdate::ScratchChanged(Arc::new(StreamScratch::default())),
+                    cx,
+                );
+            });
+        });
+
+        let final_key = SectionKey {
+            response_id: resp,
+            run_anchor: item_id,
+        };
+
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            let chip_after = r
+                .rows()
+                .entity_id(&final_key.chip_id(), cx)
+                .or_else(|| r.rows().entity_id(&final_key.rail_id(), cx))
+                .expect("section chrome after finalize");
+            let rail_after = r
+                .rows()
+                .entity_id(&final_key.rail_id(), cx)
+                .expect("section rail after finalize");
+            assert_eq!(
+                chip_before, chip_after,
+                "section chip EntityId must survive provisional→durable rekey"
+            );
+            assert_eq!(
+                rail_before, rail_after,
+                "section rail EntityId must survive provisional→durable rekey"
+            );
         });
     }
 
@@ -1056,18 +1300,24 @@ mod tests {
             });
         });
 
-        let upper_key = SectionKey {
+        let section_key = SectionKey {
             response_id: ResponseId::new("resp_a"),
-            run_anchor: ItemId::new("r20"),
+            run_anchor: ItemId::new("r10"),
         };
-        let chip_before = cx.update(|cx| {
+        let (chip_before, rail_before) = cx.update(|cx| {
             replica.update(cx, |r, cx| {
-                let _ = cx;
-                r.rows()
-                    .entity_id(&upper_key.rail_id(), cx)
-                    .or_else(|| r.rows().entity_id(&upper_key.chip_id(), cx))
+                let chip = r
+                    .rows()
+                    .entity_id(&section_key.chip_id(), cx)
+                    .or_else(|| r.rows().entity_id(&section_key.rail_id(), cx));
+                let rail = r.rows().entity_id(&section_key.rail_id(), cx);
+                (chip, rail)
             })
         });
+        assert!(
+            chip_before.is_some() || rail_before.is_some(),
+            "post-Tail section chrome must exist at sticky anchor r10"
+        );
 
         let prepend_rows: Vec<_> = (5..=9)
             .map(|o| (o, reasoning_item(&format!("r{o}"), "resp_a")))
@@ -1102,11 +1352,16 @@ mod tests {
             }
             let chip_after = r
                 .rows()
-                .entity_id(&upper_key.rail_id(), cx)
-                .or_else(|| r.rows().entity_id(&upper_key.chip_id(), cx));
+                .entity_id(&section_key.chip_id(), cx)
+                .or_else(|| r.rows().entity_id(&section_key.rail_id(), cx));
+            let rail_after = r.rows().entity_id(&section_key.rail_id(), cx);
             assert_eq!(
                 chip_before, chip_after,
-                "section anchor must stay stable across backward prepend"
+                "sticky run_anchor r10: section chip EntityId must survive backward prepend"
+            );
+            assert_eq!(
+                rail_before, rail_after,
+                "sticky run_anchor r10: section rail EntityId must survive backward prepend"
             );
         });
     }
