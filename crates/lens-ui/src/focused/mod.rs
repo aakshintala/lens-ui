@@ -4744,6 +4744,53 @@ mod tests {
         });
     }
 
+    /// I1 (fatal twin): a reader-fatal error must also clear `page_in_flight` so paging
+    /// is not permanently latched off after a fatal I/O failure on a backward page.
+    #[gpui::test]
+    async fn reader_fatal_clears_page_in_flight(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    tail_read(
+                        vec![(5, message_item("m5", None)), (6, message_item("m6", None))],
+                        6,
+                    ),
+                    cx,
+                );
+                r.page_older_if_near_top(0, cx);
+            });
+        });
+        let _ = rx.try_recv().expect("backward page enqueued");
+        cx.read(|cx| {
+            assert!(replica.read(cx).page_in_flight_for_test());
+        });
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.on_reader_fatal("fatal io".into(), cx);
+            });
+        });
+        cx.read(|cx| {
+            assert!(!replica.read(cx).page_in_flight_for_test());
+        });
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.page_older_if_near_top(0, cx);
+            });
+        });
+        let _ = rx
+            .try_recv()
+            .expect("second backward page after fatal recovery");
+    }
+
     /// I2: successful `apply_read(Backward)` must clear `page_in_flight`.
     #[gpui::test]
     async fn backward_apply_read_clears_page_in_flight(cx: &mut gpui::TestAppContext) {

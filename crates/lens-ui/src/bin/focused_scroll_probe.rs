@@ -428,8 +428,8 @@ async fn drive_scroll_probe(
     // never exercises the eviction path. Here we seed LARGE-byte rows so a backward
     // page tips resident over the 24 MB cap; paused (`following=false`) eviction then
     // drops rows from the HI (newest) side while the anchor sits near the top. The
-    // arithmetic is pinned headless; this proves the two-splice survives REAL layout:
-    // the RowId at the top of the viewport must be identical before and after.
+    // identity re-pin is pinned headless; this proves it survives REAL layout: the
+    // RowId at the top of the viewport must be identical before and after.
     let _ = weak.update_in(&mut wcx, |view, _, cx| {
         view.replica.update(cx, |r, cx| {
             r.set_following(false, cx);
