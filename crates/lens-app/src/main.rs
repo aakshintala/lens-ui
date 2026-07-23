@@ -13,15 +13,19 @@ use lens_core::domain::scalars::{ErrorInfo, SessionLifecycle};
 use lens_core::domain::session::SessionState;
 #[cfg(feature = "demo")]
 use lens_core::domain::usage::Cost;
+#[cfg(feature = "demo")]
+use lens_core::persist::TranscriptStore;
 use lens_core::persist::{
     BoardStore, ConnectionRecord, ControlStore, SqliteBoardStore, SqliteControlStore,
-    SqliteTranscriptStore, TranscriptStore,
+    SqliteTranscriptStore,
 };
 use lens_ui::board::{BoardReplica, BoardView};
 #[cfg(feature = "demo")]
 use lens_ui::card::model::SessionCard;
 use lens_ui::clock::{UiClock, WallUiClock};
-use lens_ui::fleet::store::{FleetStore, ReaderFactory};
+use lens_ui::fleet::store::FleetStore;
+#[cfg(feature = "demo")]
+use lens_ui::fleet::store::ReaderFactory;
 use lens_ui::slot::placeholder_tab;
 use std::path::{Path, PathBuf};
 use std::process;
