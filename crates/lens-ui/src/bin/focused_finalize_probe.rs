@@ -201,7 +201,10 @@ async fn drive_legacy_finalize_probe(
             .splice(0..view.list_state.item_count(), count);
         cx.notify();
     });
-    wait_frames(wcx, 3).await;
+    // Wait past the 100ms markdown reparse throttle so the taller parsed_result actually
+    // applies and drives a real update_bounds height change (P2 carve-out is only exercised
+    // by a REAL rendered-height change, not the source string growing).
+    wait_frames(wcx, 12).await;
 
     let _ = weak.update_in(wcx, |view, _, cx| {
         view.replica.update(cx, |r, cx| {
@@ -306,7 +309,9 @@ async fn drive_canonical_finalize_probe(
         });
         cx.notify();
     });
-    wait_frames(wcx, 3).await;
+    // Wait past the 100ms markdown reparse throttle so the taller parsed_result applies and
+    // drives a real update_bounds height change (see legacy-phase note).
+    wait_frames(wcx, 12).await;
 
     let _ = weak.update_in(wcx, |view, _, cx| {
         view.replica.update(cx, |r, cx| {
@@ -594,17 +599,24 @@ impl Render for HarnessView {
                                 "markdown entity id changed {target:?} -> {md_eid:?}"
                             ));
                         }
+                        // Arm selection only AFTER the target's initial 0x0->real layout has
+                        // settled on a prior frame's paint. Arming on the first sighting (bounds
+                        // still 0x0) would let the first real layout count as a size change and
+                        // clear the pre-layout selection — a probe artifact, not a P2 failure.
+                        if !p.markdown_selection_armed {
+                            markdown_probe_arm_selection(
+                                content_key.as_element_id().as_str(),
+                                window,
+                                cx,
+                            );
+                            p.markdown_selection_armed = true;
+                            p.armed_element_id =
+                                Some(content_key.as_element_id().as_str().to_string());
+                            p.armed_source_len = source.len();
+                            p.max_source_len = source.len();
+                        }
                     } else {
                         p.target_markdown_entity = Some(md_eid);
-                        markdown_probe_arm_selection(
-                            content_key.as_element_id().as_str(),
-                            window,
-                            cx,
-                        );
-                        p.markdown_selection_armed = true;
-                        p.armed_element_id =
-                            Some(content_key.as_element_id().as_str().to_string());
-                        p.armed_source_len = source.len();
                         p.max_source_len = source.len();
                     }
                     if p.markdown_selection_armed {
