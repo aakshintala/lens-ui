@@ -276,6 +276,8 @@ impl RowStore {
         into: &mut RowStore,
         cx: &mut App,
     ) {
+        into.structure
+            .retain(|e| !matches!(e, StructureEntry::LoadOlder));
         into.structure.truncate(prefix_len);
         into.sections.retain(|key, _| {
             into.structure

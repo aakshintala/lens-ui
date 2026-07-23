@@ -581,11 +581,13 @@ impl FocusedTranscript {
         if generation != self.focus_generation {
             return;
         }
+        self.page_in_flight = false;
         self.reader_error = Some(err);
         cx.notify();
     }
 
     pub(crate) fn on_reader_fatal(&mut self, err: String, cx: &mut Context<Self>) {
+        self.page_in_flight = false;
         self.reader_error = Some(err);
         // Staged rows in pending_finalize stay visible — recovery path, not orphan.
         cx.notify();
@@ -810,6 +812,15 @@ impl FocusedTranscript {
     fn reproject(&mut self, full: bool, prepend_sync: bool, cx: &mut Context<Self>) {
         let expansion = self.compute_expansion_flags();
         let prev_len = self.rows.len();
+        let prepend_anchor_row: Option<RowId> = if prepend_sync {
+            self.rows
+                .order()
+                .iter()
+                .find(|r| !matches!(r, RowId::LoadOlder))
+                .cloned()
+        } else {
+            None
+        };
         self.rows.set_all_response_expansion(&expansion, None);
 
         self.rows.strip_markers();
@@ -865,9 +876,35 @@ impl FocusedTranscript {
         let pending_accs: HashSet<AccId> = self.pending_finalize.keys().cloned().collect();
         self.rows.gc_entities(&pending_accs);
         let new_len = self.rows.len();
-        if prepend_sync && new_len > prev_len {
-            self.rows
-                .sync_list_prepend(&self.list_state, new_len - prev_len);
+        if prepend_sync {
+            let inserted_front = prepend_anchor_row
+                .as_ref()
+                .and_then(|id| self.rows.order().iter().position(|r| r == id));
+            match inserted_front {
+                Some(i) => {
+                    if i > 0 {
+                        self.rows.sync_list_prepend(&self.list_state, i);
+                    }
+                    // gpui now has prev_len + i items; actual is new_len. Any hi-side
+                    // eviction removed rows at the TAIL (below the shifted anchor) — remove
+                    // them so the count matches without disturbing the anchor.
+                    let gpui_len = prev_len + i;
+                    if new_len < gpui_len {
+                        self.rows
+                            .splice_into(&self.list_state, new_len..gpui_len, 0);
+                    } else if new_len > gpui_len {
+                        self.rows.splice_into(
+                            &self.list_state,
+                            gpui_len..gpui_len,
+                            new_len - gpui_len,
+                        );
+                    }
+                }
+                None => {
+                    // anchor row vanished (empty/degenerate) — safe fallback.
+                    self.rows.sync_list_count(&self.list_state, prev_len);
+                }
+            }
         } else {
             self.rows.sync_list_count(&self.list_state, prev_len);
         }
@@ -4491,6 +4528,309 @@ mod tests {
                     .is_some_and(|e| e.read(cx).presentation.text == "ok")
             });
             assert!(found, "orphan output must render without panic");
+        });
+    }
+
+    const LARGE_ROW_BYTES: usize = 4 * 1024 * 1024;
+
+    fn large_byte_read(rows: Vec<(i64, Item)>, watermark: i64) -> RangeRead {
+        RangeRead {
+            rows: rows
+                .into_iter()
+                .map(|(ord, item)| (ord, LARGE_ROW_BYTES, item))
+                .collect(),
+            skipped: vec![],
+            watermark: Some(watermark),
+        }
+    }
+
+    /// C1: incremental live-tail reproject must not drop the last settled block when
+    /// `LoadOlder` occupies structure index 0.
+    #[gpui::test]
+    async fn load_older_sentinel_survives_incremental_live_tail_reproject(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        let resp = ResponseId::new("resp_live");
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    tail_read(
+                        vec![
+                            (5, user_item("u5", "settled-a")),
+                            (6, user_item("u6", "settled-b")),
+                            (7, reasoning_item("r7", "resp_live")),
+                            (8, reasoning_item("r8", "resp_live")),
+                            (9, reasoning_item("r9", "resp_live")),
+                        ],
+                        9,
+                    ),
+                    cx,
+                );
+                r.active_response = Some(resp.clone());
+                r.recompute_live_section_lo();
+                r.recompute_settled_prefix();
+            });
+        });
+
+        let settled_before = cx.read(|cx| {
+            let r = replica.read(cx);
+            assert!(r.resident_lo_for_test() > 0);
+            assert_eq!(r.rows().order().first(), Some(&RowId::LoadOlder));
+            assert_eq!(r.live_section_lo_for_test(), Some(7));
+            vec![
+                RowId::Sibling(ItemId::new("u5")),
+                RowId::Sibling(ItemId::new("u6")),
+            ]
+        });
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.fold_detailed(
+                    StreamUpdate::ScratchChanged(Arc::new(StreamScratch {
+                        open_reasoning: Some(lens_core::domain::item::ReasoningAcc {
+                            acc_id: AccId::new("acc_live"),
+                            full_text: "streaming".into(),
+                            summary_text: String::new(),
+                            encrypted: false,
+                        }),
+                        ..Default::default()
+                    })),
+                    cx,
+                );
+            });
+        });
+
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert_eq!(r.rows().order().first(), Some(&RowId::LoadOlder));
+            let order = r.rows().order();
+            for (i, id) in settled_before.iter().enumerate() {
+                assert_eq!(
+                    order.iter().position(|r| r == id),
+                    Some(i + 1),
+                    "settled row {id:?} must remain at index {} after incremental reproject",
+                    i + 1
+                );
+            }
+        });
+    }
+
+    /// C2: backward prepend with hi-side eviction must keep gpui list count aligned with RowStore
+    /// and shift the scroll anchor by the true front-insert count (not net delta).
+    #[gpui::test]
+    async fn backward_prepend_with_eviction_keeps_list_count_synced(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        let anchor = gpui::ListOffset {
+            item_ix: 1,
+            offset_in_item: gpui::px(0.),
+        };
+        const INSERTED: usize = 4;
+
+        let anchor_row = RowId::Sibling(ItemId::new("m10"));
+        let tail_rows: Vec<_> = (10..=14)
+            .map(|o| (o, message_item(&format!("m{o}"), None)))
+            .collect();
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.set_following(false, cx);
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    large_byte_read(tail_rows, 14),
+                    cx,
+                );
+                r.list_state.scroll_to(anchor);
+            });
+        });
+
+        let hi_before = cx.read(|cx| {
+            let r = replica.read(cx);
+            assert_eq!(r.resident_hi_for_test(), 14);
+            assert_eq!(r.list_state().logical_scroll_top().item_ix, anchor.item_ix);
+            r.resident_hi_for_test()
+        });
+
+        let prepend_rows: Vec<_> = (6..=9)
+            .map(|o| (o, message_item(&format!("p{o}"), None)))
+            .collect();
+        assert_eq!(prepend_rows.len(), INSERTED);
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Backward {
+                        before: 10,
+                        byte_budget: PAGE_BUDGET_BYTES,
+                    },
+                    large_byte_read(prepend_rows, 14),
+                    cx,
+                );
+            });
+        });
+
+        let expected_anchor = cx.read(|cx| {
+            let r = replica.read(cx);
+            let inserted_front = r
+                .rows()
+                .order()
+                .iter()
+                .position(|id| id == &anchor_row)
+                .expect("anchor row must survive backward prepend");
+            assert!(
+                inserted_front > INSERTED.saturating_sub(1),
+                "precondition: true front-insert count must exceed net row delta when hi evicts"
+            );
+            prepend_scroll_compensation(anchor, inserted_front)
+        });
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert!(
+                r.resident_hi_for_test() < hi_before,
+                "backward prepend must evict from hi side when over cap"
+            );
+            assert!(
+                !r.has_item_ordinal_for_test(14),
+                "evicted hi ordinal must be gone from items"
+            );
+            assert_eq!(
+                r.list_state().logical_scroll_top().item_ix,
+                expected_anchor.item_ix,
+                "anchor must shift by true front-insert count, not net delta"
+            );
+            assert_eq!(
+                r.list_state().item_count(),
+                r.rows().len(),
+                "two-splice prepend+tail-trim must keep gpui count aligned with RowStore"
+            );
+        });
+    }
+
+    /// I1: read errors must clear `page_in_flight` so paging can resume.
+    #[gpui::test]
+    async fn read_error_clears_page_in_flight(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    tail_read(
+                        vec![(0, message_item("m0", None)), (1, message_item("m1", None))],
+                        1,
+                    ),
+                    cx,
+                );
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    tail_read(
+                        vec![(5, message_item("m5", None)), (6, message_item("m6", None))],
+                        6,
+                    ),
+                    cx,
+                );
+                r.page_older_if_near_top(0, cx);
+            });
+        });
+        let _ = rx.try_recv().expect("backward page enqueued");
+        cx.read(|cx| {
+            assert!(replica.read(cx).page_in_flight_for_test());
+        });
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.on_read_error(1, "busy".into(), cx);
+            });
+        });
+        cx.read(|cx| {
+            assert!(!replica.read(cx).page_in_flight_for_test());
+        });
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.page_older_if_near_top(0, cx);
+            });
+        });
+        let _ = rx
+            .try_recv()
+            .expect("second backward page after error recovery");
+        cx.read(|cx| {
+            assert!(replica.read(cx).page_in_flight_for_test());
+        });
+    }
+
+    /// I2: successful `apply_read(Backward)` must clear `page_in_flight`.
+    #[gpui::test]
+    async fn backward_apply_read_clears_page_in_flight(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    tail_read(
+                        vec![
+                            (10, reasoning_item("r10", "resp_a")),
+                            (11, reasoning_item("r11", "resp_a")),
+                        ],
+                        11,
+                    ),
+                    cx,
+                );
+                r.page_older_if_near_top(0, cx);
+            });
+        });
+        let _ = rx.try_recv().expect("backward page enqueued");
+        cx.read(|cx| {
+            assert!(replica.read(cx).page_in_flight_for_test());
+        });
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Backward {
+                        before: 10,
+                        byte_budget: PAGE_BUDGET_BYTES,
+                    },
+                    tail_read(vec![(8, reasoning_item("r8", "resp_a"))], 11),
+                    cx,
+                );
+            });
+        });
+        cx.read(|cx| {
+            assert!(!replica.read(cx).page_in_flight_for_test());
+        });
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.page_older_if_near_top(0, cx);
+            });
+        });
+        let _ = rx.try_recv().expect("backward page after successful apply");
+        cx.read(|cx| {
+            assert!(replica.read(cx).page_in_flight_for_test());
         });
     }
 }
