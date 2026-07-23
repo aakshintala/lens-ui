@@ -191,11 +191,13 @@ pub(crate) fn row_to_item_at_offset(r: &rusqlite::Row, offset: usize) -> rusqlit
     })
 }
 
-/// Decode a reader row: `ordinal` at column 0, then `row_to_item` columns at `1..`.
-pub(crate) fn row_to_ordinal_item(r: &rusqlite::Row) -> rusqlite::Result<(i64, Item)> {
-    let ordinal = r.get(0)?;
-    let item = row_to_item_at_offset(r, 1)?;
-    Ok((ordinal, item))
+/// Reader row: ordinal @0, length(payload) @1, then row_to_item columns @2..
+pub(crate) fn row_to_ordinal_len_item(r: &rusqlite::Row) -> rusqlite::Result<(i64, usize, Item)> {
+    Ok((
+        r.get(0)?,
+        r.get::<_, i64>(1)? as usize,
+        row_to_item_at_offset(r, 2)?,
+    ))
 }
 
 #[cfg(test)]
