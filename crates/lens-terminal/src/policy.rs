@@ -282,6 +282,7 @@ fn engine_config_for(resource: &TerminalResource, options: &TerminalOpenOptions)
 }
 
 #[cfg(any(test, feature = "test-util"))]
+#[cfg_attr(not(test), allow(dead_code))] // only called from #[cfg(test)] modules today
 pub(crate) fn engine_config_for_test(options: &TerminalOpenOptions) -> EngineConfig {
     engine_config(options)
 }

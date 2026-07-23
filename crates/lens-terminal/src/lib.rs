@@ -517,6 +517,8 @@ pub struct TerminalTab {
     pending_click_frames: VecDeque<(u64, Arc<Frame>)>,
     /// Monotonic source for the Left-down click token.
     next_click_seq: u64,
+    #[cfg(any(test, feature = "test-util"))]
+    host_events_seen: Vec<TerminalHostEvent>,
 }
 
 const PENDING_HOST_REQUESTS_CAP: usize = 64;
@@ -569,6 +571,8 @@ impl TerminalTab {
             mouse_time_base: std::time::Instant::now(),
             pending_click_frames: VecDeque::new(),
             next_click_seq: 0,
+            #[cfg(any(test, feature = "test-util"))]
+            host_events_seen: Vec::new(),
         }
     }
 
@@ -631,6 +635,8 @@ impl TerminalTab {
             mouse_time_base: std::time::Instant::now(),
             pending_click_frames: VecDeque::new(),
             next_click_seq: 0,
+            #[cfg(any(test, feature = "test-util"))]
+            host_events_seen: Vec::new(),
         }
     }
 
@@ -660,8 +666,19 @@ impl TerminalTab {
             .unwrap_or(0)
     }
 
+    /// Every [`TerminalHostEvent`] delivered to this tab, in arrival order.
+    /// Test-only observability: sub-slice D asserts fleet-level forwarding
+    /// fidelity, which has no other observable effect on a tab that has not
+    /// yet bound a `terminal_id`.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn host_events_for_test(&self) -> &[TerminalHostEvent] {
+        &self.host_events_seen
+    }
+
     /// The single typed inbound seam.
     pub fn on_host_event(&mut self, event: TerminalHostEvent, cx: &mut Context<Self>) {
+        #[cfg(any(test, feature = "test-util"))]
+        self.host_events_seen.push(event.clone());
         match event {
             TerminalHostEvent::Sleep => self.on_sleep(cx),
             TerminalHostEvent::Wake => self.on_wake(cx),
@@ -2922,6 +2939,37 @@ mod tests {
             tab
         });
         (engine, tab)
+    }
+
+    #[gpui::test]
+    async fn host_event_recorder_records_in_order(cx: &mut gpui::TestAppContext) {
+        let engine = std::sync::Arc::new(EngineHandle::spawn(test_cfg()).expect("engine"));
+        let tab = cx.update(|cx| TerminalTab::open_with_engine_for_test(engine, cx));
+        cx.update(|cx| {
+            tab.update(cx, |tab, cx| {
+                tab.on_host_event(
+                    TerminalHostEvent::ResourceDeleted {
+                        terminal_id: TerminalId::new("term_1"),
+                    },
+                    cx,
+                );
+                tab.on_host_event(TerminalHostEvent::Sleep, cx);
+            });
+        });
+        cx.update(|cx| {
+            let recorded = tab.read(cx).host_events_for_test().to_vec();
+            assert_eq!(recorded.len(), 2, "both host events recorded");
+            assert!(
+                matches!(recorded[0], TerminalHostEvent::ResourceDeleted { .. }),
+                "first recorded event is ResourceDeleted, got {:?}",
+                recorded[0]
+            );
+            assert!(
+                matches!(recorded[1], TerminalHostEvent::Sleep),
+                "second recorded event is Sleep, got {:?}",
+                recorded[1]
+            );
+        });
     }
 
     #[gpui::test]
