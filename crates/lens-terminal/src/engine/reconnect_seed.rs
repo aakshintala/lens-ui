@@ -140,6 +140,10 @@ fn retained_reconnect_seed_viewport_matches_fresh_engine() {
     stop_engine(fresh);
 }
 
+// Cross-session (transfer) no-double-feed is NOT testable at the engine layer — `VtEngine`
+// has no session concept. That guarantee (server B replays clear+redraw, not full history)
+// is owned by the live riders (design Q6).
+
 #[test]
 fn retained_reconnect_seed_does_not_duplicate_scrollback() {
     let lines = load_capture_lines(RECONNECT_CAPTURE);
@@ -161,32 +165,5 @@ fn retained_reconnect_seed_does_not_duplicate_scrollback() {
     assert!(
         delta <= rows as usize,
         "scrollback grew by {delta} (> viewport); retained seed duplicated history (sb0={sb0}, sb1={sb1})"
-    );
-}
-
-#[test]
-fn transfer_seed_across_sessions_does_not_duplicate_scrollback() {
-    // Identical mechanics to retained_reconnect_seed_does_not_duplicate_scrollback:
-    // a retained engine already holds leg1 history; the cross-session (B) attach seed is
-    // leg2 (clear+redraw). Feeding leg2 must NOT grow scrollback beyond one viewport.
-    let lines = load_capture_lines(RECONNECT_CAPTURE);
-    let legs = split_reconnect_legs(&lines);
-    let cfg = reconnect_config();
-    let rows = cfg.rows;
-
-    let mut engine = VtEngine::new(&cfg, |_| {}, {
-        let (tx, _rx) = crossbeam_channel::bounded(1);
-        tx
-    })
-    .expect("VtEngine");
-    engine.feed(&legs.leg1_seed);
-    let sb0 = engine.scrollback_rows_for_test();
-    engine.feed(&legs.leg2_seed);
-    let sb1 = engine.scrollback_rows_for_test();
-
-    let delta = sb1.saturating_sub(sb0);
-    assert!(
-        delta <= rows as usize,
-        "transfer seed duplicated history across sessions (delta={delta}, sb0={sb0}, sb1={sb1})"
     );
 }

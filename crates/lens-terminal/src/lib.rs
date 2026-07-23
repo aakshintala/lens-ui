@@ -394,6 +394,8 @@ pub enum TerminalHostEvent {
     /// Host-driven cross-session supersede: the server has moved this live terminal
     /// (same `terminal_id`) into `new_session`. Reuses the retained frozen engine via a
     /// transport-only re-attach against B, retargeting `current_session` (design §10, Q3).
+    /// A `Transfer` whose `new_session` equals the current session is treated as an
+    /// agent-switch (adopt's same-session fresh-rediscover branch), not a reuse — intentional and leak-safe.
     Transfer { new_session: SessionId },
     /// Host response to a typed permission request emitted on [`TerminalEvent`].
     HostRequestResponse {
