@@ -2228,10 +2228,17 @@ impl TerminalTab {
                     matches!(detail, DetachedDetail::ClientDetached),
                     "policy reattach_available must match ClientDetached detail"
                 );
-                // on_detach derives reattach_available from the detail (ClientDetached⇔true),
-                // which matches policy.rs (only TerminalDetached sets it), and now bumps the epoch
-                // + clears adopt_in_flight so an in-flight adopt/wake/reconnect cannot resurrect.
-                self.on_detach(detail, cx);
+                // 4404-first (Slice 5-A): a TerminalGone on a discover-or-create target may
+                // have an exact-key successor coming — wait for it (retaining the frozen
+                // engine, Task 3) instead of hard-detaching. Existing targets never adopt a
+                // different resource, so they stay a hard detach.
+                if matches!(detail, DetachedDetail::TerminalGone)
+                    && matches!(self.target, TerminalTarget::OpenOrCreate { .. })
+                {
+                    self.enter_replacement_waiting(cx);
+                } else {
+                    self.on_detach(detail, cx);
+                }
             }
             PolicyAction::DowngradeReadOnly => {
                 let was_write = matches!(self.presentation.access, AccessMode::Write);
@@ -2942,6 +2949,46 @@ mod tests {
                 tab.lifecycle,
                 Lifecycle::ReplacementWaiting,
                 "late 4404 close must not clobber ReplacementWaiting → Detached"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn openorcreate_4404_while_live_enters_replacement_waiting(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (_engine, tab) = live_tab_for_test(cx, true, "t1", "main", "k");
+        tab.update(cx, |tab, cx| {
+            assert_eq!(tab.lifecycle, Lifecycle::Live);
+            tab.apply_bridge_event(
+                BridgeEvent::Closed(lens_client::CloseCause::TerminalNotFound),
+                cx,
+            );
+            assert_eq!(
+                tab.lifecycle,
+                Lifecycle::ReplacementWaiting,
+                "OpenOrCreate 4404 must wait for a successor, not hard-detach"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn existing_4404_while_live_hard_detaches(cx: &mut gpui::TestAppContext) {
+        let (_engine, tab) = live_tab_for_test(cx, false, "t1", "main", "k"); // Existing target
+        tab.update(cx, |tab, cx| {
+            assert_eq!(tab.lifecycle, Lifecycle::Live);
+            tab.apply_bridge_event(
+                BridgeEvent::Closed(lens_client::CloseCause::TerminalNotFound),
+                cx,
+            );
+            assert_eq!(
+                tab.lifecycle,
+                Lifecycle::Detached,
+                "Existing 4404 has no successor semantics — stays hard-detach"
+            );
+            assert_eq!(
+                tab.presentation.detached_detail,
+                Some(DetachedDetail::TerminalGone)
             );
         });
     }
