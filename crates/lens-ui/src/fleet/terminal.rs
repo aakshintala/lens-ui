@@ -641,7 +641,7 @@ fn terminal_key_from_id(id: &TerminalKeyId) -> TerminalKey {
 mod tests {
     use super::*;
     use crate::clock::ManualUiClock;
-    use crate::fleet::loader::{FakeSessionLoader, GatedSessionLoader};
+    use crate::fleet::loader::{FakeSessionLoader, GatedSessionLoader, ReentrantSessionLoader};
     use lens_client::ids::TerminalId;
     use lens_core::actor::TerminalResourceSignal;
     use lens_terminal::{EngineConfig, EngineHandle, PER_CELL_BYTES, TerminalHostEvent};
@@ -1977,6 +1977,41 @@ mod tests {
                 }
                 other => panic!("expected Transfer, got {other:?}"),
             }
+        });
+    }
+
+    #[gpui::test]
+    async fn supersede_load_deferred_outside_store_update(cx: &mut gpui::TestAppContext) {
+        let clock = Arc::new(ManualUiClock::new(5_000));
+        let store = cx.update(|cx| FleetStore::new(clock.clone(), cx));
+        let loader = Rc::new(ReentrantSessionLoader);
+        let sess_a = SessionId::new("conv_a");
+        let sess_b = SessionId::new("conv_b");
+        let key = test_key("main", "sk_a");
+        let (_e, tab) = spawn_tab_with_rows(cx, 0);
+
+        cx.update(|cx| {
+            store.update(cx, |store, cx| {
+                store.set_session_loader(loader.clone());
+                store.insert_terminal_for_test(sess_a.clone(), key.clone(), tab.clone(), cx);
+                store.on_session_control(
+                    &sess_a,
+                    SessionControl::Superseded {
+                        target: sess_b.clone(),
+                        reason: "clear".into(),
+                    },
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let s = store.read(cx);
+            assert!(
+                s.terminal_member_for_test(&sess_b, &key, cx).is_some(),
+                "load invoked outside an active store update must complete"
+            );
         });
     }
 }

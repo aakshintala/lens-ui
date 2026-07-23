@@ -109,6 +109,31 @@ impl SessionLoader for GatedSessionLoader {
     }
 }
 
+/// Poison fake: synchronously `update`s the store from inside `load`. The
+/// trait forbids this because gpui entity updates are not re-entrant. Do not
+/// "fix" this fake — the forbidden behavior is intentional so a regression
+/// (calling `load` inline from `on_supersede` during an active store update)
+/// panics with gpui's re-entrancy error.
+#[cfg(test)]
+pub(crate) struct ReentrantSessionLoader;
+
+#[cfg(test)]
+impl SessionLoader for ReentrantSessionLoader {
+    fn load(
+        &self,
+        session_id: SessionId,
+        store: WeakEntity<FleetStore>,
+        cx: &mut App,
+    ) -> Task<Result<(), String>> {
+        match store.update(cx, |store, cx| {
+            store.spawn_fake_session(session_id, cx);
+        }) {
+            Ok(()) => Task::ready(Ok(())),
+            Err(e) => Task::ready(Err(format!("store gone: {e:?}"))),
+        }
+    }
+}
+
 #[cfg(test)]
 impl SessionLoader for FakeSessionLoader {
     fn load(
