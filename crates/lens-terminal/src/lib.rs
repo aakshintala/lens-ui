@@ -2663,15 +2663,29 @@ pub fn open(
 ) -> Entity<TerminalTab> {
     let entity = cx
         .new(|cx| TerminalTab::starting(target.clone(), Arc::clone(&client), options.clone(), cx));
+    let epoch = entity.read(cx).reconnect_epoch;
     let weak = entity.downgrade();
     cx.spawn(async move |cx| {
         let outcome = cx
             .background_executor()
             .spawn(async move { discover_and_attach(client, target, options) })
             .await;
-        let _ = weak.update(cx, |tab, cx| match outcome {
-            Ok(parts) => tab.on_attached(parts, cx),
-            Err(detail) => tab.on_detach(detail, cx),
+        let _ = weak.update(cx, |tab, cx| {
+            // Re-check at APPLY time, like the wake/reconnect/adopt/replacement
+            // spawns: a `TerminalHostEvent::End` (or any transition) while the initial
+            // attach was in flight bumps `reconnect_epoch` and leaves the tab no longer
+            // `Starting`. Applying then would resurrect an Ended tab with a live
+            // engine/transport outside fleet accounting (codex/Opus review finding 3).
+            if tab.reconnect_epoch != epoch || tab.lifecycle != Lifecycle::Starting {
+                if let Ok(parts) = outcome {
+                    tab.close_parts_off_foreground(parts, cx);
+                }
+                return;
+            }
+            match outcome {
+                Ok(parts) => tab.on_attached(parts, cx),
+                Err(detail) => tab.on_detach(detail, cx),
+            }
         });
     })
     .detach();
@@ -2972,6 +2986,54 @@ mod tests {
             assert!(
                 tab.runtime.is_none(),
                 "TerminalGone must release runtime via full teardown"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn end_during_initial_attach_does_not_resurrect(cx: &mut gpui::TestAppContext) {
+        let target = TerminalTarget::OpenOrCreate {
+            session_id: SessionId::new("s1"),
+            key: TerminalKey {
+                terminal_name: "main".into(),
+                session_key: "k1".into(),
+            },
+        };
+        let tab = cx.update(|cx| {
+            open(
+                target,
+                Arc::new(Client::stub_for_test()),
+                TerminalOpenOptions::default(),
+                cx,
+            )
+        });
+        assert_eq!(
+            tab.read_with(cx, |t, _| t.lifecycle),
+            Lifecycle::Starting,
+            "open returns Starting with discover_and_attach in flight"
+        );
+
+        // Host closes the tab while the initial attach is still in flight.
+        tab.update(cx, |tab, cx| {
+            tab.on_host_event(TerminalHostEvent::End, cx);
+        });
+        assert_eq!(tab.read_with(cx, |t, _| t.lifecycle), Lifecycle::Ended);
+
+        // Drive the in-flight initial attach to completion. It must NOT resurrect
+        // the Ended tab (reinstalling a live engine/transport outside fleet
+        // accounting) — the exact leak finding 3 targets. The other attach spawns
+        // (wake/reconnect/adopt/replacement) already re-check the epoch at apply;
+        // the initial `open` spawn must too.
+        cx.run_until_parked();
+        assert_eq!(
+            tab.read_with(cx, |t, _| t.lifecycle),
+            Lifecycle::Ended,
+            "a late initial attach must not resurrect an Ended tab"
+        );
+        tab.read_with(cx, |t, _| {
+            assert!(
+                t.runtime.is_none(),
+                "Ended tab must not hold a runtime after a late attach resolves"
             );
         });
     }
