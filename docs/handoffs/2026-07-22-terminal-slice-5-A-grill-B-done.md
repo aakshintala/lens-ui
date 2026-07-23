@@ -7,21 +7,38 @@
 ## START HERE (cold-boot for a new session)
 
 State on branch `terminal-slice-5-fleetstore` (nothing pushed, tree clean):
-- **B done** (`1bbcdef`) + **C done** (`2c12a91`, incl. an Opus flaky-test fix) +
-  compile-unblock (`9b5c541`) + docs (`c4d25e7`, `1826cc3`). Workspace compiles
-  and per-crate gates are green.
+- **B done** (`1bbcdef`) + **C done** (`2c12a91`) + compile-unblock (`9b5c541`).
+- **B+C cross-family review DONE + fully resolved (2026-07-23).** codex `gpt-5.6`
+  review returned DON'T-MERGE with 4 HIGH blockers + 4 MED/LOW
+  (`docs/reviews/2026-07-23-slice5-BC-codex.md`). All resolved test-first:
+  - `694870b` — findings 1 (control signals off the lossy `OutcomeRing` →
+    reliable `send_blocking`), 2 (`cascade_wake` clears `pending_sleep`), 3 (new
+    `TerminalHostEvent::End` → teardown → `Ended`), 4 (`real-window` feature
+    isolates the harness trigger from `test-util` unification). 5+7 **re-scoped to
+    Slice 6** (no production caller of the FleetStore terminal API exists yet).
+  - `6e169ae` — findings 6 (engine 2-atomic retained-bytes fast path) + 8
+    (lens-drive structured JSON). Composer-authored, Opus-reviewed.
+  - `b12676e` — finding 3 COMPLETION: an **Opus re-review**
+    (`docs/reviews/2026-07-23-slice5-BC-fixes-opus.md`) caught that the initial
+    `open()` attach spawn was unguarded (resurrected an `Ended` tab, re-leaking);
+    now epoch-guarded like the other 4 spawns. Opus re-review otherwise MERGE.
+  - `e5c72fb` — cherry-picked the main-branch terminal-test speed fix (31s→3s).
+  - Gate green: combined `--lib` (client 174 + core 311 + terminal 208 + ui 177),
+    clippy `-D warnings` + fmt clean. Real-window bins no longer activate in the
+    ordinary gate. (Did NOT run real-window harnesses — they hang headless.)
 - **A** = the risky `lens-terminal` lifecycle slice — **grill paused mid-Q1**
   (Q1 below is the first thing to answer). A gates D.
 
 **Do next, in order:**
 1. **Answer Q1** (adoption shape — recommendation: unified `adopt()`) → finish A
-   grill **Q2–Q6** (queued below) → write A plan (TDD tasks).
-2. **Cross-family review of B + C together** — codex `gpt-5.6`, `codex exec
-   -s read-only` (NEVER via Cursor). Both composer-authored; review is MANDATORY
-   before any merge to main. Validate B's 4 + C's 3 judgment calls (each listed in
-   its section). Can run in background while the A grill resumes.
-3. Execute A (composer author + Opus supervision on the frozen seam) →
+   grill **Q2–Q6** (queued below) → write A plan (TDD tasks). A's Q1 is premised on
+   finding 1's reliable control path, which is now fixed + verified.
+2. Execute A (composer author + Opus supervision on the frozen seam) →
    whole-branch review → live rider → land. Then **D** (needs A + B + C).
+
+**REVIEW ROUTING (2026-07-23):** codex/gpt-5.6 quota exhausted for the week — use a
+FRESH Opus subagent (builds+tests) or grok-4.5 via cursor-delegate for reviews, NOT
+`codex exec`. (memory `codex-quota-exhausted-week-2026-07-23`.)
 
 Everything below is the full grounding; the grill skill (`userSettings:grilling`)
 governs Q-by-Q, one question at a time with a recommended answer.
