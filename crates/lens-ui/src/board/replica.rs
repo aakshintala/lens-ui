@@ -24,6 +24,12 @@ pub(crate) enum Op {
         group_id: BoardItemId,
         collapsed: bool,
     },
+    MoveItem {
+        item_id: BoardItemId,
+        new_board_id: BoardId,
+        new_parent: Option<BoardItemId>,
+        new_ordinal: i32,
+    },
 }
 
 enum OpOutcome {
@@ -84,6 +90,7 @@ pub struct BoardReplica {
     pub(crate) dropped_writes: u32,                   // banner honesty (M8)
     pub(crate) banner_dismissed: bool,
     pub(crate) _tempdir: Option<tempfile::TempDir>, // keeps test/demo file alive; None in prod
+    layout_generation: u64,
 }
 
 pub(crate) fn state_is_writable(s: ReplicaState) -> bool {
@@ -137,6 +144,7 @@ impl BoardReplica {
             dropped_writes: 0,
             banner_dismissed: false,
             _tempdir: tempdir,
+            layout_generation: 0,
         };
         cx.observe(&this.fleet.clone(), |this: &mut Self, _f, cx| {
             this.on_fleet_change(cx)
@@ -219,6 +227,10 @@ impl BoardReplica {
         self.state
     }
 
+    pub fn layout_generation(&self) -> u64 {
+        self.layout_generation
+    }
+
     pub fn banner_dismissed(&self) -> bool {
         self.banner_dismissed
     }
@@ -248,6 +260,10 @@ impl BoardReplica {
                     continue;
                 }
                 Some(Op::SetCollapsed { .. }) if !self.is_writable() => {
+                    self.dropped_writes = self.dropped_writes.saturating_add(1);
+                    continue;
+                }
+                Some(Op::MoveItem { .. }) if !self.is_writable() => {
                     self.dropped_writes = self.dropped_writes.saturating_add(1);
                     continue;
                 }
@@ -288,6 +304,7 @@ impl BoardReplica {
                 // instead of being hidden by an earlier dismissal (codex final-review #6).
                 self.banner_dismissed = false;
                 self.layout = Arc::new(layout);
+                self.layout_generation = self.layout_generation.wrapping_add(1);
                 self.state = load_state(mode, skipped_empty);
                 if self.is_writable() {
                     self.reconcile(cx); // initial/post-recovery reconcile (Task 6)
@@ -300,6 +317,7 @@ impl BoardReplica {
             } => {
                 self.op_retries = 0;
                 self.layout = Arc::new(layout);
+                self.layout_generation = self.layout_generation.wrapping_add(1);
                 self.state = load_state(mode, skipped_empty); // ~always Writable; consistent
                 self.reconcile_in_flight = false;
                 self.note_place_result(); // suppress stuck keys (Task 6, C1)
@@ -312,6 +330,7 @@ impl BoardReplica {
             } => {
                 self.op_retries = 0;
                 self.layout = Arc::new(layout);
+                self.layout_generation = self.layout_generation.wrapping_add(1);
                 self.state = load_state(mode, skipped_empty);
             }
             OpOutcome::Failed { op, err } => {
@@ -421,6 +440,9 @@ impl BoardReplica {
             }
             Op::SetCollapsed { .. } => {
                 self.state = ReplicaState::Stale; // keep current layout
+            }
+            Op::MoveItem { .. } => {
+                self.state = ReplicaState::Stale;
             }
         }
         // Persistent failure: queued writes won't succeed on replay — drop (banner names them).
@@ -549,6 +571,20 @@ fn run_op_inner(slot: &mut StoreSlot, op: &Op) -> lens_core::persist::Result<OpO
             collapsed,
         } => {
             store.set_collapsed(group_id, *collapsed)?; // persist (idempotent, absolute value)
+            let (layout, skipped_empty, mode) = read_committed(store)?;
+            Ok(OpOutcome::Wrote {
+                layout,
+                skipped_empty,
+                mode,
+            })
+        }
+        Op::MoveItem {
+            item_id,
+            new_board_id,
+            new_parent,
+            new_ordinal,
+        } => {
+            store.move_item(item_id, new_board_id, new_parent.clone(), *new_ordinal)?;
             let (layout, skipped_empty, mode) = read_committed(store)?;
             Ok(OpOutcome::Wrote {
                 layout,
@@ -825,6 +861,215 @@ mod tests {
         // Contract (§5): a rejected user write is COUNTED so the banner names the loss
         // (codex final-review Important #2). It is never silently dropped.
         replica.read_with(cx, |r, _| assert_eq!(r.dropped_writes(), before + 1));
+    }
+
+    fn top_level_card_ids(layout: &BoardLayout) -> Vec<BoardItemId> {
+        let mut cards: Vec<(i32, BoardItemId)> = layout
+            .items
+            .iter()
+            .filter(|i| i.parent_item_id.is_none())
+            .filter_map(|i| match &i.kind {
+                BoardItemKind::Card { .. } => Some((i.ordinal, i.id.clone())),
+                _ => None,
+            })
+            .collect();
+        cards.sort_by_key(|(ord, _)| *ord);
+        cards.into_iter().map(|(_, id)| id).collect()
+    }
+
+    #[gpui::test]
+    async fn move_item_round_trips_reorder_and_persists(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.db");
+        {
+            let store = SqliteBoardStore::open(&path).unwrap();
+            let c = ConnectionId::new("conn_test");
+            let target = PlacementTarget {
+                board_id: None,
+                parent_item_id: None,
+                ordinal: None,
+            };
+            store
+                .place_session(&c, &SessionId::new("a"), &target)
+                .unwrap();
+            store
+                .place_session(&c, &SessionId::new("b"), &target)
+                .unwrap();
+        }
+        let fleet = cx.update(test_fleet);
+        let replica = cx
+            .update(|cx| cx.new(|cx| BoardReplica::for_test_file(fleet.clone(), path.clone(), cx)));
+        cx.run_until_parked();
+        let (id0, id1, board_id) = replica.read_with(cx, |r, _| {
+            let ids = top_level_card_ids(&r.layout());
+            assert_eq!(ids.len(), 2);
+            (
+                ids[0].clone(),
+                ids[1].clone(),
+                r.layout().default_board_id().unwrap().clone(),
+            )
+        });
+        replica.update(cx, |r, cx| {
+            r.write(
+                Op::MoveItem {
+                    item_id: id0.clone(),
+                    new_board_id: board_id.clone(),
+                    new_parent: None,
+                    new_ordinal: 1,
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        replica.read_with(cx, |r, _| {
+            assert_eq!(r.state(), ReplicaState::Writable);
+            assert_eq!(top_level_card_ids(&r.layout()), vec![id1.clone(), id0.clone()]);
+        });
+        let fleet2 = cx.update(test_fleet);
+        let replica2 =
+            cx.update(|cx| cx.new(|cx| BoardReplica::for_test_file(fleet2, path.clone(), cx)));
+        cx.run_until_parked();
+        replica2.read_with(cx, |r, _| {
+            assert_eq!(top_level_card_ids(&r.layout()), vec![id1, id0]);
+        });
+    }
+
+    #[gpui::test]
+    async fn move_item_round_trips_into_and_out_of_group(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.db");
+        let gid = {
+            let store = SqliteBoardStore::open(&path).unwrap();
+            let board_id = BoardId::new(DEFAULT_BOARD_ID);
+            let gid = store.create_group(&board_id, None, 0, "G").unwrap();
+            let c = ConnectionId::new("conn_test");
+            store
+                .place_session(
+                    &c,
+                    &SessionId::new("loose"),
+                    &PlacementTarget {
+                        board_id: None,
+                        parent_item_id: None,
+                        ordinal: None,
+                    },
+                )
+                .unwrap();
+            gid
+        };
+        let fleet = cx.update(test_fleet);
+        let replica = cx
+            .update(|cx| cx.new(|cx| BoardReplica::for_test_file(fleet.clone(), path.clone(), cx)));
+        cx.run_until_parked();
+        let (card_id, board_id) = replica.read_with(cx, |r, _| {
+            let layout = r.layout();
+            let board_id = layout.default_board_id().unwrap().clone();
+            let card_id = layout
+                .items
+                .iter()
+                .find(|it| matches!(it.kind, BoardItemKind::Card { .. }))
+                .map(|it| it.id.clone())
+                .expect("seeded card");
+            (card_id, board_id)
+        });
+        replica.update(cx, |r, cx| {
+            r.write(
+                Op::MoveItem {
+                    item_id: card_id.clone(),
+                    new_board_id: board_id.clone(),
+                    new_parent: Some(gid.clone()),
+                    new_ordinal: 0,
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        replica.read_with(cx, |r, _| {
+            let layout = r.layout();
+            let it = layout.item(&card_id).unwrap();
+            assert_eq!(it.parent_item_id.as_ref(), Some(&gid));
+        });
+        replica.update(cx, |r, cx| {
+            r.write(
+                Op::MoveItem {
+                    item_id: card_id.clone(),
+                    new_board_id: board_id.clone(),
+                    new_parent: None,
+                    new_ordinal: 0,
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        replica.read_with(cx, |r, _| {
+            assert!(r.layout().item(&card_id).unwrap().parent_item_id.is_none());
+        });
+    }
+
+    #[gpui::test]
+    async fn move_item_refused_when_non_writable(cx: &mut gpui::TestAppContext) {
+        let fleet = cx.update(test_fleet);
+        let replica = cx.update(|cx| {
+            cx.new(|cx| BoardReplica::for_test_file(fleet, "/dev/null/nope.db".into(), cx))
+        });
+        cx.run_until_parked();
+        let before = replica.read_with(cx, |r, _| {
+            assert_eq!(r.state(), ReplicaState::LoadFailed);
+            r.dropped_writes()
+        });
+        let disp = replica.update(cx, |r, cx| {
+            r.write(
+                Op::MoveItem {
+                    item_id: BoardItemId::new("i_x"),
+                    new_board_id: BoardId::new(DEFAULT_BOARD_ID),
+                    new_parent: None,
+                    new_ordinal: 0,
+                },
+                cx,
+            )
+        });
+        assert!(matches!(
+            disp,
+            WriteDisposition::Rejected(ReplicaState::LoadFailed)
+        ));
+        replica.read_with(cx, |r, _| assert_eq!(r.dropped_writes(), before + 1));
+    }
+
+    #[gpui::test]
+    async fn move_item_idempotent_rerun_is_noop(cx: &mut gpui::TestAppContext) {
+        let fleet = cx.update(test_fleet);
+        let replica = cx.update(|cx| cx.new(|cx| BoardReplica::for_test(fleet.clone(), cx)));
+        cx.run_until_parked();
+        let c = ConnectionId::new("conn_test");
+        replica.update(cx, |r, cx| {
+            r.run_op(Op::PlaceSessions(vec![(c.clone(), SessionId::new("a"))]), cx);
+            r.run_op(Op::PlaceSessions(vec![(c.clone(), SessionId::new("b"))]), cx);
+        });
+        cx.run_until_parked();
+        let (item_id, board_id, order_before) = replica.read_with(cx, |r, _| {
+            let ids = top_level_card_ids(&r.layout());
+            (
+                ids[0].clone(),
+                r.layout().default_board_id().unwrap().clone(),
+                ids,
+            )
+        });
+        let make_op = || Op::MoveItem {
+            item_id: item_id.clone(),
+            new_board_id: board_id.clone(),
+            new_parent: None,
+            new_ordinal: 0,
+        };
+        replica.update(cx, |r, cx| {
+            r.write(make_op(), cx);
+        });
+        cx.run_until_parked();
+        replica.update(cx, |r, cx| {
+            r.write(make_op(), cx);
+        });
+        cx.run_until_parked();
+        replica.read_with(cx, |r, _| {
+            assert_eq!(top_level_card_ids(&r.layout()), order_before);
+        });
     }
 
     #[gpui::test]
