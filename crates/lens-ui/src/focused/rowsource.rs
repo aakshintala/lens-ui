@@ -57,7 +57,10 @@ pub enum RowContent {
         source: String,
         content_key: ContentKey,
     },
-    UserVerbatim { text: String },
+    UserVerbatim {
+        text: String,
+        content_key: ContentKey,
+    },
     Reasoning {
         summary: String,
         full: String,
@@ -73,7 +76,7 @@ impl RowContent {
         match self {
             RowContent::Stub { text } => text.as_str(),
             RowContent::AssistantMarkdown { source, .. } => source.as_str(),
-            RowContent::UserVerbatim { text } => text.as_str(),
+            RowContent::UserVerbatim { text, .. } => text.as_str(),
             RowContent::Reasoning { full, .. } => full.as_str(),
         }
     }
@@ -911,6 +914,7 @@ pub(crate) fn row_content_for_item(item: &Item) -> RowContent {
                 .filter_map(|block| block.text.as_deref())
                 .collect::<Vec<_>>()
                 .join(""),
+            content_key: ContentKey::from_acc(&AccId::new(item.id.as_str())),
         },
         ItemKind::Message { content, .. } => RowContent::AssistantMarkdown {
             source: crate::md::safe_prefix(
@@ -955,6 +959,7 @@ pub(crate) fn presentation_for_item(item: &Item) -> RowPresentation {
                     .filter_map(|b| b.text.as_deref())
                     .collect::<Vec<_>>()
                     .join(""),
+                content_key: ContentKey::from_acc(&AccId::new(item.id.as_str())),
             },
             collapsed: false,
             height_hint: None,

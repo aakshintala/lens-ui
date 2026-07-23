@@ -1,4 +1,4 @@
-use gpui::{div, prelude::*, App, IntoElement, ParentElement, Styled, Window};
+use gpui::{div, prelude::*, App, IntoElement, ParentElement, SharedString, Styled, Window};
 
 use crate::focused::autolink::{scan_prose_autolinks, AutolinkTarget};
 use crate::focused::content_events::emit_navigate_to_file;
@@ -32,13 +32,24 @@ pub fn split_user_segments(text: &str) -> Vec<UserSegment> {
             } else {
                 lang_end
             };
-            let close = text[body_start..]
-                .find("\n```")
-                .map(|p| body_start + p + 1)
-                .unwrap_or(text.len());
-            let body = text[body_start..close].to_string();
+            let (close, body) = if text[body_start..].starts_with("```") {
+                (body_start, String::new())
+            } else {
+                let close = text[body_start..]
+                    .find("\n```")
+                    .map(|p| body_start + p + 1)
+                    .unwrap_or(text.len());
+                let body = text[body_start..close].to_string();
+                (close, body)
+            };
             out.push(UserSegment::Fenced { lang, body });
-            i = if close < text.len() { close + 4 } else { text.len() };
+            i = if text[body_start..].starts_with("```") {
+                body_start + 3
+            } else if close < text.len() {
+                close + 4
+            } else {
+                text.len()
+            };
             continue;
         }
         if text[i..].starts_with('`') {
@@ -64,8 +75,12 @@ pub(crate) fn link_verdict_for_autolink(target: &AutolinkTarget) -> LinkVerdict 
     validate_link_url(&autolink_ref(target))
 }
 
-fn autolink_element_id(seg_ix: usize, hit_ix: usize) -> (&'static str, u64) {
-    ("ual", ((seg_ix as u64) << 32) | hit_ix as u64)
+fn autolink_element_id(base: &str, seg_ix: usize, hit_ix: usize) -> SharedString {
+    SharedString::from(format!("{base}-ual-{seg_ix}-{hit_ix}"))
+}
+
+fn user_md_fence_key(base: &str, seg_ix: usize) -> ContentKey {
+    ContentKey::from_label(format!("{base}-user-md-{seg_ix}"))
 }
 
 fn autolink_ref(target: &AutolinkTarget) -> String {
@@ -83,14 +98,20 @@ pub fn render_user_content(
     window: &mut Window,
     cx: &mut App,
 ) -> gpui::AnyElement {
-    let RowContent::UserVerbatim { text } = content else {
+    let RowContent::UserVerbatim { text, content_key } = content else {
         return div().into_any_element();
     };
+    let base = content_key.as_element_id();
     let mut root = div().flex().flex_col().gap_1();
     for (seg_ix, seg) in split_user_segments(text).into_iter().enumerate() {
         match seg {
             UserSegment::Prose(prose) => {
-                root = root.child(render_prose_with_autolinks(&prose, seg_ix, cx));
+                root = root.child(render_prose_with_autolinks(
+                    &prose,
+                    base.as_str(),
+                    seg_ix,
+                    cx,
+                ));
             }
             UserSegment::InlineCode(code) => {
                 root = root.child(div().font_family("monospace").child(code));
@@ -99,7 +120,7 @@ pub fn render_user_content(
                 let lang_l = lang.as_deref().map(|s| s.to_ascii_lowercase());
                 match lang_l.as_deref() {
                     Some("md") | Some("markdown") => {
-                        let key = ContentKey::from_label(format!("user-md-{seg_ix}"));
+                        let key = user_md_fence_key(base.as_str(), seg_ix);
                         root = root.child(
                             MarkdownView::new(key.as_element_id(), body, window, cx)
                                 .scrollable(false)
@@ -124,7 +145,12 @@ pub fn render_user_content(
     root.into_any_element()
 }
 
-fn render_prose_with_autolinks(prose: &str, seg_ix: usize, _cx: &mut App) -> gpui::AnyElement {
+fn render_prose_with_autolinks(
+    prose: &str,
+    base: &str,
+    seg_ix: usize,
+    _cx: &mut App,
+) -> gpui::AnyElement {
     let hits = scan_prose_autolinks(prose);
     if hits.is_empty() {
         return div()
@@ -148,7 +174,7 @@ fn render_prose_with_autolinks(prose: &str, seg_ix: usize, _cx: &mut App) -> gpu
                 let url = ref_str;
                 row = row.child(
                     div()
-                        .id(autolink_element_id(seg_ix, hit_ix))
+                        .id(autolink_element_id(base, seg_ix, hit_ix))
                         .cursor_pointer()
                         .text_decoration_1()
                         .child(label)
@@ -162,7 +188,7 @@ fn render_prose_with_autolinks(prose: &str, seg_ix: usize, _cx: &mut App) -> gpu
             LinkVerdict::NavigateToFile { path, line } => {
                 row = row.child(
                     div()
-                        .id(autolink_element_id(seg_ix, hit_ix))
+                        .id(autolink_element_id(base, seg_ix, hit_ix))
                         .cursor_pointer()
                         .text_decoration_1()
                         .child(label)
@@ -239,6 +265,33 @@ mod tests {
                 lang: None,
                 body: "plain\n".into(),
             }]
+        );
+    }
+
+    #[test]
+    fn empty_md_fence_has_empty_body() {
+        let segs = split_user_segments("```md\n```");
+        assert_eq!(
+            segs,
+            vec![UserSegment::Fenced {
+                lang: Some("md".into()),
+                body: String::new(),
+            }]
+        );
+    }
+
+    #[test]
+    fn user_md_fence_key_is_row_namespaced() {
+        use lens_core::domain::ids::AccId;
+
+        let k_a = ContentKey::from_acc(&AccId::new("item_a"));
+        let k_b = ContentKey::from_acc(&AccId::new("item_b"));
+        let md_a = user_md_fence_key(k_a.as_element_id().as_str(), 0);
+        let md_b = user_md_fence_key(k_b.as_element_id().as_str(), 0);
+        assert_ne!(
+            md_a.as_element_id(),
+            md_b.as_element_id(),
+            "user md-fence keys must be namespaced by row identity (no cross-row keyed-state bleed)"
         );
     }
 
