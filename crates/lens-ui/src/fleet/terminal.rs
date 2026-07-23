@@ -3,6 +3,7 @@
 use crate::fleet::store::FleetStore;
 use gpui::{Context, Entity, Subscription};
 use lens_client::Client;
+use lens_core::actor::TerminalResourceSignal;
 use lens_core::domain::ids::SessionId;
 use lens_terminal::{
     Lifecycle, TerminalEvent, TerminalHostEvent, TerminalKey, TerminalOpenOptions, TerminalTab,
@@ -12,6 +13,15 @@ use std::sync::Arc;
 
 /// Provisional hidden-idle threshold (~10 min) in [`crate::clock::UiClock`] millis.
 pub const TERMINAL_IDLE_SLEEP_THRESHOLD_MS: u64 = 10 * 60 * 1000;
+
+/// Session-level control signals `FleetStore` owns (design §4.1). The poller
+/// converts the two `ActorOutcome` control variants into this typed form so the
+/// store never matches outcomes it does not own, and so the
+/// `target_conversation_id: String -> SessionId` conversion happens once.
+pub(crate) enum SessionControl {
+    Superseded { target: SessionId, reason: String },
+    TerminalResource(TerminalResourceSignal),
+}
 
 /// Fleet memory-pressure signal (Slice 6 wires the OS source).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -149,6 +159,61 @@ impl FleetStore {
             for member in map.into_values() {
                 end_member_tab(&member, cx);
             }
+        }
+    }
+
+    /// Entry point for session-level control outcomes routed by the poller.
+    pub(crate) fn on_session_control(
+        &mut self,
+        session_id: &SessionId,
+        signal: SessionControl,
+        cx: &mut Context<Self>,
+    ) {
+        match signal {
+            SessionControl::TerminalResource(signal) => {
+                self.forward_terminal_resource(session_id, signal, cx);
+            }
+            SessionControl::Superseded { target, reason } => {
+                // Task 5 replaces this body with load-B + move + Transfer.
+                let _ = (target, reason);
+            }
+        }
+    }
+
+    /// Fan a resource signal out to every terminal owned by `session_id`. The
+    /// tab filters to its own identity (Slice-4 contract), so a broadcast to
+    /// the session's terminals is correct and keeps the store free of
+    /// terminal-identity logic.
+    fn forward_terminal_resource(
+        &mut self,
+        session_id: &SessionId,
+        signal: TerminalResourceSignal,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(inner) = self.terminals.get(session_id) else {
+            return;
+        };
+        let event = match signal {
+            TerminalResourceSignal::Created {
+                terminal_id,
+                terminal_name,
+                session_key,
+                session_id,
+            } => TerminalHostEvent::ResourceCreated {
+                session_id,
+                terminal_id,
+                terminal_name,
+                session_key,
+            },
+            TerminalResourceSignal::Deleted { terminal_id } => {
+                TerminalHostEvent::ResourceDeleted { terminal_id }
+            }
+        };
+        let tabs: Vec<_> = inner.values().map(|m| m.tab.clone()).collect();
+        for tab in tabs {
+            tab.update(cx, |tab, cx| {
+                tab.on_host_event(event.clone(), cx);
+            });
         }
     }
 
@@ -416,7 +481,9 @@ fn terminal_key_from_id(id: &TerminalKeyId) -> TerminalKey {
 mod tests {
     use super::*;
     use crate::clock::ManualUiClock;
-    use lens_terminal::{EngineConfig, EngineHandle, PER_CELL_BYTES};
+    use lens_client::ids::TerminalId;
+    use lens_core::actor::TerminalResourceSignal;
+    use lens_terminal::{EngineConfig, EngineHandle, PER_CELL_BYTES, TerminalHostEvent};
     use std::sync::Arc;
 
     fn test_engine_cfg() -> EngineConfig {
@@ -1098,6 +1165,98 @@ mod tests {
                 Lifecycle::Ended,
                 "the replacement tab must stay live"
             );
+        });
+    }
+
+    #[gpui::test]
+    async fn resource_signal_forwards_to_owned_terminals_only(cx: &mut gpui::TestAppContext) {
+        let clock = Arc::new(ManualUiClock::new(1_000));
+        let store = cx.update(|cx| FleetStore::new(clock.clone(), cx));
+
+        let sess_a = SessionId::new("conv_a");
+        let sess_b = SessionId::new("conv_b");
+        let key_a = test_key("main", "sk_a");
+        let key_b = test_key("main", "sk_b");
+
+        let (_e1, tab_a) = spawn_tab_with_rows(cx, 0);
+        let (_e2, tab_b) = spawn_tab_with_rows(cx, 0);
+        cx.update(|cx| {
+            store.update(cx, |store, cx| {
+                store.insert_terminal_for_test(sess_a.clone(), key_a.clone(), tab_a.clone(), cx);
+                store.insert_terminal_for_test(sess_b.clone(), key_b.clone(), tab_b.clone(), cx);
+            });
+        });
+
+        let signal = TerminalResourceSignal::Deleted {
+            terminal_id: TerminalId::new("term_1"),
+        };
+        cx.update(|cx| {
+            store.update(cx, |store, cx| {
+                store.on_session_control(&sess_a, SessionControl::TerminalResource(signal), cx);
+            });
+        });
+
+        cx.update(|cx| {
+            let a_events = tab_a.read(cx).host_events_for_test().to_vec();
+            assert_eq!(
+                a_events.len(),
+                1,
+                "owned terminal got exactly one host event"
+            );
+            assert!(
+                matches!(a_events[0], TerminalHostEvent::ResourceDeleted { .. }),
+                "owned terminal got ResourceDeleted, got {:?}",
+                a_events[0]
+            );
+            assert!(
+                tab_b.read(cx).host_events_for_test().is_empty(),
+                "a terminal owned by a DIFFERENT session must not be forwarded to"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn resource_created_forwards_full_identity(cx: &mut gpui::TestAppContext) {
+        let clock = Arc::new(ManualUiClock::new(1_000));
+        let store = cx.update(|cx| FleetStore::new(clock.clone(), cx));
+        let sess = SessionId::new("conv_a");
+        let key = test_key("main", "sk_a");
+        let (_e, tab) = spawn_tab_with_rows(cx, 0);
+        cx.update(|cx| {
+            store.update(cx, |store, cx| {
+                store.insert_terminal_for_test(sess.clone(), key.clone(), tab.clone(), cx);
+            });
+        });
+
+        let signal = TerminalResourceSignal::Created {
+            terminal_id: TerminalId::new("term_9"),
+            terminal_name: "main".into(),
+            session_key: "sk_a".into(),
+            session_id: sess.clone(),
+        };
+        cx.update(|cx| {
+            store.update(cx, |store, cx| {
+                store.on_session_control(&sess, SessionControl::TerminalResource(signal), cx);
+            });
+        });
+
+        cx.update(|cx| {
+            let events = tab.read(cx).host_events_for_test().to_vec();
+            assert_eq!(events.len(), 1);
+            match &events[0] {
+                TerminalHostEvent::ResourceCreated {
+                    session_id,
+                    terminal_id,
+                    terminal_name,
+                    session_key,
+                } => {
+                    assert_eq!(session_id, &sess);
+                    assert_eq!(terminal_id.as_str(), "term_9");
+                    assert_eq!(terminal_name, "main");
+                    assert_eq!(session_key, "sk_a");
+                }
+                other => panic!("expected ResourceCreated, got {other:?}"),
+            }
         });
     }
 

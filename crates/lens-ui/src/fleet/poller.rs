@@ -1,6 +1,7 @@
 use crate::card::model::{ConnectionOverlay, READY_DECAY_MS, SessionCard};
 use crate::clock::UiClock;
 use crate::fleet::store::FleetStore;
+use crate::fleet::terminal::SessionControl;
 use futures::future::{Either, select};
 use futures::pin_mut;
 use gpui::{App, Task, WeakEntity};
@@ -97,6 +98,23 @@ pub fn spawn_session_poller(
                                         reconcile_in_flight,
                                         cx,
                                     ),
+                                    ActorOutcome::Superseded {
+                                        target_conversation_id,
+                                        reason,
+                                    } => store.on_session_control(
+                                        &session_id,
+                                        SessionControl::Superseded {
+                                            target: SessionId::new(target_conversation_id),
+                                            reason,
+                                        },
+                                        cx,
+                                    ),
+                                    ActorOutcome::TerminalResource(signal) => store
+                                        .on_session_control(
+                                            &session_id,
+                                            SessionControl::TerminalResource(signal),
+                                            cx,
+                                        ),
                                     other => {
                                         if let Some(card) = &card {
                                             card.update(cx, |card, _cx| {
@@ -142,9 +160,8 @@ fn apply_outcome(card: &mut SessionCard, outcome: ActorOutcome) {
         | ActorOutcome::Slept
         | ActorOutcome::SleepDeclined
         | ActorOutcome::Command(_) => {}
-        // Terminal-5 sub-slice B added these control outcomes; sub-slice D routes
-        // them into FleetStore (load-B/re-parent/Transfer + resource forwarding).
-        // No-op interim so lens-ui compiles between B and D.
+        // Routed by the poller to FleetStore::on_session_control (sub-slice D);
+        // these never reach the card-bound outcome path. Arm kept for exhaustiveness.
         ActorOutcome::Superseded { .. } | ActorOutcome::TerminalResource(_) => {}
     }
 }
