@@ -2,8 +2,23 @@
 
 use crate::actor::api::CommandOutcome;
 use crate::actor::transport::{ActorTransport, ParkReason};
+use crate::domain::ids::{SessionId, TerminalId};
 use lens_client::error::ClientError;
 use std::collections::VecDeque;
+
+/// Session-level control signal for terminal resource lifecycle (Slice 5).
+#[derive(Clone, Debug, PartialEq)]
+pub enum TerminalResourceSignal {
+    Created {
+        terminal_id: TerminalId,
+        terminal_name: String,
+        session_key: String,
+        session_id: SessionId,
+    },
+    Deleted {
+        terminal_id: TerminalId,
+    },
+}
 
 /// Unified actor → foreground outcome channel. `Parked` is the sole terminal
 /// disconnect outcome — the actor thread exits and recovery is a fresh respawn.
@@ -32,6 +47,13 @@ pub enum ActorOutcome {
         lens_pending_id: String,
         content: String,
     },
+    /// Session superseded (e.g. `/clear` rotation) — FleetStore control path.
+    Superseded {
+        target_conversation_id: String,
+        reason: String,
+    },
+    /// Terminal resource created/deleted — FleetStore control path.
+    TerminalResource(TerminalResourceSignal),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -2,7 +2,7 @@
 //! persist write-through, coalesce, emit to the foreground bridge.
 
 use crate::actor::api::{CommandOutcome, SessionApi};
-use crate::actor::feed::ActorFeed;
+use crate::actor::feed::{self, ActorFeed};
 use crate::actor::outcome::{ActorOutcome, Mapped, OutcomeRing, map_client_error};
 use crate::actor::summary::SummaryUpdate;
 use crate::actor::transport::{ActorTransport, ParkReason};
@@ -699,7 +699,12 @@ fn apply_reduced_batch(
             let had_snapshot = batch
                 .iter()
                 .any(|u| matches!(u, StreamUpdate::SnapshotRestored(_)));
-            for u in coalesce(batch) {
+            for u in batch.iter() {
+                if let Some(outcome) = feed::control_outcome_from_update(u) {
+                    ctx.ring.push(outcome);
+                }
+            }
+            for u in coalesce(feed::feed_updates(batch)) {
                 if ctx
                     .output
                     .feed
@@ -722,6 +727,11 @@ fn apply_reduced_batch(
             }
         }
         OutputMode::Summary => {
+            for u in batch.iter() {
+                if let Some(outcome) = feed::control_outcome_from_update(u) {
+                    ctx.ring.push(outcome);
+                }
+            }
             if ctx
                 .output
                 .feed
@@ -1180,6 +1190,9 @@ fn persist_scalars(
             StreamUpdate::ScratchChanged(_)
             | StreamUpdate::ChildSessionChanged
             | StreamUpdate::ResourcesChanged
+            | StreamUpdate::Superseded { .. }
+            | StreamUpdate::TerminalResourceCreated { .. }
+            | StreamUpdate::TerminalResourceDeleted { .. }
             | StreamUpdate::PendingUserChanged(_)
             | StreamUpdate::Reconnecting { .. }
             | StreamUpdate::Reconnected { .. }

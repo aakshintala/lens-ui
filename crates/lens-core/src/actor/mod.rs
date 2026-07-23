@@ -11,7 +11,7 @@ mod transport;
 
 pub use api::{ClientSessionApi, CommandOutcome, SessionApi};
 pub use feed::ActorFeed;
-pub use outcome::ActorOutcome;
+pub use outcome::{ActorOutcome, TerminalResourceSignal};
 pub use runloop::{
     ActorHandle, ActorStores, OutputMode, SessionCommand, spawn_actor, spawn_actor_dual,
 };
