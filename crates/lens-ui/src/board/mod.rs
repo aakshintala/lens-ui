@@ -1,4 +1,5 @@
 pub mod replica;
+mod drag;
 mod rollup;
 
 pub use replica::{BoardReplica, ReplicaState, WriteDisposition};
