@@ -1,11 +1,13 @@
 //! gpui `list()` render surface for the focused transcript (T-2 §7).
 
-use crate::focused::{FocusedTranscript, RowContent, RowKind, RowPresentation};
+use crate::focused::reasoning::{ReasoningUiState, render_reasoning};
+use crate::focused::{ContentKey, FocusedTranscript, RowContent, RowKind, RowPresentation};
 use crate::md::MarkdownView;
 use gpui::{
     App, ClickEvent, Context, Entity, FocusHandle, IntoElement, ListOffset, ListScrollEvent,
-    ParentElement, Render, Styled, Window, div, list, prelude::*, px,
+    ParentElement, Render, Styled, WeakEntity, Window, div, list, prelude::*, px,
 };
+use std::collections::HashMap;
 
 /// Auto-follow ↔ paused (§16 contract 1).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -22,6 +24,8 @@ pub struct FocusedTranscriptView {
     rows_at_pause: usize,
     last_row_count: usize,
     focus_handle: FocusHandle,
+    /// Per-reasoning-row expand flag (default collapsed when finalized).
+    reasoning_expanded: HashMap<ContentKey, bool>,
 }
 
 impl FocusedTranscriptView {
@@ -43,6 +47,7 @@ impl FocusedTranscriptView {
             rows_at_pause: row_count,
             last_row_count: row_count,
             focus_handle,
+            reasoning_expanded: HashMap::new(),
         }
     }
 
@@ -147,8 +152,10 @@ impl FocusedTranscriptView {
     }
 
     fn render_row(
+        reasoning_expanded: &HashMap<ContentKey, bool>,
         pres: &RowPresentation,
         ix: usize,
+        view_weak: WeakEntity<Self>,
         window: &mut Window,
         cx: &mut App,
     ) -> gpui::AnyElement {
@@ -159,7 +166,45 @@ impl FocusedTranscriptView {
             RowContent::UserVerbatim { .. } => {
                 crate::focused::user_content::render_user_content(&pres.content, window, cx)
             }
-            RowContent::Reasoning { .. } => Self::render_stub_row(pres, ix),
+            RowContent::Reasoning {
+                live,
+                encrypted,
+                duration_secs,
+                content_key,
+                ..
+            } => {
+                let ui = if *encrypted {
+                    ReasoningUiState::Encrypted {
+                        duration_secs: *duration_secs,
+                    }
+                } else if *live {
+                    ReasoningUiState::LiveExpanded
+                } else if reasoning_expanded
+                    .get(content_key)
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    ReasoningUiState::SummaryExpanded
+                } else {
+                    ReasoningUiState::Collapsed {
+                        duration_secs: *duration_secs,
+                    }
+                };
+                let on_expand = if *encrypted || *live {
+                    None
+                } else {
+                    let content_key = content_key.clone();
+                    Some(Box::new(move |cx: &mut App| {
+                        view_weak
+                            .update(cx, |view, cx| {
+                                view.reasoning_expanded.insert(content_key.clone(), true);
+                                cx.notify();
+                            })
+                            .ok();
+                    }) as Box<dyn Fn(&mut App) + 'static>)
+                };
+                render_reasoning(&pres.content, ui, on_expand, window, cx)
+            }
             RowContent::Stub { .. } => Self::render_stub_row(pres, ix),
         }
     }
@@ -224,14 +269,21 @@ impl Render for FocusedTranscriptView {
         let weak = cx.weak_entity();
         // Scroll events fire from input, outside the render/update pass, so a direct weak.update
         // is not re-entrant (the re-entrancy panic was the replica observer, fixed in `new`).
-        list_state.set_scroll_handler(move |event: &ListScrollEvent, _, app| {
-            weak.update(app, |view, cx| view.on_scroll_event(event, cx))
-                .ok();
+        list_state.set_scroll_handler({
+            let weak = weak.clone();
+            move |event: &ListScrollEvent, _, app| {
+                weak.update(app, |view, cx| view.on_scroll_event(event, cx))
+                    .ok();
+            }
         });
 
         let replica = self.replica.clone();
+        let view_weak = weak.clone();
+        let reasoning_expanded = self.reasoning_expanded.clone();
         let list_el = list(list_state, move |ix, window, app| {
             let replica = replica.clone();
+            let view_weak = view_weak.clone();
+            let reasoning_expanded = reasoning_expanded.clone();
             let Some(id) = replica.read(app).rows().id_at(ix) else {
                 return div().into_any_element();
             };
@@ -239,7 +291,14 @@ impl Render for FocusedTranscriptView {
                 return div().into_any_element();
             };
             let pres = entity.read(app).presentation.clone();
-            FocusedTranscriptView::render_row(&pres, ix, window, app)
+            Self::render_row(
+                &reasoning_expanded,
+                &pres,
+                ix,
+                view_weak,
+                window,
+                app,
+            )
         })
         .size_full();
 

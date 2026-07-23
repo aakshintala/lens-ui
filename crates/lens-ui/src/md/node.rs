@@ -1128,7 +1128,9 @@ impl Node {
         let node_cx = node_cx.clone();
 
         if list_state.item_count() != children.len() {
+            let prev_offset = list_state.logical_scroll_top();
             list_state.reset(children.len());
+            list_state.scroll_to(prev_offset);
         }
 
         gpui::list(list_state, move |ix, window, cx| {
@@ -1257,5 +1259,26 @@ impl Node {
                 div().into_any_element()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    #[gpui::test]
+    fn render_root_none_list_state_does_not_panic(cx: &mut TestAppContext) {
+        cx.update(|app| crate::md::init(app));
+        let mut vcx = cx.add_empty_window();
+        let root = Node::Root {
+            children: vec![Node::Paragraph(Paragraph::new("hello".into()))],
+        };
+        let node_cx = NodeContext::default();
+        vcx.update(|window, app| {
+            let _ = root
+                .render_root(None, &node_cx, window, app)
+                .into_any_element();
+        });
     }
 }

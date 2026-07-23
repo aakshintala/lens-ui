@@ -5,6 +5,7 @@ pub mod autolink;
 pub mod content_events;
 pub mod reader;
 mod content_key;
+pub mod reasoning;
 mod rowsource;
 mod user_content;
 mod streaming;
