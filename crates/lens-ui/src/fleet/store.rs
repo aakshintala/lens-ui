@@ -74,11 +74,9 @@ pub struct FleetStore {
     /// Bumped on every supersede that starts a load; the async completion
     /// no-ops unless it still matches. Same apply-time-guard discipline as
     /// sub-slice A's `reconnect_epoch`.
-    #[allow(dead_code)] // Task 5 supersede handler reads/writes this.
     pub(crate) supersede_epoch: u64,
     /// Targets with a load in flight — prevents a duplicate/replayed
     /// `Superseded` from double GET/seed/spawning the same session.
-    #[allow(dead_code)] // Task 5 supersede handler reads/writes this.
     pub(crate) supersede_in_flight: std::collections::HashSet<SessionId>,
     focused_replica: Option<(SessionId, Entity<FocusedTranscript>)>,
     focus_generation: u64,

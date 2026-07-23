@@ -174,10 +174,85 @@ impl FleetStore {
                 self.forward_terminal_resource(session_id, signal, cx);
             }
             SessionControl::Superseded { target, reason } => {
-                // Task 5 replaces this body with load-B + move + Transfer.
-                let _ = (target, reason);
+                let _ = reason;
+                self.on_supersede(session_id, target, cx);
             }
         }
+    }
+
+    /// `/clear` rotated session A to a brand-new session B and the server
+    /// transferred the terminal live (same `TerminalId`). To keep the terminal
+    /// we must load B, re-parent the member, and drive a retain-engine
+    /// `Transfer` so scrollback survives (design §10).
+    fn on_supersede(&mut self, from: &SessionId, to: SessionId, cx: &mut Context<Self>) {
+        // Nothing to follow. Slice 5 makes B reachable only for the terminal
+        // follow; the view auto-follow to B is Slice 6.
+        if self.terminals.get(from).is_none_or(|m| m.is_empty()) {
+            return;
+        }
+        // Already tracked (duplicate/replayed signal) — skip straight to the move.
+        if self.cards.contains_key(&to) {
+            self.complete_supersede(from, &to, cx);
+            return;
+        }
+        let Some(loader) = self.session_loader.clone() else {
+            return;
+        };
+        // Dedup: a load for B is already running.
+        if !self.supersede_in_flight.insert(to.clone()) {
+            return;
+        }
+        self.supersede_epoch = self.supersede_epoch.saturating_add(1);
+        let epoch = self.supersede_epoch;
+        let from = from.clone();
+        cx.spawn(async move |store, cx| {
+            // NOTE: this runs AFTER the outer `FleetStore` update has returned,
+            // so `load` is invoked with no active entity update. gpui entity
+            // updates are not re-entrant — invoking `load` inline from
+            // `on_supersede` would panic for any loader that touches the store.
+            let loaded = match cx.update(|cx| loader.load(to.clone(), store.clone(), cx)) {
+                Ok(task) => task.await.is_ok(),
+                Err(_) => false,
+            };
+            let _ = store.update(cx, |store, cx| {
+                store.supersede_in_flight.remove(&to);
+                // Apply-time guard: a newer supersede supersedes this one, and
+                // a failed load must not re-parent into a session that does not
+                // exist. In both cases the member stays under A, where A's
+                // replacement timeout still bounds the tab's wait.
+                if !loaded || store.supersede_epoch != epoch {
+                    return;
+                }
+                store.complete_supersede(&from, &to, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Re-parent A's terminals to B and retarget each tab to B.
+    fn complete_supersede(&mut self, from: &SessionId, to: &SessionId, cx: &mut Context<Self>) {
+        let moved = self.move_terminal_members(from, to, cx);
+        if moved.is_empty() {
+            return;
+        }
+        let tabs: Vec<_> = self
+            .terminals
+            .get(to)
+            .into_iter()
+            .flat_map(|inner| moved.iter().filter_map(|k| inner.get(k)))
+            .map(|m| m.tab.clone())
+            .collect();
+        for tab in tabs {
+            tab.update(cx, |tab, cx| {
+                tab.on_host_event(
+                    TerminalHostEvent::Transfer {
+                        new_session: to.clone(),
+                    },
+                    cx,
+                );
+            });
+        }
+        cx.notify();
     }
 
     /// Fan a resource signal out to every terminal owned by `session_id`. The
@@ -365,7 +440,6 @@ impl FleetStore {
     /// `SessionId`, so the move must build a **fresh** subscription bound to
     /// `to`; otherwise the callback keeps looking the member up under `from`,
     /// where it no longer exists, and deferred `pending_sleep` dies silently.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn move_terminal_members(
         &mut self,
         from: &SessionId,
@@ -537,9 +611,11 @@ fn terminal_key_from_id(id: &TerminalKeyId) -> TerminalKey {
 mod tests {
     use super::*;
     use crate::clock::ManualUiClock;
+    use crate::fleet::loader::FakeSessionLoader;
     use lens_client::ids::TerminalId;
     use lens_core::actor::TerminalResourceSignal;
     use lens_terminal::{EngineConfig, EngineHandle, PER_CELL_BYTES, TerminalHostEvent};
+    use std::rc::Rc;
     use std::sync::Arc;
 
     fn test_engine_cfg() -> EngineConfig {
@@ -1410,5 +1486,211 @@ mod tests {
     #[allow(dead_code)]
     fn _estimate_helper_doc(rows: usize) -> usize {
         estimate_for_rows(rows, 10)
+    }
+
+    #[gpui::test]
+    async fn supersede_loads_b_moves_member_and_drives_transfer(cx: &mut gpui::TestAppContext) {
+        let clock = Arc::new(ManualUiClock::new(5_000));
+        let store = cx.update(|cx| FleetStore::new(clock.clone(), cx));
+        let loader = Rc::new(FakeSessionLoader::new());
+        let sess_a = SessionId::new("conv_a");
+        let sess_b = SessionId::new("conv_b");
+        let key = test_key("main", "sk_a");
+        let (_e, tab) = spawn_tab_with_rows(cx, 0);
+
+        cx.update(|cx| {
+            store.update(cx, |store, cx| {
+                store.set_session_loader(loader.clone());
+                store.insert_terminal_for_test(sess_a.clone(), key.clone(), tab.clone(), cx);
+                store.on_session_control(
+                    &sess_a,
+                    SessionControl::Superseded {
+                        target: sess_b.clone(),
+                        reason: "clear".into(),
+                    },
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        assert_eq!(loader.loaded(), vec![sess_b.clone()], "B was loaded");
+        cx.update(|cx| {
+            let s = store.read(cx);
+            assert!(
+                s.terminal_member_for_test(&sess_a, &key, cx).is_none(),
+                "member left A"
+            );
+            assert!(
+                s.terminal_member_for_test(&sess_b, &key, cx).is_some(),
+                "member re-parented to B under the SAME key (no rekey)"
+            );
+        });
+        cx.update(|cx| {
+            let events = tab.read(cx).host_events_for_test().to_vec();
+            let transfer = events
+                .iter()
+                .find(|e| matches!(e, TerminalHostEvent::Transfer { .. }))
+                .expect("Transfer was driven");
+            match transfer {
+                TerminalHostEvent::Transfer { new_session } => {
+                    assert_eq!(new_session, &sess_b, "Transfer retargets to B");
+                }
+                other => panic!("expected Transfer, got {other:?}"),
+            }
+        });
+    }
+
+    #[gpui::test]
+    async fn supersede_does_not_reparent_when_load_fails(cx: &mut gpui::TestAppContext) {
+        let clock = Arc::new(ManualUiClock::new(5_000));
+        let store = cx.update(|cx| FleetStore::new(clock.clone(), cx));
+        let loader = Rc::new(FakeSessionLoader::failing());
+        let sess_a = SessionId::new("conv_a");
+        let sess_b = SessionId::new("conv_b");
+        let key = test_key("main", "sk_a");
+        let (_e, tab) = spawn_tab_with_rows(cx, 0);
+
+        cx.update(|cx| {
+            store.update(cx, |store, cx| {
+                store.set_session_loader(loader.clone());
+                store.insert_terminal_for_test(sess_a.clone(), key.clone(), tab.clone(), cx);
+                store.on_session_control(
+                    &sess_a,
+                    SessionControl::Superseded {
+                        target: sess_b.clone(),
+                        reason: "clear".into(),
+                    },
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let s = store.read(cx);
+            assert!(
+                s.terminal_member_for_test(&sess_a, &key, cx).is_some(),
+                "load failed -> member stays under A, never orphaned into an unloaded B"
+            );
+            assert!(s.terminal_member_for_test(&sess_b, &key, cx).is_none());
+        });
+        cx.update(|cx| {
+            assert!(
+                !tab.read(cx)
+                    .host_events_for_test()
+                    .iter()
+                    .any(|e| matches!(e, TerminalHostEvent::Transfer { .. })),
+                "no Transfer when B could not be loaded"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn supersede_without_owned_terminals_does_not_load(cx: &mut gpui::TestAppContext) {
+        let clock = Arc::new(ManualUiClock::new(5_000));
+        let store = cx.update(|cx| FleetStore::new(clock.clone(), cx));
+        let loader = Rc::new(FakeSessionLoader::new());
+        let sess_a = SessionId::new("conv_a");
+        let sess_b = SessionId::new("conv_b");
+
+        cx.update(|cx| {
+            store.update(cx, |store, cx| {
+                store.set_session_loader(loader.clone());
+                store.on_session_control(
+                    &sess_a,
+                    SessionControl::Superseded {
+                        target: sess_b.clone(),
+                        reason: "clear".into(),
+                    },
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        assert!(
+            loader.loaded().is_empty(),
+            "no owned terminals -> nothing to follow -> do not load B \
+             (Slice 5 makes B reachable only for the terminal follow; view \
+              auto-follow is Slice 6)"
+        );
+    }
+
+    #[gpui::test]
+    async fn supersede_without_loader_is_a_noop(cx: &mut gpui::TestAppContext) {
+        let clock = Arc::new(ManualUiClock::new(5_000));
+        let store = cx.update(|cx| FleetStore::new(clock.clone(), cx));
+        let sess_a = SessionId::new("conv_a");
+        let sess_b = SessionId::new("conv_b");
+        let key = test_key("main", "sk_a");
+        let (_e, tab) = spawn_tab_with_rows(cx, 0);
+
+        // No set_session_loader call.
+        cx.update(|cx| {
+            store.update(cx, |store, cx| {
+                store.insert_terminal_for_test(sess_a.clone(), key.clone(), tab.clone(), cx);
+                store.on_session_control(
+                    &sess_a,
+                    SessionControl::Superseded {
+                        target: sess_b.clone(),
+                        reason: "clear".into(),
+                    },
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            assert!(
+                store
+                    .read(cx)
+                    .terminal_member_for_test(&sess_a, &key, cx)
+                    .is_some(),
+                "no loader -> member stays under A, never stranded"
+            );
+            assert!(
+                !tab.read(cx)
+                    .host_events_for_test()
+                    .iter()
+                    .any(|e| matches!(e, TerminalHostEvent::Transfer { .. })),
+                "no loader -> no Transfer"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn duplicate_supersede_loads_b_once(cx: &mut gpui::TestAppContext) {
+        let clock = Arc::new(ManualUiClock::new(5_000));
+        let store = cx.update(|cx| FleetStore::new(clock.clone(), cx));
+        let loader = Rc::new(FakeSessionLoader::new());
+        let sess_a = SessionId::new("conv_a");
+        let sess_b = SessionId::new("conv_b");
+        let key = test_key("main", "sk_a");
+        let (_e, tab) = spawn_tab_with_rows(cx, 0);
+
+        cx.update(|cx| {
+            store.update(cx, |store, cx| {
+                store.set_session_loader(loader.clone());
+                store.insert_terminal_for_test(sess_a.clone(), key.clone(), tab.clone(), cx);
+                // Two Superseded signals for the same rotation, back to back, with
+                // no chance to park between them: the second must not start a
+                // second GET/seed/spawn of B.
+                let signal = || SessionControl::Superseded {
+                    target: sess_b.clone(),
+                    reason: "clear".into(),
+                };
+                store.on_session_control(&sess_a, signal(), cx);
+                store.on_session_control(&sess_a, signal(), cx);
+            });
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            loader.loaded(),
+            vec![sess_b.clone()],
+            "B loaded exactly once despite a duplicate Superseded"
+        );
     }
 }

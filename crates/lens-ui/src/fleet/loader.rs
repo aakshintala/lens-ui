@@ -48,7 +48,6 @@ impl FakeSessionLoader {
 
     /// A loader that always fails — proves the store does not re-parent
     /// terminals into a session it could not load.
-    #[allow(dead_code)] // Task 5 supersede tests use failing loader.
     pub(crate) fn failing() -> Self {
         Self {
             loaded: std::cell::RefCell::new(Vec::new()),
