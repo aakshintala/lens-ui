@@ -312,8 +312,17 @@ async fn drive_scroll_probe(
         .unwrap();
 
     // Prepend-anchor contract: backward page must not yank visible content.
+    //
+    // Seed a LARGE tail (200 rows) so that when we scroll up, the anchor lands
+    // with enough content BELOW it to fill the viewport. Otherwise a
+    // Bottom-aligned list snaps `logical_scroll_top` back to `None` (bottom)
+    // during layout whenever the rows below the anchor cannot fill the viewport
+    // (gpui list.rs `ListAlignment::Bottom => logical_scroll_top = None`), and
+    // the prepend contract cannot be observed at all. We also read the
+    // pre-prepend anchor AFTER a settle frame so it reflects the laid-out
+    // (post-snap) position, comparable to the post-prepend read.
     let _ = weak.update_in(&mut wcx, |view, _, cx| {
-        let tail_rows: Vec<_> = (50..90)
+        let tail_rows: Vec<_> = (50..250)
             .map(|i| {
                 row_with_len(
                     i,
@@ -328,7 +337,7 @@ async fn drive_scroll_probe(
                 RangeRead {
                     rows: tail_rows,
                     skipped: vec![],
-                    watermark: Some(89),
+                    watermark: Some(249),
                 },
                 cx,
             );
@@ -337,13 +346,26 @@ async fn drive_scroll_probe(
     });
     wait_frames(&mut wcx, 4).await;
 
-    let anchor_before_prepend = weak
+    // Scroll far up, then settle a frame so the anchor is a stable laid-out
+    // position (not the raw pre-layout `scroll_by` result).
+    let _ = weak.update_in(&mut wcx, |view, _, cx| {
+        view.replica.read(cx).list_state().scroll_by(px(-3000.));
+    });
+    wait_frames(&mut wcx, 4).await;
+
+    let (anchor_before_prepend, row_count_before) = weak
         .update_in(&mut wcx, |view, _, cx| {
-            let list = view.replica.read(cx).list_state();
-            list.scroll_by(px(-500.));
-            AnchorSnapshot::from(list.logical_scroll_top())
+            let replica = view.replica.read(cx);
+            (
+                AnchorSnapshot::from(replica.list_state().logical_scroll_top()),
+                replica.rows().len(),
+            )
         })
         .unwrap();
+    // Guard against a degenerate setup: if the anchor snapped to the bottom
+    // sentinel (item_ix == count), we are not genuinely scrolled up and the
+    // prepend contract would pass vacuously. Surface it as a failure.
+    let scrolled_up_before = anchor_before_prepend.top_item_index < row_count_before;
 
     let resident_lo = weak
         .update_in(&mut wcx, |view, _, cx| view.replica.read(cx).resident_lo())
@@ -364,7 +386,7 @@ async fn drive_scroll_probe(
                 RangeRead {
                     rows: prepend_rows,
                     skipped: vec![],
-                    watermark: Some(89),
+                    watermark: Some(249),
                 },
                 cx,
             );
@@ -411,6 +433,12 @@ async fn drive_scroll_probe(
                 p.failures.push(format!(
                     "paused-not-yanked: anchor shifted {:?} -> {:?}",
                     anchor_before_paused_appends, anchor_after_paused_appends
+                ));
+            }
+            if !scrolled_up_before {
+                p.failures.push(format!(
+                    "prepend-anchor setup: not scrolled up before prepend (anchor {:?}, count {})",
+                    anchor_before_prepend, row_count_before
                 ));
             }
             if p.prepend_anchor_stable != Some(true) {
