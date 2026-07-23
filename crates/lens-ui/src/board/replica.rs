@@ -858,10 +858,7 @@ mod tests {
     }
 
     fn busy_err() -> PersistError {
-        PersistError::Sqlite(rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error::new(5), // SQLITE_BUSY
-            None,
-        ))
+        PersistError::synthetic_busy()
     }
 
     impl BoardStore for FlakyStore {

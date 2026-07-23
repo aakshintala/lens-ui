@@ -252,20 +252,10 @@ fn merge_delta_ranges(existing: &ReadRange, incoming: &ReadRange) -> ReadRange {
 }
 
 fn classify_persist_error(err: PersistError) -> ReadOutcome {
-    if is_sqlite_busy(&err) {
+    if err.is_busy() {
         ReadOutcome::Retryable
     } else {
         ReadOutcome::Fatal(err.to_string())
-    }
-}
-
-fn is_sqlite_busy(err: &PersistError) -> bool {
-    match err {
-        PersistError::Sqlite(e) => matches!(
-            e.sqlite_error_code(),
-            Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
-        ),
-        _ => false,
     }
 }
 
@@ -401,13 +391,7 @@ mod tests {
                 ScriptedOutcome::Ok(read) => Ok(read),
                 ScriptedOutcome::Busy => {
                     self.busy_attempts.fetch_add(1, Ordering::SeqCst);
-                    Err(PersistError::Sqlite(rusqlite::Error::SqliteFailure(
-                        rusqlite::ffi::Error {
-                            code: rusqlite::ErrorCode::DatabaseBusy,
-                            extended_code: rusqlite::ffi::SQLITE_BUSY,
-                        },
-                        Some("database is locked".into()),
-                    )))
+                    Err(PersistError::synthetic_busy())
                 }
                 ScriptedOutcome::Fatal(message) => {
                     Err(PersistError::Io(std::io::Error::other(message)))
@@ -762,16 +746,16 @@ mod tests {
             ScriptedOutcome::Busy,
             ScriptedOutcome::Ok(empty_read()),
         ]);
-        assert!(is_sqlite_busy(
-            &fake
-                .read_range(ReadRange::All)
+        assert!(
+            fake.read_range(ReadRange::All)
                 .expect_err("first read busy")
-        ));
-        assert!(is_sqlite_busy(
-            &fake
-                .read_range(ReadRange::All)
+                .is_busy()
+        );
+        assert!(
+            fake.read_range(ReadRange::All)
                 .expect_err("second read busy")
-        ));
+                .is_busy()
+        );
         assert!(fake.read_range(ReadRange::All).is_ok());
         assert_eq!(fake.busy_attempts.load(Ordering::SeqCst), 2);
     }
