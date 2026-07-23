@@ -1,7 +1,7 @@
 //! Id-keyed retained row store — owned `RowPresentation` per projected block (T-2 §6).
 //! Two-level nesting: `Section` owns child rows; flattening is derived from the collapse flag.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 use gpui::{App, AppContext, Entity, EntityId, ListState};
@@ -514,6 +514,34 @@ impl RowStore {
                 }
             }
         }
+    }
+
+    /// Drop `Entity` handles not referenced by the current projection (§6).
+    pub(crate) fn gc_entities(&mut self, live_stream_tails: &HashSet<AccId>) {
+        let mut retain = HashSet::new();
+        for id in &self.order {
+            retain.insert(id.clone());
+        }
+        for (key, node) in &self.sections {
+            retain.insert(key.chip_id());
+            retain.insert(key.rail_id());
+            for child in &node.children {
+                retain.insert(child.clone());
+            }
+        }
+        for key in self.pending_tail_section.values() {
+            retain.insert(key.chip_id());
+            retain.insert(key.rail_id());
+        }
+        for acc in live_stream_tails {
+            retain.insert(RowId::StreamTail(acc.clone()));
+        }
+        for entry in &self.structure {
+            if let StructureEntry::Marker(id) = entry {
+                retain.insert(id.clone());
+            }
+        }
+        self.entities.retain(|id, _| retain.contains(id));
     }
 
     pub(crate) fn section_containing_child(&self, child: &RowId) -> Option<&SectionKey> {
@@ -1060,6 +1088,75 @@ mod tests {
 
         store.set_response_expanded(&resp_a, true, Some(&list));
         assert_eq!(store.len(), 2);
+    }
+
+    #[gpui::test]
+    fn collapsed_child_entity_survives_gc_and_expand(cx: &mut gpui::TestAppContext) {
+        let resp_a = ResponseId::new("resp_a");
+        let items = [
+            reasoning("r1", Some("resp_a")),
+            call("c1", Some("resp_a"), "call_1"),
+        ];
+        let refs: Vec<&Item> = items.iter().collect();
+        let scratch = lens_core::domain::item::StreamScratch::default();
+        let projected = project(&refs, &scratch, Some(&resp_a));
+        let blocks = group_work_section(projected, Some(&resp_a));
+
+        let mut store = RowStore::new();
+        cx.update(|cx| RowStore::materialize_full(&blocks, &mut store, cx));
+
+        let child_id = RowId::Work(ItemId::new("c1"));
+        let child_entity_before = cx.read(|cx| store.entity_id(&child_id, cx).expect("child"));
+
+        store.set_response_expanded(&resp_a, false, None);
+        store.gc_entities(&HashSet::new());
+
+        let child_entity_collapsed =
+            cx.read(|cx| store.entity_id(&child_id, cx).expect("child after gc"));
+        assert_eq!(
+            child_entity_before, child_entity_collapsed,
+            "collapsed children must survive gc_entities"
+        );
+
+        store.set_response_expanded(&resp_a, true, None);
+        let child_entity_expanded =
+            cx.read(|cx| store.entity_id(&child_id, cx).expect("child after expand"));
+        assert_eq!(
+            child_entity_before, child_entity_expanded,
+            "expand must reuse the same EntityId after gc"
+        );
+    }
+
+    #[gpui::test]
+    fn pending_finalize_stream_tail_survives_gc(cx: &mut gpui::TestAppContext) {
+        let acc = AccId::new("acc_pending_gc");
+        let mut store = RowStore::new();
+        let entity_before = cx.update(|cx| {
+            store.stage_stream_finalize(
+                &acc,
+                RowPresentation {
+                    kind: RowKind::StreamingMessage,
+                    text: "staged".into(),
+                    collapsed: false,
+                    height_hint: None,
+                },
+                None,
+                None,
+                cx,
+            )
+        });
+        let live = HashSet::from([acc.clone()]);
+        store.gc_entities(&live);
+        let entity_after = cx.read(|cx| {
+            store
+                .entity_id(&RowId::StreamTail(acc), cx)
+                .expect("pending tail entity")
+        });
+        assert_eq!(
+            entity_before,
+            Some(entity_after),
+            "mid-finalize StreamTail must survive gc via live_stream_tails"
+        );
     }
 
     /// Pre-fix rail keys used `RowId::Marker(0x8000… | hash)`; reconnect markers share that namespace.

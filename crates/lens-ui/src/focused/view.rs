@@ -67,9 +67,16 @@ impl FocusedTranscriptView {
         self.last_row_count = row_count;
     }
 
-    fn new_since_pause(&self, row_count: usize) -> usize {
+    fn new_since_pause(&self, cx: &App) -> usize {
         if self.follow_mode == FollowMode::Paused {
-            row_count.saturating_sub(self.rows_at_pause)
+            let replica = self.replica.read(cx);
+            let hi = replica.resident_hi();
+            let committed = replica.known_committed();
+            if hi >= 0 && committed > hi {
+                (committed - hi) as usize
+            } else {
+                0
+            }
         } else {
             0
         }
@@ -136,12 +143,12 @@ impl FocusedTranscriptView {
 
     #[doc(hidden)]
     pub fn new_since_pause_for_test(&self, cx: &App) -> usize {
-        self.new_since_pause(self.row_count(cx))
+        self.new_since_pause(cx)
     }
 
     #[doc(hidden)]
     pub fn pill_visible_for_test(&self, cx: &App) -> bool {
-        self.follow_mode == FollowMode::Paused && self.new_since_pause(self.row_count(cx)) > 0
+        self.follow_mode == FollowMode::Paused && self.new_since_pause(cx) > 0
     }
 
     #[doc(hidden)]
@@ -192,7 +199,7 @@ impl Render for FocusedTranscriptView {
         .size_full();
 
         let pill = if self.follow_mode == FollowMode::Paused {
-            let n = self.new_since_pause(row_count);
+            let n = self.new_since_pause(cx);
             if n > 0 {
                 Some(
                     div()
@@ -515,27 +522,12 @@ mod tests {
     }
 
     #[gpui::test]
-    fn follow_mode_pill_n_counts_rows_since_pause(cx: &mut gpui::TestAppContext) {
+    fn follow_mode_pill_n_counts_committed_unresident(cx: &mut gpui::TestAppContext) {
         let replica = new_replica(cx);
         cx.update(|cx| {
-            replica.update(cx, |r, cx| {
-                for i in 0..3 {
-                    let id = RowId::Sibling(ItemId::new(format!("m{i}")));
-                    r.rows_mut().upsert(
-                        id.clone(),
-                        RowPresentation {
-                            kind: RowKind::Message,
-                            text: format!("row {i}"),
-                            collapsed: false,
-                            height_hint: None,
-                        },
-                        cx,
-                    );
-                    r.rows_mut()
-                        .structure
-                        .push(crate::focused::rowsource::StructureEntry::Sibling(id));
-                }
-                r.rows_mut().rebuild_flat_order();
+            replica.update(cx, |r, _| {
+                r.known_committed = 10;
+                r.resident_hi = 7;
             });
         });
         let view = cx.update(|cx| cx.new(|cx| FocusedTranscriptView::new(replica.clone(), cx)));
@@ -543,35 +535,13 @@ mod tests {
         cx.update(|cx| {
             view.update(cx, |v, _| {
                 v.set_follow_mode(FollowMode::Paused, 3);
-                v.note_row_count(3);
             });
-            replica.update(cx, |r, cx| {
-                let prev = r.rows().len();
-                let id = RowId::Sibling(ItemId::new("new1"));
-                r.rows_mut().upsert(
-                    id.clone(),
-                    RowPresentation {
-                        kind: RowKind::Message,
-                        text: "new".into(),
-                        collapsed: false,
-                        height_hint: None,
-                    },
-                    cx,
-                );
-                r.rows_mut()
-                    .structure
-                    .push(crate::focused::rowsource::StructureEntry::Sibling(id));
-                r.rows_mut().rebuild_flat_order();
-                let list = r.list_state().clone();
-                r.rows_mut().sync_list_count(&list, prev);
-            });
-            view.update(cx, |v, _| v.note_row_count(4));
         });
 
         cx.read(|cx| {
             let v = view.read(cx);
             assert_eq!(v.follow_mode(), FollowMode::Paused);
-            assert_eq!(v.new_since_pause_for_test(cx), 1);
+            assert_eq!(v.new_since_pause_for_test(cx), 3);
             assert!(v.pill_visible_for_test(cx));
         });
 
@@ -583,9 +553,6 @@ mod tests {
             let v = view.read(cx);
             assert_eq!(v.follow_mode(), FollowMode::Following);
             assert!(!v.pill_visible_for_test(cx));
-            let offset = replica.read(cx).list_state().logical_scroll_top();
-            let count = replica.read(cx).rows().len();
-            assert_eq!(offset.item_ix, count);
         });
     }
 
