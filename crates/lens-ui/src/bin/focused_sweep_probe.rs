@@ -128,7 +128,7 @@ async fn drive_sweep(
     let baseline_deadline = cold_start + BASELINE_TIMEOUT;
     while Instant::now() < baseline_deadline {
         let landed = cx
-            .update(|app| replica.read(app).rows().order().len() > 0)
+            .update(|app| !replica.read(app).rows().order().is_empty())
             .unwrap_or(false);
         if landed {
             break;
@@ -136,7 +136,7 @@ async fn drive_sweep(
         cx.background_executor().timer(POLL_INTERVAL).await;
     }
     if !cx
-        .update(|app| replica.read(app).rows().order().len() > 0)
+        .update(|app| !replica.read(app).rows().order().is_empty())
         .unwrap_or(false)
     {
         fail("baseline Tail never landed within timeout");

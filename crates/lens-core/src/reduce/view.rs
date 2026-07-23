@@ -180,19 +180,14 @@ pub fn group_work_section<'a>(
         run_key: &mut Option<&'a ResponseId>,
     ) {
         if let Some(key) = run_key.take() {
-            if let Some(run_anchor) =
-                run.iter()
-                    .find_map(anchor_of)
-                    .map(|id| id.clone())
-                    .or_else(|| {
-                        run.iter().find_map(|block| match block {
-                            ViewBlock::StreamingReasoning { acc, .. } => {
-                                Some(ItemId::new(acc.acc_id.as_str()))
-                            }
-                            _ => None,
-                        })
-                    })
-            {
+            if let Some(run_anchor) = run.iter().find_map(anchor_of).cloned().or_else(|| {
+                run.iter().find_map(|block| match block {
+                    ViewBlock::StreamingReasoning { acc, .. } => {
+                        Some(ItemId::new(acc.acc_id.as_str()))
+                    }
+                    _ => None,
+                })
+            }) {
                 out.push(ViewBlock::WorkSection {
                     response_id: key,
                     run_anchor,

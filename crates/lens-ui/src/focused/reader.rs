@@ -197,10 +197,9 @@ impl TargetCoalescer {
                         ..
                     }),
                 ) = (target.range, self.page.as_ref())
+                    && incoming_before >= *existing_before
                 {
-                    if incoming_before >= *existing_before {
-                        return;
-                    }
+                    return;
                 }
                 self.page = Some(target);
             }

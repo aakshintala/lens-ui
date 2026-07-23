@@ -1578,7 +1578,7 @@ mod tests {
             assert_eq!(r.resident_lo_for_test(), 5);
             assert_eq!(r.resident_hi_for_test(), 20);
             for ord in 5..=9 {
-                let id = ItemId::new(&format!("r{ord}"));
+                let id = ItemId::new(format!("r{ord}"));
                 assert!(
                     r.rows()
                         .order()
@@ -4432,7 +4432,7 @@ mod tests {
         cx.read(|cx| {
             let r = replica.read(cx);
             assert!(
-                !r.rows().order().iter().any(|id| *id == RowId::LoadOlder),
+                !r.rows().order().contains(&RowId::LoadOlder),
                 "no sentinel when resident_lo absent"
             );
         });
@@ -4457,7 +4457,7 @@ mod tests {
             let r = replica.read(cx);
             assert_eq!(r.resident_lo_for_test(), 0);
             assert!(
-                !r.rows().order().iter().any(|id| *id == RowId::LoadOlder),
+                !r.rows().order().contains(&RowId::LoadOlder),
                 "resident_lo == 0 must not show sentinel"
             );
         });
