@@ -357,7 +357,17 @@ impl Element for Inline {
                         Self::link_for_position(&text_layout, &links, event.position)
                     {
                         cx.stop_propagation();
-                        cx.open_url(&link.url);
+                        match crate::security::validate_link_url(&link.url) {
+                            crate::security::LinkVerdict::AllowOpenUrl => {
+                                cx.open_url(&link.url);
+                            }
+                            crate::security::LinkVerdict::NavigateToFile { path, line } => {
+                                crate::focused::content_events::emit_navigate_to_file(
+                                    path, line, cx,
+                                );
+                            }
+                            crate::security::LinkVerdict::Strip => {}
+                        }
                     }
                 }
             });

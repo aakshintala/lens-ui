@@ -20,6 +20,9 @@ pub fn validate_link_url(url: &str) -> LinkVerdict {
     if url.len() > MAX_URL_LEN {
         return LinkVerdict::Strip;
     }
+    if url.chars().any(|c| c.is_control()) {
+        return LinkVerdict::Strip;
+    }
     let lower = url.to_ascii_lowercase();
     if lower.starts_with("javascript:")
         || lower.starts_with("data:")
@@ -74,10 +77,10 @@ fn looks_like_file_path(url: &str) -> bool {
 }
 
 fn split_path_line(url: &str) -> (String, Option<u32>) {
-    if let Some((path, line)) = url.rsplit_once(':') {
-        if let Ok(n) = line.parse::<u32>() {
-            return (path.to_string(), Some(n));
-        }
+    if let Some((path, line)) = url.rsplit_once(':')
+        && let Ok(n) = line.parse::<u32>()
+    {
+        return (path.to_string(), Some(n));
     }
     (url.to_string(), None)
 }

@@ -1,6 +1,8 @@
 //! Store-owned focused transcript replica (T-2 §5). State machine + fold rules;
 //! two-level retained rows, staged finalize, and collapse timing (Task 12).
 
+pub mod autolink;
+pub mod content_events;
 pub mod reader;
 mod content_key;
 mod rowsource;

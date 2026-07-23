@@ -6,9 +6,9 @@ use std::{
 
 use gpui::{
     AnyElement, App, DefiniteLength, Div, Element, ElementId, FontStyle, FontWeight, Half,
-    HighlightStyle, InteractiveElement as _, IntoElement, Length, ListState, ObjectFit,
-    ParentElement, SharedString, SharedUri, StatefulInteractiveElement, Styled, StyledImage as _,
-    Window, div, img, prelude::FluentBuilder as _, px, relative, rems,
+    HighlightStyle, InteractiveElement as _, IntoElement, Length, ListState,
+    ParentElement, SharedString, SharedUri, StatefulInteractiveElement, Styled,
+    Window, div, prelude::FluentBuilder as _, px, relative, rems,
 };
 use markdown::mdast;
 use ropey::Rope;
@@ -16,13 +16,13 @@ use ropey::Rope;
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, StyledExt, h_flex,
     highlighter::{HighlightTheme, SyntaxHighlighter},
-    tooltip::Tooltip,
     v_flex,
 };
 use crate::md::{
     inline::{Inline, InlineState},
     text_view::CodeBlockActionsFn,
 };
+use crate::security::{validate_image_ref, validate_link_url, ImageVerdict, LinkVerdict};
 
 use super::{TextViewStyle, utils::list_item_prefix};
 
@@ -605,25 +605,29 @@ impl Paragraph {
                         .into_any_element(),
                     );
                 }
-                child_nodes.push(
-                    img(image.url.clone())
-                        .id(ix)
-                        .object_fit(ObjectFit::Contain)
-                        .max_w(relative(1.))
-                        .when_some(image.width, |this, width| this.w(width))
-                        .when_some(image.link.clone(), |this, link| {
-                            let title = image.title();
-                            this.cursor_pointer()
-                                .tooltip(move |window, cx| {
-                                    Tooltip::new(title.clone()).build(window, cx)
-                                })
-                                .on_click(move |_, _, cx| {
-                                    cx.stop_propagation();
-                                    cx.open_url(&link.url);
-                                })
-                        })
-                        .into_any_element(),
-                );
+                if let Some(image_element) = match validate_image_ref(&image.url) {
+                    ImageVerdict::AllowArtifactImg { url } => {
+                        // §8 deferral: artifact fetch API absent — never call `img()` for a
+                        // live network fetch. Artifact refs paint as a link-placeholder.
+                        // When the authenticated artifact API lands, replace this arm with
+                        // `img(resolved_local_or_authenticated_url)` only.
+                        Some(
+                            div()
+                                .id(ix)
+                                .child(format!("[artifact: {url}]"))
+                                .into_any_element(),
+                        )
+                    }
+                    ImageVerdict::RenderAsLink { url } => Some(
+                        div()
+                            .id(ix)
+                            .child(format!("[image: {url}]"))
+                            .into_any_element(),
+                    ),
+                    ImageVerdict::Strip => None,
+                } {
+                    child_nodes.push(image_element);
+                }
 
                 text.clear();
                 links.clear();
@@ -652,12 +656,6 @@ impl Paragraph {
                     }
 
                     if let Some(mut link_mark) = style.link.clone() {
-                        highlight.color = Some(cx.theme().link);
-                        highlight.underline = Some(gpui::UnderlineStyle {
-                            thickness: gpui::px(1.),
-                            ..Default::default()
-                        });
-
                         // convert link references, replace link
                         if let Some(identifier) = link_mark.identifier.as_ref() {
                             if let Some(mark) = node_cx.link_refs.get(identifier) {
@@ -665,7 +663,17 @@ impl Paragraph {
                             }
                         }
 
-                        links.push((inner_range.clone(), link_mark));
+                        match validate_link_url(&link_mark.url) {
+                            LinkVerdict::Strip => {}
+                            LinkVerdict::AllowOpenUrl | LinkVerdict::NavigateToFile { .. } => {
+                                highlight.color = Some(cx.theme().link);
+                                highlight.underline = Some(gpui::UnderlineStyle {
+                                    thickness: gpui::px(1.),
+                                    ..Default::default()
+                                });
+                                links.push((inner_range.clone(), link_mark));
+                            }
+                        }
                     }
 
                     node_highlights.push((inner_range, highlight));
