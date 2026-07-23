@@ -355,6 +355,62 @@ impl FleetStore {
         }
     }
 
+    /// Re-parent every terminal owned by `from` to `to` (design §10 step 2).
+    ///
+    /// The inner `TerminalKeyId` is deliberately **not** rekeyed: a retained
+    /// `TerminalId` implies a retained `(terminal_name, session_key)`, and keys
+    /// are session-scoped so they cannot collide with B's own terminals.
+    ///
+    /// Each member's `TerminalEvent` subscription captures its owning
+    /// `SessionId`, so the move must build a **fresh** subscription bound to
+    /// `to`; otherwise the callback keeps looking the member up under `from`,
+    /// where it no longer exists, and deferred `pending_sleep` dies silently.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn move_terminal_members(
+        &mut self,
+        from: &SessionId,
+        to: &SessionId,
+        cx: &mut Context<Self>,
+    ) -> Vec<TerminalKeyId> {
+        let Some(inner) = self.terminals.remove(from) else {
+            return Vec::new();
+        };
+        let mut moved = Vec::with_capacity(inner.len());
+        for (key_id, member) in inner {
+            let key = terminal_key_from_id(&key_id);
+            let session_for_sub = to.clone();
+            let key_for_sub = key.clone();
+            let tab = member.tab.clone();
+            let sub = cx.subscribe(&tab, move |store, _tab, event, cx| {
+                if matches!(event, TerminalEvent::PresentationChanged) {
+                    store.on_terminal_presentation_changed(&session_for_sub, &key_for_sub, cx);
+                }
+            });
+            let rebound = TerminalMember {
+                tab,
+                last_viewed: member.last_viewed,
+                hidden: member.hidden,
+                pending_sleep: member.pending_sleep,
+                _sub: sub,
+            };
+            // Dropping `member` here drops its old subscription (bound to `from`).
+            drop(member);
+            let previous = self
+                .terminals
+                .entry(to.clone())
+                .or_default()
+                .insert(key_id.clone(), rebound);
+            // Defensive: keys are session-scoped so a collision should be
+            // impossible, but never leave a tab with a live engine outside
+            // fleet accounting.
+            if let Some(previous) = previous {
+                end_member_tab(&previous, cx);
+            }
+            moved.push(key_id);
+        }
+        moved
+    }
+
     fn policy_sleep_terminal(
         &mut self,
         session_id: &SessionId,
@@ -1257,6 +1313,97 @@ mod tests {
                 }
                 other => panic!("expected ResourceCreated, got {other:?}"),
             }
+        });
+    }
+
+    #[gpui::test]
+    async fn move_terminal_members_reparents_preserving_state(cx: &mut gpui::TestAppContext) {
+        let clock = Arc::new(ManualUiClock::new(5_000));
+        let store = cx.update(|cx| FleetStore::new(clock.clone(), cx));
+        let sess_a = SessionId::new("conv_a");
+        let sess_b = SessionId::new("conv_b");
+        let key = test_key("main", "sk_a");
+        let (_e, tab) = spawn_tab_with_rows(cx, 0);
+
+        cx.update(|cx| {
+            store.update(cx, |store, cx| {
+                store.insert_terminal_for_test(sess_a.clone(), key.clone(), tab.clone(), cx);
+                store.set_terminal_visible(&sess_a, &key, false, cx); // hidden = true
+                store.set_member_pending_sleep_for_test(&sess_a, &key, true);
+            });
+        });
+
+        let before = cx.update(|cx| {
+            let s = store.read(cx);
+            let m = s
+                .terminal_member_for_test(&sess_a, &key, cx)
+                .expect("member under A");
+            (m.last_viewed, m.hidden, m.pending_sleep)
+        });
+
+        let moved = cx.update(|cx| {
+            store.update(cx, |store, cx| {
+                store.move_terminal_members(&sess_a, &sess_b, cx)
+            })
+        });
+        assert_eq!(moved.len(), 1, "exactly one member moved");
+
+        cx.update(|cx| {
+            let s = store.read(cx);
+            assert!(
+                s.terminal_member_for_test(&sess_a, &key, cx).is_none(),
+                "member no longer under A"
+            );
+            let m = s
+                .terminal_member_for_test(&sess_b, &key, cx)
+                .expect("member now under B");
+            assert_eq!(
+                (m.last_viewed, m.hidden, m.pending_sleep),
+                before,
+                "last_viewed/hidden/pending_sleep preserved across the move"
+            );
+        });
+    }
+
+    // THE TRAP: the subscription closure captures the owning SessionId. If the move
+    // does not rebuild it, PresentationChanged still calls back with session A,
+    // where the key no longer exists -> deferred pending_sleep silently dies.
+    #[gpui::test]
+    async fn moved_member_subscription_is_rebound_to_new_session(cx: &mut gpui::TestAppContext) {
+        let clock = Arc::new(ManualUiClock::new(5_000));
+        let store = cx.update(|cx| FleetStore::new(clock.clone(), cx));
+        let sess_a = SessionId::new("conv_a");
+        let sess_b = SessionId::new("conv_b");
+        let key = test_key("main", "sk_a");
+        let (_e, tab) = spawn_tab_with_rows(cx, 0);
+
+        cx.update(|cx| {
+            store.update(cx, |store, cx| {
+                store.insert_terminal_for_test(sess_a.clone(), key.clone(), tab.clone(), cx);
+                store.set_member_pending_sleep_for_test(&sess_a, &key, true);
+                store.move_terminal_members(&sess_a, &sess_b, cx);
+            });
+        });
+
+        // Fire the subscription. If it is still bound to A, on_terminal_presentation_changed
+        // early-returns and pending_sleep stays set forever.
+        cx.update(|cx| {
+            tab.update(cx, |_tab, cx| {
+                cx.emit(TerminalEvent::PresentationChanged);
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let s = store.read(cx);
+            let m = s
+                .terminal_member_for_test(&sess_b, &key, cx)
+                .expect("member under B");
+            assert!(
+                !m.pending_sleep,
+                "subscription must be rebound to B: deferred sleep should have been \
+                 applied and pending_sleep cleared"
+            );
         });
     }
 
