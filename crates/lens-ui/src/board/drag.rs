@@ -126,6 +126,44 @@ pub fn reflow_preview_placeholder_footprint(item: &Item) -> (usize, usize) {
     (item.fc.max(1), item.fr.max(1))
 }
 
+/// Positive delta scrolls content down (cursor near bottom); negative toward top.
+pub fn edge_scroll_delta(
+    cursor_y: f32,
+    viewport_top: f32,
+    viewport_h: f32,
+    band_px: f32,
+    nudge_px: f32,
+) -> f32 {
+    let y = cursor_y - viewport_top;
+    if y <= band_px {
+        -nudge_px
+    } else if y >= viewport_h - band_px {
+        nudge_px
+    } else {
+        0.0
+    }
+}
+
+use gpui::{Context, Render, div, prelude::*, px};
+
+/// Lightweight ghost following the cursor during drag (real chrome is Task 6 polish).
+pub struct DragGhost {
+    #[allow(dead_code)] // payload identity; ghost chrome is Task 6 polish
+    pub id: BoardItemId,
+}
+
+impl Render for DragGhost {
+    fn render(&mut self, _: &mut gpui::Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .w(px(lens_core::pack::CARD_W))
+            .h(px(lens_core::pack::CARD_H))
+            .rounded(px(8.0))
+            .bg(gpui::rgb(0x3a3a44))
+            .border_1()
+            .border_color(gpui::rgb(0x6a6a74))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use lens_core::domain::board::DEFAULT_BOARD_ID;
@@ -215,5 +253,20 @@ mod tests {
         let mut s = start_b();
         assert!(begin_commit(&mut s, 2).is_none(), "generation changed → abort");
         assert_eq!(s.phase, DragPhase::Idle);
+    }
+
+    #[test]
+    fn edge_scroll_nudges_near_top_and_bottom() {
+        assert_eq!(edge_scroll_delta(10.0, 0.0, 600.0, 40.0, 12.0), -12.0);
+        assert_eq!(edge_scroll_delta(590.0, 0.0, 600.0, 40.0, 12.0), 12.0);
+        assert_eq!(edge_scroll_delta(300.0, 0.0, 600.0, 40.0, 12.0), 0.0);
+    }
+
+    #[test]
+    fn reflow_preview_uses_gap_not_second_card() {
+        let card = Item::card();
+        assert_eq!(reflow_preview_placeholder_footprint(&card), (1, 1));
+        let g = Item::group(4);
+        assert_eq!(reflow_preview_placeholder_footprint(&g), (g.fc, g.fr));
     }
 }

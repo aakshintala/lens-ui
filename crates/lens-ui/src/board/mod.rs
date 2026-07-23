@@ -12,12 +12,16 @@ use crate::fleet::store::FleetStore;
 use crate::slot::{TabHandle, focused_transcript_tab};
 use crate::theme::ActiveLensTheme as _;
 use gpui::{
-    AnyElement, AnyView, App, AppContext, Bounds, ClickEvent, Context, Entity, EntityId,
-    IntoElement, ParentElement, Pixels, Render, ScrollHandle, Styled, Window, div, prelude::*, px,
+    AnyElement, AnyView, App, AppContext, Bounds, ClickEvent, Context, DragMoveEvent, Entity,
+    EntityId, IntoElement, ParentElement, Pixels, Render, ScrollHandle, StatefulInteractiveElement,
+    Styled, Window, div, prelude::*, px,
 };
-use lens_core::domain::board::BoardNode;
-use lens_core::domain::ids::{BoardItemId, SessionId};
-use lens_core::pack::{self, CARD_H, CARD_W, CELL_H, CELL_W, GAP, HEADER, INSET, Item};
+use lens_core::domain::board::{BoardItemKind, BoardNode};
+use lens_core::domain::ids::{BoardId, BoardItemId, SessionId};
+use lens_core::pack::{
+    self, DropTile, DraggedKind, Item, item_height, CARD_H, CARD_W, CELL_H, CELL_W, GAP, HEADER,
+    INSET,
+};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
@@ -53,6 +57,25 @@ const PAD: f32 = 16.0;
 /// without horizontal scroll (was a flat 286 that clipped the 294px group box).
 const RAIL_W: f32 = CARD_W + 2.0 * GUTTER + 2.0 * PAD;
 
+/// Edge-band auto-scroll tuning (on-device refinement in Task 6).
+const EDGE_BAND_PX: f32 = 40.0;
+const EDGE_NUDGE_PX: f32 = 12.0;
+
+fn node_pack_row(node: &BoardNode<'_>) -> (BoardItemId, Item, bool) {
+    match node {
+        BoardNode::Card(item) => (item.id.clone(), Item::card(), false),
+        BoardNode::Group { item, members } => {
+            let collapsed = matches!(item.kind, BoardItemKind::Group { collapsed: true, .. });
+            let pack_item = if collapsed {
+                Item::group_collapsed(members.len())
+            } else {
+                Item::group(members.len())
+            };
+            (item.id.clone(), pack_item, collapsed)
+        }
+    }
+}
+
 /// Shell layout mode derived from `FleetStore::focused`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShellMode {
@@ -73,6 +96,7 @@ impl ShellMode {
 
 /// Per-tile group metadata threaded from `board_tree` into the renderer (B-3).
 /// `completed_count` is Archive-side (B-6); B-3 passes 0.
+#[derive(Clone)]
 struct GroupMeta {
     id: BoardItemId,
     name: String,
@@ -127,6 +151,10 @@ pub struct BoardView {
     rollup_wake: Option<gpui::Task<()>>,
     /// The deadline `rollup_wake` is currently armed for — re-arm only when it changes.
     armed_rollup_deadline: Option<i64>,
+    /// Active drag session (`None` = Idle).
+    drag: Option<drag::DragSession>,
+    /// Column count from the last `pack_and_render` — snapshot building reuses it.
+    last_pack_cols: usize,
 }
 
 impl BoardView {
@@ -138,8 +166,22 @@ impl BoardView {
         pty_probe: Option<PtyProbe>,
         cx: &mut Context<Self>,
     ) -> Self {
-        cx.observe(&replica, |_b: &mut BoardView, _, cx| cx.notify())
-            .detach();
+        cx.observe(&replica, |board: &mut BoardView, _, cx| {
+            if let Some(ref mut session) = board.drag {
+                if session.phase == drag::DragPhase::Committing {
+                    drag::on_wrote(session);
+                    board.drag = None;
+                }
+            }
+            if board.drag.is_some() && board.replica.read(cx).state() == ReplicaState::Stale {
+                if let Some(ref mut session) = board.drag {
+                    drag::on_failed(session);
+                }
+                board.drag = None;
+            }
+            cx.notify();
+        })
+        .detach();
         let cards: Vec<_> = fleet
             .read(cx)
             .cards
@@ -178,6 +220,8 @@ impl BoardView {
             last_group_chrome: Vec::new(),
             rollup_wake: None,
             armed_rollup_deadline: None,
+            drag: None,
+            last_pack_cols: 1,
         }
     }
 
@@ -355,7 +399,7 @@ impl BoardView {
                 .layout()
                 .item(&group_id)
                 .map(|it| &it.kind),
-            Some(lens_core::domain::board::BoardItemKind::Group {
+            Some(BoardItemKind::Group {
                 collapsed: true,
                 ..
             })
@@ -369,6 +413,108 @@ impl BoardView {
                 cx,
             );
         });
+    }
+
+    fn sibling_index(
+        layout: &lens_core::domain::board::BoardLayout,
+        item_id: &BoardItemId,
+        parent: Option<&BoardItemId>,
+    ) -> Option<usize> {
+        let mut siblings: Vec<_> = layout
+            .items
+            .iter()
+            .filter(|i| i.parent_item_id.as_ref() == parent)
+            .collect();
+        siblings.sort_by_key(|i| i.ordinal);
+        siblings
+            .iter()
+            .position(|i| &i.id == item_id)
+    }
+
+    fn build_drop_snapshot(
+        layout: &lens_core::domain::board::BoardLayout,
+        board_id: &BoardId,
+        dragged_id: &BoardItemId,
+        cols: usize,
+    ) -> Vec<DropTile> {
+        let nodes = layout.board_tree(board_id).unwrap_or_default();
+        let mut items = Vec::new();
+        let mut ids = Vec::new();
+        let mut collapsed = Vec::new();
+        for node in &nodes {
+            let (item_id, item, is_collapsed) = node_pack_row(node);
+            if item_id == *dragged_id {
+                continue;
+            }
+            items.push(item);
+            ids.push(item_id);
+            collapsed.push(is_collapsed);
+        }
+        let packing = pack::pack(&items, cols);
+        packing
+            .tiles
+            .into_iter()
+            .map(|placed| DropTile {
+                id: ids[placed.item_index].clone(),
+                collapsed: collapsed[placed.item_index],
+                placed,
+            })
+            .collect()
+    }
+
+    fn begin_item_drag(
+        &mut self,
+        item_id: BoardItemId,
+        kind: DraggedKind,
+        cursor: (f32, f32),
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .drag
+            .as_ref()
+            .is_some_and(|s| s.phase != drag::DragPhase::Idle)
+        {
+            return;
+        }
+        let layout = self.replica.read(cx).layout();
+        let board_id = match layout.default_board_id() {
+            Ok(id) => id.clone(),
+            Err(_) => return,
+        };
+        let snapshot = Self::build_drop_snapshot(&layout, &board_id, &item_id, self.last_pack_cols);
+        let Some(item) = layout.item(&item_id) else {
+            return;
+        };
+        let start_parent = item.parent_item_id.clone();
+        let sibling_idx = Self::sibling_index(&layout, &item_id, start_parent.as_ref());
+        let layout_gen = self.replica.read(cx).layout_generation();
+        self.drag = Some(drag::start_drag(
+            item_id,
+            kind,
+            snapshot,
+            layout_gen,
+            cursor,
+            sibling_idx,
+            start_parent,
+            board_id,
+        ));
+    }
+
+    fn gap_placeholder_element(placed: &pack::Placed) -> AnyElement {
+        let (fc, _fr) = drag::reflow_preview_placeholder_footprint(&placed.item);
+        let w = fc as f32 * CELL_W - GAP;
+        let h = item_height(&placed.item);
+        div()
+            .absolute()
+            .left(px(placed.cell_left()))
+            .top(px(placed.cell_top()))
+            .w(px(w))
+            .h(px(h))
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(gpui::rgb(0x4a4a54))
+            .bg(gpui::rgb(0x1a1a22))
+            .into_any_element()
     }
 
     fn render_nav_rail(&self, cx: &App) -> impl IntoElement {
@@ -404,47 +550,111 @@ impl BoardView {
         };
         let nodes = layout.board_tree(&board_id).unwrap_or_default();
 
-        // nodes → parallel (pack items, per-tile session ids, per-tile group meta)
-        let mut items: Vec<Item> = Vec::with_capacity(nodes.len());
-        let mut tile_sessions: Vec<Vec<SessionId>> = Vec::with_capacity(nodes.len());
-        let mut tile_groups: Vec<Option<GroupMeta>> = Vec::with_capacity(nodes.len());
-        for node in &nodes {
-            let sessions: Vec<SessionId> = node.leaf_sessions().into_iter().cloned().collect();
-            let (item, meta) = match node {
-                BoardNode::Card(_) => (Item::card(), None),
-                BoardNode::Group { item, .. } => {
-                    let (name, color_token, collapsed) = match &item.kind {
-                        lens_core::domain::board::BoardItemKind::Group {
+        struct PackRow {
+            item: Item,
+            item_id: BoardItemId,
+            sessions: Vec<SessionId>,
+            meta: Option<GroupMeta>,
+            is_gap: bool,
+        }
+
+        let mut rows: Vec<PackRow> = nodes
+            .iter()
+            .map(|node| {
+                let sessions: Vec<SessionId> = node.leaf_sessions().into_iter().cloned().collect();
+                let (item_id, item, collapsed) = node_pack_row(node);
+                let meta = match node {
+                    BoardNode::Card(_) => None,
+                    BoardNode::Group { item, .. } => {
+                        let (name, color_token) = match &item.kind {
+                            BoardItemKind::Group {
+                                name,
+                                color_token,
+                                ..
+                            } => (name.clone(), color_token.clone()),
+                            _ => (String::new(), None),
+                        };
+                        Some(GroupMeta {
+                            id: item.id.clone(),
                             name,
                             color_token,
                             collapsed,
-                            ..
-                        } => (name.clone(), color_token.clone(), *collapsed),
-                        _ => (String::new(), None, false),
-                    };
-                    let meta = GroupMeta {
-                        id: item.id.clone(),
-                        name,
-                        color_token,
-                        collapsed,
-                        completed_count: 0, // Archive-side (B-6)
-                    };
-                    let item = if collapsed {
-                        Item::group_collapsed(sessions.len())
-                    } else {
-                        Item::group(sessions.len())
-                    };
-                    (item, Some(meta))
+                            completed_count: 0,
+                        })
+                    }
+                };
+                PackRow {
+                    item,
+                    item_id,
+                    sessions,
+                    meta,
+                    is_gap: false,
                 }
-            };
-            items.push(item);
-            tile_sessions.push(sessions);
-            tile_groups.push(meta);
+            })
+            .collect();
+
+        let drag_preview = self.drag.as_ref().filter(|s| {
+            matches!(
+                s.phase,
+                drag::DragPhase::Dragging | drag::DragPhase::Committing
+            )
+        });
+        if let Some(session) = drag_preview {
+            let dragged_id = session.dragged_id.clone();
+            if let Some(pos) = rows.iter().position(|r| r.item_id == dragged_id) {
+                let removed = rows.remove(pos);
+                if session.target.parent.is_none() {
+                    let ord = session.target.ordinal.min(rows.len());
+                    rows.insert(
+                        ord,
+                        PackRow {
+                            item: removed.item,
+                            item_id: dragged_id,
+                            sessions: Vec::new(),
+                            meta: None,
+                            is_gap: true,
+                        },
+                    );
+                }
+            } else if session.target.parent.is_none() {
+                let footprint = layout
+                    .item(&dragged_id)
+                    .map(|it| match &it.kind {
+                        BoardItemKind::Card { .. } => Item::card(),
+                        BoardItemKind::Group { .. } => {
+                            let n = layout
+                                .items
+                                .iter()
+                                .filter(|i| i.parent_item_id.as_ref() == Some(&dragged_id))
+                                .count();
+                            Item::group(n.max(1))
+                        }
+                    })
+                    .unwrap_or(Item::card());
+                let ord = session.target.ordinal.min(rows.len());
+                rows.insert(
+                    ord,
+                    PackRow {
+                        item: footprint,
+                        item_id: dragged_id,
+                        sessions: Vec::new(),
+                        meta: None,
+                        is_gap: true,
+                    },
+                );
+            }
         }
+
+        let items: Vec<Item> = rows.iter().map(|r| r.item).collect();
+        let tile_sessions: Vec<Vec<SessionId>> = rows.iter().map(|r| r.sessions.clone()).collect();
+        let tile_groups: Vec<Option<GroupMeta>> = rows.iter().map(|r| r.meta.clone()).collect();
+        let tile_is_gap: Vec<bool> = rows.iter().map(|r| r.is_gap).collect();
+        let tile_item_ids: Vec<BoardItemId> = rows.iter().map(|r| r.item_id.clone()).collect();
 
         // Cap the natural column count so a wide/ultrawide viewport packs into a bounded
         // block (centered below) instead of fanning a handful of sessions edge-to-edge.
         let cols = pack::cols_for_width(avail_width).min(max_cols);
+        self.last_pack_cols = cols;
         let packing = pack::pack(&items, cols);
 
         // Vertical mirror of `center_offset` (see the horizontal block below): when the whole
@@ -492,26 +702,93 @@ impl BoardView {
         // side, so a tile at cell (0,0) would paint at (-GUTTER, -GUTTER) and clip against
         // the scroll viewport (on-device: "Group card clipped on the left and top"; the ring
         // reach also clipped loose top-left cards). `content` stays a positioning context.
+        let scroll_for_drag = scroll.clone();
         let mut content = div()
             .absolute()
             .left(px(PAD + GUTTER + center_offset))
             .top(px(PAD + GUTTER + v_center_offset))
             .w(px(used_cols as f32 * CELL_W))
-            .h(px(packing.content_height));
+            .h(px(packing.content_height))
+            .on_drag_move(cx.listener(
+                move |board, event: &DragMoveEvent<BoardItemId>, _window, cx| {
+                    let bounds = event.bounds;
+                    let cursor = event.event.position;
+                    let local = (
+                        f32::from(cursor.x) - f32::from(bounds.origin.x),
+                        f32::from(cursor.y) - f32::from(bounds.origin.y),
+                    );
+                    let layout_gen = board.replica.read(cx).layout_generation();
+                    if let Some(ref mut session) = board.drag {
+                        if session.phase == drag::DragPhase::Dragging {
+                            if !drag::on_cursor_move(session, local, layout_gen) {
+                                board.drag = None;
+                                cx.notify();
+                                return;
+                            }
+                            let dy = drag::edge_scroll_delta(
+                                f32::from(cursor.y),
+                                f32::from(bounds.origin.y),
+                                f32::from(bounds.size.height),
+                                EDGE_BAND_PX,
+                                EDGE_NUDGE_PX,
+                            );
+                            if dy != 0.0 {
+                                let mut off = scroll_for_drag.offset();
+                                off.y -= px(dy);
+                                scroll_for_drag.set_offset(off);
+                            }
+                            cx.notify();
+                        }
+                    }
+                },
+            ))
+            .on_drop(cx.listener(|board, id: &BoardItemId, _window, cx| {
+                let layout_gen = board.replica.read(cx).layout_generation();
+                let Some(ref mut session) = board.drag else {
+                    return;
+                };
+                if &session.dragged_id != id {
+                    return;
+                }
+                if let Some(op) = drag::begin_commit(session, layout_gen) {
+                    board.replica.update(cx, |r, cx| {
+                        r.write(op, cx);
+                    });
+                } else {
+                    board.drag = None;
+                }
+                cx.notify();
+            }));
+
+        let dragged_session = drag_preview.and_then(|s| {
+            layout.item(&s.dragged_id).and_then(|it| match &it.kind {
+                BoardItemKind::Card { session, .. } => Some(session.clone()),
+                _ => None,
+            })
+        });
 
         let mut visible: Vec<SessionId> = Vec::new();
         for placed in &packing.tiles {
             if !placed.intersects_band(lo, hi) {
-                continue; // culled → absent from child vec → gpui never builds it
+                continue;
+            }
+            if tile_is_gap.get(placed.item_index).copied().unwrap_or(false) {
+                content = content.child(Self::gap_placeholder_element(placed));
+                continue;
             }
             let sessions = &tile_sessions[placed.item_index];
+            let item_id = tile_item_ids[placed.item_index].clone();
             match placed.item.kind {
                 pack::Kind::Card => {
+                    if dragged_session.as_ref() == Some(&sessions[0]) {
+                        continue;
+                    }
                     visible.push(sessions[0].clone());
                     if let Some(tile) = self.absolute_card(
                         &sessions[0],
+                        &item_id,
                         placed.cell_left(),
-                        placed.cell_top(), // pixel-masonry top; a loose card carries no header lane
+                        placed.cell_top(),
                         cx,
                     ) {
                         content = content.child(tile);
@@ -521,17 +798,25 @@ impl BoardView {
                     let meta = tile_groups[placed.item_index].as_ref();
                     let collapsed = meta.map(|m| m.collapsed).unwrap_or(false);
                     if collapsed {
-                        // FORK: members feed the rollup (read inside), but are NOT visible —
-                        // no card views spawn for a collapsed group's members.
                         let (el, snap) =
                             self.absolute_collapsed_group(placed, sessions, meta, now_ms, cx);
                         content = content.child(el);
                         group_chrome.push(snap);
                     } else {
                         for s in sessions {
-                            visible.push(s.clone());
+                            if dragged_session.as_ref() != Some(s) {
+                                visible.push(s.clone());
+                            }
                         }
-                        let (els, snap) = self.absolute_group(placed, sessions, meta, now_ms, cx);
+                        let (els, snap) = self.absolute_group(
+                            placed,
+                            sessions,
+                            meta,
+                            now_ms,
+                            dragged_session.as_ref(),
+                            drag_preview.map(|s| &s.target),
+                            cx,
+                        );
                         for el in els {
                             content = content.child(el);
                         }
@@ -571,6 +856,7 @@ impl BoardView {
     fn absolute_card(
         &self,
         session_id: &SessionId,
+        item_id: &BoardItemId,
         left: f32,
         top: f32,
         cx: &mut Context<Self>,
@@ -578,6 +864,8 @@ impl BoardView {
         let cached = self.cached_tiles.get(session_id)?.clone();
         let entity_id = self.card_views.get(session_id)?.entity_id();
         let sid = session_id.clone();
+        let drag_id = item_id.clone();
+        let weak = cx.weak_entity();
         Some(
             div()
                 .absolute()
@@ -586,9 +874,25 @@ impl BoardView {
                 .w(px(CARD_W))
                 .h(px(CARD_H))
                 .id(("session-card-click", entity_id))
+                .cursor_move()
                 .on_click(cx.listener(move |board, event, window, cx| {
                     board.card_click(sid.clone(), event, window, cx);
                 }))
+                .on_drag(drag_id.clone(), {
+                    let card_left = left;
+                    let card_top = top;
+                    move |id, offset, _window, cx: &mut App| {
+                        let cursor = (
+                            card_left + f32::from(offset.x),
+                            card_top + f32::from(offset.y),
+                        );
+                        weak.update(cx, |board, cx| {
+                            board.begin_item_drag(id.clone(), DraggedKind::Card, cursor, cx);
+                        })
+                        .ok();
+                        cx.new(|_| drag::DragGhost { id: id.clone() })
+                    }
+                })
                 .child(cached)
                 .into_any_element(),
         )
@@ -610,6 +914,8 @@ impl BoardView {
         sessions: &[SessionId],
         meta: Option<&GroupMeta>,
         now_ms: i64,
+        hide_session: Option<&SessionId>,
+        drop_target: Option<&lens_core::pack::DropTarget>,
         cx: &mut Context<Self>,
     ) -> (Vec<AnyElement>, GroupChromeSnapshot) {
         let (fc, fr) = (placed.item.fc, placed.item.fr);
@@ -684,13 +990,46 @@ impl BoardView {
         );
 
         // Header-lane (top HEADER-tall band): dot · name · spend · age · ✓N · caret.
-        out.push(
+        let header_x = x;
+        let header_y = y;
+        let weak = cx.weak_entity();
+        let caret = {
+            let gid = group_id.clone();
             div()
+                .id(("group-caret", placed.item_index))
+                .cursor_pointer()
+                .text_color(gpui::rgb(0x8a8a94))
+                .child("⌄")
+                .on_click(cx.listener(move |board, _ev, _win, cx| {
+                    cx.stop_propagation();
+                    if let Some(gid) = gid.clone() {
+                        board.toggle_group_collapsed(gid, cx);
+                    }
+                }))
+        };
+        out.push(match group_id.clone() {
+            Some(gid) => div()
                 .absolute()
                 .left(px(x))
                 .top(px(y))
                 .w(px(block_w))
                 .h(px(HEADER))
+                .id(("group-header-drag", placed.item_index))
+                .cursor_move()
+                .on_drag(
+                    gid,
+                    move |id: &BoardItemId, offset, _window, cx: &mut App| {
+                        let cursor = (
+                            header_x + f32::from(offset.x),
+                            header_y + f32::from(offset.y),
+                        );
+                        weak.update(cx, |board, cx| {
+                            board.begin_item_drag(id.clone(), DraggedKind::Group, cursor, cx);
+                        })
+                        .ok();
+                        cx.new(|_| drag::DragGhost { id: id.clone() })
+                    },
+                )
                 .flex()
                 .flex_row()
                 .items_center()
@@ -709,34 +1048,109 @@ impl BoardView {
                         .clone()
                         .map(|t| div().text_color(gpui::rgb(0x8a8a94)).child(t)),
                 )
-                .child({
-                    let gid = group_id.clone();
-                    div()
-                        .id(("group-caret", placed.item_index))
-                        .cursor_pointer()
-                        .text_color(gpui::rgb(0x8a8a94))
-                        .child("⌄")
-                        .on_click(cx.listener(move |board, _ev, _win, cx| {
-                            cx.stop_propagation();
-                            if let Some(gid) = gid.clone() {
-                                board.toggle_group_collapsed(gid, cx);
-                            }
-                        }))
-                })
+                .child(caret)
                 .into_any_element(),
-        );
+            None => div()
+                .absolute()
+                .left(px(x))
+                .top(px(y))
+                .w(px(block_w))
+                .h(px(HEADER))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1p5()
+                .px_1p5()
+                .cursor_move()
+                .child(div().size(px(8.0)).rounded_full().bg(accent))
+                .child(div().text_color(gpui::rgb(0xd6d6de)).child(name.clone()))
+                .child(
+                    div()
+                        .flex_grow()
+                        .text_color(gpui::rgb(0x8a8a94))
+                        .child(spend_age.clone()),
+                )
+                .children(
+                    badge
+                        .clone()
+                        .map(|t| div().text_color(gpui::rgb(0x8a8a94)).child(t)),
+                )
+                .child(caret)
+                .into_any_element(),
+        });
+
+        let layout = self.replica.read(cx).layout();
+        let in_group_target = drop_target.and_then(|t| {
+            if t.parent.as_ref() == group_id.as_ref() {
+                Some(t.ordinal)
+            } else {
+                None
+            }
+        });
 
         // Members at full size in body-zones (unchanged geometry from B-2).
         for (i, session) in sessions.iter().enumerate() {
+            if hide_session == Some(session) {
+                continue;
+            }
             let cc = i % fc;
             let rr = i / fc;
             let mx = INSET + cc as f32 * CELL_W;
-            // Tight vertical stride (CARD_H + GAP), not CELL_H — members share the group's one
-            // header, so no phantom header lane between stacked rows (matches the horizontal GAP).
             let my = INSET + HEADER + rr as f32 * (CARD_H + GAP);
-            if let Some(tile) = self.absolute_card(session, x - INSET + mx, y - INSET + my, cx) {
+            let member_left = x - INSET + mx;
+            let member_top = y - INSET + my;
+            if in_group_target == Some(i) {
+                out.push(
+                    div()
+                        .absolute()
+                        .left(px(member_left))
+                        .top(px(member_top))
+                        .w(px(CARD_W))
+                        .h(px(CARD_H))
+                        .rounded(px(8.0))
+                        .border_1()
+                        .border_color(gpui::rgb(0x4a4a54))
+                        .bg(gpui::rgb(0x1a1a22))
+                        .into_any_element(),
+                );
+            }
+            let member_item_id = layout
+                .items
+                .iter()
+                .find(|it| matches!(&it.kind, BoardItemKind::Card { session: s, .. } if s == session))
+                .map(|it| it.id.clone());
+            let Some(member_item_id) = member_item_id else {
+                continue;
+            };
+            if let Some(tile) = self.absolute_card(
+                session,
+                &member_item_id,
+                member_left,
+                member_top,
+                cx,
+            ) {
                 out.push(tile);
             }
+        }
+        if in_group_target == Some(sessions.len()) {
+            let i = sessions.len();
+            let cc = i % fc;
+            let rr = i / fc;
+            let mx = INSET + cc as f32 * CELL_W;
+            let my = INSET + HEADER + rr as f32 * (CARD_H + GAP);
+            out.push(
+                div()
+                    .absolute()
+                    .left(px(x - INSET + mx))
+                    .top(px(y - INSET + my))
+                    .w(px(CARD_W))
+                    .h(px(CARD_H))
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(gpui::rgb(0x4a4a54))
+                    .bg(gpui::rgb(0x1a1a22))
+                    .into_any_element(),
+            );
         }
 
         (out, snapshot)
