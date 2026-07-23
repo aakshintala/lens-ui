@@ -387,6 +387,10 @@ mod tests {
         }
     }
 
+    fn test_row(ord: i64, item: Item) -> (i64, usize, Item) {
+        (ord, 2, item)
+    }
+
     fn empty_read() -> RangeRead {
         RangeRead {
             rows: vec![],
@@ -630,7 +634,7 @@ mod tests {
             ScriptedOutcome::Busy,
             ScriptedOutcome::Busy,
             ScriptedOutcome::Ok(RangeRead {
-                rows: vec![(0, message_item("ok"))],
+                rows: vec![test_row(0, message_item("ok"))],
                 skipped: vec![],
                 watermark: Some(0),
             }),
@@ -692,7 +696,7 @@ mod tests {
         let fake = Arc::new(FakeReader::new(vec![
             ScriptedOutcome::Ok(empty_read()),
             ScriptedOutcome::Ok(RangeRead {
-                rows: vec![(0, message_item("stale"))],
+                rows: vec![test_row(0, message_item("stale"))],
                 skipped: vec![],
                 watermark: Some(0),
             }),

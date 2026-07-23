@@ -12,7 +12,7 @@ use lens_core::domain::item::{Item, ItemKind, StreamScratch};
 use lens_core::domain::scalars::Role;
 use lens_core::persist::{RangeRead, ReadRange};
 use lens_core::reduce::{RetireDisposition, StreamUpdate, group_work_section, project};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,6 +23,11 @@ pub use rowsource::{
 
 const LIST_OVERDRAW: Pixels = gpui::px(200.);
 const SYNC_DEBOUNCE_MS: u64 = 150;
+const TAIL_BUDGET_BYTES: usize = 8 * 1024 * 1024;
+#[cfg_attr(not(test), allow(dead_code))]
+const PAGE_BUDGET_BYTES: usize = 4 * 1024 * 1024;
+#[allow(dead_code)] // T3 eviction
+const RESIDENT_CAP_BYTES: usize = 24 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MarkerKind {
@@ -37,11 +42,17 @@ pub struct Marker {
 }
 
 pub struct FocusedTranscript {
-    items: Vec<Item>,
+    items: BTreeMap<i64, Item>,
+    item_bytes: HashMap<ItemId, usize>,
     scratch: Arc<StreamScratch>,
     active_response: Option<ResponseId>,
     last_rendered_ordinal: i64,
-    live_section_start: usize,
+    resident_lo: i64,
+    resident_hi: i64,
+    known_committed: i64,
+    resident_bytes: usize,
+    following: bool,
+    live_section_lo: Option<i64>,
     rows: RowStore,
     list_state: ListState,
     pending_finalize: HashMap<AccId, RowPresentation>,
@@ -85,11 +96,17 @@ impl FocusedTranscript {
         cx: &mut Context<Self>,
     ) -> Self {
         let replica = Self {
-            items: Vec::new(),
+            items: BTreeMap::new(),
+            item_bytes: HashMap::new(),
             scratch: Arc::new(StreamScratch::default()),
             active_response: None,
             last_rendered_ordinal: -1,
-            live_section_start: 0,
+            resident_lo: -1,
+            resident_hi: -1,
+            known_committed: -1,
+            resident_bytes: 0,
+            following: true,
+            live_section_lo: None,
             rows: RowStore::new(),
             list_state: ListState::new(0, ListAlignment::Bottom, LIST_OVERDRAW),
             pending_finalize: HashMap::new(),
@@ -109,7 +126,13 @@ impl FocusedTranscript {
             live_section_projection_count: 0,
             settled_structure_len: 0,
         };
-        replica.enqueue_read(ReadRange::All, Priority::Baseline, focus_generation);
+        replica.enqueue_read(
+            ReadRange::Tail {
+                byte_budget: TAIL_BUDGET_BYTES,
+            },
+            Priority::Baseline,
+            focus_generation,
+        );
         cx.notify();
         replica
     }
@@ -123,11 +146,17 @@ impl FocusedTranscript {
         cx: &mut Context<Self>,
     ) -> Self {
         let replica = Self {
-            items: Vec::new(),
+            items: BTreeMap::new(),
+            item_bytes: HashMap::new(),
             scratch: Arc::new(StreamScratch::default()),
             active_response: None,
             last_rendered_ordinal: -1,
-            live_section_start: 0,
+            resident_lo: -1,
+            resident_hi: -1,
+            known_committed: -1,
+            resident_bytes: 0,
+            following: true,
+            live_section_lo: None,
             rows: RowStore::new(),
             list_state: ListState::new(0, ListAlignment::Bottom, LIST_OVERDRAW),
             pending_finalize: HashMap::new(),
@@ -187,8 +216,23 @@ impl FocusedTranscript {
     }
 
     #[cfg(test)]
-    pub(crate) fn live_section_start_for_test(&self) -> usize {
-        self.live_section_start
+    pub(crate) fn live_section_lo_for_test(&self) -> Option<i64> {
+        self.live_section_lo
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resident_lo_for_test(&self) -> i64 {
+        self.resident_lo
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resident_hi_for_test(&self) -> i64 {
+        self.resident_hi
+    }
+
+    #[cfg(test)]
+    pub(crate) fn known_committed_for_test(&self) -> i64 {
+        self.known_committed
     }
 
     #[cfg(test)]
@@ -198,7 +242,19 @@ impl FocusedTranscript {
 
     #[cfg(test)]
     pub(crate) fn live_slice_len_for_test(&self) -> usize {
-        self.items.len().saturating_sub(self.live_section_start)
+        match self.live_section_lo {
+            Some(lo) => self.items.range(lo..).count(),
+            None => 0,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_item_ordinal_for_test(&self, ord: i64) -> bool {
+        self.items.contains_key(&ord)
+    }
+
+    pub fn set_following(&mut self, following: bool) {
+        self.following = following;
     }
 
     pub fn fold_detailed(&mut self, u: StreamUpdate, cx: &mut Context<Self>) {
@@ -206,7 +262,7 @@ impl FocusedTranscript {
         match u {
             StreamUpdate::Rebased(state) => {
                 self.active_response = state.active_response.clone();
-                self.recompute_live_section_start();
+                self.recompute_live_section_lo();
                 self.reproject(true, cx);
                 dirty = true;
             }
@@ -233,7 +289,7 @@ impl FocusedTranscript {
             }
             StreamUpdate::ActiveResponseChanged(r) => {
                 self.active_response = r;
-                self.recompute_live_section_start();
+                self.recompute_live_section_lo();
                 self.recompute_settled_prefix();
                 self.apply_expansion_flags(cx);
                 self.reproject(false, cx);
@@ -294,7 +350,14 @@ impl FocusedTranscript {
 
     pub fn on_reconcile_epoch_settled(&mut self, epoch: u64, cx: &mut Context<Self>) {
         if self.epoch_overlapped_baseline(epoch) {
-            self.enqueue_read(ReadRange::All, Priority::Reconcile, self.focus_generation);
+            self.enqueue_read(
+                ReadRange::Span {
+                    from: self.resident_lo,
+                    through: self.resident_hi,
+                },
+                Priority::Reconcile,
+                self.focus_generation,
+            );
             cx.notify();
         }
     }
@@ -310,16 +373,45 @@ impl FocusedTranscript {
             return;
         }
         self.reader_error = None;
-        let full_replace = matches!(range, ReadRange::All);
+        let full_replace = matches!(
+            range,
+            ReadRange::All
+                | ReadRange::Span { .. }
+                | ReadRange::Tail { .. }
+                | ReadRange::Backward { .. }
+        );
         match range {
-            ReadRange::All => self.replace_read_rows(&read.rows),
-            ReadRange::Delta { .. } | ReadRange::One { .. } => {
+            ReadRange::All | ReadRange::Tail { .. } => self.replace_read_rows(&read.rows),
+            ReadRange::Span { from, through } => self.replace_span_rows(from, through, &read.rows),
+            ReadRange::Delta { .. } | ReadRange::One { .. } | ReadRange::Backward { .. } => {
                 self.upsert_read_rows(&read.rows);
             }
         }
+        if let Some((min_ord, max_ord)) = read_ordinal_bounds(&read.rows) {
+            match range {
+                ReadRange::All | ReadRange::Tail { .. } => {
+                    self.resident_lo = min_ord;
+                    self.resident_hi = max_ord;
+                }
+                ReadRange::Span { .. } => {
+                    self.resident_lo = self.resident_lo.min(min_ord);
+                    self.resident_hi = self.resident_hi.max(max_ord);
+                }
+                ReadRange::Backward { .. } => {
+                    self.resident_lo = self.resident_lo.min(min_ord);
+                }
+                ReadRange::Delta { through, .. } => {
+                    self.resident_hi = self.resident_hi.max(max_ord).max(through);
+                }
+                ReadRange::One { ordinal } => {
+                    self.resident_hi = self.resident_hi.max(ordinal);
+                }
+            }
+        }
         match range {
-            ReadRange::All => {
+            ReadRange::All | ReadRange::Tail { .. } | ReadRange::Span { .. } => {
                 if let Some(watermark) = read.watermark {
+                    self.known_committed = watermark;
                     self.last_rendered_ordinal = watermark;
                 }
             }
@@ -327,10 +419,17 @@ impl FocusedTranscript {
                 if through > self.last_rendered_ordinal {
                     self.last_rendered_ordinal = through;
                 }
+                if let Some(watermark) = read.watermark {
+                    self.known_committed = self.known_committed.max(watermark);
+                }
             }
-            ReadRange::One { .. } => {}
+            ReadRange::Backward { .. } | ReadRange::One { .. } => {
+                if let Some(watermark) = read.watermark {
+                    self.known_committed = self.known_committed.max(watermark);
+                }
+            }
         }
-        self.recompute_live_section_start();
+        self.recompute_live_section_lo();
         self.recompute_settled_prefix();
         self.commit_pending_disk_rows(&read.rows, cx);
         if full_replace {
@@ -411,16 +510,16 @@ impl FocusedTranscript {
         epoch > self.baseline_epoch
     }
 
-    fn recompute_live_section_start(&mut self) {
+    fn recompute_live_section_lo(&mut self) {
         let Some(active) = &self.active_response else {
-            self.live_section_start = self.items.len();
+            self.live_section_lo = None;
             return;
         };
-        self.live_section_start = self
+        self.live_section_lo = self
             .items
             .iter()
-            .position(|item| item.ctx.response_id.as_ref() == Some(active))
-            .unwrap_or(self.items.len());
+            .find(|(_, item)| item.ctx.response_id.as_ref() == Some(active))
+            .map(|(ord, _)| *ord);
     }
 
     fn handle_retired(
@@ -432,7 +531,8 @@ impl FocusedTranscript {
         let prev_len = self.rows.len();
         match disposition {
             RetireDisposition::Finalizing { item_id } => {
-                self.pending_item_ids.insert(item_id, acc_id.clone());
+                self.pending_item_ids
+                    .insert(item_id.clone(), acc_id.clone());
                 let pres =
                     self.stream_presentation(&acc_id, cx)
                         .unwrap_or_else(|| RowPresentation {
@@ -442,7 +542,13 @@ impl FocusedTranscript {
                             height_hint: None,
                         });
                 self.pending_finalize.insert(acc_id.clone(), pres.clone());
-                self.rows.stage_stream_finalize(&acc_id, pres, cx);
+                self.rows.stage_stream_finalize(
+                    &acc_id,
+                    pres,
+                    Some(item_id.clone()),
+                    self.active_response.clone(),
+                    cx,
+                );
                 self.rows.sync_list_count(&self.list_state, prev_len);
             }
             RetireDisposition::Discarded => {
@@ -461,8 +567,8 @@ impl FocusedTranscript {
             .map(|e| e.read(cx).presentation.clone())
     }
 
-    fn commit_pending_disk_rows(&mut self, rows: &[(i64, Item)], cx: &mut Context<Self>) {
-        for (_, item) in rows {
+    fn commit_pending_disk_rows(&mut self, rows: &[(i64, usize, Item)], cx: &mut Context<Self>) {
+        for (_, _, item) in rows {
             let Some(acc_id) = self.pending_item_ids.remove(&item.id) else {
                 continue;
             };
@@ -503,7 +609,7 @@ impl FocusedTranscript {
     fn compute_expansion_flags(&self) -> HashMap<ResponseId, bool> {
         let latest_settled = self.latest_settled_before_next_user();
         let mut flags = HashMap::new();
-        for item in &self.items {
+        for item in self.items.values() {
             if let Some(r) = &item.ctx.response_id {
                 flags.entry(r.clone()).or_insert_with(|| {
                     self.active_response.as_ref() == Some(r) || latest_settled.as_ref() == Some(r)
@@ -518,39 +624,43 @@ impl FocusedTranscript {
 
     fn latest_settled_before_next_user(&self) -> Option<ResponseId> {
         let active = self.active_response.as_ref();
-        let last_user_idx = self
+        let last_user_ord = self
             .items
             .iter()
-            .enumerate()
-            .rposition(|(_, item)| is_user_message(item));
+            .rev()
+            .find_map(|(ord, item)| is_user_message(item).then_some(*ord));
 
-        let mut last_idx_per_resp: HashMap<&ResponseId, usize> = HashMap::new();
-        for (i, item) in self.items.iter().enumerate() {
+        let mut last_ord_per_resp: HashMap<&ResponseId, i64> = HashMap::new();
+        for (ord, item) in &self.items {
             if let Some(r) = &item.ctx.response_id {
-                last_idx_per_resp.insert(r, i);
+                last_ord_per_resp.insert(r, *ord);
             }
         }
 
-        let mut best: Option<(ResponseId, usize)> = None;
-        for (resp, &idx) in &last_idx_per_resp {
+        let mut best: Option<(ResponseId, i64)> = None;
+        for (resp, &ord) in &last_ord_per_resp {
             if active == Some(*resp) {
                 continue;
             }
-            if let Some(u_idx) = last_user_idx
-                && u_idx > idx
+            if let Some(u_ord) = last_user_ord
+                && u_ord > ord
             {
                 continue;
             }
-            if best.as_ref().is_none_or(|(_, b)| idx > *b) {
-                best = Some(((*resp).clone(), idx));
+            if best.as_ref().is_none_or(|(_, b)| ord > *b) {
+                best = Some(((*resp).clone(), ord));
             }
         }
         best.map(|(r, _)| r)
     }
 
+    fn settled_item_refs(&self) -> Vec<&Item> {
+        let lo = self.live_section_lo.unwrap_or(i64::MAX);
+        self.items.range(..lo).map(|(_, item)| item).collect()
+    }
+
     fn recompute_settled_prefix(&mut self) {
-        let slice = &self.items[..self.live_section_start.min(self.items.len())];
-        let refs: Vec<&Item> = slice.iter().collect();
+        let refs = self.settled_item_refs();
         let empty_scratch = StreamScratch::default();
         let blocks = group_work_section(
             project(&refs, &empty_scratch, self.active_response.as_ref()),
@@ -567,7 +677,7 @@ impl FocusedTranscript {
         self.rows.strip_markers();
 
         if full {
-            let refs: Vec<&Item> = self.items.iter().collect();
+            let refs: Vec<&Item> = self.items.values().collect();
             let blocks = group_work_section(
                 project(&refs, self.scratch.as_ref(), self.active_response.as_ref()),
                 self.active_response.as_ref(),
@@ -576,10 +686,16 @@ impl FocusedTranscript {
             self.recompute_settled_prefix();
         } else {
             let prefix = self.settled_structure_len;
-            let slice = &self.items[self.live_section_start..];
-            let refs: Vec<&Item> = slice.iter().collect();
+            let live_refs: Vec<&Item> = match self.live_section_lo {
+                Some(lo) => self.items.range(lo..).map(|(_, item)| item).collect(),
+                None => Vec::new(),
+            };
             let blocks = group_work_section(
-                project(&refs, self.scratch.as_ref(), self.active_response.as_ref()),
+                project(
+                    &live_refs,
+                    self.scratch.as_ref(),
+                    self.active_response.as_ref(),
+                ),
                 self.active_response.as_ref(),
             );
             RowStore::materialize_live_tail(prefix, &blocks, &mut self.rows, cx);
@@ -590,10 +706,16 @@ impl FocusedTranscript {
 
         self.overlay_pending_finalize(cx);
         self.rows.sync_list_count(&self.list_state, prev_len);
-        let slice = &self.items[self.live_section_start..];
-        let refs: Vec<&Item> = slice.iter().collect();
-        self.live_section_projection_count =
-            project(&refs, self.scratch.as_ref(), self.active_response.as_ref()).len();
+        let live_refs: Vec<&Item> = match self.live_section_lo {
+            Some(lo) => self.items.range(lo..).map(|(_, item)| item).collect(),
+            None => Vec::new(),
+        };
+        self.live_section_projection_count = project(
+            &live_refs,
+            self.scratch.as_ref(),
+            self.active_response.as_ref(),
+        )
+        .len();
     }
 
     fn overlay_pending_finalize(&mut self, cx: &mut Context<Self>) {
@@ -607,26 +729,55 @@ impl FocusedTranscript {
         }
     }
 
-    fn replace_read_rows(&mut self, rows: &[(i64, Item)]) {
-        let mut sorted: Vec<_> = rows.iter().collect();
-        sorted.sort_by_key(|(ordinal, _)| *ordinal);
-        self.items = sorted.into_iter().map(|(_, item)| item.clone()).collect();
+    fn remove_item_accounting(&mut self, item_id: &ItemId) {
+        if let Some(bytes) = self.item_bytes.remove(item_id) {
+            self.resident_bytes = self.resident_bytes.saturating_sub(bytes);
+        }
+        self.item_ordinals.remove(item_id);
+    }
+
+    fn replace_read_rows(&mut self, rows: &[(i64, usize, Item)]) {
+        self.items.clear();
         self.item_ordinals.clear();
-        for (ordinal, item) in rows {
+        self.item_bytes.clear();
+        self.resident_bytes = 0;
+        for (ordinal, len, item) in rows {
+            self.item_bytes.insert(item.id.clone(), *len);
+            self.resident_bytes += *len;
             self.item_ordinals.insert(item.id.clone(), *ordinal);
+            self.items.insert(*ordinal, item.clone());
         }
     }
 
-    fn upsert_read_rows(&mut self, rows: &[(i64, Item)]) {
-        for (ordinal, item) in rows {
-            self.items.retain(|existing| existing.id != item.id);
-            let ord = *ordinal as usize;
-            if ord >= self.items.len() {
-                self.items.push(item.clone());
-            } else {
-                self.items.insert(ord, item.clone());
+    fn replace_span_rows(&mut self, from: i64, through: i64, rows: &[(i64, usize, Item)]) {
+        let read_ordinals: HashSet<i64> = rows.iter().map(|(ord, _, _)| *ord).collect();
+        let to_remove: Vec<i64> = self
+            .items
+            .range(from..=through)
+            .filter(|(ord, _)| !read_ordinals.contains(ord))
+            .map(|(ord, _)| *ord)
+            .collect();
+        for ord in to_remove {
+            if let Some(item) = self.items.remove(&ord) {
+                self.remove_item_accounting(&item.id);
             }
+        }
+        self.upsert_read_rows(rows);
+    }
+
+    fn upsert_read_rows(&mut self, rows: &[(i64, usize, Item)]) {
+        for (ordinal, len, item) in rows {
+            if let Some(existing) = self.items.values().find(|existing| existing.id == item.id) {
+                let existing_id = existing.id.clone();
+                if let Some(old_ord) = self.item_ordinals.get(&existing_id).copied() {
+                    self.items.remove(&old_ord);
+                }
+                self.remove_item_accounting(&existing_id);
+            }
+            self.item_bytes.insert(item.id.clone(), *len);
+            self.resident_bytes += *len;
             self.item_ordinals.insert(item.id.clone(), *ordinal);
+            self.items.insert(*ordinal, item.clone());
         }
     }
 
@@ -637,13 +788,34 @@ impl FocusedTranscript {
     }
 
     #[cfg(test)]
-    fn seed_item(&mut self, ordinal: usize, item: Item) {
-        if ordinal >= self.items.len() {
-            self.items.push(item);
-        } else {
-            self.items.insert(ordinal, item);
+    fn seed_item(&mut self, ordinal: i64, item: Item) {
+        let len = test_payload_len(&item);
+        if let Some(existing) = self.items.remove(&ordinal) {
+            self.remove_item_accounting(&existing.id);
+        }
+        self.item_bytes.insert(item.id.clone(), len);
+        self.resident_bytes += len;
+        self.item_ordinals.insert(item.id.clone(), ordinal);
+        self.items.insert(ordinal, item);
+        if self.resident_lo < 0 || ordinal < self.resident_lo {
+            self.resident_lo = ordinal;
+        }
+        if ordinal > self.resident_hi {
+            self.resident_hi = ordinal;
         }
     }
+}
+
+#[cfg(test)]
+fn test_payload_len(item: &Item) -> usize {
+    rowsource::item_text_stub(item).len().max(1)
+}
+
+fn read_ordinal_bounds(rows: &[(i64, usize, Item)]) -> Option<(i64, i64)> {
+    rows.iter()
+        .map(|(ord, _, _)| *ord)
+        .min()
+        .zip(rows.iter().map(|(ord, _, _)| *ord).max())
 }
 
 fn is_user_message(item: &Item) -> bool {
@@ -758,17 +930,235 @@ mod tests {
 
     fn range_read(rows: Vec<(i64, Item)>, watermark: i64) -> RangeRead {
         RangeRead {
-            rows,
+            rows: rows
+                .into_iter()
+                .map(|(ord, item)| {
+                    let len = test_payload_len(&item);
+                    (ord, len, item)
+                })
+                .collect(),
             skipped: vec![],
             watermark: Some(watermark),
         }
+    }
+
+    fn tail_read(rows: Vec<(i64, Item)>, watermark: i64) -> RangeRead {
+        range_read(rows, watermark)
+    }
+
+    #[gpui::test]
+    async fn baseline_tail_sets_cursors(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        let rows: Vec<_> = (0..=5)
+            .map(|o| (o, message_item(&format!("m{o}"), None)))
+            .collect();
+        let min_ordinal = 0;
+        let max_ordinal = 5;
+        let watermark = 0;
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    tail_read(rows.clone(), watermark),
+                    cx,
+                );
+            });
+        });
+
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert_eq!(r.resident_lo_for_test(), min_ordinal);
+            assert_eq!(r.resident_hi_for_test(), max_ordinal);
+            assert_eq!(r.known_committed_for_test(), watermark);
+            assert_eq!(r.items_len_for_test(), rows.len());
+        });
+    }
+
+    #[gpui::test]
+    async fn span_de_ghost_fc_live_at_5(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        let msg_store = message_item("msg_store", None);
+        let fc_live = reasoning_item("fc_live", "resp_a");
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    tail_read(vec![(0, msg_store.clone()), (5, fc_live.clone())], 0),
+                    cx,
+                );
+            });
+        });
+
+        let (resident_lo, resident_hi) = cx.read(|cx| {
+            let r = replica.read(cx);
+            (r.resident_lo_for_test(), r.resident_hi_for_test())
+        });
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Span {
+                        from: resident_lo,
+                        through: resident_hi,
+                    },
+                    range_read(vec![(0, msg_store.clone())], 0),
+                    cx,
+                );
+            });
+        });
+
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert!(
+                !r.has_item_ordinal_for_test(5),
+                "fold-deleted provisional must leave items"
+            );
+            assert!(
+                !r.rows()
+                    .order()
+                    .iter()
+                    .any(|id| matches!(id, RowId::Work(id) if id.as_str() == "fc_live")),
+                "no ghost Work row for fc_live"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn backward_prepend_materializes_rows(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        let tail_rows: Vec<_> = (10..=20)
+            .map(|o| (o, reasoning_item(&format!("r{o}"), "resp_a")))
+            .collect();
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    tail_read(tail_rows, 20),
+                    cx,
+                );
+            });
+        });
+
+        let upper_key = SectionKey {
+            response_id: ResponseId::new("resp_a"),
+            run_anchor: ItemId::new("r20"),
+        };
+        let chip_before = cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                let _ = cx;
+                r.rows()
+                    .entity_id(&upper_key.rail_id(), cx)
+                    .or_else(|| r.rows().entity_id(&upper_key.chip_id(), cx))
+            })
+        });
+
+        let prepend_rows: Vec<_> = (5..=9)
+            .map(|o| (o, reasoning_item(&format!("r{o}"), "resp_a")))
+            .collect();
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Backward {
+                        before: 10,
+                        byte_budget: PAGE_BUDGET_BYTES,
+                    },
+                    tail_read(prepend_rows, 20),
+                    cx,
+                );
+            });
+        });
+
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert_eq!(r.resident_lo_for_test(), 5);
+            assert_eq!(r.resident_hi_for_test(), 20);
+            for ord in 5..=9 {
+                let id = ItemId::new(&format!("r{ord}"));
+                assert!(
+                    r.rows()
+                        .order()
+                        .iter()
+                        .any(|row_id| row_id == &RowId::Work(id.clone())),
+                    "prepended ordinal {ord} must materialize in RowStore order"
+                );
+            }
+            let chip_after = r
+                .rows()
+                .entity_id(&upper_key.rail_id(), cx)
+                .or_else(|| r.rows().entity_id(&upper_key.chip_id(), cx));
+            assert_eq!(
+                chip_before, chip_after,
+                "section anchor must stay stable across backward prepend"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn reconcile_uses_span(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    tail_read(
+                        vec![(3, message_item("m3", None)), (4, message_item("m4", None))],
+                        3,
+                    ),
+                    cx,
+                );
+            });
+        });
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.on_reconcile_epoch_settled(1, cx);
+            });
+        });
+
+        let reconcile = rx.try_recv().expect("reconcile span read");
+        assert_eq!(
+            reconcile.range,
+            ReadRange::Span {
+                from: 3,
+                through: 4,
+            }
+        );
+        assert_eq!(reconcile.priority, Priority::Reconcile);
     }
 
     #[gpui::test]
     async fn rebased_updates_scalars_never_clears_items(cx: &mut gpui::TestAppContext) {
         let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
         let baseline = rx.try_recv().expect("baseline read at new");
-        assert_eq!(baseline.range, ReadRange::All);
+        assert_eq!(
+            baseline.range,
+            ReadRange::Tail {
+                byte_budget: TAIL_BUDGET_BYTES
+            }
+        );
         assert_eq!(baseline.priority, Priority::Baseline);
 
         let resp = ResponseId::new("resp_a");
@@ -776,6 +1166,8 @@ mod tests {
             replica.update(cx, |r, _| {
                 r.seed_item(0, message_item("item_a", Some("resp_a")));
                 r.active_response = Some(resp.clone());
+                r.recompute_live_section_lo();
+                r.recompute_settled_prefix();
             });
             replica.update(cx, |r, cx| {
                 r.fold_detailed(
@@ -854,7 +1246,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn active_response_changed_recomputes_live_section_start(cx: &mut gpui::TestAppContext) {
+    async fn active_response_changed_recomputes_live_section_lo(cx: &mut gpui::TestAppContext) {
         let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
         let _ = rx.try_recv().expect("baseline");
 
@@ -875,7 +1267,7 @@ mod tests {
 
         cx.read(|cx| {
             let r = replica.read(cx);
-            assert_eq!(r.live_section_start, 1);
+            assert_eq!(r.live_section_lo_for_test(), Some(1));
             assert_eq!(r.active_response.as_ref(), Some(&resp_b));
         });
 
@@ -886,7 +1278,7 @@ mod tests {
         });
         cx.read(|cx| {
             let r = replica.read(cx);
-            assert_eq!(r.live_section_start, 3);
+            assert_eq!(r.live_section_lo_for_test(), None);
         });
 
         cx.update(|cx| {
@@ -902,7 +1294,7 @@ mod tests {
         });
         cx.read(|cx| {
             let r = replica.read(cx);
-            assert_eq!(r.live_section_start, 0);
+            assert_eq!(r.live_section_lo_for_test(), None);
         });
         assert!(rx.try_recv().is_err());
     }
@@ -915,7 +1307,7 @@ mod tests {
         cx.update(|cx| {
             replica.update(cx, |r, _| {
                 r.seed_item(0, message_item("m0", Some("resp_a")));
-                r.live_section_start = 0;
+                r.live_section_lo = Some(0);
             });
             replica.update(cx, |r, cx| {
                 r.reproject(false, cx);
@@ -965,7 +1357,13 @@ mod tests {
         });
 
         let reconcile = rx.try_recv().expect("reconcile re-read");
-        assert_eq!(reconcile.range, ReadRange::All);
+        assert_eq!(
+            reconcile.range,
+            ReadRange::Span {
+                from: -1,
+                through: -1,
+            }
+        );
         assert_eq!(reconcile.priority, Priority::Reconcile);
     }
 
@@ -1004,9 +1402,10 @@ mod tests {
         });
         cx.read(|cx| {
             let r = replica.read(cx);
+            let ids: Vec<_> = r.items.values().map(|i| i.id.clone()).collect();
             assert_eq!(r.items.len(), 2, "deleted row b must not ghost");
-            assert_eq!(r.items[0].id, a.id);
-            assert_eq!(r.items[1].id, c_reord.id);
+            assert_eq!(ids[0], a.id);
+            assert_eq!(ids[1], c_reord.id);
         });
         assert!(rx.try_recv().is_err());
     }
@@ -1031,7 +1430,7 @@ mod tests {
         cx.read(|cx| {
             let r = replica.read(cx);
             assert_eq!(r.items.len(), 1, "rekey must not leave stale twin");
-            assert_eq!(r.items[0].id, y.id);
+            assert_eq!(r.items.values().next().unwrap().id, y.id);
         });
         assert!(rx.try_recv().is_err());
     }
@@ -1063,9 +1462,10 @@ mod tests {
         });
         cx.read(|cx| {
             let r = replica.read(cx);
+            let ids: Vec<_> = r.items.values().map(|i| i.id.clone()).collect();
             assert_eq!(r.items.len(), 2);
-            assert_eq!(r.items[0].id, a.id);
-            assert_eq!(r.items[1].id, b.id);
+            assert_eq!(ids[0], a.id);
+            assert_eq!(ids[1], b.id);
         });
         assert!(rx.try_recv().is_err());
     }
@@ -1082,7 +1482,7 @@ mod tests {
                     99,
                     ReadRange::All,
                     RangeRead {
-                        rows: vec![(0, item.clone())],
+                        rows: vec![(0, test_payload_len(&item), item.clone())],
                         skipped: vec![],
                         watermark: Some(0),
                     },
@@ -1100,7 +1500,7 @@ mod tests {
                     1,
                     ReadRange::All,
                     RangeRead {
-                        rows: vec![(0, item)],
+                        rows: vec![(0, test_payload_len(&item), item)],
                         skipped: vec![],
                         watermark: Some(0),
                     },
@@ -1136,7 +1536,13 @@ mod tests {
         });
 
         let reconcile = rx.try_recv().expect("Imp-4 reconcile re-read");
-        assert_eq!(reconcile.range, ReadRange::All);
+        assert_eq!(
+            reconcile.range,
+            ReadRange::Span {
+                from: -1,
+                through: -1,
+            }
+        );
         assert_eq!(reconcile.generation, 7);
         assert_eq!(reconcile.priority, Priority::Reconcile);
     }
@@ -1151,7 +1557,9 @@ mod tests {
         cx.update(|cx| {
             replica.update(cx, |r, _| {
                 r.active_response = Some(resp.clone());
-                r.live_section_start = 0;
+                r.recompute_live_section_lo();
+                r.recompute_settled_prefix();
+                r.live_section_lo = Some(0);
             });
             replica.update(cx, |r, cx| {
                 r.fold_detailed(
@@ -1228,7 +1636,9 @@ mod tests {
                     cx,
                 );
                 r.active_response = Some(resp_c.clone());
-                r.recompute_live_section_start();
+                r.recompute_live_section_lo();
+                r.recompute_settled_prefix();
+                r.recompute_live_section_lo();
                 r.apply_expansion_flags(cx);
             });
         });
@@ -1290,7 +1700,9 @@ mod tests {
                     cx,
                 );
                 r.active_response = Some(ResponseId::new("resp_live"));
-                r.recompute_live_section_start();
+                r.recompute_live_section_lo();
+                r.recompute_settled_prefix();
+                r.recompute_live_section_lo();
                 r.apply_expansion_flags(cx);
             });
         });
@@ -1361,6 +1773,8 @@ mod tests {
                     cx,
                 );
                 r.active_response = Some(resp.clone());
+                r.recompute_live_section_lo();
+                r.recompute_settled_prefix();
             });
         });
 
@@ -1514,14 +1928,18 @@ mod tests {
         let resp_b = ResponseId::new("resp_b");
         // StreamingReasoning is spliced after settled items, so with
         // [r_a, r_b] + stream(active=resp_a) the tail opens a new resp_a run
-        // (run_index 1) that is NOT the last section (resp_b is).
+        // run_anchor r_a0) that is NOT the last section (resp_b is).
+        let stream_key = SectionKey {
+            response_id: resp_a.clone(),
+            run_anchor: ItemId::new(acc.as_str()),
+        };
         let key_a = SectionKey {
             response_id: resp_a.clone(),
-            run_index: 1,
+            run_anchor: item_id.clone(),
         };
         let key_b = SectionKey {
             response_id: resp_b.clone(),
-            run_index: 0,
+            run_anchor: ItemId::new("r_b0"),
         };
 
         cx.update(|cx| {
@@ -1566,14 +1984,14 @@ mod tests {
             let r = replica.read(cx);
             assert_eq!(
                 r.rows().section_containing_child(&tail),
-                Some(&key_a),
-                "precondition: live reasoning tail under resp_a run 1 (not last)"
+                Some(&stream_key),
+                "precondition: live reasoning tail under resp_a stream run (not last)"
             );
             assert!(
                 r.rows()
                     .order()
                     .iter()
-                    .any(|id| matches!(id, RowId::SectionRail(r, 0) | RowId::Section(r, 0) if r == &resp_b)),
+                    .any(|id| matches!(id, RowId::SectionRail(r, anchor) | RowId::Section(r, anchor) if r == &resp_b && anchor.as_str() == "r_b0")),
                 "precondition: resp_b section exists after resp_a's stream run"
             );
             r.rows().entity_id(&tail, cx)
@@ -1902,15 +2320,21 @@ mod tests {
         let acc = AccId::new("acc_r_vanish");
         let item_id = ItemId::new("r_local_vanish");
         let resp_a = ResponseId::new("resp_a");
+        let stream_key = SectionKey {
+            response_id: resp_a.clone(),
+            run_anchor: ItemId::new(acc.as_str()),
+        };
         let key_a = SectionKey {
             response_id: resp_a.clone(),
-            run_index: 0,
+            run_anchor: item_id.clone(),
         };
 
         let entity_before = cx.update(|cx| {
             replica.update(cx, |r, _| {
                 r.active_response = Some(resp_a.clone());
-                r.live_section_start = 0;
+                r.recompute_live_section_lo();
+                r.recompute_settled_prefix();
+                r.live_section_lo = Some(0);
             });
             replica.update(cx, |r, cx| {
                 r.fold_detailed(
@@ -1930,7 +2354,7 @@ mod tests {
             let r = replica.read(cx);
             assert_eq!(
                 r.rows().section_containing_child(&tail),
-                Some(&key_a),
+                Some(&stream_key),
                 "precondition: reasoning-only section owns the live tail"
             );
             r.rows().entity_id(&tail, cx)
@@ -2033,6 +2457,8 @@ mod tests {
                     cx,
                 );
                 r.active_response = Some(resp_b.clone());
+                r.recompute_live_section_lo();
+                r.recompute_settled_prefix();
             });
         });
 
@@ -2111,7 +2537,9 @@ mod tests {
         let entity_before = cx.update(|cx| {
             replica.update(cx, |r, _| {
                 r.active_response = Some(resp.clone());
-                r.live_section_start = 0;
+                r.recompute_live_section_lo();
+                r.recompute_settled_prefix();
+                r.live_section_lo = Some(0);
             });
             replica.update(cx, |r, cx| {
                 r.fold_detailed(
@@ -2297,6 +2725,8 @@ mod tests {
         cx.update(|cx| {
             replica.update(cx, |r, _| {
                 r.active_response = Some(resp.clone());
+                r.recompute_live_section_lo();
+                r.recompute_settled_prefix();
             });
             replica.update(cx, |r, cx| {
                 r.fold_detailed(
@@ -2364,7 +2794,11 @@ mod tests {
                         through: 1,
                     },
                     RangeRead {
-                        rows: vec![(1, message_item("m1", Some("resp_a")))],
+                        rows: vec![(
+                            1,
+                            test_payload_len(&message_item("m1", Some("resp_a"))),
+                            message_item("m1", Some("resp_a")),
+                        )],
                         skipped: vec![],
                         watermark: Some(5),
                     },
@@ -2407,7 +2841,11 @@ mod tests {
                     1,
                     ReadRange::One { ordinal: 0 },
                     RangeRead {
-                        rows: vec![(0, user_item("u0", "rewrite"))],
+                        rows: vec![(
+                            0,
+                            test_payload_len(&user_item("u0", "rewrite")),
+                            user_item("u0", "rewrite"),
+                        )],
                         skipped: vec![],
                         watermark: Some(9),
                     },
@@ -2595,6 +3033,8 @@ mod tests {
                 r.last_rendered_ordinal = 0;
                 r.fold_detailed(StreamUpdate::Reconnected { gap: Some(5) }, cx);
                 r.active_response = Some(ResponseId::new("resp_b"));
+                r.recompute_live_section_lo();
+                r.recompute_settled_prefix();
             });
         });
 
@@ -2886,11 +3326,11 @@ mod tests {
             let small_r = small.read(cx);
             let large_r = large.read(cx);
             assert!(
-                small_r.live_section_start_for_test() < small_r.items_len_for_test(),
+                small_r.live_slice_len_for_test() > 0,
                 "small: live section must not be empty"
             );
             assert!(
-                large_r.live_section_start_for_test() < large_r.items_len_for_test(),
+                large_r.live_slice_len_for_test() > 0,
                 "large: live section must not be empty"
             );
             assert_eq!(

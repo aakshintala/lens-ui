@@ -103,10 +103,17 @@ fn message_item(id: &str, text: &str) -> lens_core::domain::item::Item {
     }
 }
 
+fn row_with_len(
+    ord: i64,
+    item: lens_core::domain::item::Item,
+) -> (i64, usize, lens_core::domain::item::Item) {
+    (ord, 4, item)
+}
+
 fn seed_rows(replica: &Entity<FocusedTranscript>, count: usize, cx: &mut App) {
     let rows: Vec<_> = (0..count)
         .map(|i| {
-            (
+            row_with_len(
                 i as i64,
                 message_item(&format!("m{i}"), &format!("row {i}")),
             )
@@ -141,7 +148,7 @@ fn append_row(
                 through: ordinal,
             },
             RangeRead {
-                rows: vec![(ordinal, message_item(id, text))],
+                rows: vec![row_with_len(ordinal, message_item(id, text))],
                 skipped: vec![],
                 watermark: Some(ordinal),
             },
@@ -283,7 +290,10 @@ async fn drive_scroll_probe(
                     through: SEED as i64 + 4,
                 },
                 RangeRead {
-                    rows: vec![(SEED as i64 + 4, message_item("msg_scroll_fin", "finalized"))],
+                    rows: vec![row_with_len(
+                        SEED as i64 + 4,
+                        message_item("msg_scroll_fin", "finalized"),
+                    )],
                     skipped: vec![],
                     watermark: Some(SEED as i64 + 4),
                 },

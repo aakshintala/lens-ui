@@ -113,10 +113,17 @@ fn message_item(id: &str, text: &str, resp: &str) -> lens_core::domain::item::It
     }
 }
 
+fn row_with_len(
+    ord: i64,
+    item: lens_core::domain::item::Item,
+) -> (i64, usize, lens_core::domain::item::Item) {
+    (ord, 4, item)
+}
+
 fn seed_rows(replica: &Entity<FocusedTranscript>, count: usize, cx: &mut App) {
     let rows: Vec<_> = (0..count)
         .map(|i| {
-            (
+            row_with_len(
                 i as i64,
                 message_item(
                     &format!("m{i}"),
