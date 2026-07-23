@@ -382,9 +382,33 @@ mod tests {
 
     #[test]
     fn block_html_becomes_html_codeblock_source() {
-        use crate::md::safe_prefix;
-        let src = safe_prefix("<a href=\"javascript:alert(1)\">x</a>\n\nparagraph");
-        assert!(src.contains("<a href="));
-        let _ = src;
+        use crate::md::node::Node;
+
+        let style = TextViewStyle::default();
+        let highlight_theme = style.highlight_theme.as_ref();
+        let mut node_cx = NodeContext::default();
+
+        let root = parse(
+            "<div>x</div>\n\np",
+            &style,
+            &mut node_cx,
+            highlight_theme,
+        )
+        .expect("block HTML markdown should parse");
+
+        fn find_html_codeblock(node: &Node) -> Option<&CodeBlock> {
+            match node {
+                Node::CodeBlock(cb) if cb.lang().is_some_and(|l| l.as_ref() == "html") => Some(cb),
+                Node::Root { children }
+                | Node::Blockquote { children }
+                | Node::List { children, .. } => children.iter().find_map(find_html_codeblock),
+                Node::ListItem { children, .. } => children.iter().find_map(find_html_codeblock),
+                _ => None,
+            }
+        }
+
+        let code_block = find_html_codeblock(&root).expect("block HTML should map to html CodeBlock");
+        assert!(code_block.code().contains("<div>x</div>"));
     }
 }
+

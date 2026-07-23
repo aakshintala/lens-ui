@@ -126,7 +126,7 @@ struct UpdateFuture {
     code_block_actions: Option<Arc<CodeBlockActionsFn>>,
     throttle_armed: bool,
     pending_parse: bool,
-    streaming: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    streaming: crate::md::stream_flag::StreamingFlag,
 }
 
 impl UpdateFuture {
@@ -140,7 +140,7 @@ impl UpdateFuture {
         tx_result: smol::channel::Sender<Result<ParsedContent, SharedString>>,
         delay: Duration,
         code_block_actions: Option<Arc<CodeBlockActionsFn>>,
-        streaming: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        streaming: crate::md::stream_flag::StreamingFlag,
     ) -> Self {
         Self {
             type_,
@@ -169,8 +169,7 @@ impl Future for UpdateFuture {
                     let changed = match update {
                         Update::Text(text) if self.current_text != text => {
                             self.current_text = text;
-                            self.streaming
-                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                            self.streaming.mark_streaming();
                             true
                         }
                         Update::Style(style) if self.current_style != *style => {
@@ -210,8 +209,6 @@ impl Future for UpdateFuture {
                         self.timer.set_after(delay);
                     } else {
                         self.throttle_armed = false;
-                        self.streaming
-                            .store(false, std::sync::atomic::Ordering::Relaxed);
                     }
                     continue;
                 }
@@ -247,7 +244,7 @@ pub(crate) struct TextViewState {
     is_selecting: bool,
     is_selectable: bool,
     list_state: ListState,
-    streaming: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    streaming: crate::md::stream_flag::StreamingFlag,
 }
 
 impl TextViewState {
@@ -263,7 +260,7 @@ impl TextViewState {
             is_selecting: false,
             is_selectable: false,
             list_state: ListState::new(0, gpui::ListAlignment::Top, px(1000.)),
-            streaming: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            streaming: crate::md::stream_flag::StreamingFlag::new(),
         }
     }
 }
@@ -592,11 +589,11 @@ impl Element for TextView {
                         if let Some(state) = state.upgrade() {
                             _ = state.update(cx, |state, cx| {
                                 state.parsed_result = Some(parsed_result);
+                                state.streaming.mark_settled();
                                 if let Some(parent_entity) = state.parent_entity {
                                     let app = &mut **cx;
                                     app.notify(parent_entity);
                                 }
-                                // (selection intentionally preserved across reparse — P2)
                             });
                         } else {
                             // state released, stopping processing
@@ -688,7 +685,7 @@ impl Element for TextView {
             .state
             .read(cx)
             .streaming
-            .load(std::sync::atomic::Ordering::Relaxed);
+            .preserve_on_resize();
         self.state.update(cx, |state, _| {
             state.parent_entity = Some(entity_id);
             state.update_bounds(bounds, preserve_selection_on_resize);

@@ -4,6 +4,7 @@ mod format;
 mod global_state;
 mod inline;
 mod node;
+mod stream_flag;
 mod style;
 mod text_view;
 mod utils;
