@@ -273,7 +273,11 @@ impl FocusedTranscript {
             | StreamUpdate::ContextWindowChanged(_)
             | StreamUpdate::Reconnecting { .. }
             | StreamUpdate::Disconnected(_)
-            | StreamUpdate::SnapshotRestored(_) => {}
+            | StreamUpdate::SnapshotRestored(_)
+            // Terminal-5 control-path updates: routed via ActorOutcome, no replica delta.
+            | StreamUpdate::Superseded { .. }
+            | StreamUpdate::TerminalResourceCreated { .. }
+            | StreamUpdate::TerminalResourceDeleted { .. } => {}
             StreamUpdate::Reconnected { gap } => {
                 if gap != Some(0) {
                     let seq = self.next_marker_seq();

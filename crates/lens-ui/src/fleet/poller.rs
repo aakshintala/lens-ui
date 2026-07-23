@@ -142,6 +142,10 @@ fn apply_outcome(card: &mut SessionCard, outcome: ActorOutcome) {
         | ActorOutcome::Slept
         | ActorOutcome::SleepDeclined
         | ActorOutcome::Command(_) => {}
+        // Terminal-5 sub-slice B added these control outcomes; sub-slice D routes
+        // them into FleetStore (load-B/re-parent/Transfer + resource forwarding).
+        // No-op interim so lens-ui compiles between B and D.
+        ActorOutcome::Superseded { .. } | ActorOutcome::TerminalResource(_) => {}
     }
 }
 

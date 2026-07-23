@@ -740,6 +740,18 @@ fn actor_outcome_json(outcome: &ActorOutcome) -> Value {
             "lens_pending_id": lens_pending_id,
             "content": content,
         }),
+        ActorOutcome::Superseded {
+            target_conversation_id,
+            reason,
+        } => json!({
+            "variant": "Superseded",
+            "target_conversation_id": target_conversation_id,
+            "reason": reason,
+        }),
+        ActorOutcome::TerminalResource(signal) => json!({
+            "variant": "TerminalResource",
+            "signal": format!("{signal:?}"),
+        }),
     }
 }
 
