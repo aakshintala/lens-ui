@@ -391,6 +391,10 @@ pub enum TerminalHostEvent {
     /// caller-held entity that outlives fleet membership cannot keep the runtime
     /// alive. Terminal sink — no reattach, no wake.
     End,
+    /// Host-driven cross-session supersede: the server has moved this live terminal
+    /// (same `terminal_id`) into `new_session`. Reuses the retained frozen engine via a
+    /// transport-only re-attach against B, retargeting `current_session` (design §10, Q3).
+    Transfer { new_session: SessionId },
     /// Host response to a typed permission request emitted on [`TerminalEvent`].
     HostRequestResponse {
         id: HostRequestId,
@@ -661,6 +665,11 @@ impl TerminalTab {
             TerminalHostEvent::Wake => self.on_wake(cx),
             TerminalHostEvent::Reattach => self.on_reattach(cx),
             TerminalHostEvent::End => self.on_host_end(cx),
+            TerminalHostEvent::Transfer { new_session } => {
+                if let Some(tid) = self.current_tid.clone() {
+                    self.adopt(new_session, tid, cx);
+                }
+            }
             TerminalHostEvent::ResourceCreated {
                 session_id,
                 terminal_id,
@@ -3156,6 +3165,64 @@ mod tests {
             );
         });
         let _ = engine;
+    }
+
+    #[gpui::test]
+    async fn transfer_reuses_retained_engine_and_retargets_session(cx: &mut gpui::TestAppContext) {
+        let (_engine, tab) = live_tab_for_test(cx, true, "t1", "main", "k");
+        // Reset -> ReplacementWaiting retains the frozen engine (Task 3).
+        tab.update(cx, |tab, cx| {
+            tab.on_host_event(
+                TerminalHostEvent::ResourceDeleted {
+                    terminal_id: TerminalId::new("t1"),
+                },
+                cx,
+            );
+            assert!(tab.runtime.is_some(), "engine retained pending transfer");
+        });
+        let engine_ptr_before = tab.read_with(cx, |tab, _| {
+            tab.runtime
+                .as_ref()
+                .and_then(|r| r.engine_ref())
+                .map(|e| e as *const _ as usize)
+        });
+        // Host drives a cross-session transfer to session B, then assert the reuse branch
+        // was taken SYNCHRONOUSLY (engine NOT dropped/rebuilt) — BEFORE the offline attach resolves.
+        tab.update(cx, |tab, cx| {
+            tab.on_host_event(
+                TerminalHostEvent::Transfer {
+                    new_session: SessionId::new("session_B"),
+                },
+                cx,
+            );
+            let engine_ptr_sync = tab
+                .runtime
+                .as_ref()
+                .and_then(|r| r.engine_ref())
+                .map(|e| e as *const _ as usize);
+            assert!(
+                tab.runtime.is_some(),
+                "Transfer must take the REUSE branch: retained engine kept, NOT dropped (contrast same-session adopt which drops synchronously)"
+            );
+            assert_eq!(
+                engine_ptr_before, engine_ptr_sync,
+                "Transfer must REUSE the exact retained engine instance, not build a fresh one"
+            );
+        });
+        // After park the OFFLINE attach against session_B cannot succeed (no AttachHandle builder
+        // offline) -> honest reachable end-state.
+        cx.run_until_parked();
+        tab.read_with(cx, |tab, _| {
+            assert_eq!(tab.lifecycle, Lifecycle::Detached);
+            assert_eq!(
+                tab.presentation.detached_detail,
+                Some(DetachedDetail::DiscoveryFailed)
+            );
+            assert!(
+                tab.runtime.is_none(),
+                "offline attach against session_B fails -> on_detach(DiscoveryFailed) tears down engine"
+            );
+        });
     }
 
     #[gpui::test]

@@ -163,3 +163,30 @@ fn retained_reconnect_seed_does_not_duplicate_scrollback() {
         "scrollback grew by {delta} (> viewport); retained seed duplicated history (sb0={sb0}, sb1={sb1})"
     );
 }
+
+#[test]
+fn transfer_seed_across_sessions_does_not_duplicate_scrollback() {
+    // Identical mechanics to retained_reconnect_seed_does_not_duplicate_scrollback:
+    // a retained engine already holds leg1 history; the cross-session (B) attach seed is
+    // leg2 (clear+redraw). Feeding leg2 must NOT grow scrollback beyond one viewport.
+    let lines = load_capture_lines(RECONNECT_CAPTURE);
+    let legs = split_reconnect_legs(&lines);
+    let cfg = reconnect_config();
+    let rows = cfg.rows;
+
+    let mut engine = VtEngine::new(&cfg, |_| {}, {
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        tx
+    })
+    .expect("VtEngine");
+    engine.feed(&legs.leg1_seed);
+    let sb0 = engine.scrollback_rows_for_test();
+    engine.feed(&legs.leg2_seed);
+    let sb1 = engine.scrollback_rows_for_test();
+
+    let delta = sb1.saturating_sub(sb0);
+    assert!(
+        delta <= rows as usize,
+        "transfer seed duplicated history across sessions (delta={delta}, sb0={sb0}, sb1={sb1})"
+    );
+}
