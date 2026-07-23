@@ -70,6 +70,16 @@ pub struct FleetStore {
     reconcile_epochs: HashMap<SessionId, ReconcileEpoch>,
     pub(crate) terminals:
         HashMap<SessionId, HashMap<terminal::TerminalKeyId, terminal::TerminalMember>>,
+    pub(crate) session_loader: Option<std::rc::Rc<dyn crate::fleet::loader::SessionLoader>>,
+    /// Bumped on every supersede that starts a load; the async completion
+    /// no-ops unless it still matches. Same apply-time-guard discipline as
+    /// sub-slice A's `reconnect_epoch`.
+    #[allow(dead_code)] // Task 5 supersede handler reads/writes this.
+    pub(crate) supersede_epoch: u64,
+    /// Targets with a load in flight — prevents a duplicate/replayed
+    /// `Superseded` from double GET/seed/spawning the same session.
+    #[allow(dead_code)] // Task 5 supersede handler reads/writes this.
+    pub(crate) supersede_in_flight: std::collections::HashSet<SessionId>,
     focused_replica: Option<(SessionId, Entity<FocusedTranscript>)>,
     focus_generation: u64,
     #[cfg(test)]
@@ -91,6 +101,9 @@ impl FleetStore {
             reader_factories: HashMap::new(),
             reconcile_epochs: HashMap::new(),
             terminals: HashMap::new(),
+            session_loader: None,
+            supersede_epoch: 0,
+            supersede_in_flight: std::collections::HashSet::new(),
             focused_replica: None,
             focus_generation: 0,
             #[cfg(test)]
@@ -112,11 +125,24 @@ impl FleetStore {
             reader_factories: HashMap::new(),
             reconcile_epochs: HashMap::new(),
             terminals: HashMap::new(),
+            session_loader: None,
+            supersede_epoch: 0,
+            supersede_in_flight: std::collections::HashSet::new(),
             focused_replica: None,
             focus_generation: 0,
             #[cfg(test)]
             focused_detailed_fanout_count: Cell::new(0),
         })
+    }
+
+    /// Inject the session-load seam (design §10 step 1). `lens-app` wires the
+    /// real loader at startup; tests inject a fake. Without a loader the
+    /// supersede handler no-ops rather than stranding terminals.
+    pub fn set_session_loader(
+        &mut self,
+        loader: std::rc::Rc<dyn crate::fleet::loader::SessionLoader>,
+    ) {
+        self.session_loader = Some(loader);
     }
 
     pub fn store_notify_count(&self) -> u64 {
