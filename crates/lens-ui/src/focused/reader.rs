@@ -20,6 +20,7 @@ pub enum Priority {
     Delta,
     Reconcile,
     Rewrite,
+    Page,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -142,6 +143,7 @@ struct TargetCoalescer {
     rewrites: Vec<ReadTarget>,
     reconcile: Option<ReadTarget>,
     baseline: Option<ReadTarget>,
+    page: Option<ReadTarget>,
     delta: Option<ReadTarget>,
 }
 
@@ -151,6 +153,7 @@ impl TargetCoalescer {
             rewrites: Vec::new(),
             reconcile: None,
             baseline: None,
+            page: None,
             delta: None,
         }
     }
@@ -159,6 +162,7 @@ impl TargetCoalescer {
         self.rewrites.is_empty()
             && self.reconcile.is_none()
             && self.baseline.is_none()
+            && self.page.is_none()
             && self.delta.is_none()
     }
 
@@ -178,6 +182,28 @@ impl TargetCoalescer {
             }
             Priority::Reconcile => self.reconcile = Some(target),
             Priority::Baseline => self.baseline = Some(target),
+            Priority::Page => {
+                if let (
+                    ReadRange::Backward {
+                        before: incoming_before,
+                        ..
+                    },
+                    Some(ReadTarget {
+                        range:
+                            ReadRange::Backward {
+                                before: existing_before,
+                                ..
+                            },
+                        ..
+                    }),
+                ) = (target.range, self.page.as_ref())
+                {
+                    if incoming_before >= *existing_before {
+                        return;
+                    }
+                }
+                self.page = Some(target);
+            }
             Priority::Delta => {
                 if let Some(existing) = &mut self.delta {
                     existing.range = merge_delta_ranges(&existing.range, &target.range);
@@ -197,6 +223,9 @@ impl TargetCoalescer {
             return Some(target);
         }
         if let Some(target) = self.baseline.take() {
+            return Some(target);
+        }
+        if let Some(target) = self.page.take() {
             return Some(target);
         }
         self.delta.take()
@@ -573,7 +602,10 @@ mod tests {
             priority: Priority::Delta,
         });
         reader.enqueue(ReadTarget {
-            range: ReadRange::All,
+            range: ReadRange::Span {
+                from: 0,
+                through: 5,
+            },
             generation: 1,
             priority: Priority::Reconcile,
         });
@@ -581,7 +613,13 @@ mod tests {
 
         let ranges = read_log.lock().expect("read log lock");
         assert_eq!(ranges.len(), 3);
-        assert_eq!(ranges[1], ReadRange::All);
+        assert_eq!(
+            ranges[1],
+            ReadRange::Span {
+                from: 0,
+                through: 5
+            }
+        );
         assert_eq!(
             ranges[2],
             ReadRange::Delta {
@@ -736,6 +774,36 @@ mod tests {
         ));
         assert!(fake.read_range(ReadRange::All).is_ok());
         assert_eq!(fake.busy_attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn coalescer_backward_pages_keep_lowest_before() {
+        let mut coalescer = TargetCoalescer::new();
+        coalescer.insert(ReadTarget {
+            range: ReadRange::Backward {
+                before: 20,
+                byte_budget: 1024,
+            },
+            generation: 1,
+            priority: Priority::Page,
+        });
+        coalescer.insert(ReadTarget {
+            range: ReadRange::Backward {
+                before: 10,
+                byte_budget: 1024,
+            },
+            generation: 1,
+            priority: Priority::Page,
+        });
+        let target = coalescer.pop_highest().expect("page target");
+        assert_eq!(
+            target.range,
+            ReadRange::Backward {
+                before: 10,
+                byte_budget: 1024,
+            }
+        );
+        assert!(coalescer.is_empty());
     }
 
     #[test]
