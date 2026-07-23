@@ -1042,7 +1042,7 @@ CREATE TABLE IF NOT EXISTS items (
     fn payload_len(s: &SqliteTranscriptStore, id: &str) -> usize {
         s.conn
             .query_row(
-                "SELECT length(payload) FROM items WHERE item_id = ?1",
+                "SELECT length(CAST(payload AS BLOB)) FROM items WHERE item_id = ?1",
                 [id],
                 |r| r.get::<_, i64>(0),
             )
@@ -1062,11 +1062,10 @@ CREATE TABLE IF NOT EXISTS items (
         s.upsert_item(3, &function_call("fc_live", "c1"), true)
             .unwrap(); // provisional — newest ordinal, not the watermark
 
-        let len_a = payload_len(&s, "item_a");
-        let len_b = payload_len(&s, "item_b");
         let len_c = payload_len(&s, "item_c");
         let len_fc = payload_len(&s, "fc_live");
-        let byte_budget = len_c + len_fc + 1; // newest row + one older; may overshoot budget
+        // DESC: 3, 2 fit within budget; adding ordinal 1 overshoots — excludes 0 and keeps [1,2,3].
+        let byte_budget = len_c + len_fc + 1;
 
         let r = SqliteTranscriptReader::open_read_only(
             &d.path().join("conv_1.db"),
@@ -1075,18 +1074,35 @@ CREATE TABLE IF NOT EXISTS items (
         .unwrap();
         let read = r.read_range(ReadRange::Tail { byte_budget }).unwrap();
 
-        assert!(read.rows.windows(2).all(|w| w[0].0 < w[1].0));
-        assert!(!read.rows.is_empty());
-        assert_eq!(read.rows.last().unwrap().0, 3); // includes the newest row
+        let ords: Vec<i64> = read.rows.iter().map(|(o, _, _)| *o).collect();
+        assert_eq!(ords, vec![1, 2, 3]);
         assert_eq!(read.watermark, Some(2)); // newest non-provisional
 
         let total_payload: usize = read.rows.iter().map(|(_, len, _)| *len).sum();
-        assert!(total_payload > byte_budget || read.rows.len() == 1);
-        let expected_min_len = if byte_budget >= len_fc { 2 } else { 1 };
-        assert!(read.rows.len() >= expected_min_len);
-        // sanity: budget should include at least the newest payload
-        assert!(read.rows.iter().any(|(_, len, _)| *len == len_fc));
-        let _ = (len_a, len_b); // seeded for varied store; not all rows fit the budget
+        assert!(total_payload > byte_budget);
+    }
+
+    #[test]
+    fn read_range_tail_undersized_budget_yields_newest_row_only() {
+        let d = tempdir().unwrap();
+        let s = store(d.path());
+        s.upsert_item(0, &item("item_a", None, "aaaa"), false)
+            .unwrap();
+        s.upsert_item(1, &item("item_b", None, "bbbbbbbb"), false)
+            .unwrap();
+        s.upsert_item(2, &item("item_c", None, "cc"), false)
+            .unwrap();
+
+        let r = SqliteTranscriptReader::open_read_only(
+            &d.path().join("conv_1.db"),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        let read = r.read_range(ReadRange::Tail { byte_budget: 0 }).unwrap();
+
+        let ords: Vec<i64> = read.rows.iter().map(|(o, _, _)| *o).collect();
+        assert_eq!(ords, vec![2]); // newest only, even though its payload exceeds budget
+        assert_eq!(read.rows.len(), 1);
     }
 
     #[test]
@@ -1099,10 +1115,13 @@ CREATE TABLE IF NOT EXISTS items (
             .unwrap();
         s.upsert_item(2, &item("item_c", None, "cc"), false)
             .unwrap();
+        s.upsert_item(3, &item("item_d", None, "dddddddddd"), false)
+            .unwrap();
 
-        let len_a = payload_len(&s, "item_a");
-        let len_b = payload_len(&s, "item_b");
-        let byte_budget = len_b + 1; // newest eligible row + one older; overshoots on second
+        let len_c = payload_len(&s, "item_c");
+        let len_d = payload_len(&s, "item_d");
+        // Eligible: ordinals < 4. DESC 3,2 fit; adding 1 overshoots — excludes 0, keeps [1,2,3].
+        let byte_budget = len_c + len_d + 1;
 
         let r = SqliteTranscriptReader::open_read_only(
             &d.path().join("conv_1.db"),
@@ -1111,18 +1130,17 @@ CREATE TABLE IF NOT EXISTS items (
         .unwrap();
         let read = r
             .read_range(ReadRange::Backward {
-                before: 2,
+                before: 4,
                 byte_budget,
             })
             .unwrap();
 
-        assert!(read.rows.windows(2).all(|w| w[0].0 < w[1].0));
-        assert!(!read.rows.is_empty());
-        assert!(read.rows.iter().all(|(ord, _, _)| *ord < 2));
-        assert_eq!(read.rows.last().unwrap().0, 1);
+        let ords: Vec<i64> = read.rows.iter().map(|(o, _, _)| *o).collect();
+        assert_eq!(ords, vec![1, 2, 3]);
+        assert!(read.rows.iter().all(|(ord, _, _)| *ord < 4));
+
         let total_payload: usize = read.rows.iter().map(|(_, len, _)| *len).sum();
-        assert!(total_payload > byte_budget || read.rows.len() == 1);
-        let _ = len_a;
+        assert!(total_payload > byte_budget);
     }
 
     #[test]
