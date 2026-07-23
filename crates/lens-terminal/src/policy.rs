@@ -28,24 +28,37 @@ pub(crate) enum PolicyAction {
     DowngradeReadOnly,
 }
 
-/// 30s wall-clock retry window with per-attempt backoff (injected `now` for tests).
+/// Production wall-clock retry window. Tests inject a tiny window via
+/// [`RetryWindow::with_window`] so the reconnect loop's real per-attempt
+/// `thread::sleep` (each delay is clamped to the remaining window) collapses to
+/// near-zero instead of burning the full 30s in `run_until_parked`.
+const DEFAULT_RETRY_WINDOW: Duration = Duration::from_secs(30);
+
+/// Wall-clock retry window with per-attempt backoff (injected `now` for tests).
 pub(crate) struct RetryWindow {
     started: Option<Instant>,
     backoff: Backoff,
+    window: Duration,
 }
 
 impl RetryWindow {
     pub fn new() -> Self {
+        Self::with_window(DEFAULT_RETRY_WINDOW)
+    }
+
+    pub fn with_window(window: Duration) -> Self {
         Self {
             started: None,
             backoff: Backoff::default(),
+            window,
         }
     }
 
-    /// `now` injected. First call starts a 30s wall window. Returns None once `now >= started+30s`.
-    /// `Some(delay)` = `backoff.next_delay()` clamped to the remaining window.
+    /// `now` injected. First call starts the wall window. Returns None once
+    /// `now >= started + window`. `Some(delay)` = `backoff.next_delay()` clamped
+    /// to the remaining window.
     pub fn next_delay(&mut self, now: Instant) -> Option<Duration> {
-        let window = Duration::from_secs(30);
+        let window = self.window;
         match self.started {
             None => {
                 self.started = Some(now);
@@ -78,6 +91,17 @@ impl PolicyState {
     pub fn new() -> Self {
         Self {
             retry: RetryWindow::new(),
+            unauthorized_once: false,
+        }
+    }
+
+    /// Test seam: a short retry window keeps the reconnect loop from sleeping the
+    /// full production window in `run_until_parked`. Gated to match
+    /// `TerminalTab::with_engine_for_test`, its only caller.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn with_retry_window(window: Duration) -> Self {
+        Self {
+            retry: RetryWindow::with_window(window),
             unauthorized_once: false,
         }
     }

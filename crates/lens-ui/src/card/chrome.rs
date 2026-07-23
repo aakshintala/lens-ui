@@ -244,6 +244,16 @@ const WASH_GRADIENT_SPREAD: f32 = 1.0;
 const WASH_FLAT_ALPHA: f32 = 0.14;
 const WASH_FAINT_ALPHA: f32 = 0.08;
 
+/// Whether to paint the context-window budget bar. Only the engaged states (a session you're
+/// actively driving) show it; dormant states (Ready / Scheduled / Idle / Slept / Neutral)
+/// suppress it so a static bar doesn't read as live activity.
+fn shows_context_bar(wave: Wave) -> bool {
+    matches!(
+        wave,
+        Wave::Working | Wave::NeedsInput | Wave::Failed | Wave::AwaitingReview
+    )
+}
+
 fn wave_wash(wave: Wave) -> Wash {
     match wave {
         Wave::NeedsInput | Wave::Failed | Wave::AwaitingReview | Wave::Ready => Wash::Gradient {
@@ -258,15 +268,32 @@ fn wave_wash(wave: Wave) -> Wash {
     }
 }
 
-/// Apply the wave's wash as the card background. `status` is the wave's status color.
-fn apply_wash(root: Div, wave: Wave, status: Hsla) -> Div {
+/// sRGB alpha-composite of `top` at opacity `a` over an opaque `base` → an opaque color.
+/// The card body must be opaque so the group's background wash sits fully behind it and
+/// never bleeds through (the shipped `status.opacity(a)` was translucent over nothing).
+fn over(base: Hsla, top: Hsla, a: f32) -> Hsla {
+    let (b, t): (gpui::Rgba, gpui::Rgba) = (base.into(), top.into());
+    gpui::Rgba {
+        r: b.r * (1.0 - a) + t.r * a,
+        g: b.g * (1.0 - a) + t.g * a,
+        b: b.b * (1.0 - a) + t.b * a,
+        a: 1.0,
+    }
+    .into()
+}
+
+/// Apply the wave's wash as the card background, composited over the opaque `surface` (bg2)
+/// so the card reads as an opaque foreground tile. `status` is the wave's status color.
+/// Mockup intent: `color-mix(status <a>%, bg2)` — a tint over an opaque surface, not a
+/// translucent fill.
+fn apply_wash(root: Div, wave: Wave, status: Hsla, surface: Hsla) -> Div {
     match wave_wash(wave) {
-        Wash::None => root,
-        Wash::Flat(a) => root.bg(status.opacity(a)),
+        Wash::None => root.bg(surface),
+        Wash::Flat(a) => root.bg(over(surface, status, a)),
         Wash::Gradient { peak, spread } => root.bg(linear_gradient(
             135.0,
-            linear_color_stop(status.opacity(peak), 0.0),
-            linear_color_stop(status.opacity(0.0), spread),
+            linear_color_stop(over(surface, status, peak), 0.0),
+            linear_color_stop(surface, spread),
         )),
     }
 }
@@ -384,7 +411,7 @@ pub fn render_card_chrome(
     // Status-colored wash behind the content, per-wave (gradient / flat / none). The gradient
     // is a 135° top-left→bottom-right linear approximation of the SSOT corner radial (gpui has
     // no radial); pane-ui-match uses full spread so it covers the body, not just the corner.
-    root = apply_wash(root, wave, border);
+    root = apply_wash(root, wave, border, t.base.muted);
 
     // Header: 44px icon-tile + stacked status / title + kebab.
     let mut header = div()
@@ -401,6 +428,9 @@ pub fn render_card_chrome(
                 .items_center()
                 .gap_2()
                 .flex_grow()
+                // min-width:0 lets this group shrink below its content so the title column's
+                // ellipsis engages instead of the title overflowing past the card edge.
+                .min_w(px(0.0))
                 // No overflow_hidden here: the countdown ring's `inset(-4)` canvas extends past
                 // the tile and must not be clipped. Text truncation is handled by the title
                 // column's own overflow_hidden below.
@@ -411,6 +441,7 @@ pub fn render_card_chrome(
                 .child(
                     div()
                         .flex_grow()
+                        .min_w(px(0.0))
                         .overflow_hidden()
                         .flex()
                         .flex_col()
@@ -540,16 +571,21 @@ pub fn render_card_chrome(
                 .when(dim, |d| d.opacity(0.42)),
         );
 
-    root = root.child(
-        div()
-            .h(px(4.0))
-            .w_full()
-            .rounded(px(2.0))
-            .overflow_hidden()
-            .bg(pbar_track)
-            .child(div().h_full().w(relative(ctx_frac)).bg(pbar_fill))
-            .when(dim, |d| d.opacity(0.42)),
-    );
+    // Context-window bar: a live budget signal, only meaningful while a session is actively
+    // consuming context. On dormant states (finished / idle / scheduled / archived) a static
+    // bar reads as false activity, so it's suppressed there entirely (not just dimmed).
+    if shows_context_bar(wave) {
+        root = root.child(
+            div()
+                .h(px(4.0))
+                .w_full()
+                .rounded(px(2.0))
+                .overflow_hidden()
+                .bg(pbar_track)
+                .child(div().h_full().w(relative(ctx_frac)).bg(pbar_fill))
+                .when(dim, |d| d.opacity(0.42)),
+        );
+    }
 
     if let Some(phase) = sweep_phase {
         root = root.child(render_sweep_overlay(border, phase));

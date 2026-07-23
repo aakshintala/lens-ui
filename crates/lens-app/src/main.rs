@@ -101,7 +101,13 @@ fn main() {
             let fleet = FleetStore::new_live(clock, cx);
             lens_ui::shortcuts::register(&fleet, cx);
 
-            cx.open_window(WindowOptions::default(), move |window, cx| {
+            let window_options = WindowOptions {
+                // Transparent native titlebar + an in-app themed TitleBar (rendered by
+                // BoardView) so the dark theme's title bar replaces the white system strip.
+                titlebar: Some(gpui_component::TitleBar::title_bar_options()),
+                ..Default::default()
+            };
+            cx.open_window(window_options, move |window, cx| {
                 if let Some(prep) = live_prep {
                     fleet.update(cx, |fleet, cx| {
                         for sid in prep.session_ids {
@@ -182,9 +188,10 @@ fn demo_session_ids() -> Vec<String> {
 /// Open a temp board store and seed TWO adjacent, distinctly-colored 2×2 groups over the
 /// first 8 demo stems (conn `lens-app`, matching the replica) so the loaded board renders
 /// B-3 group chrome AND exercises two group tiles meeting in the inter-tile gap:
-/// - "Demo group A" (blue): the loud pair — needs-input, ready, working, failed (failed
-///   lands bottom-right, on the shared edge, so its attention ring reaches toward group B).
-/// - "Demo group B" (orange): the quiet four — slept, neutral, scheduled, awaiting-review.
+/// - "Demo group A" (blue, 2×2): the loud four — needs-input, ready, working, failed.
+/// - "Demo group B" (orange, 2×1): a quiet pair — slept, neutral.
+/// - loose (no group): scheduled + awaiting-review — so the board exercises the grouped +
+///   loose mix (loose tiles hole-backfill beside/below the groups).
 ///
 /// Adjacency is what makes the on-device check meaningful: now that the ring-gutter (12) >
 /// half the inter-tile gap (8), two group tint boxes overlap ~8px in the seam. At
@@ -204,11 +211,13 @@ fn seed_demo_groups(
 
     let groups: [(&str, &str, &[String]); 2] = [
         ("Demo group A", "blue", &ids[..ids.len().min(4)]),
+        // Group B trimmed to 2 members (slept, neutral) so the board also exercises the
+        // grouped + loose mix: scheduled and awaiting-review are placed loose below.
         (
             "Demo group B",
             "orange",
             if ids.len() > 4 {
-                &ids[4..ids.len().min(8)]
+                &ids[4..ids.len().min(6)]
             } else {
                 &[]
             },
@@ -233,6 +242,19 @@ fn seed_demo_groups(
                 },
             );
         }
+    }
+    // Loose cards: the remaining stems (scheduled, awaiting-review) placed at board
+    // top-level (no parent group), ordinals after the two groups — a grouped + loose mix.
+    for (i, sid) in ids.iter().enumerate().skip(6).take(2) {
+        let _ = store.place_session(
+            conn,
+            &SessionId::new(sid.clone()),
+            &PlacementTarget {
+                board_id: Some(board.clone()),
+                parent_item_id: None,
+                ordinal: Some((groups.len() + (i - 6)) as i32),
+            },
+        );
     }
     Some(Box::new(store) as _)
 }
@@ -408,10 +430,12 @@ fn run_demo() {
             let fleet = FleetStore::new_live(clock, cx);
             lens_ui::shortcuts::register(&fleet, cx);
 
-            // Size the demo window so the 8 cards land as a centered 4×2 grid
-            // (4×280 card + 3×28 gap + 56 padding + 48 nav rail ≈ 1300px wide).
+            // Size the demo window just above the 4-column breakpoint
+            // (`max_cols_for_width` ≥ 1400 → 4 cols) so the demo cards land as a
+            // centered 4-wide masonry. Below 1400 the board caps to 3 cols (still
+            // centered); on the real screens it steps 1800→4, 2056→5, 3840→6.
             let mut bounds =
-                gpui::Bounds::centered(None, gpui::size(gpui::px(1340.0), gpui::px(860.0)), cx);
+                gpui::Bounds::centered(None, gpui::size(gpui::px(1440.0), gpui::px(900.0)), cx);
             // Stagger + title so two demo windows can be told apart in an A/B (LENS_DEMO_LABEL).
             if let Some(dx) = std::env::var("LENS_DEMO_DX")
                 .ok()
@@ -422,10 +446,10 @@ fn run_demo() {
             }
             let window_options = WindowOptions {
                 window_bounds: Some(gpui::WindowBounds::Windowed(bounds)),
-                titlebar: Some(gpui::TitlebarOptions {
-                    title: std::env::var("LENS_DEMO_LABEL").ok().map(Into::into),
-                    ..Default::default()
-                }),
+                // Transparent native titlebar; BoardView renders the in-app themed TitleBar
+                // so the dark strip replaces the white system titlebar (label dropped — the
+                // transparent bar shows no OS title anyway).
+                titlebar: Some(gpui_component::TitleBar::title_bar_options()),
                 ..Default::default()
             };
             cx.open_window(window_options, move |window, cx| {
