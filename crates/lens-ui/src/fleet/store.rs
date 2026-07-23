@@ -71,10 +71,12 @@ pub struct FleetStore {
     pub(crate) terminals:
         HashMap<SessionId, HashMap<terminal::TerminalKeyId, terminal::TerminalMember>>,
     pub(crate) session_loader: Option<std::rc::Rc<dyn crate::fleet::loader::SessionLoader>>,
-    /// Bumped on every supersede that starts a load; the async completion
-    /// no-ops unless it still matches. Same apply-time-guard discipline as
-    /// sub-slice A's `reconnect_epoch`.
-    pub(crate) supersede_epoch: u64,
+    /// Bumped per source session on every supersede that starts a load; the
+    /// async completion no-ops unless it still matches. Scoped per `from`
+    /// because a supersede of one session must never invalidate an in-flight
+    /// supersede of a different one (sub-slice A's `reconnect_epoch` is
+    /// per-tab for the same reason).
+    pub(crate) supersede_epochs: HashMap<SessionId, u64>,
     /// Targets with a load in flight — prevents a duplicate/replayed
     /// `Superseded` from double GET/seed/spawning the same session.
     pub(crate) supersede_in_flight: std::collections::HashSet<SessionId>,
@@ -100,7 +102,7 @@ impl FleetStore {
             reconcile_epochs: HashMap::new(),
             terminals: HashMap::new(),
             session_loader: None,
-            supersede_epoch: 0,
+            supersede_epochs: HashMap::new(),
             supersede_in_flight: std::collections::HashSet::new(),
             focused_replica: None,
             focus_generation: 0,
@@ -124,7 +126,7 @@ impl FleetStore {
             reconcile_epochs: HashMap::new(),
             terminals: HashMap::new(),
             session_loader: None,
-            supersede_epoch: 0,
+            supersede_epochs: HashMap::new(),
             supersede_in_flight: std::collections::HashSet::new(),
             focused_replica: None,
             focus_generation: 0,

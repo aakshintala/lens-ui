@@ -60,6 +60,55 @@ impl FakeSessionLoader {
     }
 }
 
+/// Test loader that holds each `load` until [`GatedSessionLoader::release`].
+#[cfg(test)]
+pub(crate) struct GatedSessionLoader {
+    loaded: std::cell::RefCell<Vec<SessionId>>,
+    waiters: std::cell::RefCell<Vec<async_channel::Sender<()>>>,
+}
+
+#[cfg(test)]
+impl GatedSessionLoader {
+    pub(crate) fn new() -> Self {
+        Self {
+            loaded: std::cell::RefCell::new(Vec::new()),
+            waiters: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    pub(crate) fn loaded(&self) -> Vec<SessionId> {
+        self.loaded.borrow().clone()
+    }
+
+    pub(crate) fn release(&self) {
+        for tx in self.waiters.borrow_mut().drain(..) {
+            let _ = tx.try_send(());
+        }
+    }
+}
+
+#[cfg(test)]
+impl SessionLoader for GatedSessionLoader {
+    fn load(
+        &self,
+        session_id: SessionId,
+        store: WeakEntity<FleetStore>,
+        cx: &mut App,
+    ) -> Task<Result<(), String>> {
+        self.loaded.borrow_mut().push(session_id.clone());
+        let (tx, rx) = async_channel::bounded(1);
+        self.waiters.borrow_mut().push(tx);
+        cx.spawn(async move |cx| {
+            let _ = rx.recv().await;
+            store
+                .update(cx, |store, cx| {
+                    store.spawn_fake_session(session_id, cx);
+                })
+                .map_err(|e| format!("store gone: {e:?}"))
+        })
+    }
+}
+
 #[cfg(test)]
 impl SessionLoader for FakeSessionLoader {
     fn load(

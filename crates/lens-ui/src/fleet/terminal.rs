@@ -212,8 +212,11 @@ impl FleetStore {
         if !self.supersede_in_flight.insert(to.clone()) {
             return;
         }
-        self.supersede_epoch = self.supersede_epoch.saturating_add(1);
-        let epoch = self.supersede_epoch;
+        let epoch = {
+            let entry = self.supersede_epochs.entry(from.clone()).or_insert(0);
+            *entry = entry.saturating_add(1);
+            *entry
+        };
         let from = from.clone();
         cx.spawn(async move |store, cx| {
             // NOTE: this runs AFTER the outer `FleetStore` update has returned,
@@ -246,10 +249,11 @@ impl FleetStore {
                 // a failed load must not re-parent into a session that does not
                 // exist. In both cases the member stays under A, where A's
                 // replacement timeout still bounds the tab's wait.
-                if !loaded || store.supersede_epoch != epoch {
+                if !loaded || store.supersede_epochs.get(&from) != Some(&epoch) {
                     return;
                 }
                 store.complete_supersede(&from, &to, cx);
+                store.supersede_epochs.remove(&from);
             });
         })
         .detach();
@@ -637,7 +641,7 @@ fn terminal_key_from_id(id: &TerminalKeyId) -> TerminalKey {
 mod tests {
     use super::*;
     use crate::clock::ManualUiClock;
-    use crate::fleet::loader::FakeSessionLoader;
+    use crate::fleet::loader::{FakeSessionLoader, GatedSessionLoader};
     use lens_client::ids::TerminalId;
     use lens_core::actor::TerminalResourceSignal;
     use lens_terminal::{EngineConfig, EngineHandle, PER_CELL_BYTES, TerminalHostEvent};
@@ -1788,5 +1792,191 @@ mod tests {
             vec![sess_b.clone()],
             "B loaded exactly once despite a duplicate Superseded"
         );
+    }
+
+    #[gpui::test]
+    async fn concurrent_independent_supersedes_both_complete(cx: &mut gpui::TestAppContext) {
+        let clock = Arc::new(ManualUiClock::new(5_000));
+        let store = cx.update(|cx| FleetStore::new(clock.clone(), cx));
+        let loader = Rc::new(GatedSessionLoader::new());
+        let sess_a = SessionId::new("conv_a");
+        let sess_b = SessionId::new("conv_b");
+        let sess_c = SessionId::new("conv_c");
+        let sess_d = SessionId::new("conv_d");
+        let key_a = test_key("main", "sk_a");
+        let key_c = test_key("main", "sk_c");
+        let (_e_a, tab_a) = spawn_tab_with_rows(cx, 0);
+        let (_e_c, tab_c) = spawn_tab_with_rows(cx, 0);
+
+        cx.update(|cx| {
+            store.update(cx, |store, cx| {
+                store.set_session_loader(loader.clone());
+                store.insert_terminal_for_test(sess_a.clone(), key_a.clone(), tab_a.clone(), cx);
+                store.insert_terminal_for_test(sess_c.clone(), key_c.clone(), tab_c.clone(), cx);
+                store.on_session_control(
+                    &sess_a,
+                    SessionControl::Superseded {
+                        target: sess_b.clone(),
+                        reason: "clear".into(),
+                    },
+                    cx,
+                );
+                store.on_session_control(
+                    &sess_c,
+                    SessionControl::Superseded {
+                        target: sess_d.clone(),
+                        reason: "clear".into(),
+                    },
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            loader.loaded(),
+            vec![sess_b.clone(), sess_d.clone()],
+            "both loads started before either completed"
+        );
+        cx.update(|cx| {
+            let s = store.read(cx);
+            assert!(
+                s.terminal_member_for_test(&sess_a, &key_a, cx).is_some(),
+                "A's member still under A while loads are gated"
+            );
+            assert!(
+                s.terminal_member_for_test(&sess_c, &key_c, cx).is_some(),
+                "C's member still under C while loads are gated"
+            );
+        });
+
+        loader.release();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let s = store.read(cx);
+            assert!(
+                s.terminal_member_for_test(&sess_a, &key_a, cx).is_none(),
+                "A's member left A"
+            );
+            assert!(
+                s.terminal_member_for_test(&sess_b, &key_a, cx).is_some(),
+                "A's member re-parented to B"
+            );
+            assert!(
+                s.terminal_member_for_test(&sess_c, &key_c, cx).is_none(),
+                "C's member left C"
+            );
+            assert!(
+                s.terminal_member_for_test(&sess_d, &key_c, cx).is_some(),
+                "C's member re-parented to D"
+            );
+        });
+        cx.update(|cx| {
+            let transfer_b = tab_a
+                .read(cx)
+                .host_events_for_test()
+                .iter()
+                .find(|e| matches!(e, TerminalHostEvent::Transfer { .. }))
+                .expect("A's tab saw Transfer");
+            match transfer_b {
+                TerminalHostEvent::Transfer { new_session } => {
+                    assert_eq!(new_session, &sess_b);
+                }
+                other => panic!("expected Transfer, got {other:?}"),
+            }
+            let transfer_d = tab_c
+                .read(cx)
+                .host_events_for_test()
+                .iter()
+                .find(|e| matches!(e, TerminalHostEvent::Transfer { .. }))
+                .expect("C's tab saw Transfer");
+            match transfer_d {
+                TerminalHostEvent::Transfer { new_session } => {
+                    assert_eq!(new_session, &sess_d);
+                }
+                other => panic!("expected Transfer, got {other:?}"),
+            }
+        });
+    }
+
+    #[gpui::test]
+    async fn stale_supersede_completion_is_rejected(cx: &mut gpui::TestAppContext) {
+        let clock = Arc::new(ManualUiClock::new(5_000));
+        let store = cx.update(|cx| FleetStore::new(clock.clone(), cx));
+        let loader = Rc::new(GatedSessionLoader::new());
+        let sess_a = SessionId::new("conv_a");
+        let sess_b = SessionId::new("conv_b");
+        let sess_c = SessionId::new("conv_c");
+        let key = test_key("main", "sk_a");
+        let (_e, tab) = spawn_tab_with_rows(cx, 0);
+
+        cx.update(|cx| {
+            store.update(cx, |store, cx| {
+                store.set_session_loader(loader.clone());
+                store.insert_terminal_for_test(sess_a.clone(), key.clone(), tab.clone(), cx);
+                store.on_session_control(
+                    &sess_a,
+                    SessionControl::Superseded {
+                        target: sess_b.clone(),
+                        reason: "clear".into(),
+                    },
+                    cx,
+                );
+                store.on_session_control(
+                    &sess_a,
+                    SessionControl::Superseded {
+                        target: sess_c.clone(),
+                        reason: "clear".into(),
+                    },
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            loader.loaded(),
+            vec![sess_b.clone(), sess_c.clone()],
+            "both targets were loaded"
+        );
+
+        loader.release();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let s = store.read(cx);
+            assert!(
+                s.terminal_member_for_test(&sess_a, &key, cx).is_none(),
+                "member left A"
+            );
+            assert!(
+                s.terminal_member_for_test(&sess_b, &key, cx).is_none(),
+                "stale B completion must not re-parent"
+            );
+            assert!(
+                s.terminal_member_for_test(&sess_c, &key, cx).is_some(),
+                "only the latest supersede (to C) may re-parent"
+            );
+        });
+        cx.update(|cx| {
+            let transfers: Vec<_> = tab
+                .read(cx)
+                .host_events_for_test()
+                .iter()
+                .filter(|e| matches!(e, TerminalHostEvent::Transfer { .. }))
+                .collect();
+            assert_eq!(
+                transfers.len(),
+                1,
+                "exactly one Transfer for the winning supersede"
+            );
+            match transfers[0] {
+                TerminalHostEvent::Transfer { new_session } => {
+                    assert_eq!(new_session, &sess_c);
+                }
+                other => panic!("expected Transfer, got {other:?}"),
+            }
+        });
     }
 }
