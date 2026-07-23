@@ -913,11 +913,13 @@ pub(crate) fn row_content_for_item(item: &Item) -> RowContent {
                 .join(""),
         },
         ItemKind::Message { content, .. } => RowContent::AssistantMarkdown {
-            source: content
-                .iter()
-                .filter_map(|block| block.text.as_deref())
-                .collect::<Vec<_>>()
-                .join(""),
+            source: crate::md::safe_prefix(
+                &content
+                    .iter()
+                    .filter_map(|block| block.text.as_deref())
+                    .collect::<Vec<_>>()
+                    .join(""),
+            ),
             content_key: ContentKey::from_acc(&AccId::new(item.id.as_str())),
         },
         ItemKind::Reasoning {
@@ -1075,6 +1077,17 @@ mod tests {
                 }],
             },
         )
+    }
+
+    #[test]
+    fn finalized_assistant_message_uses_safe_prefix_pipeline() {
+        let item = assistant_msg("msg1", Some("resp"), "**bo");
+        match row_content_for_item(&item) {
+            RowContent::AssistantMarkdown { source, .. } => {
+                assert_eq!(source, "**bo**");
+            }
+            _ => panic!("expected AssistantMarkdown"),
+        }
     }
 
     #[gpui::test]

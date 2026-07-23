@@ -70,6 +70,7 @@ pub fn markdown_state_entity_id(
     Some(state.entity_id())
 }
 
+#[cfg(feature = "probe")]
 pub fn markdown_probe_arm_selection(id: &str, window: &mut Window, cx: &mut App) {
     let key = SharedString::from(format!("{id}/state"));
     let state = window.use_keyed_state::<text_view::TextViewState>(key, cx, |_, cx| {
@@ -77,10 +78,10 @@ pub fn markdown_probe_arm_selection(id: &str, window: &mut Window, cx: &mut App)
     });
     state.update(cx, |s, _| {
         s.set_selection_for_test(gpui::point(gpui::px(1.), gpui::px(1.)));
-        s.mark_streaming_for_test();
     });
 }
 
+#[cfg(feature = "probe")]
 pub fn markdown_probe_selection_is_some(id: &str, window: &mut Window, cx: &mut App) -> bool {
     let key = SharedString::from(format!("{id}/state"));
     let state = window.use_keyed_state::<text_view::TextViewState>(key, cx, |_, cx| {

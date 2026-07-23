@@ -1,4 +1,5 @@
-//! Real-window staged-finalize probe — must run on the main thread (`cargo run -p lens-ui --bin focused_finalize_probe`).
+//! Real-window staged-finalize probe — must run on the main thread
+//! (`cargo run -p lens-ui --features probe --bin focused_finalize_probe`).
 //! `Application::new().run()`; not invokable from `#[gpui::test]` worker threads.
 
 use std::cell::RefCell;
@@ -23,6 +24,14 @@ use lens_ui::md::{
     markdown_state_entity_id, MarkdownView,
 };
 
+/// Short initial stream chunk; a later delta appends [`STREAM_GROWTH`] so rendered height grows.
+const STREAM_START: &str = "Start";
+const STREAM_GROWTH: &str = "\n\n- alpha\n- beta\n- gamma\n\nA taller paragraph that forces additional layout height in MarkdownView.";
+
+fn stream_full_text() -> String {
+    format!("{STREAM_START}{STREAM_GROWTH}")
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct AnchorSnapshot {
     top_item_index: usize,
@@ -45,7 +54,10 @@ struct ProbeState {
     target_entity: Option<EntityId>,
     target_markdown_entity: Option<EntityId>,
     markdown_selection_armed: bool,
-    selection_preserved: bool,
+    armed_element_id: Option<String>,
+    armed_source_len: usize,
+    max_source_len: usize,
+    markdown_source_grew: bool,
     min_row_count: usize,
 }
 
@@ -155,7 +167,7 @@ async fn drive_legacy_finalize_probe(
                     open_message: Some(lens_core::domain::item::MessageAcc {
                         acc_id: acc_id.clone(),
                         message_id: None,
-                        text: "streaming text".into(),
+                        text: STREAM_START.into(),
                         block_index: 0,
                     }),
                     ..Default::default()
@@ -165,6 +177,28 @@ async fn drive_legacy_finalize_probe(
         });
         let count = view.replica.read(cx).rows().len();
         view.list_state.reset(count);
+        cx.notify();
+    });
+    wait_frames(wcx, 3).await;
+
+    let _ = weak.update_in(wcx, |view, _, cx| {
+        view.replica.update(cx, |r, cx| {
+            r.fold_detailed(
+                StreamUpdate::ScratchChanged(std::sync::Arc::new(StreamScratch {
+                    open_message: Some(lens_core::domain::item::MessageAcc {
+                        acc_id: acc_id.clone(),
+                        message_id: None,
+                        text: stream_full_text(),
+                        block_index: 0,
+                    }),
+                    ..Default::default()
+                })),
+                cx,
+            );
+        });
+        let count = view.replica.read(cx).rows().len();
+        view.list_state
+            .splice(0..view.list_state.item_count(), count);
         cx.notify();
     });
     wait_frames(wcx, 3).await;
@@ -242,7 +276,7 @@ async fn drive_canonical_finalize_probe(
                     open_message: Some(lens_core::domain::item::MessageAcc {
                         acc_id: acc_id.clone(),
                         message_id: None,
-                        text: "streaming text".into(),
+                        text: STREAM_START.into(),
                         block_index: 0,
                     }),
                     ..Default::default()
@@ -251,6 +285,25 @@ async fn drive_canonical_finalize_probe(
             );
         });
         // Production reproject/sync_list_count grows replica ListState — no manual splice.
+        cx.notify();
+    });
+    wait_frames(wcx, 3).await;
+
+    let _ = weak.update_in(wcx, |view, _, cx| {
+        view.replica.update(cx, |r, cx| {
+            r.fold_detailed(
+                StreamUpdate::ScratchChanged(std::sync::Arc::new(StreamScratch {
+                    open_message: Some(lens_core::domain::item::MessageAcc {
+                        acc_id: acc_id.clone(),
+                        message_id: None,
+                        text: stream_full_text(),
+                        block_index: 0,
+                    }),
+                    ..Default::default()
+                })),
+                cx,
+            );
+        });
         cx.notify();
     });
     wait_frames(wcx, 3).await;
@@ -375,7 +428,7 @@ async fn drive_finalize_probe(
                 && p.samples >= 4
                 && p.target_entity.is_some()
                 && p.target_markdown_entity.is_some()
-                && p.selection_preserved
+                && p.markdown_source_grew
                 && p.min_row_count > 0
         })
         .unwrap_or(false);
@@ -416,7 +469,7 @@ async fn drive_finalize_probe(
                 && p.samples >= 4
                 && p.target_entity.is_some()
                 && p.target_markdown_entity.is_some()
-                && p.selection_preserved
+                && p.markdown_source_grew
                 && p.min_row_count > 0
         })
         .unwrap_or(false);
@@ -511,7 +564,10 @@ impl Render for HarnessView {
                     anchor.top_item_index, anchor.sub_offset
                 ));
             }
-            if !text.is_empty() && text != "streaming text" && text != "hi" {
+            if !text.is_empty()
+                && text != "hi"
+                && !text.starts_with(STREAM_START)
+            {
                 p.failures.push(format!("unexpected content: {text:?}"));
             }
             if let Some(pres) = pres.as_ref()
@@ -546,22 +602,30 @@ impl Render for HarnessView {
                             cx,
                         );
                         p.markdown_selection_armed = true;
+                        p.armed_element_id =
+                            Some(content_key.as_element_id().as_str().to_string());
+                        p.armed_source_len = source.len();
+                        p.max_source_len = source.len();
                     }
-                    if p.markdown_selection_armed
-                        && markdown_probe_selection_is_some(
-                            content_key.as_element_id().as_str(),
-                            window,
-                            cx,
-                        )
-                    {
-                        p.selection_preserved = true;
+                    if p.markdown_selection_armed {
+                        p.max_source_len = p.max_source_len.max(source.len());
+                        if source.len() > p.armed_source_len.saturating_add(10) {
+                            p.markdown_source_grew = true;
+                        }
                     }
                 }
             }
-            if p.markdown_selection_armed && !p.selection_preserved && self.finalized && p.samples >= 4
-            {
-                p.failures
-                    .push("markdown selection lost across streamed height growth".into());
+            if self.finalized && p.samples >= 4 && p.markdown_selection_armed {
+                if !p.markdown_source_grew {
+                    p.failures
+                        .push("markdown stream source never grew in height".into());
+                }
+                if let Some(ref id) = p.armed_element_id
+                    && !markdown_probe_selection_is_some(id, window, cx)
+                {
+                    p.failures
+                        .push("markdown selection lost across streamed height growth".into());
+                }
             }
             p.samples += 1;
         }

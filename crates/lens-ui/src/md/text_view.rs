@@ -290,15 +290,18 @@ impl TextViewState {
         }
     }
 
+    #[cfg(any(test, feature = "probe"))]
     pub(crate) fn selection_is_some_for_test(&self) -> bool {
         self.selection_positions.0.is_some()
     }
 
+    #[cfg(any(test, feature = "probe"))]
     pub(crate) fn set_selection_for_test(&mut self, origin: Point<Pixels>) {
         self.selection_positions = (Some(origin), Some(origin));
         self.is_selecting = false;
     }
 
+    #[cfg(any(test, feature = "probe"))]
     pub(crate) fn mark_streaming_for_test(&mut self) {
         self.streaming.mark_streaming();
     }

@@ -389,6 +389,9 @@ impl FocusedTranscript {
                 dirty = true;
             }
             StreamUpdate::ScratchChanged(scratch) => {
+                // Coalescer sub-budget (`None`) does not yet skip `reproject`; reproject is
+                // live-tail bounded. Frame-budget gating + pending-flush on finalize deferred
+                // (T-3 review roll-up).
                 let old = Arc::clone(&self.scratch);
                 self.coalesce_message_scratch_delta(&old, &scratch, cx);
                 self.scratch = scratch;
@@ -685,6 +688,8 @@ impl FocusedTranscript {
         new: &StreamScratch,
         cx: &mut Context<Self>,
     ) {
+        // Sub-budget `None` from `StreamCoalescer::push_delta` still reprojects above; only
+        // live-tail bounded today — skip-on-sub-budget + finalize flush deferred (T-3 roll-up).
         let Some(msg) = &new.open_message else {
             self.message_coalescers.clear();
             return;
@@ -723,6 +728,7 @@ impl FocusedTranscript {
         disposition: RetireDisposition,
         cx: &mut Context<Self>,
     ) {
+        self.message_coalescers.remove(&acc_id);
         let prev_len = self.rows.len();
         match disposition {
             RetireDisposition::Finalizing { item_id } => {

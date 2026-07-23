@@ -31,10 +31,12 @@ tempfile = "3"
 
 [features]
 demo = []
+probe = []
 
 [[bin]]
 name = "focused_finalize_probe"
 path = "src/bin/focused_finalize_probe.rs"
+required-features = ["probe"]
 
 [[bin]]
 name = "focused_scroll_probe"
