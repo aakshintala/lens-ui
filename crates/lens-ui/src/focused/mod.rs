@@ -275,11 +275,6 @@ impl FocusedTranscript {
         self.following
     }
 
-    #[cfg(test)]
-    pub(crate) fn is_following_for_test(&self) -> bool {
-        self.following
-    }
-
     pub fn set_following(&mut self, following: bool, cx: &mut Context<Self>) {
         self.following = following;
         cx.notify();
