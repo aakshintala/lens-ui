@@ -488,10 +488,9 @@ impl FocusedTranscript {
         }
         if let Some((min_ord, max_ord)) = read_ordinal_bounds(&read.rows) {
             match range {
-                ReadRange::All | ReadRange::Tail { .. } => {
-                    self.resident_lo = min_ord;
-                    self.resident_hi = max_ord;
-                }
+                // Replacement reads set the band from `items` below (recompute), which also
+                // handles the empty-read case correctly (→ -1/-1) — see F3.
+                ReadRange::All | ReadRange::Tail { .. } | ReadRange::Span { .. } => {}
                 ReadRange::Backward { .. } => {
                     self.resident_lo = self.resident_lo.min(min_ord);
                 }
@@ -501,22 +500,30 @@ impl FocusedTranscript {
                 ReadRange::One { ordinal } => {
                     self.resident_hi = self.resident_hi.max(ordinal);
                 }
-                ReadRange::Span { .. } => {}
             }
         }
-        if matches!(range, ReadRange::Span { .. }) {
+        // A replacement read (All/Tail/Span) makes the resident band EXACTLY what is now in
+        // `items`; recompute unconditionally so an empty read collapses the band to -1/-1
+        // instead of leaving a stale, nonexistent band (F3).
+        if matches!(
+            range,
+            ReadRange::All | ReadRange::Tail { .. } | ReadRange::Span { .. }
+        ) {
             self.recompute_resident_bounds_from_items();
         }
+        // `known_committed` and `last_rendered_ordinal` are monotonic frontiers: never let a
+        // read regress them (a concurrent stream event may have advanced `known_committed`
+        // past this read's watermark before it applied) — F4.
         match range {
             ReadRange::All | ReadRange::Tail { .. } => {
                 if let Some(watermark) = read.watermark {
-                    self.known_committed = watermark;
-                    self.last_rendered_ordinal = watermark;
+                    self.known_committed = self.known_committed.max(watermark);
+                    self.last_rendered_ordinal = self.last_rendered_ordinal.max(watermark);
                 }
             }
             ReadRange::Span { .. } => {
                 if let Some(watermark) = read.watermark {
-                    self.known_committed = watermark;
+                    self.known_committed = self.known_committed.max(watermark);
                 }
                 if let Some((_, max_ord)) = read_ordinal_bounds(&read.rows) {
                     self.last_rendered_ordinal = self.last_rendered_ordinal.max(max_ord);
@@ -540,7 +547,20 @@ impl FocusedTranscript {
         let evicted_any = self.evict_if_over_cap(cx);
         self.recompute_live_section_lo();
         self.recompute_settled_prefix();
-        let full = full_replace || evicted_any;
+        // The incremental live-tail reproject only rebuilds the live section on top of a frozen
+        // settled prefix. A non-replacement read (Delta/One) that adds or rewrites a row in the
+        // SETTLED band — below `live_section_lo`, or ANY row when there is no live section (e.g. a
+        // committed item arriving while no response is active) — would be silently dropped by it
+        // (materialized into `items` but never into `rows`), so force a full reproject (F1).
+        let touched_settled = !full_replace
+            && read
+                .rows
+                .iter()
+                .any(|(ord, _, _)| match self.live_section_lo {
+                    Some(lo) => *ord < lo,
+                    None => true,
+                });
+        let full = full_replace || evicted_any || touched_settled;
         let prepend_sync = matches!(range, ReadRange::Backward { .. });
         if full {
             self.settled_structure_len = 0;
@@ -809,12 +829,18 @@ impl FocusedTranscript {
         // number of rows inserted ABOVE the anchor depends on where the anchor sits
         // (e.g. anchored at the LoadOlder sentinel → shift 0; anchored at content →
         // shift = inserted). Arithmetic on the insert count gets this wrong.
-        let prepend_anchor: Option<(RowId, Pixels)> = if prepend_sync {
+        // (anchor RowId, sub-offset, fallback successor RowId). The fallback pins the row that
+        // was just below the anchor when the anchor itself vanishes after the rebuild — e.g. the
+        // viewport sits on the `LoadOlder` sentinel and a backward page reaches ordinal 0, which
+        // removes the sentinel; without a fallback the re-pin is skipped and the list yanks to the
+        // bottom (F7).
+        let prepend_anchor: Option<(RowId, Pixels, Option<RowId>)> = if prepend_sync {
             let a = self.list_state.logical_scroll_top();
-            self.rows
-                .order()
-                .get(a.item_ix)
-                .map(|r| (r.clone(), a.offset_in_item))
+            let order = self.rows.order();
+            order.get(a.item_ix).map(|r| {
+                let fallback = order.get(a.item_ix + 1).cloned();
+                (r.clone(), a.offset_in_item, fallback)
+            })
         } else {
             None
         };
@@ -872,12 +898,24 @@ impl FocusedTranscript {
         self.overlay_pending_finalize(cx);
         let pending_accs: HashSet<AccId> = self.pending_finalize.keys().cloned().collect();
         self.rows.gc_entities(&pending_accs);
-        if let Some((anchor_row, offset)) = &prepend_anchor {
+        if let Some((anchor_row, offset, fallback)) = &prepend_anchor {
             // Fix the total count first (this may reset the scroll), then re-pin the
             // anchor to the captured row's new index. Correct whether or not hi-side
             // eviction co-occurred, and regardless of how many rows landed above it.
             self.rows.sync_list_count(&self.list_state, prev_len);
-            if let Some(new_ix) = self.rows.order().iter().position(|r| r == anchor_row) {
+            let new_ix = self
+                .rows
+                .order()
+                .iter()
+                .position(|r| r == anchor_row)
+                .or_else(|| {
+                    // Anchor row vanished (e.g. the LoadOlder sentinel at the top of history);
+                    // pin the row that was just below it so the view does not yank (F7).
+                    fallback
+                        .as_ref()
+                        .and_then(|f| self.rows.order().iter().position(|r| r == f))
+                });
+            if let Some(new_ix) = new_ix {
                 self.list_state.scroll_to(ListOffset {
                     item_ix: new_ix,
                     offset_in_item: *offset,
@@ -1046,6 +1084,15 @@ impl FocusedTranscript {
                     self.items.remove(&old_ord);
                 }
                 self.remove_item_accounting(&existing_id);
+            }
+            // A DIFFERENT id occupying the target ordinal is displaced by this insert; drop its
+            // byte/ordinal/anchor accounting first or `resident_bytes` drifts up permanently and
+            // defeats the cap (F2).
+            if let Some(displaced) = self.items.get(ordinal)
+                && displaced.id != item.id
+            {
+                let displaced_id = displaced.id.clone();
+                self.remove_item_accounting(&displaced_id);
             }
             self.item_bytes.insert(item.id.clone(), *len);
             self.resident_bytes += *len;
@@ -4893,6 +4940,257 @@ mod tests {
         let _ = rx.try_recv().expect("backward page after successful apply");
         cx.read(|cx| {
             assert!(replica.read(cx).page_in_flight_for_test());
+        });
+    }
+
+    /// Codex F1 (Critical): a committed item arriving via Delta while NO response is active
+    /// (`live_section_lo == None`) lands in the settled band; the incremental live-tail reproject
+    /// would drop it. It must be materialized into `rows`.
+    #[gpui::test]
+    async fn delta_with_no_live_section_materializes_settled_item(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    tail_read(
+                        vec![(0, user_item("u0", "a")), (1, user_item("u1", "b"))],
+                        1,
+                    ),
+                    cx,
+                );
+                assert!(
+                    r.live_section_lo_for_test().is_none(),
+                    "precondition: no active response -> no live section"
+                );
+                r.apply_read(
+                    1,
+                    ReadRange::Delta {
+                        after: 1,
+                        through: 2,
+                    },
+                    range_read(vec![(2, user_item("u2", "c"))], 2),
+                    cx,
+                );
+            });
+        });
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert!(r.has_item_ordinal_for_test(2), "item resident");
+            assert!(
+                r.rows()
+                    .order()
+                    .contains(&RowId::Sibling(ItemId::new("u2"))),
+                "committed settled item must be materialized, not dropped by the incremental path"
+            );
+        });
+    }
+
+    /// Codex F2: upserting a DIFFERENT id at an already-occupied ordinal must free the displaced
+    /// item's byte accounting, or `resident_bytes` drifts up permanently.
+    #[gpui::test]
+    async fn upsert_displaced_ordinal_frees_bytes(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    tail_read(vec![(5, message_item("x5", None))], 5),
+                    cx,
+                );
+            });
+        });
+        let bytes_single = cx.read(|cx| replica.read(cx).resident_bytes_for_test());
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::One { ordinal: 5 },
+                    range_read(vec![(5, message_item("y5", None))], 5),
+                    cx,
+                );
+            });
+        });
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert_eq!(
+                r.resident_bytes_for_test(),
+                bytes_single,
+                "displaced x5 bytes must be freed; not x5+y5 accumulated"
+            );
+            assert!(
+                r.rows()
+                    .order()
+                    .contains(&RowId::Sibling(ItemId::new("y5")))
+            );
+            assert!(
+                !r.rows()
+                    .order()
+                    .contains(&RowId::Sibling(ItemId::new("x5")))
+            );
+        });
+    }
+
+    /// Codex F3: an empty replacement read (Tail) must collapse the resident band to -1/-1,
+    /// not leave a stale nonexistent band that paging/the sentinel then act on.
+    #[gpui::test]
+    async fn empty_tail_collapses_resident_band(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    tail_read(
+                        vec![(3, message_item("m3", None)), (4, message_item("m4", None))],
+                        4,
+                    ),
+                    cx,
+                );
+            });
+        });
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert_eq!(r.resident_lo_for_test(), 3);
+            assert_eq!(r.resident_hi_for_test(), 4);
+        });
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    tail_read(vec![], 4),
+                    cx,
+                );
+            });
+        });
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert_eq!(r.resident_lo_for_test(), -1, "empty tail collapses lo");
+            assert_eq!(r.resident_hi_for_test(), -1, "empty tail collapses hi");
+        });
+    }
+
+    /// Codex F4: `known_committed` is monotonic; a Tail whose watermark is behind a
+    /// concurrently-advanced frontier must not regress it.
+    #[gpui::test]
+    async fn tail_watermark_does_not_regress_known_committed(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    tail_read(vec![(10, message_item("m10", None))], 100),
+                    cx,
+                );
+            });
+        });
+        assert_eq!(
+            cx.read(|cx| replica.read(cx).known_committed_for_test()),
+            100
+        );
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    tail_read(vec![(10, message_item("m10", None))], 90),
+                    cx,
+                );
+            });
+        });
+        assert_eq!(
+            cx.read(|cx| replica.read(cx).known_committed_for_test()),
+            100,
+            "known_committed must not regress from 100 to 90"
+        );
+    }
+
+    /// Codex F7: viewport anchored on the LoadOlder sentinel, a backward page reaching ordinal 0
+    /// removes the sentinel; the re-pin must fall back to the successor row, not reset to bottom.
+    #[gpui::test]
+    async fn backward_page_to_zero_repins_to_successor(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    tail_read(
+                        (5..=9)
+                            .map(|o| (o, message_item(&format!("m{o}"), None)))
+                            .collect(),
+                        9,
+                    ),
+                    cx,
+                );
+                assert_eq!(r.rows().order().first(), Some(&RowId::LoadOlder));
+                r.list_state.scroll_to(gpui::ListOffset {
+                    item_ix: 0,
+                    offset_in_item: gpui::px(0.),
+                });
+            });
+        });
+        let successor = cx
+            .read(|cx| replica.read(cx).rows().order().get(1).cloned())
+            .expect("row below sentinel");
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Backward {
+                        before: 5,
+                        byte_budget: PAGE_BUDGET_BYTES,
+                    },
+                    range_read(
+                        (0..=4)
+                            .map(|o| (o, message_item(&format!("m{o}"), None)))
+                            .collect(),
+                        9,
+                    ),
+                    cx,
+                );
+            });
+        });
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert!(
+                !r.rows().order().contains(&RowId::LoadOlder),
+                "sentinel removed at ordinal 0"
+            );
+            let successor_ix = r
+                .rows()
+                .order()
+                .iter()
+                .position(|x| *x == successor)
+                .expect("successor survived");
+            assert_eq!(
+                r.list_state().logical_scroll_top().item_ix,
+                successor_ix,
+                "anchor re-pinned to the successor row, not reset to bottom"
+            );
         });
     }
 }
