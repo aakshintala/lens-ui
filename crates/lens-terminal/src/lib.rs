@@ -3181,6 +3181,10 @@ mod tests {
         tab.update(cx, |tab, cx| {
             let same = tab.current_session.clone().unwrap();
             tab.adopt(same, TerminalId::new("t1"), cx);
+            assert!(
+                tab.runtime.is_none(),
+                "same-session adopt must synchronously DROP the retained engine (fresh path), not reuse it"
+            );
         });
         cx.run_until_parked();
         tab.read_with(cx, |tab, _| {
@@ -3250,10 +3254,10 @@ mod tests {
                 !tab.adopt_in_flight,
                 "4404-first delete+create must drive adopt() to completion"
             );
-            assert_ne!(
+            assert_eq!(
                 tab.lifecycle,
-                Lifecycle::ReplacementWaiting,
-                "adoption must leave ReplacementWaiting (Live or Detached via stub attach)"
+                Lifecycle::Detached,
+                "4404-first entry must drive through delete+create -> adopt -> (offline stub) Detached, not strand in ReplacementWaiting"
             );
         });
     }
