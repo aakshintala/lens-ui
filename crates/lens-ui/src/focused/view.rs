@@ -1,6 +1,6 @@
 //! gpui `list()` render surface for the focused transcript (T-2 §7).
 
-use crate::focused::reasoning::{ReasoningUiState, render_reasoning};
+use crate::focused::reasoning::{ReasoningExpand, ReasoningSetExpandFn, ReasoningUiState, render_reasoning};
 use crate::focused::{ContentKey, FocusedTranscript, RowContent, RowKind, RowPresentation};
 use crate::md::MarkdownView;
 use gpui::{
@@ -24,8 +24,8 @@ pub struct FocusedTranscriptView {
     rows_at_pause: usize,
     last_row_count: usize,
     focus_handle: FocusHandle,
-    /// Per-reasoning-row expand flag (default collapsed when finalized).
-    reasoning_expanded: HashMap<ContentKey, bool>,
+    /// Per-reasoning-row expand target (default collapsed when finalized).
+    reasoning_expanded: HashMap<ContentKey, ReasoningExpand>,
 }
 
 impl FocusedTranscriptView {
@@ -152,7 +152,7 @@ impl FocusedTranscriptView {
     }
 
     fn render_row(
-        reasoning_expanded: &HashMap<ContentKey, bool>,
+        reasoning_expanded: &HashMap<ContentKey, ReasoningExpand>,
         pres: &RowPresentation,
         ix: usize,
         view_weak: WeakEntity<Self>,
@@ -178,32 +178,40 @@ impl FocusedTranscriptView {
                         duration_secs: *duration_secs,
                     }
                 } else if *live {
-                    ReasoningUiState::LiveExpanded
-                } else if reasoning_expanded
-                    .get(content_key)
-                    .copied()
-                    .unwrap_or(false)
-                {
-                    ReasoningUiState::SummaryExpanded
-                } else {
                     ReasoningUiState::Collapsed {
                         duration_secs: *duration_secs,
                     }
+                } else {
+                    match reasoning_expanded
+                        .get(content_key)
+                        .copied()
+                        .unwrap_or_default()
+                    {
+                        ReasoningExpand::Collapsed => ReasoningUiState::Collapsed {
+                            duration_secs: *duration_secs,
+                        },
+                        ReasoningExpand::Summary => ReasoningUiState::SummaryExpanded,
+                        ReasoningExpand::Full => ReasoningUiState::FullExpanded,
+                    }
                 };
-                let on_expand = if *encrypted || *live {
+                let on_set_expand = if *encrypted || *live {
                     None
                 } else {
                     let content_key = content_key.clone();
-                    Some(Box::new(move |cx: &mut App| {
+                    Some(Box::new(move |target: ReasoningExpand, cx: &mut App| {
                         view_weak
                             .update(cx, |view, cx| {
-                                view.reasoning_expanded.insert(content_key.clone(), true);
+                                if target == ReasoningExpand::Collapsed {
+                                    view.reasoning_expanded.remove(&content_key);
+                                } else {
+                                    view.reasoning_expanded.insert(content_key.clone(), target);
+                                }
                                 cx.notify();
                             })
                             .ok();
-                    }) as Box<dyn Fn(&mut App) + 'static>)
+                    }) as ReasoningSetExpandFn)
                 };
-                render_reasoning(&pres.content, ui, on_expand, window, cx)
+                render_reasoning(&pres.content, ui, on_set_expand, window, cx)
             }
             RowContent::Stub { .. } => Self::render_stub_row(pres, ix),
         }

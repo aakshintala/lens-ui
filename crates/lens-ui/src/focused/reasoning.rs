@@ -4,12 +4,20 @@ use gpui::{
 use crate::focused::RowContent;
 use crate::md::MarkdownView;
 
-pub type ReasoningExpandFn = Box<dyn Fn(&mut App) + 'static>;
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ReasoningExpand {
+    #[default]
+    Collapsed,
+    Summary,
+    Full,
+}
+
+pub type ReasoningSetExpandFn = Box<dyn Fn(ReasoningExpand, &mut App) + 'static>;
 
 pub enum ReasoningUiState {
-    LiveExpanded,
     Collapsed { duration_secs: Option<u32> },
     SummaryExpanded,
+    FullExpanded,
     Encrypted { duration_secs: Option<u32> },
 }
 
@@ -26,10 +34,29 @@ pub fn reasoning_collapsed_label(encrypted: bool, duration_secs: Option<u32>) ->
     }
 }
 
+/// Body text for expanded reasoning rows — summary (or full if empty) vs full chain-of-thought.
+fn expanded_body<'a>(
+    state: ReasoningUiState,
+    summary: &'a str,
+    full: &'a str,
+) -> &'a str {
+    match state {
+        ReasoningUiState::FullExpanded => full,
+        ReasoningUiState::SummaryExpanded => {
+            if summary.is_empty() {
+                full
+            } else {
+                summary
+            }
+        }
+        _ => summary,
+    }
+}
+
 pub fn render_reasoning(
     content: &RowContent,
     ui_state: ReasoningUiState,
-    on_expand: Option<ReasoningExpandFn>,
+    on_set_expand: Option<ReasoningSetExpandFn>,
     window: &mut Window,
     cx: &mut App,
 ) -> gpui::AnyElement {
@@ -79,29 +106,29 @@ pub fn render_reasoning(
         ReasoningUiState::Collapsed { duration_secs } => {
             let label = reasoning_collapsed_label(false, duration_secs);
             let base = div().child(label);
-            if let Some(on_expand) = on_expand {
+            if let Some(on_set_expand) = on_set_expand {
                 base.id(SharedString::from(format!(
                     "reasoning-expand-{}",
                     content_key.as_element_id()
                 )))
                 .cursor_pointer()
-                .on_click(move |_, _, cx| on_expand(cx))
+                .on_click(move |_, _, cx| on_set_expand(ReasoningExpand::Summary, cx))
                 .into_any_element()
             } else {
                 base.into_any_element()
             }
         }
-        ReasoningUiState::SummaryExpanded | ReasoningUiState::LiveExpanded => {
-            let body = if summary.is_empty() { full } else { summary };
+        ReasoningUiState::SummaryExpanded => {
+            let body = expanded_body(ui_state, summary, full);
             let expand_link = div().child("show full reasoning ↗");
-            let expand_link = if let Some(on_expand) = on_expand {
+            let expand_link = if let Some(on_set_expand) = on_set_expand {
                 expand_link
                     .id(SharedString::from(format!(
                         "reasoning-show-full-{}",
                         content_key.as_element_id()
                     )))
                     .cursor_pointer()
-                    .on_click(move |_, _, cx| on_expand(cx))
+                    .on_click(move |_, _, cx| on_set_expand(ReasoningExpand::Full, cx))
             } else {
                 expand_link.id(SharedString::from(format!(
                     "reasoning-show-full-{}",
@@ -115,7 +142,38 @@ pub fn render_reasoning(
                 .child(div().child(reasoning_collapsed_label(false, *duration_secs)))
                 .child(expand_link)
                 .child(
-                    MarkdownView::new(content_key.as_element_id(), body.clone(), window, cx)
+                    MarkdownView::new(content_key.as_element_id(), body.to_owned(), window, cx)
+                        .scrollable(false)
+                        .selectable(true)
+                        .into_inner(),
+                )
+                .into_any_element()
+        }
+        ReasoningUiState::FullExpanded => {
+            let body = expanded_body(ui_state, summary, full);
+            let collapse_link = div().child("show summary ↖");
+            let collapse_link = if let Some(on_set_expand) = on_set_expand {
+                collapse_link
+                    .id(SharedString::from(format!(
+                        "reasoning-show-summary-{}",
+                        content_key.as_element_id()
+                    )))
+                    .cursor_pointer()
+                    .on_click(move |_, _, cx| on_set_expand(ReasoningExpand::Summary, cx))
+            } else {
+                collapse_link.id(SharedString::from(format!(
+                    "reasoning-show-summary-{}",
+                    content_key.as_element_id()
+                )))
+            };
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(div().child(reasoning_collapsed_label(false, *duration_secs)))
+                .child(collapse_link)
+                .child(
+                    MarkdownView::new(content_key.as_element_id(), body.to_owned(), window, cx)
                         .scrollable(false)
                         .selectable(true)
                         .into_inner(),
@@ -162,5 +220,40 @@ mod tests {
             _ => panic!("expected reasoning"),
         };
         assert!(label.contains("4s"), "label should contain durable duration_secs: {label}");
+    }
+
+    #[test]
+    fn expand_advances_collapsed_summary_full() {
+        assert_eq!(ReasoningExpand::default(), ReasoningExpand::Collapsed);
+        assert_ne!(ReasoningExpand::Collapsed, ReasoningExpand::Summary);
+        assert_ne!(ReasoningExpand::Summary, ReasoningExpand::Full);
+    }
+
+    #[test]
+    fn full_expanded_renders_full_not_summary() {
+        assert_eq!(
+            expanded_body(
+                ReasoningUiState::FullExpanded,
+                "short",
+                "LONG"
+            ),
+            "LONG"
+        );
+        assert_eq!(
+            expanded_body(
+                ReasoningUiState::SummaryExpanded,
+                "short",
+                "LONG"
+            ),
+            "short"
+        );
+        assert_eq!(
+            expanded_body(
+                ReasoningUiState::SummaryExpanded,
+                "",
+                "LONG"
+            ),
+            "LONG"
+        );
     }
 }
