@@ -319,8 +319,26 @@ _Last curated 2026-07-22 (**`origin/main` merged into `lens-transript`** to pick
       foreground gate → merge. **Two seed issues + branch state:** handoff
       `docs/handoffs/2026-07-22-board-visual-pass.md` — (1) group bg fill 7%→maybe 10–12%; (2) groups
       don't reflow in the focused rail (`pack.rs:102/111` stores unclamped `fc`; pre-existing).
-    - **B-4c/d** — drag/move (spike candidate: gpui `on_drag`/`on_drop` vs packer geometry),
-      context-menu grouping. Each adds `write()` op variants via B-4a's `run_op` seam.
+    - **B-4c — drag/move — SPIKE DONE (2026-07-23, `spikes/board-drag/`, verdict GO).** De-risked the
+      reverse hit-test (cursor → `(parent, ordinal)`) over the forward-only masonry. Findings:
+      `docs/spikes/2026-07-23-board-b4c-drag-reverse-hittest.md`. (1) **gpui mechanics = low risk** —
+      `0.2.2` ships `on_drag`/`on_drag_move`/`on_drop`/`can_drop`, drop dispatch is **hitbox-based**, so
+      absolute-masonry positioning is orthogonal (real-window proof deferred to the build). (2) **Write-path
+      = low risk** — domain `move_item(id, board, parent, ordinal)` already covers reorder + in/out-of-group +
+      cross-board; needs only a new `Op::MoveItem` mirroring `SetCollapsed`. (3) **Reverse hit-test crux:
+      masonry is forward-only + ordinal order is NOT spatially monotonic** → no closed-form inverse; resolver
+      **scans the placed tiles** (into-group body = clean grid; top-level = nearest-tile + reading-order
+      side). Pure `resolve_drop` + `to_move_ordinal`, **10/10 tests** incl. the non-monotonic backfill case.
+      **codex (gpt-5.6) cross-family review** confirmed all geometry, caught 1 Medium (partial-last-row empty
+      trailing cell resolved before-last-member instead of append) → fixed + regression test. **Open design
+      decisions surfaced for the brainstorm:** insertion convention (nearest-tile vs marker vs reflow-preview;
+      lean = live reflow-preview), no natural end-of-list target (append when `cursor.y > content_height`),
+      group body-vs-header semantics, edge auto-scroll. **NEXT: B-4c brainstorm → plan → grill** (spike is the
+      input). Fold verdict into the B-4c design doc, then delete the spike. Carry the focused-rail group-reflow
+      minor (`pack.rs` unclamped `fc`) into B-4c since it touches this geometry.
+    - **B-4d — context-menu grouping.** Still **gated** on the non-idempotent-retry commit-phase seam
+      (design §8) that B-4a deferred — drag-to-*group* is B-4d, not B-4c. Adds `write()` op variants via
+      B-4a's `run_op` seam.
   - **B-5 — multiple boards + rail switcher** — board CRUD (B-1 seeds only the default board), the
     externally-discovered-session landing policy, and `FleetStore` connection-scoping.
   - **B-6 — archive-as-board surface.**
