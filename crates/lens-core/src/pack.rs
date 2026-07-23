@@ -231,9 +231,300 @@ impl Placed {
     }
 }
 
+use crate::domain::ids::BoardItemId;
+
+#[derive(Clone, Debug)]
+pub struct DropTile {
+    pub placed: Placed,
+    pub id: BoardItemId,
+    /// True iff collapsed group — no member drop zone (§4.2 step 3).
+    pub collapsed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DraggedKind {
+    Card,
+    Group,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DropTarget {
+    pub parent: Option<BoardItemId>,
+    pub ordinal: usize,
+}
+
+pub fn to_move_ordinal(spatial_ordinal: usize, dragged_sibling_index: Option<usize>) -> usize {
+    match dragged_sibling_index {
+        Some(i) if i < spatial_ordinal => spatial_ordinal - 1,
+        _ => spatial_ordinal,
+    }
+}
+
+/// `snapshot` = frozen S: packed tiles with the dragged item already removed (§4.1).
+pub fn resolve_drop(
+    snapshot: &[DropTile],
+    cursor: (f32, f32),
+    dragged: DraggedKind,
+) -> DropTarget {
+    let (cx, cy) = cursor;
+    // (1) into expanded group body — card drags only (§6).
+    if dragged == DraggedKind::Card {
+        for tile in snapshot {
+            let Kind::Group { members } = tile.placed.item.kind else {
+                continue;
+            };
+            if tile.collapsed || members == 0 {
+                continue;
+            }
+            let (x0, y0) = (tile.placed.cell_left(), tile.placed.cell_top());
+            let fc = tile.placed.item.fc.max(1);
+            let fr = tile.placed.item.fr.max(1);
+            let block_w = fc as f32 * CELL_W - GAP;
+            let block_h = HEADER + fr as f32 * CARD_H + (fr as f32 - 1.0) * GAP;
+            let body_top = y0 + HEADER;
+            let in_body = cx >= x0 && cx <= x0 + block_w && cy >= body_top && cy <= y0 + block_h;
+            if !in_body {
+                continue;
+            }
+            return DropTarget {
+                parent: Some(tile.id.clone()),
+                ordinal: member_ordinal(cx, cy, x0, y0, fc, members),
+            };
+        }
+    }
+    // (2) top-level nearest + reading-order side.
+    DropTarget {
+        parent: None,
+        ordinal: top_level_ordinal(snapshot, cx, cy),
+    }
+}
+
+fn member_ordinal(cx: f32, cy: f32, x0: f32, y0: f32, fc: usize, members: usize) -> usize {
+    let body_top = y0 + HEADER;
+    let rows = members.div_ceil(fc);
+    let col = (((cx - x0) / CELL_W).floor() as isize)
+        .clamp(0, fc as isize - 1) as usize;
+    let row = (((cy - body_top) / (CARD_H + GAP)).floor() as isize)
+        .clamp(0, rows as isize - 1) as usize;
+    let raw = row * fc + col;
+    if raw >= members {
+        return members; // empty trailing cell → append (codex 2026-07-23)
+    }
+    let cell_center_x = x0 + col as f32 * CELL_W + CARD_W / 2.0;
+    let after = cx > cell_center_x;
+    (raw + usize::from(after)).min(members)
+}
+
+fn top_level_ordinal(snapshot: &[DropTile], cx: f32, cy: f32) -> usize {
+    let mut best: Option<(f32, usize)> = None;
+    for (i, tile) in snapshot.iter().enumerate() {
+        let (x0, y0) = (tile.placed.cell_left(), tile.placed.cell_top());
+        let (w, h) = tile_size(&tile.placed);
+        let d2 = rect_dist_sq(cx, cy, x0, y0, w, h);
+        if best.is_none_or(|(bd, _)| d2 < bd) {
+            best = Some((d2, i));
+        }
+    }
+    let Some((_, k)) = best else {
+        return 0;
+    };
+    let placed = &snapshot[k].placed;
+    let y0 = placed.cell_top();
+    let (_w, h) = tile_size(placed);
+    let after = cy > y0 + h / 2.0;
+    (k + usize::from(after)).min(snapshot.len())
+}
+
+fn tile_size(placed: &Placed) -> (f32, f32) {
+    match placed.item.kind {
+        Kind::Card => (CARD_W, CARD_H),
+        Kind::Group { .. } => {
+            let fc = placed.item.fc.max(1);
+            let fr = placed.item.fr.max(1);
+            (
+                fc as f32 * CELL_W - GAP,
+                HEADER + fr as f32 * CARD_H + (fr as f32 - 1.0) * GAP,
+            )
+        }
+    }
+}
+
+fn rect_dist_sq(px: f32, py: f32, x: f32, y: f32, w: f32, h: f32) -> f32 {
+    let dx = (x - px).max(0.0).max(px - (x + w));
+    let dy = (y - py).max(0.0).max(py - (y + h));
+    dx * dx + dy * dy
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::ids::BoardItemId;
+
+    fn bid(s: &str) -> BoardItemId {
+        BoardItemId::new(s)
+    }
+
+    /// Pack items, zip parallel ids + collapsed flags → DropTile snapshot (S).
+    fn snap(items: &[Item], ids: &[&str], collapsed: &[bool], cols: usize) -> Vec<DropTile> {
+        let packing = pack(items, cols);
+        packing
+            .tiles
+            .into_iter()
+            .map(|placed| DropTile {
+                id: bid(ids[placed.item_index]),
+                collapsed: collapsed[placed.item_index],
+                placed,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn drop_above_center_inserts_before() {
+        let items = [Item::card(), Item::card(), Item::card()];
+        let s = snap(&items, &["a", "b", "c"], &[false; 3], 1);
+        let py1 = CARD_H + GAP;
+        let t = resolve_drop(&s, (CARD_W / 2.0, py1 + 4.0), DraggedKind::Card);
+        assert_eq!(t, DropTarget {
+            parent: None,
+            ordinal: 1
+        });
+    }
+
+    #[test]
+    fn drop_below_center_inserts_after() {
+        let items = [Item::card(), Item::card(), Item::card()];
+        let s = snap(&items, &["a", "b", "c"], &[false; 3], 1);
+        let py1 = CARD_H + GAP;
+        let t = resolve_drop(&s, (CARD_W / 2.0, py1 + CARD_H - 4.0), DraggedKind::Card);
+        assert_eq!(t, DropTarget {
+            parent: None,
+            ordinal: 2
+        });
+    }
+
+    #[test]
+    fn drop_below_everything_resolves_after_nearest() {
+        let items = [Item::card(), Item::card()];
+        let s = snap(&items, &["a", "b"], &[false; 2], 1);
+        let t = resolve_drop(&s, (CARD_W / 2.0, 10_000.0), DraggedKind::Card);
+        assert_eq!(t, DropTarget {
+            parent: None,
+            ordinal: 2
+        });
+    }
+
+    #[test]
+    fn ordinal_is_not_spatial_order_under_backfill() {
+        let items = [Item::group(4), Item::card(), Item::card()];
+        let s = snap(&items, &["g", "x", "y"], &[false; 3], 3);
+        let x_col2 = 2.0 * CELL_W + CARD_W / 2.0;
+        let t = resolve_drop(&s, (x_col2, 4.0), DraggedKind::Card);
+        assert_eq!(t, DropTarget {
+            parent: None,
+            ordinal: 1
+        });
+        let py_y = CARD_H + GAP;
+        let t_low = resolve_drop(&s, (x_col2, py_y + 4.0), DraggedKind::Card);
+        assert_eq!(t_low, DropTarget {
+            parent: None,
+            ordinal: 2
+        });
+    }
+
+    #[test]
+    fn drop_into_expanded_group_body_targets_member_slot() {
+        let items = [Item::group(4)];
+        let s = snap(&items, &["g"], &[false], 3);
+        let t = resolve_drop(&s, (4.0, HEADER + CARD_H / 2.0), DraggedKind::Card);
+        assert_eq!(t, DropTarget {
+            parent: Some(bid("g")),
+            ordinal: 0
+        });
+        let x_m1 = CELL_W + CARD_W - 4.0;
+        let t2 = resolve_drop(&s, (x_m1, HEADER + CARD_H / 2.0), DraggedKind::Card);
+        assert_eq!(t2, DropTarget {
+            parent: Some(bid("g")),
+            ordinal: 2
+        });
+    }
+
+    #[test]
+    fn empty_trailing_cell_in_partial_last_row_appends() {
+        let items = [Item::group(5)];
+        let s = snap(&items, &["g"], &[false], 3);
+        let t = resolve_drop(&s, (618.0, 218.0), DraggedKind::Card);
+        assert_eq!(t, DropTarget {
+            parent: Some(bid("g")),
+            ordinal: 5
+        });
+        let m4_center_x = CELL_W + CARD_W / 2.0;
+        let y_row1 = HEADER + (CARD_H + GAP) + CARD_H / 2.0;
+        assert_eq!(
+            resolve_drop(&s, (m4_center_x - 20.0, y_row1), DraggedKind::Card),
+            DropTarget {
+                parent: Some(bid("g")),
+                ordinal: 4
+            }
+        );
+        assert_eq!(
+            resolve_drop(&s, (m4_center_x + 20.0, y_row1), DraggedKind::Card),
+            DropTarget {
+                parent: Some(bid("g")),
+                ordinal: 5
+            }
+        );
+    }
+
+    #[test]
+    fn drop_on_group_header_is_top_level_not_into_group() {
+        let items = [Item::card(), Item::group(2)];
+        let s = snap(&items, &["a", "g"], &[false; 2], 3);
+        let gx = 1.0 * CELL_W;
+        let t = resolve_drop(&s, (gx + 10.0, 4.0), DraggedKind::Card);
+        assert_eq!(t.parent, None, "header drop must not enter the group");
+    }
+
+    #[test]
+    fn collapsed_group_has_no_member_drop_zone() {
+        let items = [Item::group_collapsed(3)];
+        let s = snap(&items, &["g"], &[true], 3);
+        let t = resolve_drop(
+            &s,
+            (CARD_W / 2.0, HEADER + CARD_H / 2.0),
+            DraggedKind::Card,
+        );
+        assert_eq!(t.parent, None);
+    }
+
+    #[test]
+    fn dragged_group_over_group_body_falls_through_to_top_level() {
+        let items = [Item::group(4), Item::group(2)];
+        let s = snap(&items, &["g0", "g1"], &[false; 2], 3);
+        let t = resolve_drop(
+            &s,
+            (4.0, HEADER + CARD_H / 2.0),
+            DraggedKind::Group,
+        );
+        assert_eq!(t.parent, None, "group drag must not nest under another group");
+    }
+
+    #[test]
+    fn move_ordinal_shifts_when_dragged_precedes_target() {
+        assert_eq!(to_move_ordinal(3, Some(1)), 2);
+        assert_eq!(to_move_ordinal(1, Some(1)), 1);
+        assert_eq!(to_move_ordinal(0, Some(3)), 0);
+        assert_eq!(to_move_ordinal(3, None), 3);
+    }
+
+    #[test]
+    fn empty_board_resolves_to_zero() {
+        let s: [DropTile; 0] = [];
+        let t = resolve_drop(&s, (100.0, 100.0), DraggedKind::Card);
+        assert_eq!(t, DropTarget {
+            parent: None,
+            ordinal: 0
+        });
+    }
 
     #[test]
     fn foot_anchors() {
