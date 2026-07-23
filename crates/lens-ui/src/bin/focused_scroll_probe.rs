@@ -18,7 +18,7 @@ use lens_core::persist::{RangeRead, ReadRange};
 use lens_core::reduce::{RetireDisposition, StreamUpdate};
 use lens_ui::fleet::store::ReconcileEpoch;
 use lens_ui::focused::view::{FocusedTranscriptView, FollowMode};
-use lens_ui::focused::{FocusedTranscript, ReaderWorkerHandle, prepend_scroll_compensation};
+use lens_ui::focused::{FocusedTranscript, ReaderWorkerHandle};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct AnchorSnapshot {
@@ -109,6 +109,16 @@ fn row_with_len(
     item: lens_core::domain::item::Item,
 ) -> (i64, usize, lens_core::domain::item::Item) {
     (ord, 4, item)
+}
+
+/// Row carrying an explicit resident byte length — used to drive resident_bytes
+/// toward RESIDENT_CAP_BYTES so a backward page forces hi-side eviction (C2).
+fn row_with_len_bytes(
+    ord: i64,
+    bytes: usize,
+    item: lens_core::domain::item::Item,
+) -> (i64, usize, lens_core::domain::item::Item) {
+    (ord, bytes, item)
 }
 
 fn seed_rows(replica: &Entity<FocusedTranscript>, count: usize, cx: &mut App) {
@@ -353,13 +363,16 @@ async fn drive_scroll_probe(
     });
     wait_frames(&mut wcx, 4).await;
 
-    let (anchor_before_prepend, row_count_before) = weak
+    let (anchor_before_prepend, row_count_before, top_row_before) = weak
         .update_in(&mut wcx, |view, _, cx| {
             let replica = view.replica.read(cx);
-            (
-                AnchorSnapshot::from(replica.list_state().logical_scroll_top()),
-                replica.rows().len(),
-            )
+            let a = AnchorSnapshot::from(replica.list_state().logical_scroll_top());
+            let top = replica
+                .rows()
+                .order()
+                .get(a.top_item_index)
+                .map(|id| format!("{id:?}"));
+            (a, replica.rows().order().len(), top)
         })
         .unwrap();
     // Guard against a degenerate setup: if the anchor snapped to the bottom
@@ -374,7 +387,6 @@ async fn drive_scroll_probe(
     let prepend_rows: Vec<_> = (40..49)
         .map(|i| row_with_len(i, message_item(&format!("pre{i}"), &format!("pre row {i}"))))
         .collect();
-    let inserted = prepend_rows.len();
     let _ = weak.update_in(&mut wcx, |view, _, cx| {
         view.replica.update(cx, |r, cx| {
             r.apply_read(
@@ -395,18 +407,126 @@ async fn drive_scroll_probe(
     });
     wait_frames(&mut wcx, 4).await;
 
-    let anchor_after_prepend = weak
+    let (anchor_after_prepend, top_row_after) = weak
         .update_in(&mut wcx, |view, _, cx| {
-            AnchorSnapshot::from(view.replica.read(cx).list_state().logical_scroll_top())
+            let replica = view.replica.read(cx);
+            let a = AnchorSnapshot::from(replica.list_state().logical_scroll_top());
+            let top = replica
+                .rows()
+                .order()
+                .get(a.top_item_index)
+                .map(|id| format!("{id:?}"));
+            (a, top)
         })
         .unwrap();
-    let expected_after = AnchorSnapshot::from(prepend_scroll_compensation(
-        gpui::ListOffset {
-            item_ix: anchor_before_prepend.top_item_index,
-            offset_in_item: anchor_before_prepend.sub_offset,
-        },
-        inserted,
-    ));
+    // The row at the top of the viewport must be identical before and after the
+    // prepend — the arithmetic-independent statement of "content did not yank".
+    let prepend_identity_ok = top_row_before.is_some() && top_row_before == top_row_after;
+
+    // ── C2: backward prepend + hi-side eviction must not yank visible content ──
+    // The prepend section above stays under RESIDENT_CAP_BYTES (tiny rows), so it
+    // never exercises the eviction path. Here we seed LARGE-byte rows so a backward
+    // page tips resident over the 24 MB cap; paused (`following=false`) eviction then
+    // drops rows from the HI (newest) side while the anchor sits near the top. The
+    // arithmetic is pinned headless; this proves the two-splice survives REAL layout:
+    // the RowId at the top of the viewport must be identical before and after.
+    let _ = weak.update_in(&mut wcx, |view, _, cx| {
+        view.replica.update(cx, |r, cx| {
+            r.set_following(false, cx);
+            let rows: Vec<_> = (1000..1200)
+                .map(|i| {
+                    row_with_len_bytes(
+                        i,
+                        110 * 1024,
+                        message_item(&format!("big{i}"), &format!("big row {i}")),
+                    )
+                })
+                .collect();
+            r.apply_read(
+                1,
+                ReadRange::All,
+                RangeRead {
+                    rows,
+                    skipped: vec![],
+                    watermark: Some(1199),
+                },
+                cx,
+            );
+        });
+        cx.notify();
+    });
+    wait_frames(&mut wcx, 4).await;
+
+    // Scroll up and settle so the anchor is a stable, genuinely-scrolled-up position.
+    let _ = weak.update_in(&mut wcx, |view, _, cx| {
+        view.replica.read(cx).list_state().scroll_by(px(-4000.));
+    });
+    wait_frames(&mut wcx, 4).await;
+
+    let (c2_anchor_before, c2_top_before, c2_count_before) = weak
+        .update_in(&mut wcx, |view, _, cx| {
+            let r = view.replica.read(cx);
+            let a = AnchorSnapshot::from(r.list_state().logical_scroll_top());
+            let top = r
+                .rows()
+                .order()
+                .get(a.top_item_index)
+                .map(|id| format!("{id:?}"));
+            (a, top, r.rows().order().len())
+        })
+        .unwrap();
+    let c2_resident_lo = weak
+        .update_in(&mut wcx, |view, _, cx| view.replica.read(cx).resident_lo())
+        .unwrap();
+
+    const C2_INSERTED: usize = 40;
+    let _ = weak.update_in(&mut wcx, |view, _, cx| {
+        view.replica.update(cx, |r, cx| {
+            let rows: Vec<_> = ((c2_resident_lo - C2_INSERTED as i64)..c2_resident_lo)
+                .map(|i| {
+                    row_with_len_bytes(
+                        i,
+                        110 * 1024,
+                        message_item(&format!("big{i}"), &format!("big row {i}")),
+                    )
+                })
+                .collect();
+            r.apply_read(
+                1,
+                ReadRange::Backward {
+                    before: c2_resident_lo,
+                    byte_budget: 4 * 1024 * 1024,
+                },
+                RangeRead {
+                    rows,
+                    skipped: vec![],
+                    watermark: Some(1199),
+                },
+                cx,
+            );
+        });
+        cx.notify();
+    });
+    wait_frames(&mut wcx, 4).await;
+
+    let (c2_top_after, c2_count_after) = weak
+        .update_in(&mut wcx, |view, _, cx| {
+            let r = view.replica.read(cx);
+            let a = AnchorSnapshot::from(r.list_state().logical_scroll_top());
+            let top = r
+                .rows()
+                .order()
+                .get(a.top_item_index)
+                .map(|id| format!("{id:?}"));
+            (top, r.rows().order().len())
+        })
+        .unwrap();
+
+    // Setup guards: genuinely scrolled up, and the page actually forced eviction
+    // (else the eviction arm of C2 is untested — a false-green).
+    let c2_scrolled_up = c2_anchor_before.top_item_index < c2_count_before;
+    let c2_evicted = c2_count_after < c2_count_before + C2_INSERTED;
+    let c2_identity_ok = c2_top_before.is_some() && c2_top_before == c2_top_after;
 
     let ok = weak
         .update_in(&mut wcx, |view, _, _| {
@@ -414,7 +534,7 @@ async fn drive_scroll_probe(
             p.finalize_anchor_stable = Some(anchor_before_finalize == anchor_after_finalize);
             p.paused_anchor_stable =
                 Some(anchor_before_paused_appends == anchor_after_paused_appends);
-            p.prepend_anchor_stable = Some(anchor_after_prepend == expected_after);
+            p.prepend_anchor_stable = Some(prepend_identity_ok);
             if !p.saw_initial_bottom {
                 p.failures
                     .push("contract 4: new session did not land at bottom".into());
@@ -443,8 +563,26 @@ async fn drive_scroll_probe(
             }
             if p.prepend_anchor_stable != Some(true) {
                 p.failures.push(format!(
-                    "prepend-anchor: visible content shifted {:?} -> {:?} (expected {:?})",
-                    anchor_before_prepend, anchor_after_prepend, expected_after
+                    "prepend-anchor: visible content yanked, top row {:?} -> {:?} (anchor {:?} -> {:?})",
+                    top_row_before, top_row_after, anchor_before_prepend, anchor_after_prepend
+                ));
+            }
+            if !c2_scrolled_up {
+                p.failures.push(format!(
+                    "C2 setup: not scrolled up before eviction page (anchor {:?}, count {})",
+                    c2_anchor_before, c2_count_before
+                ));
+            }
+            if !c2_evicted {
+                p.failures.push(format!(
+                    "C2 setup: backward page did not force hi eviction (count {} -> {}, inserted {})",
+                    c2_count_before, c2_count_after, C2_INSERTED
+                ));
+            }
+            if !c2_identity_ok {
+                p.failures.push(format!(
+                    "C2 prepend+eviction yanked visible content: top row {:?} -> {:?}",
+                    c2_top_before, c2_top_after
                 ));
             }
             if anchor_before_pause == anchor_after_paused_appends {

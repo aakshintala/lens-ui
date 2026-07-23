@@ -6,7 +6,7 @@ mod rowsource;
 pub mod view;
 
 use crate::fleet::store::{ReaderFactory, ReconcileEpoch};
-use gpui::{Context, ListAlignment, ListState, Pixels};
+use gpui::{Context, ListAlignment, ListOffset, ListState, Pixels};
 use lens_core::domain::ids::{AccId, ItemId, ResponseId, SessionId};
 use lens_core::domain::item::{Item, ItemKind, StreamScratch};
 use lens_core::domain::scalars::Role;
@@ -46,19 +46,6 @@ pub struct Marker {
 /// Scroll-near-top decision for backward paging (§5) — unit-testable outside gpui scroll injection.
 pub fn should_page_older(visible_start: usize, resident_lo: i64, page_in_flight: bool) -> bool {
     resident_lo > 0 && !page_in_flight && visible_start <= NEAR_TOP_ROWS
-}
-
-/// After prepending `inserted_rows` at the front of a bottom-aligned list, shift the logical
-/// scroll anchor so the same content stays visible (gpui `splice(0..0, n)` adjusts `item_ix`
-/// the same way; this pure fn documents and unit-tests that contract).
-pub fn prepend_scroll_compensation(
-    anchor: gpui::ListOffset,
-    inserted_rows: usize,
-) -> gpui::ListOffset {
-    gpui::ListOffset {
-        item_ix: anchor.item_ix.saturating_add(inserted_rows),
-        offset_in_item: anchor.offset_in_item,
-    }
 }
 
 pub struct FocusedTranscript {
@@ -812,12 +799,18 @@ impl FocusedTranscript {
     fn reproject(&mut self, full: bool, prepend_sync: bool, cx: &mut Context<Self>) {
         let expansion = self.compute_expansion_flags();
         let prev_len = self.rows.len();
-        let prepend_anchor_row: Option<RowId> = if prepend_sync {
+        // For a prepend (Backward page, possibly with hi-side eviction), capture the
+        // exact row the scroll anchor references so we can re-pin it after the full
+        // rebuild — wherever it lands. This is robust to a non-uniform shift: the
+        // number of rows inserted ABOVE the anchor depends on where the anchor sits
+        // (e.g. anchored at the LoadOlder sentinel → shift 0; anchored at content →
+        // shift = inserted). Arithmetic on the insert count gets this wrong.
+        let prepend_anchor: Option<(RowId, Pixels)> = if prepend_sync {
+            let a = self.list_state.logical_scroll_top();
             self.rows
                 .order()
-                .iter()
-                .find(|r| !matches!(r, RowId::LoadOlder))
-                .cloned()
+                .get(a.item_ix)
+                .map(|r| (r.clone(), a.offset_in_item))
         } else {
             None
         };
@@ -875,35 +868,16 @@ impl FocusedTranscript {
         self.overlay_pending_finalize(cx);
         let pending_accs: HashSet<AccId> = self.pending_finalize.keys().cloned().collect();
         self.rows.gc_entities(&pending_accs);
-        let new_len = self.rows.len();
-        if prepend_sync {
-            let inserted_front = prepend_anchor_row
-                .as_ref()
-                .and_then(|id| self.rows.order().iter().position(|r| r == id));
-            match inserted_front {
-                Some(i) => {
-                    if i > 0 {
-                        self.rows.sync_list_prepend(&self.list_state, i);
-                    }
-                    // gpui now has prev_len + i items; actual is new_len. Any hi-side
-                    // eviction removed rows at the TAIL (below the shifted anchor) — remove
-                    // them so the count matches without disturbing the anchor.
-                    let gpui_len = prev_len + i;
-                    if new_len < gpui_len {
-                        self.rows
-                            .splice_into(&self.list_state, new_len..gpui_len, 0);
-                    } else if new_len > gpui_len {
-                        self.rows.splice_into(
-                            &self.list_state,
-                            gpui_len..gpui_len,
-                            new_len - gpui_len,
-                        );
-                    }
-                }
-                None => {
-                    // anchor row vanished (empty/degenerate) — safe fallback.
-                    self.rows.sync_list_count(&self.list_state, prev_len);
-                }
+        if let Some((anchor_row, offset)) = &prepend_anchor {
+            // Fix the total count first (this may reset the scroll), then re-pin the
+            // anchor to the captured row's new index. Correct whether or not hi-side
+            // eviction co-occurred, and regardless of how many rows landed above it.
+            self.rows.sync_list_count(&self.list_state, prev_len);
+            if let Some(new_ix) = self.rows.order().iter().position(|r| r == anchor_row) {
+                self.list_state.scroll_to(ListOffset {
+                    item_ix: new_ix,
+                    offset_in_item: *offset,
+                });
             }
         } else {
             self.rows.sync_list_count(&self.list_state, prev_len);
@@ -4403,17 +4377,6 @@ mod tests {
         assert!(!should_page_older(0, 5, true));
     }
 
-    #[test]
-    fn prepend_scroll_compensation_shifts_item_ix() {
-        let anchor = gpui::ListOffset {
-            item_ix: 12,
-            offset_in_item: gpui::px(4.),
-        };
-        let compensated = prepend_scroll_compensation(anchor, 5);
-        assert_eq!(compensated.item_ix, 17);
-        assert_eq!(compensated.offset_in_item, gpui::px(4.));
-    }
-
     #[gpui::test]
     async fn load_older_sentinel_present_iff_resident_lo_positive(cx: &mut gpui::TestAppContext) {
         let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
@@ -4622,8 +4585,11 @@ mod tests {
         });
     }
 
-    /// C2: backward prepend with hi-side eviction must keep gpui list count aligned with RowStore
-    /// and shift the scroll anchor by the true front-insert count (not net delta).
+    /// C2: a backward prepend with hi-side eviction must re-pin the scroll anchor to the
+    /// SAME row it referenced (wherever that row lands) and keep the gpui list count aligned
+    /// with the RowStore. Shifting by an insert-count proxy gets this wrong (the LoadOlder
+    /// sentinel offsets the count, and an anchor sitting at/above the insertion point should
+    /// not move at all).
     #[gpui::test]
     async fn backward_prepend_with_eviction_keeps_list_count_synced(cx: &mut gpui::TestAppContext) {
         let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
@@ -4679,21 +4645,7 @@ mod tests {
             });
         });
 
-        let expected_anchor = cx.read(|cx| {
-            let r = replica.read(cx);
-            let inserted_front = r
-                .rows()
-                .order()
-                .iter()
-                .position(|id| id == &anchor_row)
-                .expect("anchor row must survive backward prepend");
-            assert!(
-                inserted_front > INSERTED.saturating_sub(1),
-                "precondition: true front-insert count must exceed net row delta when hi evicts"
-            );
-            prepend_scroll_compensation(anchor, inserted_front)
-        });
-        cx.read(|cx| {
+        let anchor_new_ix = cx.read(|cx| {
             let r = replica.read(cx);
             assert!(
                 r.resident_hi_for_test() < hi_before,
@@ -4703,15 +4655,31 @@ mod tests {
                 !r.has_item_ordinal_for_test(14),
                 "evicted hi ordinal must be gone from items"
             );
+            let ix = r
+                .rows()
+                .order()
+                .iter()
+                .position(|id| id == &anchor_row)
+                .expect("anchor row must survive backward prepend");
+            // Precondition: the anchor row moved DOWN (older rows prepended above it) and
+            // by more than the net row delta — i.e. this exercises the eviction path.
+            assert!(
+                ix > anchor.item_ix + INSERTED.saturating_sub(1),
+                "precondition: anchor row must shift past the net delta when hi evicts"
+            );
+            ix
+        });
+        cx.read(|cx| {
+            let r = replica.read(cx);
             assert_eq!(
                 r.list_state().logical_scroll_top().item_ix,
-                expected_anchor.item_ix,
-                "anchor must shift by true front-insert count, not net delta"
+                anchor_new_ix,
+                "anchor must be re-pinned to the SAME row after prepend + eviction"
             );
             assert_eq!(
                 r.list_state().item_count(),
                 r.rows().len(),
-                "two-splice prepend+tail-trim must keep gpui count aligned with RowStore"
+                "prepend + tail-trim must keep gpui count aligned with RowStore"
             );
         });
     }

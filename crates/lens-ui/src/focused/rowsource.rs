@@ -246,14 +246,6 @@ impl RowStore {
         }
     }
 
-    /// Prepend splice — shifts `logical_scroll_top.item_ix` by `inserted` without resetting
-    /// anchors inside the replaced band (gpui `ListState::splice(0..0, n)`).
-    pub fn sync_list_prepend(&self, list: &ListState, inserted: usize) {
-        if inserted > 0 {
-            self.splice_into(list, 0..0, inserted);
-        }
-    }
-
     /// Height-invalidate a content-mutated row (spike `invalidate_row_height`).
     pub fn invalidate_row_height(&self, list: &ListState, index: usize) {
         self.splice_into(list, index..index + 1, 1);
