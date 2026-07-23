@@ -277,11 +277,42 @@ fn seed_demo_transcript(dir: &Path, conn: &ConnectionId, session: &SessionId, co
         }
     }
 
+    const USER_LINES: [&str; 6] = [
+        "Can you take a look at the disk-windowing reader and confirm the byte budget is honoured?",
+        "The transcript feels slow to open on the big sessions — what's the cold-focus latency now?",
+        "Let's page older history in on scroll instead of loading the whole thing up front.",
+        "Walk me through how eviction picks which end of the window to drop.",
+        "Add a regression test so we never re-introduce the full-history reconcile.",
+        "Ship it once the sweep shows resident RAM staying under the cap at 50k items.",
+    ];
+    const ASSISTANT_LINES: [&str; 6] = [
+        "The resident window is a bounded BTreeMap keyed by ordinal; the tail read stops accumulating once it hits the 8 MiB budget, so cold focus is O(window) rather than O(history).",
+        "Scrolling near the top enqueues a single Backward page at Priority::Page; a page-in-flight guard keeps it to one outstanding read, and the LoadOlder sentinel shows while it lands.",
+        "Eviction trims the far end from the follow direction — when you're paused near the top it drops the newest resident rows, and the scroll anchor is re-pinned by row identity so nothing yanks.",
+        "At 50k items the sweep measured ~33 ms cold focus and ~12.6 MB resident after a backward page — comfortably under the 24 MB cap, so no constant tuning was needed.",
+        "I split the read primitives into Tail, Backward, and Span so the in-band reconcile replaces exactly the resident rows without ghosting, and the watermark tracks committed ordinals.",
+        "Done — tests are green, the real-window probe holds the prepend anchor, and the D19 guard asserts run_catchup never calls the full reconcile path.",
+    ];
+
+    fn fill(seed_line: &str, nbytes: usize) -> String {
+        let mut out = String::with_capacity(nbytes + seed_line.len());
+        while out.len() < nbytes {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(seed_line);
+        }
+        out
+    }
+
     fn make_item(i: i64, rng: &mut DeterministicRng) -> Item {
         let nbytes = payload_bytes(i, rng);
         let response_id = RESPONSE_IDS[(i as usize) % RESPONSE_IDS.len()];
         if i % LARGE_EVERY == 0 {
-            let text = "D".repeat(nbytes);
+            let text = fill(
+                ASSISTANT_LINES[(i as usize / 3) % ASSISTANT_LINES.len()],
+                nbytes,
+            );
             Item {
                 id: ItemId::new(format!("item_{i:08}")),
                 seq: Some(i as u64),
@@ -298,7 +329,15 @@ fn seed_demo_transcript(dir: &Path, conn: &ConnectionId, session: &SessionId, co
                 },
             }
         } else {
-            let text = format!("m{:0width$}", i, width = nbytes.saturating_sub(8));
+            let is_user = i % 7 == 0;
+            let text = if is_user {
+                USER_LINES[(i as usize / 7) % USER_LINES.len()].to_string()
+            } else {
+                fill(
+                    ASSISTANT_LINES[(i as usize / 2) % ASSISTANT_LINES.len()],
+                    nbytes,
+                )
+            };
             Item {
                 id: ItemId::new(format!("item_{i:08}")),
                 seq: Some(i as u64),
@@ -309,11 +348,7 @@ fn seed_demo_transcript(dir: &Path, conn: &ConnectionId, session: &SessionId, co
                 },
                 created_at: 1_700_000_000_000 + i,
                 kind: ItemKind::Message {
-                    role: if i % 7 == 0 {
-                        Role::User
-                    } else {
-                        Role::Assistant
-                    },
+                    role: if is_user { Role::User } else { Role::Assistant },
                     content: vec![ContentBlock {
                         kind: "text".into(),
                         text: Some(text),
@@ -358,7 +393,12 @@ fn run_demo() {
     Application::new()
         .with_assets(lens_ui::assets::LensAssets)
         .run(move |cx: &mut App| {
-            let _demo_dir = demo_dir; // hold the TempDir for the app's lifetime
+            // Leak the TempDir so the seeded dbs outlive this setup closure. The focused
+            // transcript reader opens its db LAZILY (async, after this closure returns), so a
+            // TempDir dropped at closure-end would be deleted before the first read (the board
+            // store tolerated it only because it opens eagerly and holds the fd). The process is
+            // short-lived; the OS reclaims the temp dir on exit.
+            std::mem::forget(demo_dir);
             gpui_component::init(cx);
             // Demo defaults to the dark palette; `LENS_THEME=light` still overrides.
             lens_ui::theme::install_at_startup_with_default(gpui_component::ThemeMode::Dark, cx);
