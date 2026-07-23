@@ -199,8 +199,8 @@ pub enum AccessMode {
     ReadOnly,
 }
 
-/// Open-time configuration. Holds **only** access intent, a scrollback limit,
-/// and initial user preferences.
+/// Open-time configuration. Holds **only** access intent, a scrollback byte
+/// budget, and initial user preferences.
 ///
 /// `#[non_exhaustive]` + [`Default`] + `with_*` setters so later slices can add
 /// preference fields **without** breaking a `lens-ui` struct literal (external
@@ -211,10 +211,11 @@ pub enum AccessMode {
 #[non_exhaustive]
 pub struct TerminalOpenOptions {
     pub access: AccessIntent,
-    /// Bounded scrollback cap in **lines** (`libghostty-vt` caps by line, not
-    /// byte — see the design's "Scrollback, memory, resize"). `None` = engine
-    /// default.
-    pub scrollback_lines: Option<usize>,
+    /// Scrollback retention as a **byte** budget for the engine (`max_scrollback`),
+    /// NOT a line count. `None` → the default `10_000_000` bytes (~12.5k rows @200 cols;
+    /// validated safe on the 64 MiB worker stack, memory
+    /// `terminal-max-scrollback-bytes-and-worker-stack`).
+    pub scrollback_bytes: Option<usize>,
     // Initial user preferences (mouse/paste/etc.) land with Slice 2.
 }
 
@@ -222,7 +223,7 @@ impl Default for TerminalOpenOptions {
     fn default() -> Self {
         Self {
             access: AccessIntent::Automatic,
-            scrollback_lines: None,
+            scrollback_bytes: None,
         }
     }
 }
@@ -235,10 +236,10 @@ impl TerminalOpenOptions {
         self
     }
 
-    /// Set the scrollback cap in lines (`None` = engine default).
+    /// Set the scrollback byte budget (`None` = default `10_000_000` bytes).
     #[must_use]
-    pub fn with_scrollback_lines(mut self, lines: Option<usize>) -> Self {
-        self.scrollback_lines = lines;
+    pub fn with_scrollback_bytes(mut self, bytes: Option<usize>) -> Self {
+        self.scrollback_bytes = bytes;
         self
     }
 }
@@ -3616,10 +3617,26 @@ mod tests {
     }
 
     #[test]
+    fn scrollback_bytes_default_is_ten_million_not_seven_rows() {
+        // With no override, the engine byte budget must be a real default, not 1000 bytes.
+        let opts = TerminalOpenOptions::default();
+        assert_eq!(opts.scrollback_bytes, None);
+        let cfg = super::policy::engine_config_for_test(&opts);
+        assert_eq!(cfg.max_scrollback, 10_000_000);
+    }
+
+    #[test]
+    fn with_scrollback_bytes_overrides_the_default() {
+        let opts = TerminalOpenOptions::default().with_scrollback_bytes(Some(2_048));
+        let cfg = super::policy::engine_config_for_test(&opts);
+        assert_eq!(cfg.max_scrollback, 2_048);
+    }
+
+    #[test]
     fn open_options_default_is_automatic_engine_scrollback() {
         let o = TerminalOpenOptions::default();
         assert_eq!(o.access, AccessIntent::Automatic);
-        assert_eq!(o.scrollback_lines, None);
+        assert_eq!(o.scrollback_bytes, None);
     }
 
     #[test]

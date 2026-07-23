@@ -266,15 +266,24 @@ pub(crate) fn identity_title_from_resource(resource: &TerminalResource) -> Strin
     }
 }
 
-fn engine_config_for(resource: &TerminalResource, options: &TerminalOpenOptions) -> EngineConfig {
-    let _ = resource;
+fn engine_config(options: &TerminalOpenOptions) -> EngineConfig {
     EngineConfig {
         cols: 80,
         rows: 24,
-        max_scrollback: options.scrollback_lines.unwrap_or(1000),
+        max_scrollback: options.scrollback_bytes.unwrap_or(10_000_000),
         cell_w_px: 8,
         cell_h_px: 16,
     }
+}
+
+fn engine_config_for(resource: &TerminalResource, options: &TerminalOpenOptions) -> EngineConfig {
+    let _ = resource;
+    engine_config(options)
+}
+
+#[cfg(any(test, feature = "test-util"))]
+pub(crate) fn engine_config_for_test(options: &TerminalOpenOptions) -> EngineConfig {
+    engine_config(options)
 }
 
 #[cfg(test)]
