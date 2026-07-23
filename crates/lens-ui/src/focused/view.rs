@@ -97,13 +97,16 @@ impl FocusedTranscriptView {
     /// `test-support` (`Window::dispatch_event` returns a `pub(crate)` type), so
     /// the real-window probe cannot fire this path. The render closure is
     /// trivial glue over this method; branches are covered by `on_scroll_event_*`.
-    fn on_scroll_event(&mut self, event: &ListScrollEvent) {
-        let mode = if event.is_scrolled {
-            FollowMode::Paused
-        } else {
+    fn on_scroll_event(&mut self, event: &ListScrollEvent, cx: &mut Context<Self>) {
+        let following = !event.is_scrolled;
+        let mode = if following {
             FollowMode::Following
+        } else {
+            FollowMode::Paused
         };
         self.set_follow_mode(mode, self.last_row_count);
+        self.replica
+            .update(cx, |r, cx| r.set_following(following, cx));
     }
 
     fn jump_to_latest(&mut self, cx: &mut Context<Self>) {
@@ -115,6 +118,7 @@ impl FocusedTranscriptView {
         self.follow_mode = FollowMode::Following;
         self.rows_at_pause = count;
         self.last_row_count = count;
+        self.replica.update(cx, |r, cx| r.set_following(true, cx));
         cx.notify();
     }
 
@@ -181,7 +185,8 @@ impl Render for FocusedTranscriptView {
         // Scroll events fire from input, outside the render/update pass, so a direct weak.update
         // is not re-entrant (the re-entrancy panic was the replica observer, fixed in `new`).
         list_state.set_scroll_handler(move |event: &ListScrollEvent, _, app| {
-            weak.update(app, |view, _| view.on_scroll_event(event)).ok();
+            weak.update(app, |view, cx| view.on_scroll_event(event, cx))
+                .ok();
         });
 
         let replica = self.replica.clone();
@@ -607,10 +612,10 @@ mod tests {
     fn on_scroll_event_pauses_when_scrolled_up(cx: &mut gpui::TestAppContext) {
         let (_replica, view) = view_with_rows(cx, 5);
         cx.update(|cx| {
-            view.update(cx, |v, _| {
+            view.update(cx, |v, cx| {
                 v.note_row_count(5);
                 // Scrolled up: visible window ends mid-list, is_scrolled = true.
-                v.on_scroll_event(&scroll_event(2, 5, true));
+                v.on_scroll_event(&scroll_event(2, 5, true), cx);
             });
         });
         cx.read(|cx| {
@@ -625,11 +630,11 @@ mod tests {
     fn on_scroll_event_resumes_when_back_at_bottom(cx: &mut gpui::TestAppContext) {
         let (_replica, view) = view_with_rows(cx, 5);
         cx.update(|cx| {
-            view.update(cx, |v, _| {
+            view.update(cx, |v, cx| {
                 v.note_row_count(5);
-                v.on_scroll_event(&scroll_event(2, 5, true)); // pause
+                v.on_scroll_event(&scroll_event(2, 5, true), cx); // pause
                 // Back at bottom: not scrolled (logical_scroll_top == None).
-                v.on_scroll_event(&scroll_event(5, 5, false));
+                v.on_scroll_event(&scroll_event(5, 5, false), cx);
             });
         });
         cx.read(|cx| {
@@ -641,9 +646,9 @@ mod tests {
     fn on_scroll_event_at_bottom_stays_following(cx: &mut gpui::TestAppContext) {
         let (_replica, view) = view_with_rows(cx, 5);
         cx.update(|cx| {
-            view.update(cx, |v, _| {
+            view.update(cx, |v, cx| {
                 v.note_row_count(5);
-                v.on_scroll_event(&scroll_event(5, 5, false));
+                v.on_scroll_event(&scroll_event(5, 5, false), cx);
             });
         });
         cx.read(|cx| {
@@ -662,11 +667,11 @@ mod tests {
         // (stale) range would wrongly keep the reader paused. (Codex finding.)
         let (_replica, view) = view_with_rows(cx, 5);
         cx.update(|cx| {
-            view.update(cx, |v, _| {
+            view.update(cx, |v, cx| {
                 v.note_row_count(5);
-                v.on_scroll_event(&scroll_event(2, 5, true)); // pause
+                v.on_scroll_event(&scroll_event(2, 5, true), cx); // pause
                 // Pre-scroll range still mid-list (2), but not scrolled anymore.
-                v.on_scroll_event(&scroll_event(2, 5, false));
+                v.on_scroll_event(&scroll_event(2, 5, false), cx);
             });
         });
         cx.read(|cx| {

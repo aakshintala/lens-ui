@@ -271,8 +271,18 @@ impl FocusedTranscript {
         self.items.contains_key(&ord)
     }
 
-    pub fn set_following(&mut self, following: bool) {
+    pub fn is_following(&self) -> bool {
+        self.following
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_following_for_test(&self) -> bool {
+        self.following
+    }
+
+    pub fn set_following(&mut self, following: bool, cx: &mut Context<Self>) {
         self.following = following;
+        cx.notify();
     }
 
     pub fn fold_detailed(&mut self, u: StreamUpdate, cx: &mut Context<Self>) {
@@ -287,7 +297,7 @@ impl FocusedTranscript {
             StreamUpdate::TranscriptAdvanced {
                 committed_ordinal: ord,
             } => {
-                if !self.following {
+                if !self.is_following() {
                     self.known_committed = self.known_committed.max(ord);
                     dirty = true;
                 } else if ord > self.last_rendered_ordinal {
@@ -397,7 +407,7 @@ impl FocusedTranscript {
             return;
         }
         self.reader_error = None;
-        if matches!(range, ReadRange::Delta { .. }) && !self.following {
+        if matches!(range, ReadRange::Delta { .. }) && !self.is_following() {
             if let ReadRange::Delta { through, .. } = range {
                 self.known_committed = self.known_committed.max(through);
                 if let Some(watermark) = read.watermark {
@@ -484,7 +494,7 @@ impl FocusedTranscript {
             self.reproject(false, cx);
         }
         if matches!(range, ReadRange::Delta { .. })
-            && self.following
+            && self.is_following()
             && self.resident_hi < self.known_committed
         {
             let through =
@@ -817,7 +827,7 @@ impl FocusedTranscript {
             && self.resident_lo >= 0
             && self.resident_lo <= self.resident_hi
         {
-            let evicted = if self.following {
+            let evicted = if self.is_following() {
                 self.items.pop_first()
             } else {
                 self.items.pop_last()
@@ -830,7 +840,7 @@ impl FocusedTranscript {
             if self.items.is_empty() {
                 self.resident_lo = -1;
                 self.resident_hi = -1;
-            } else if self.following {
+            } else if self.is_following() {
                 self.resident_lo = *self.items.keys().next().expect("non-empty band");
             } else {
                 self.resident_hi = *self.items.keys().next_back().expect("non-empty band");
@@ -3771,7 +3781,7 @@ mod tests {
 
         cx.update(|cx| {
             replica.update(cx, |r, cx| {
-                r.set_following(true);
+                r.set_following(true, cx);
                 r.apply_read(
                     1,
                     ReadRange::Tail {
@@ -3813,7 +3823,7 @@ mod tests {
 
         cx.update(|cx| {
             replica.update(cx, |r, cx| {
-                r.set_following(false);
+                r.set_following(false, cx);
                 r.apply_read(
                     1,
                     ReadRange::Tail {
@@ -3851,7 +3861,7 @@ mod tests {
 
         cx.update(|cx| {
             replica.update(cx, |r, cx| {
-                r.set_following(true);
+                r.set_following(true, cx);
                 r.apply_read(
                     1,
                     ReadRange::Tail {
@@ -3919,8 +3929,8 @@ mod tests {
         let hi_before = cx.read(|cx| replica.read(cx).resident_hi_for_test());
 
         cx.update(|cx| {
-            replica.update(cx, |r, _| {
-                r.set_following(false);
+            replica.update(cx, |r, cx| {
+                r.set_following(false, cx);
             });
             replica.update(cx, |r, cx| {
                 r.apply_read(
@@ -4052,7 +4062,7 @@ mod tests {
                     ),
                     cx,
                 );
-                r.set_following(false);
+                r.set_following(false, cx);
             });
         });
 
