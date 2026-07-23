@@ -1,0 +1,610 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Architecture review — Lens</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script type="module">
+      import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+      mermaid.initialize({ startOnLoad: true, theme: "neutral", securityLevel: "loose", flowchart: { curve: "basis" } });
+    </script>
+    <style>
+      .seam { stroke-dasharray: 5 5; }
+      .deep { background: linear-gradient(140deg, #0f172a, #1f2937); }
+      .hatch {
+        background-image: repeating-linear-gradient(45deg, rgba(220,38,38,.09) 0 6px, transparent 6px 12px);
+      }
+      .mermaid { display: flex; justify-content: center; }
+      code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+      article { scroll-margin-top: 2rem; }
+    </style>
+  </head>
+  <body class="bg-stone-50 text-slate-900 antialiased">
+    <main class="max-w-5xl mx-auto px-6 py-14 space-y-14">
+
+      <!-- ================= HEADER ================= -->
+      <header class="space-y-6">
+        <div class="flex items-baseline justify-between flex-wrap gap-3">
+          <h1 class="font-serif text-4xl tracking-tight">Architecture review — <span class="text-indigo-700">Lens</span></h1>
+          <p class="text-sm text-slate-500 mono">2026-07-23 · main @ 2cfd396</p>
+        </div>
+
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+          <div class="rounded-lg bg-white border border-slate-200 p-3">
+            <div class="text-2xl font-serif">76,908</div>
+            <div class="text-xs uppercase tracking-wider text-slate-500">lines · 9 crates</div>
+          </div>
+          <div class="rounded-lg bg-white border border-slate-200 p-3">
+            <div class="text-2xl font-serif text-amber-700">71</div>
+            <div class="text-xs uppercase tracking-wider text-slate-500">tests in lens-ui (15,916 ln)</div>
+          </div>
+          <div class="rounded-lg bg-white border border-slate-200 p-3">
+            <div class="text-2xl font-serif text-red-700">48</div>
+            <div class="text-xs uppercase tracking-wider text-slate-500"><span class="mono">pub fn *_for_test</span></div>
+          </div>
+          <div class="rounded-lg bg-white border border-slate-200 p-3">
+            <div class="text-2xl font-serif">4 / 0</div>
+            <div class="text-xs uppercase tracking-wider text-slate-500">store adapters / fakes</div>
+          </div>
+        </div>
+
+        <div class="rounded-lg border border-slate-200 bg-white p-4 text-xs text-slate-600 flex flex-wrap gap-x-6 gap-y-2 items-center">
+          <span class="font-semibold uppercase tracking-wider text-slate-400">Legend</span>
+          <span class="flex items-center gap-2"><span class="inline-block w-5 h-3 border border-slate-400 bg-white"></span> module</span>
+          <span class="flex items-center gap-2"><svg width="26" height="8"><line class="seam" x1="0" y1="4" x2="26" y2="4" stroke="#475569" stroke-width="2"/></svg> seam</span>
+          <span class="flex items-center gap-2"><svg width="26" height="8"><line x1="0" y1="4" x2="22" y2="4" stroke="#dc2626" stroke-width="2"/><path d="M22 1 L26 4 L22 7Z" fill="#dc2626"/></svg> leakage / duplicated knowledge</span>
+          <span class="flex items-center gap-2"><span class="inline-block w-5 h-3 deep"></span> deep module</span>
+        </div>
+
+        <p class="text-sm text-slate-600 leading-relaxed max-w-3xl">
+          Scoped to the hot spots in the last ~60 commits: <span class="mono">board</span>, <span class="mono">terminal</span>,
+          <span class="mono">focused</span> transcript, and the <span class="mono">actor/persist</span> core beneath them.
+          Six candidates below. Architecture vocabulary is the <span class="mono">/codebase-design</span> glossary;
+          domain vocabulary is <span class="mono">docs/design/capability-map-and-design-language.md</span>
+          (this repo has no <span class="mono">CONTEXT.md</span> — the keystone design doc plays that role).
+        </p>
+      </header>
+
+      <!-- ================= CANDIDATES ================= -->
+      <section id="candidates" class="space-y-12">
+
+        <!-- ---------- CARD 1 ---------- -->
+        <article id="c1" class="rounded-xl border border-slate-200 bg-white shadow-sm overflow-hidden">
+          <div class="border-b border-slate-100 px-6 py-5">
+            <div class="flex items-start justify-between gap-4 flex-wrap">
+              <h2 class="font-serif text-2xl">1 · Resolve the board frame in <span class="mono text-indigo-700">pack</span>, not in <span class="mono text-indigo-700">render</span></h2>
+              <div class="flex gap-2 shrink-0">
+                <span class="text-xs font-semibold uppercase tracking-wider px-2.5 py-1 rounded-full bg-emerald-100 text-emerald-800">Strong</span>
+                <span class="text-xs font-semibold uppercase tracking-wider px-2.5 py-1 rounded-full bg-slate-100 text-slate-600">in-process</span>
+              </div>
+            </div>
+            <p class="mt-3 mono text-sm text-slate-500">
+              crates/lens-core/src/pack.rs · crates/lens-ui/src/board/mod.rs:391–891 · spikes/board-drag/src/lib.rs
+            </p>
+          </div>
+
+          <div class="p-6 space-y-6">
+            <!-- diagram -->
+            <div class="grid md:grid-cols-2 gap-4">
+              <div class="rounded-lg border border-slate-200 p-4">
+                <div class="text-xs uppercase tracking-wider text-slate-400 mb-3">Before — one formula, four sites</div>
+                <div class="space-y-2 text-[11px] mono">
+                  <div class="rounded border border-slate-300 bg-slate-50 p-2">
+                    <div class="text-slate-400 text-[10px]">pack.rs:128 · item_height()</div>
+                    <div class="text-slate-800">HEADER + fr*CARD_H + (fr-1)*GAP</div>
+                    <div class="text-[10px] text-slate-400 italic">doc: "SINGLE source of tile height"</div>
+                  </div>
+                  <div class="flex justify-center"><svg width="200" height="26"><line class="leak" x1="100" y1="0" x2="100" y2="20" stroke="#dc2626" stroke-width="2" stroke-dasharray="3 3"/><path d="M96 20 L100 26 L104 20Z" fill="#dc2626"/><text x="108" y="16" font-size="9" fill="#dc2626">copied by hand</text></svg></div>
+                  <div class="rounded border border-red-300 hatch p-2">
+                    <div class="text-slate-400 text-[10px]">board/mod.rs:623 · absolute_group()</div>
+                    <div class="text-slate-800">HEADER + fr*CARD_H + (fr-1)*GAP</div>
+                  </div>
+                  <div class="rounded border border-red-300 hatch p-2">
+                    <div class="text-slate-400 text-[10px]">board/mod.rs:759 · absolute_collapsed_group()</div>
+                    <div class="text-slate-800">CELL_H - GAP <span class="text-slate-400">// same value, other algebra</span></div>
+                  </div>
+                  <div class="rounded border border-red-300 hatch p-2">
+                    <div class="text-slate-400 text-[10px]">spikes/board-drag:121, :206 · tile_size()</div>
+                    <div class="text-slate-800">HEADER + fr*CARD_H + (fr-1)*GAP</div>
+                    <div class="text-[10px] text-red-700">codex found a Medium bug in this copy</div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="rounded-lg border border-slate-200 p-4">
+                <div class="text-xs uppercase tracking-wider text-slate-400 mb-3">After — one deep module, rects flow out</div>
+                <div class="deep rounded-lg p-4 text-white space-y-2">
+                  <div class="text-[10px] uppercase tracking-widest text-indigo-300">pack · frame resolver</div>
+                  <div class="mono text-[11px] bg-black/30 rounded p-2 leading-relaxed">
+                    resolve_frame(<br/>
+                    &nbsp;&nbsp;tree, viewport, scroll, max_cols<br/>
+                    ) -&gt; Frame { tiles, extent, offset }
+                  </div>
+                  <div class="text-[10px] text-slate-400 space-y-0.5 pt-1">
+                    <div class="opacity-60">· pack + masonry backfill</div>
+                    <div class="opacity-60">· item_height, group box, member cells</div>
+                    <div class="opacity-60">· cull band, max-col cap, centering</div>
+                  </div>
+                </div>
+                <div class="flex justify-center py-2"><svg width="240" height="30"><line x1="60" y1="0" x2="60" y2="22" stroke="#475569" stroke-width="1.5"/><path d="M56 22 L60 28 L64 22Z" fill="#475569"/><line x1="180" y1="0" x2="180" y2="22" stroke="#475569" stroke-width="1.5"/><path d="M176 22 L180 28 L184 22Z" fill="#475569"/><line class="seam" x1="10" y1="0" x2="230" y2="0" stroke="#94a3b8" stroke-width="1.5"/></svg></div>
+                <div class="grid grid-cols-2 gap-2 text-[11px] mono">
+                  <div class="rounded border border-slate-300 bg-white p-2 text-center">absolute_* <span class="text-slate-400 block text-[10px]">paints given rects</span></div>
+                  <div class="rounded border border-slate-300 bg-white p-2 text-center">resolve_drop <span class="text-slate-400 block text-[10px]">reads same rects</span></div>
+                </div>
+              </div>
+            </div>
+
+            <div class="grid md:grid-cols-2 gap-6 text-sm">
+              <div>
+                <div class="text-xs uppercase tracking-wider text-slate-400 mb-1">Problem</div>
+                <p class="text-slate-700">Absolute tile geometry is computed inside gpui render closures, so the only way to verify it is a real window — and three other modules re-derive it by hand.</p>
+              </div>
+              <div>
+                <div class="text-xs uppercase tracking-wider text-slate-400 mb-1">Solution</div>
+                <p class="text-slate-700"><span class="mono">pack</span> returns fully-resolved tile rects (group box, header band, member cells, cull flag, centering offset); the render methods become painters over rects they no longer compute.</p>
+              </div>
+            </div>
+
+            <div>
+              <div class="text-xs uppercase tracking-wider text-slate-400 mb-2">Wins</div>
+              <ul class="grid sm:grid-cols-2 gap-x-6 gap-y-1.5 text-sm text-slate-700 list-disc list-inside">
+                <li>Locality: one formula, one module</li>
+                <li>Leverage: painter and hit-test share rects</li>
+                <li>Culling and centering testable pure</li>
+                <li>B-4c drag stops copying geometry</li>
+                <li>Interface shrinks; implementation absorbs 500 render lines</li>
+                <li>Deletes the doc-comment invariant</li>
+              </ul>
+            </div>
+
+            <div class="rounded-md bg-indigo-50 border border-indigo-200 px-4 py-3 text-sm text-indigo-900">
+              <span class="font-semibold">Load-bearing for the next build.</span> The B-4c spike (HEAD commit,
+              <span class="mono">docs/spikes/2026-07-23-board-b4c-drag-reverse-hittest.md</span>) resolves a drop by
+              <em>scanning the placed tiles “which the renderer already computes”</em> — but they only exist inside the renderer,
+              so the spike rebuilt them. Cross-family review then found a real off-by-one in that copy.
+            </div>
+          </div>
+        </article>
+
+        <!-- ---------- CARD 2 ---------- -->
+        <article id="c2" class="rounded-xl border border-slate-200 bg-white shadow-sm overflow-hidden">
+          <div class="border-b border-slate-100 px-6 py-5">
+            <div class="flex items-start justify-between gap-4 flex-wrap">
+              <h2 class="font-serif text-2xl">2 · One <span class="mono text-indigo-700">BoardStore::apply(BoardOp)</span>, not twelve methods</h2>
+              <div class="flex gap-2 shrink-0">
+                <span class="text-xs font-semibold uppercase tracking-wider px-2.5 py-1 rounded-full bg-emerald-100 text-emerald-800">Strong</span>
+                <span class="text-xs font-semibold uppercase tracking-wider px-2.5 py-1 rounded-full bg-slate-100 text-slate-600">ports &amp; adapters</span>
+              </div>
+            </div>
+            <p class="mt-3 mono text-sm text-slate-500">
+              crates/lens-core/src/persist/board.rs:16–67, 440–696 · crates/lens-ui/src/board/replica.rs:17–27, 514–558
+            </p>
+          </div>
+
+          <div class="p-6 space-y-6">
+            <div class="grid md:grid-cols-2 gap-4">
+              <!-- mass diagram before -->
+              <div class="rounded-lg border border-slate-200 p-4">
+                <div class="text-xs uppercase tracking-wider text-slate-400 mb-3">Before — shallow: interface ≈ implementation</div>
+                <div class="flex items-end gap-6 justify-center h-56">
+                  <div class="text-center">
+                    <div class="w-24 bg-red-200 border border-red-400 rounded-t" style="height:150px"></div>
+                    <div class="text-[10px] uppercase tracking-wider text-slate-500 mt-1">interface<br/>12 methods</div>
+                  </div>
+                  <div class="text-center">
+                    <div class="w-24 bg-slate-300 border border-slate-400 rounded-t" style="height:170px"></div>
+                    <div class="text-[10px] uppercase tracking-wider text-slate-500 mt-1">implementation<br/>same envelope ×12</div>
+                  </div>
+                </div>
+                <div class="mono text-[10px] bg-slate-50 border border-slate-200 rounded p-2 mt-3 leading-relaxed text-slate-600">
+                  guard_write → load_layout_inner → BoardLayout::X<br/>
+                  → tx → upsert_item → touch_board → commit
+                  <div class="text-red-700 mt-1">set_collapsed and set_color differ by one line</div>
+                </div>
+              </div>
+              <!-- mass diagram after -->
+              <div class="rounded-lg border border-slate-200 p-4">
+                <div class="text-xs uppercase tracking-wider text-slate-400 mb-3">After — deep: small interface, absorbed envelope</div>
+                <div class="flex items-end gap-6 justify-center h-56">
+                  <div class="text-center">
+                    <div class="w-24 bg-emerald-200 border border-emerald-400 rounded-t" style="height:38px"></div>
+                    <div class="text-[10px] uppercase tracking-wider text-slate-500 mt-1">interface<br/>mode · load · apply</div>
+                  </div>
+                  <div class="text-center">
+                    <div class="w-24 deep rounded-t" style="height:190px"></div>
+                    <div class="text-[10px] uppercase tracking-wider text-slate-500 mt-1">implementation<br/>envelope once + match</div>
+                  </div>
+                </div>
+                <div class="mono text-[10px] bg-slate-50 border border-slate-200 rounded p-2 mt-3 leading-relaxed text-slate-600">
+                  fn apply(&amp;self, op: &amp;BoardOp) -&gt; Result&lt;BoardLayout&gt;
+                  <div class="text-emerald-700 mt-1">new op = 1 variant + 1 match arm</div>
+                </div>
+              </div>
+            </div>
+
+            <div class="rounded-lg border border-slate-200 bg-white p-4">
+              <pre class="mermaid">
+flowchart LR
+  subgraph B["before"]
+    R1[replica run_op_inner] --> S1[place_sessions]
+    R1 --> S2[set_collapsed]
+    R1 --> S3[move_item*]
+    S1 --> RC1[read_committed]
+    S2 --> RC1
+    S3 --> RC1
+  end
+  subgraph A["after"]
+    R2[replica run_op_inner] --> AP[["BoardStore::apply(BoardOp)"]]
+    AP --> RC2[layout returned]
+  end
+  classDef ghost stroke-dasharray:4 4,stroke:#dc2626,color:#dc2626;
+  class S3 ghost;
+  classDef deep fill:#0f172a,color:#fff,stroke:#0f172a;
+  class AP deep;
+              </pre>
+              <p class="text-xs text-slate-500 text-center mt-1"><span class="mono">move_item*</span> = the 13th method B-4c is about to add.</p>
+            </div>
+
+            <div class="grid md:grid-cols-2 gap-6 text-sm">
+              <div>
+                <div class="text-xs uppercase tracking-wider text-slate-400 mb-1">Problem</div>
+                <p class="text-slate-700">The <span class="mono">BoardStore</span> interface is shallow — twelve methods that each mirror one <span class="mono">BoardLayout</span> method and repeat the same transaction envelope. Every new board mutation costs a trait method, an impl, a replica <span class="mono">Op</span> variant, and a match arm.</p>
+              </div>
+              <div>
+                <div class="text-xs uppercase tracking-wider text-slate-400 mb-1">Solution</div>
+                <p class="text-slate-700">Move <span class="mono">replica::Op</span> down into lens-core as <span class="mono">BoardOp</span>; the trait becomes <span class="mono">mode</span> + <span class="mono">load_layout</span> + <span class="mono">apply(&amp;BoardOp)</span>. The envelope is written once and the op enum becomes the seam.</p>
+              </div>
+            </div>
+
+            <div>
+              <div class="text-xs uppercase tracking-wider text-slate-400 mb-2">Wins</div>
+              <ul class="grid sm:grid-cols-2 gap-x-6 gap-y-1.5 text-sm text-slate-700 list-disc list-inside">
+                <li>Interface 12 → 3</li>
+                <li>Envelope written once, not twelve times</li>
+                <li>Locality: transaction bugs concentrate</li>
+                <li>An in-memory adapter becomes cheap</li>
+                <li>B-4c adds a variant, not a method</li>
+                <li>Op enum is the test surface</li>
+              </ul>
+            </div>
+
+            <div class="rounded-md bg-slate-100 border border-slate-200 px-4 py-3 text-sm text-slate-700">
+              <span class="font-semibold">Seam check.</span> Four store traits — <span class="mono">ControlStore</span>,
+              <span class="mono">TranscriptStore</span>, <span class="mono">TranscriptReader</span>, <span class="mono">BoardStore</span> —
+              have four sqlite adapters and zero fakes; every test opens a real tempfile db. One adapter means a hypothetical seam.
+              Either narrow the interfaces until a second adapter is cheap (this card), or drop the traits and name the structs directly.
+            </div>
+          </div>
+        </article>
+
+        <!-- ---------- CARD 3 ---------- -->
+        <article id="c3" class="rounded-xl border border-slate-200 bg-white shadow-sm overflow-hidden">
+          <div class="border-b border-slate-100 px-6 py-5">
+            <div class="flex items-start justify-between gap-4 flex-wrap">
+              <h2 class="font-serif text-2xl">3 · A pure lifecycle reducer for <span class="mono text-indigo-700">TerminalTab</span></h2>
+              <div class="flex gap-2 shrink-0">
+                <span class="text-xs font-semibold uppercase tracking-wider px-2.5 py-1 rounded-full bg-emerald-100 text-emerald-800">Strong</span>
+                <span class="text-xs font-semibold uppercase tracking-wider px-2.5 py-1 rounded-full bg-slate-100 text-slate-600">in-process</span>
+              </div>
+            </div>
+            <p class="mt-3 mono text-sm text-slate-500">
+              crates/lens-terminal/src/lib.rs:1659–2430 · generation.rs (the precedent) · policy.rs · bridge.rs
+            </p>
+          </div>
+
+          <div class="p-6 space-y-6">
+            <!-- cross-section -->
+            <div class="grid md:grid-cols-2 gap-4">
+              <div class="rounded-lg border border-slate-200 p-4">
+                <div class="text-xs uppercase tracking-wider text-slate-400 mb-3">Before — three concerns per method</div>
+                <div class="space-y-2">
+                  <div class="mono text-[11px] text-slate-500">fn on_sleep(&amp;mut self, cx: &amp;mut Context&lt;Self&gt;)</div>
+                  <div class="h-10 border-l-4 border-amber-500 bg-amber-50 flex items-center px-3 text-xs">guard: is lifecycle Live | Reconnecting | ReplacementWaiting?</div>
+                  <div class="h-10 border-l-4 border-red-500 bg-red-50 flex items-center px-3 text-xs">effect: bump epoch · teardown_runtime_full(cx)</div>
+                  <div class="h-10 border-l-4 border-slate-500 bg-slate-100 flex items-center px-3 text-xs">state: lifecycle = Sleeping · presentation = …</div>
+                  <div class="h-10 border-l-4 border-indigo-500 bg-indigo-50 flex items-center px-3 text-xs">notify: cx.emit(PresentationChanged) · cx.notify()</div>
+                  <div class="text-[11px] text-red-700 pt-1">× on_detach · on_wake · on_reattach · on_resource_signal · apply_bridge_event · adopt_successor</div>
+                </div>
+              </div>
+              <div class="rounded-lg border border-slate-200 p-4">
+                <div class="text-xs uppercase tracking-wider text-slate-400 mb-3">After — decide, then execute</div>
+                <div class="deep rounded-lg p-4 text-white space-y-2 mb-3">
+                  <div class="text-[10px] uppercase tracking-widest text-indigo-300">lifecycle · pure reducer</div>
+                  <div class="mono text-[11px] bg-black/30 rounded p-2 leading-relaxed">
+                    fn on(&amp;mut self, ev: LifecycleEvent)<br/>
+                    &nbsp;&nbsp;-&gt; (Lifecycle, Vec&lt;Effect&gt;)
+                  </div>
+                  <div class="text-[10px] text-slate-400">guards + transition table + epoch bumps, no gpui</div>
+                </div>
+                <div class="flex justify-center pb-2"><svg width="200" height="24"><line class="seam" x1="0" y1="4" x2="200" y2="4" stroke="#94a3b8" stroke-width="1.5"/><line x1="100" y1="4" x2="100" y2="16" stroke="#475569" stroke-width="1.5"/><path d="M96 16 L100 22 L104 16Z" fill="#475569"/></svg></div>
+                <div class="rounded border border-slate-300 bg-white p-3 text-[11px] mono text-center">TerminalTab <span class="text-slate-400 block text-[10px]">executes Effects, owns cx</span></div>
+              </div>
+            </div>
+
+            <div class="grid md:grid-cols-2 gap-6 text-sm">
+              <div>
+                <div class="text-xs uppercase tracking-wider text-slate-400 mb-1">Problem</div>
+                <p class="text-slate-700">770 lines where the transition decision, the teardown side effect, and the gpui notification are one method taking <span class="mono">&amp;mut Context&lt;Self&gt;</span>. No transition is verifiable without gpui, and the guards are per-method rather than tabular.</p>
+              </div>
+              <div>
+                <div class="text-xs uppercase tracking-wider text-slate-400 mb-1">Solution</div>
+                <p class="text-slate-700">The crate already has the shape: <span class="mono">generation.rs</span> is a pure reducer returning a <span class="mono">GenerationVerdict</span>. Extend it to the whole lifecycle — events in, <span class="mono">(Lifecycle, Vec&lt;Effect&gt;)</span> out — and let <span class="mono">TerminalTab</span> be the effect executor.</p>
+              </div>
+            </div>
+
+            <div>
+              <div class="text-xs uppercase tracking-wider text-slate-400 mb-2">Wins</div>
+              <ul class="grid sm:grid-cols-2 gap-x-6 gap-y-1.5 text-sm text-slate-700 list-disc list-inside">
+                <li>Transition table is the test surface</li>
+                <li>Late-event gating: one arm, not N guards</li>
+                <li>Locality: epoch bumps in one place</li>
+                <li>Whole-branch-only bugs become unit-visible</li>
+                <li>lib.rs sheds ~770 orchestration lines</li>
+                <li>Leverage: same reducer drives the demo host</li>
+              </ul>
+            </div>
+
+            <div class="rounded-md bg-amber-50 border border-amber-300 px-4 py-3 text-sm text-amber-900">
+              <span class="font-semibold">Evidence this is real.</span> The Slice-4 whole-branch review caught a Critical the per-task
+              reviews “structurally couldn’t see”: <span class="mono">apply_bridge_event</span> had no lifecycle gate, so a late
+              <span class="mono">4404</span> close clobbered <span class="mono">ReplacementWaiting</span>/<span class="mono">Sleeping</span>
+              (fixed in <span class="mono">f5ced39</span>). A transition table makes that class of gap a missing match arm.
+            </div>
+          </div>
+        </article>
+
+        <!-- ---------- CARD 4 ---------- -->
+        <article id="c4" class="rounded-xl border border-slate-200 bg-white shadow-sm overflow-hidden">
+          <div class="border-b border-slate-100 px-6 py-5">
+            <div class="flex items-start justify-between gap-4 flex-wrap">
+              <h2 class="font-serif text-2xl">4 · Split the shell module out of the board module</h2>
+              <div class="flex gap-2 shrink-0">
+                <span class="text-xs font-semibold uppercase tracking-wider px-2.5 py-1 rounded-full bg-amber-100 text-amber-800">Worth exploring</span>
+                <span class="text-xs font-semibold uppercase tracking-wider px-2.5 py-1 rounded-full bg-slate-100 text-slate-600">in-process</span>
+              </div>
+            </div>
+            <p class="mt-3 mono text-sm text-slate-500">
+              crates/lens-ui/src/board/mod.rs:57–70, 373–390, 1012–1116 · crates/lens-ui/src/slot/mod.rs · lens-ui/src/lib.rs:12
+            </p>
+          </div>
+
+          <div class="p-6 space-y-6">
+            <div class="rounded-lg border border-slate-200 bg-white p-4">
+              <pre class="mermaid">
+flowchart TB
+  subgraph BEFORE["before — board/mod.rs is both"]
+    BV["BoardView"]
+    BV --> SM["ShellMode::from_fleet"]
+    BV --> NR["render_nav_rail"]
+    BV --> TB["TitleBar + banner"]
+    BV --> RAIL["focused 1xN rail"]
+    BV --> TAB["sync_chat_tab / TabHandle"]
+    BV --> PACK["pack_and_render + absolute_*"]
+    BV -.8 escape hatches.-> T["tests"]
+  end
+  classDef leak stroke:#dc2626,stroke-width:2px,color:#b91c1c;
+  class T leak
+              </pre>
+              <pre class="mermaid">
+flowchart TB
+  subgraph AFTER["after — shell hosts surfaces"]
+    SV["ShellView<br/>mode · chrome · rail · tab slot"]
+    SV --> BS["BoardSurface<br/>tiles only"]
+    SV --> FS["FocusedSurface"]
+    SV -. "Slice 6" .-> TS["TerminalSurface"]
+  end
+  classDef deep fill:#0f172a,color:#fff,stroke:#0f172a;
+  class SV deep;
+  classDef future stroke-dasharray:5 5,color:#64748b;
+  class TS future
+              </pre>
+            </div>
+
+            <div class="grid md:grid-cols-2 gap-6 text-sm">
+              <div>
+                <div class="text-xs uppercase tracking-wider text-slate-400 mb-1">Problem</div>
+                <p class="text-slate-700"><span class="mono">ShellMode</span> lives inside <span class="mono">board/mod.rs</span>, and <span class="mono">BoardView</span> renders the nav rail, titlebar, replica banner, focused rail and chat tab as well as the board. Its interface carries eight <span class="mono">pub fn *_for_test</span> hatches — tests reach past the interface rather than through it.</p>
+              </div>
+              <div>
+                <div class="text-xs uppercase tracking-wider text-slate-400 mb-1">Solution</div>
+                <p class="text-slate-700">A <span class="mono">ShellView</span> module owns mode, chrome and the content slot; <span class="mono">BoardSurface</span> renders tiles only. The repo's own design doc already draws this line — the shell owns “containers and chrome”, surfaces own “content that fills the slots”.</p>
+              </div>
+            </div>
+
+            <div>
+              <div class="text-xs uppercase tracking-wider text-slate-400 mb-2">Wins</div>
+              <ul class="grid sm:grid-cols-2 gap-x-6 gap-y-1.5 text-sm text-slate-700 list-disc list-inside">
+                <li>Shell changes stop touching tile geometry</li>
+                <li>Escape hatches collapse toward one interface</li>
+                <li>Leverage: Slice 6 docks, doesn't edit board</li>
+                <li>Locality: mode transitions in one module</li>
+                <li>Code matches the design doc's split</li>
+              </ul>
+            </div>
+
+            <div class="rounded-md bg-slate-100 border border-slate-200 px-4 py-3 text-sm text-slate-700">
+              <span class="font-semibold">Don't design the tab seam yet.</span>
+              <span class="mono">pub trait ContentTab {}</span> (<span class="mono">slot/mod.rs:7</span>) has no methods and one real adapter —
+              a hypothetical seam. lens-ui doesn't depend on lens-terminal at all today. Terminal Slice 6 is the second adapter;
+              that's when the interface can be designed from two concrete sides rather than one
+              (memory: <span class="mono">premature-layer-boundary-binding</span>).
+            </div>
+          </div>
+        </article>
+
+        <!-- ---------- CARD 5 ---------- -->
+        <article id="c5" class="rounded-xl border border-slate-200 bg-white shadow-sm overflow-hidden">
+          <div class="border-b border-slate-100 px-6 py-5">
+            <div class="flex items-start justify-between gap-4 flex-wrap">
+              <h2 class="font-serif text-2xl">5 · Lift <span class="mono text-indigo-700">FocusedTranscript</span>'s decision core out of <span class="mono">Context&lt;Self&gt;</span></h2>
+              <div class="flex gap-2 shrink-0">
+                <span class="text-xs font-semibold uppercase tracking-wider px-2.5 py-1 rounded-full bg-amber-100 text-amber-800">Worth exploring</span>
+                <span class="text-xs font-semibold uppercase tracking-wider px-2.5 py-1 rounded-full bg-slate-100 text-slate-600">in-process</span>
+              </div>
+            </div>
+            <p class="mt-3 mono text-sm text-slate-500">
+              crates/lens-ui/src/focused/mod.rs:204–657 · src/bin/focused_{finalize,perf,scroll}_probe.rs
+            </p>
+          </div>
+
+          <div class="p-6 space-y-6">
+            <!-- call-graph collapse -->
+            <div class="grid md:grid-cols-2 gap-4">
+              <div class="rounded-lg border border-slate-200 p-4">
+                <div class="text-xs uppercase tracking-wider text-slate-400 mb-3">Before — every decision needs a window</div>
+                <div class="space-y-1.5 mono text-[11px]">
+                  <div class="rounded border border-slate-300 bg-slate-50 p-2">fold_detailed(&amp;mut self, cx)</div>
+                  <div class="pl-4 space-y-1.5">
+                    <div class="rounded border border-red-300 hatch p-1.5">recompute_live_section_start(cx)</div>
+                    <div class="rounded border border-red-300 hatch p-1.5">recompute_settled_prefix(cx)</div>
+                    <div class="rounded border border-red-300 hatch p-1.5">compute_expansion_flags(cx)</div>
+                    <div class="rounded border border-red-300 hatch p-1.5">latest_settled_before_next_user(cx)</div>
+                    <div class="rounded border border-red-300 hatch p-1.5">reinsert_markers(cx)</div>
+                    <div class="rounded border border-red-300 hatch p-1.5">upsert_read_rows(cx)</div>
+                    <div class="rounded border border-slate-300 bg-white p-1.5">reproject(cx) <span class="text-slate-400">→ gpui entities</span></div>
+                  </div>
+                  <div class="text-[10px] text-red-700 pt-1">hatched = pure decision, gpui-bound signature</div>
+                </div>
+              </div>
+              <div class="rounded-lg border border-slate-200 p-4">
+                <div class="text-xs uppercase tracking-wider text-slate-400 mb-3">After — plan, then apply</div>
+                <div class="deep rounded-lg p-4 text-white space-y-2">
+                  <div class="text-[10px] uppercase tracking-widest text-indigo-300">transcript plan · pure</div>
+                  <div class="mono text-[11px] bg-black/30 rounded p-2 leading-relaxed">
+                    plan(&amp;State, StreamUpdate)<br/>
+                    &nbsp;&nbsp;-&gt; Plan { reproject, stage,<br/>
+                    &nbsp;&nbsp;&nbsp;&nbsp;markers, reads, expansion }
+                  </div>
+                  <div class="text-[10px] text-slate-400 opacity-70">live/settled split · finalize staging · marker placement · read ranges</div>
+                </div>
+                <div class="flex justify-center py-2"><svg width="180" height="24"><line class="seam" x1="0" y1="4" x2="180" y2="4" stroke="#94a3b8" stroke-width="1.5"/><line x1="90" y1="4" x2="90" y2="16" stroke="#475569" stroke-width="1.5"/><path d="M86 16 L90 22 L94 16Z" fill="#475569"/></svg></div>
+                <div class="rounded border border-slate-300 bg-white p-2.5 text-[11px] mono text-center">FocusedTranscript <span class="text-slate-400 block text-[10px]">applies Plan to RowStore + list</span></div>
+              </div>
+            </div>
+
+            <div class="grid md:grid-cols-2 gap-6 text-sm">
+              <div>
+                <div class="text-xs uppercase tracking-wider text-slate-400 mb-1">Problem</div>
+                <p class="text-slate-700">~580 impl lines fuse the live/settled split, finalize staging, expansion flags, marker placement and disk-read merge into one state machine where every method takes <span class="mono">&amp;mut Context&lt;Self&gt;</span>. The pure decisions can't be reached without gpui, so 35 <span class="mono">#[gpui::test]</span>s plus three real-window probe binaries carry the load.</p>
+              </div>
+              <div>
+                <div class="text-xs uppercase tracking-wider text-slate-400 mb-1">Solution</div>
+                <p class="text-slate-700">Split decide from apply. A pure <span class="mono">plan()</span> over borrowed state returns what should change; the replica applies it. The precedent is one crate away — <span class="mono">lens-core/reduce/view.rs</span> is already a pure borrow-only projection.</p>
+              </div>
+            </div>
+
+            <div>
+              <div class="text-xs uppercase tracking-wider text-slate-400 mb-2">Wins</div>
+              <ul class="grid sm:grid-cols-2 gap-x-6 gap-y-1.5 text-sm text-slate-700 list-disc list-inside">
+                <li>Plan is the test surface, not the window</li>
+                <li>Probes shrink to what only a window proves</li>
+                <li>T-2b windowing lands against a pure interface</li>
+                <li>Locality: read-range policy in one place</li>
+                <li>Fewer hand-authored probe states</li>
+              </ul>
+            </div>
+
+            <div class="rounded-md bg-amber-50 border border-amber-300 px-4 py-3 text-sm text-amber-900">
+              <span class="font-semibold">Why the probes are the tell.</span> All three hand-author state production owns —
+              <span class="mono">new_test_no_baseline</span>, <span class="mono">ReaderWorkerHandle::new_test()</span>,
+              hardcoded <span class="mono">generation: 1</span>. This repo already has the scar:
+              memory <span class="mono">false-green-probe-drives-production-path</span> records a probe that validated the harness
+              rather than the product, and the T-2 review found it had falsely validated the crux.
+            </div>
+          </div>
+        </article>
+
+        <!-- ---------- CARD 6 ---------- -->
+        <article id="c6" class="rounded-xl border border-slate-200 bg-white shadow-sm overflow-hidden">
+          <div class="border-b border-slate-100 px-6 py-5">
+            <div class="flex items-start justify-between gap-4 flex-wrap">
+              <h2 class="font-serif text-2xl">6 · Wire types across the <span class="mono text-indigo-700">lens-client → lens-core</span> seam</h2>
+              <div class="flex gap-2 shrink-0">
+                <span class="text-xs font-semibold uppercase tracking-wider px-2.5 py-1 rounded-full bg-slate-200 text-slate-700">Speculative</span>
+                <span class="text-xs font-semibold uppercase tracking-wider px-2.5 py-1 rounded-full bg-slate-100 text-slate-600">ports &amp; adapters</span>
+              </div>
+            </div>
+            <p class="mt-3 mono text-sm text-slate-500">
+              crates/lens-core/src/reduce/{mod,folds,items,snapshot}.rs · crates/lens-core/src/actor/runloop.rs:223–237
+            </p>
+          </div>
+
+          <div class="p-6 space-y-6">
+            <div class="rounded-lg border border-slate-200 bg-white p-4">
+              <pre class="mermaid">
+flowchart LR
+  SSE[omnigent SSE] --> LC["lens-client<br/>39 modeled event types"]
+  LC -->|ServerStreamEvent| RD["lens-core reduce()"]
+  LC -.SessionEvent.-> F[folds.rs]
+  LC -.ResponseEvent / WireItem.-> I[items.rs]
+  LC -.Reconnected / SnapshotRestored.-> SN[snapshot.rs]
+  RD -->|StreamUpdate| UI["lens-ui<br/>clean"]
+  classDef leak stroke:#dc2626,stroke-width:2px,color:#b91c1c;
+  class F,I,SN leak
+  classDef ok fill:#ecfdf5,stroke:#059669;
+  class UI ok
+              </pre>
+            </div>
+
+            <div class="rounded-md bg-amber-50 border-l-4 border-amber-500 px-4 py-3 text-sm text-amber-900">
+              <span class="font-semibold">Contradicts a locked design decision — and should stay that way.</span>
+              <span class="mono">capability-map-and-design-language.md §0.1.3</span> commits to “omnigent-native, one seam”:
+              no <span class="mono">Backend</span> trait, no normalized cross-backend contract, the domain model
+              <em>is</em> the omnigent model. <span class="mono">ADR-0001</span> localizes contract churn to the vendored pin.
+              With one server and one contract, a translation stage would be a shallow module: deleting it moves complexity
+              rather than concentrating it.
+            </div>
+
+            <div class="grid md:grid-cols-2 gap-6 text-sm">
+              <div>
+                <div class="text-xs uppercase tracking-wider text-slate-400 mb-1">The observation</div>
+                <p class="text-slate-700">This is the largest coupling in the repo — the reducer pattern-matches <span class="mono">SessionEvent</span>, <span class="mono">ResponseEvent</span> and <span class="mono">WireItem</span> across four modules. lens-ui, by contrast, is clean: it sees only <span class="mono">ActorFeed</span> / <span class="mono">StreamUpdate</span>.</p>
+              </div>
+              <div>
+                <div class="text-xs uppercase tracking-wider text-slate-400 mb-1">Recorded so it isn't re-derived</div>
+                <p class="text-slate-700">Listed here only so the next architecture pass doesn't surface it as a finding. Revisit if — and only if — Lens ever targets a second server contract. The cheap hedge meanwhile is the existing drift check, not an abstraction.</p>
+              </div>
+            </div>
+          </div>
+        </article>
+
+      </section>
+
+      <!-- ================= TOP RECOMMENDATION ================= -->
+      <section id="top-recommendation">
+        <div class="rounded-xl deep text-white p-8 shadow-lg space-y-4">
+          <div class="text-xs uppercase tracking-widest text-indigo-300">Top recommendation</div>
+          <h2 class="font-serif text-3xl">
+            <a href="#c1" class="hover:underline">1 · Resolve the board frame in <span class="mono">pack</span></a>
+          </h2>
+          <p class="text-slate-300 leading-relaxed max-w-3xl">
+            It is the only candidate whose payoff is already scheduled. B-4c drag needs the placed tiles the renderer
+            computes; because they live inside gpui closures, the spike rebuilt the geometry a third time and review
+            found a real off-by-one in the copy. Doing this first turns B-4c's reverse hit-test from a parallel
+            implementation into a read of the same rects the painter uses — and pays down four copies of one formula
+            on the way.
+          </p>
+          <p class="text-slate-400 text-sm max-w-3xl">
+            Natural follow-on: <a href="#c2" class="underline decoration-slate-600 hover:decoration-white">candidate 2</a>,
+            since B-4c also wants a thirteenth <span class="mono">BoardStore</span> method. Doing both before the build
+            means B-4c adds one enum variant and one match arm instead of a method, an impl, an op and a dispatch arm.
+          </p>
+          <div class="flex flex-wrap gap-2 pt-2">
+            <a href="#c1" class="text-xs mono px-3 py-1.5 rounded-full bg-white/10 hover:bg-white/20">#1 board frame</a>
+            <a href="#c2" class="text-xs mono px-3 py-1.5 rounded-full bg-white/10 hover:bg-white/20">#2 BoardOp</a>
+            <a href="#c3" class="text-xs mono px-3 py-1.5 rounded-full bg-white/10 hover:bg-white/20">#3 lifecycle reducer</a>
+            <a href="#c4" class="text-xs mono px-3 py-1.5 rounded-full bg-white/10 hover:bg-white/20">#4 shell split</a>
+            <a href="#c5" class="text-xs mono px-3 py-1.5 rounded-full bg-white/10 hover:bg-white/20">#5 transcript plan</a>
+            <a href="#c6" class="text-xs mono px-3 py-1.5 rounded-full bg-white/10 hover:bg-white/20">#6 wire seam</a>
+          </div>
+        </div>
+      </section>
+
+      <footer class="text-xs text-slate-400 pt-4 border-t border-slate-200">
+        Generated 2026-07-23 · read-only review, no source files modified · claims verified against
+        <span class="mono">main @ 2cfd396</span>.
+      </footer>
+    </main>
+  </body>
+</html>
