@@ -140,7 +140,7 @@ impl FocusedTranscriptView {
                     .text_color(gpui::rgb(0x888888))
                     .child(kind_tag(pres.kind)),
             )
-            .child(pres.text.clone())
+            .child(pres.content.stub_text().to_owned())
             .when_some(pres.height_hint, |el, h| el.h(px(h)))
             .into_any_element()
     }
@@ -281,7 +281,8 @@ mod tests {
     use super::*;
     use crate::fleet::store::ReconcileEpoch;
     use crate::focused::{
-        FocusedTranscript, ReaderWorkerHandle, RowId, RowKind, RowPresentation, RowStore,
+        FocusedTranscript, ReaderWorkerHandle, RowContent, RowId, RowKind, RowPresentation,
+        RowStore,
     };
     use gpui::{ListAlignment, ListState};
     use lens_core::domain::ids::{AccId, CallId, ItemId, ResponseId};
@@ -344,6 +345,7 @@ mod tests {
                 full_text: "think".into(),
                 summary_text: String::new(),
                 encrypted: false,
+                duration_ms: None,
             },
         }
     }
@@ -433,6 +435,7 @@ mod tests {
                 full_text: "streaming reasoning".into(),
                 summary_text: String::new(),
                 encrypted: false,
+                started_at_ms: None,
             }),
             open_message: Some(MessageAcc {
                 acc_id: AccId::new("acc_m"),
@@ -453,7 +456,9 @@ mod tests {
                 marker_id.clone(),
                 RowPresentation {
                     kind: RowKind::ReconnectBreak,
-                    text: "reconnect".into(),
+                    content: RowContent::Stub {
+                        text: "reconnect".into(),
+                    },
                     collapsed: false,
                     height_hint: None,
                 },
@@ -507,7 +512,9 @@ mod tests {
                         id.clone(),
                         RowPresentation {
                             kind: RowKind::Message,
-                            text: format!("row {i}"),
+                            content: RowContent::Stub {
+                                text: format!("row {i}"),
+                            },
                             collapsed: false,
                             height_hint: None,
                         },
@@ -590,7 +597,9 @@ mod tests {
                         id.clone(),
                         RowPresentation {
                             kind: RowKind::Message,
-                            text: format!("row {i}"),
+                            content: RowContent::Stub {
+                                text: format!("row {i}"),
+                            },
                             collapsed: false,
                             height_hint: None,
                         },
@@ -721,7 +730,9 @@ mod tests {
             let _ = FocusedTranscriptView::render_stub_row(
                 &RowPresentation {
                     kind,
-                    text: "stub".into(),
+                    content: RowContent::Stub {
+                        text: "stub".into(),
+                    },
                     collapsed: false,
                     height_hint: None,
                 },
@@ -756,7 +767,9 @@ mod tests {
                         id.clone(),
                         RowPresentation {
                             kind: RowKind::Message,
-                            text: format!("row {i}"),
+                            content: RowContent::Stub {
+                                text: format!("row {i}"),
+                            },
                             collapsed: false,
                             height_hint: None,
                         },
@@ -811,7 +824,9 @@ mod tests {
                         id.clone(),
                         RowPresentation {
                             kind: RowKind::Message,
-                            text: format!("row {i}"),
+                            content: RowContent::Stub {
+                                text: format!("row {i}"),
+                            },
                             collapsed: false,
                             height_hint: None,
                         },

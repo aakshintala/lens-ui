@@ -2,6 +2,7 @@
 //! two-level retained rows, staged finalize, and collapse timing (Task 12).
 
 pub mod reader;
+mod content_key;
 mod rowsource;
 pub mod view;
 
@@ -17,8 +18,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use reader::{Priority, ReadTarget, ReaderWorkerHandle};
+pub use content_key::ContentKey;
 pub use rowsource::{
-    RowId, RowKind, RowPresentation, RowState, RowStore, SectionKey, UpsertEffect,
+    RowContent, RowId, RowKind, RowPresentation, RowState, RowStore, SectionKey, UpsertEffect,
 };
 
 const LIST_OVERDRAW: Pixels = gpui::px(200.);
@@ -684,7 +686,9 @@ impl FocusedTranscript {
                     self.stream_presentation(&acc_id, cx)
                         .unwrap_or_else(|| RowPresentation {
                             kind: RowKind::StreamingMessage,
-                            text: String::new(),
+                            content: RowContent::Stub {
+                                text: String::new(),
+                            },
                             collapsed: false,
                             height_hint: None,
                         });
@@ -940,7 +944,9 @@ impl FocusedTranscript {
         if self.resident_lo > 0 {
             let pres = RowPresentation {
                 kind: RowKind::LoadOlder,
-                text: "Load older".into(),
+                content: RowContent::Stub {
+                    text: "Load older".into(),
+                },
                 collapsed: false,
                 height_hint: None,
             };
@@ -1341,6 +1347,7 @@ mod tests {
                 full_text: "think".into(),
                 summary_text: String::new(),
                 encrypted: false,
+                duration_ms: None,
             },
         }
     }
@@ -1494,6 +1501,7 @@ mod tests {
                             full_text: "streaming chrome".into(),
                             summary_text: String::new(),
                             encrypted: false,
+                            started_at_ms: None,
                         }),
                         ..Default::default()
                     })),
@@ -2367,6 +2375,7 @@ mod tests {
                             full_text: "streaming think".into(),
                             summary_text: String::new(),
                             encrypted: false,
+                            started_at_ms: None,
                         }),
                         ..Default::default()
                     })),
@@ -2554,6 +2563,7 @@ mod tests {
                             full_text: "streaming under resp_a".into(),
                             summary_text: String::new(),
                             encrypted: false,
+                            started_at_ms: None,
                         }),
                         ..Default::default()
                     })),
@@ -2690,6 +2700,7 @@ mod tests {
                             full_text: "streaming tail".into(),
                             summary_text: String::new(),
                             encrypted: false,
+                            started_at_ms: None,
                         }),
                         ..Default::default()
                     })),
@@ -2801,6 +2812,7 @@ mod tests {
                             full_text: "streaming tail".into(),
                             summary_text: String::new(),
                             encrypted: false,
+                            started_at_ms: None,
                         }),
                         ..Default::default()
                     })),
@@ -2924,6 +2936,7 @@ mod tests {
                             full_text: "reasoning-only section".into(),
                             summary_text: String::new(),
                             encrypted: false,
+                            started_at_ms: None,
                         }),
                         ..Default::default()
                     })),
@@ -3192,7 +3205,8 @@ mod tests {
                     .unwrap()
                     .read(cx)
                     .presentation
-                    .text,
+                    .content
+                    .stub_text(),
                 "hi"
             );
         });
@@ -3281,7 +3295,8 @@ mod tests {
                     .unwrap()
                     .read(cx)
                     .presentation
-                    .text,
+                    .content
+                    .stub_text(),
                 "hi",
                 "finalized message must render its disk text"
             );
@@ -4362,6 +4377,7 @@ mod tests {
                                 full_text: format!("stream {i}"),
                                 summary_text: String::new(),
                                 encrypted: false,
+                                started_at_ms: None,
                             }),
                             ..Default::default()
                         })),
@@ -4414,6 +4430,7 @@ mod tests {
                             full_text: "staged".into(),
                             summary_text: String::new(),
                             encrypted: false,
+                            started_at_ms: None,
                         }),
                         ..Default::default()
                     })),
@@ -4579,7 +4596,7 @@ mod tests {
             let found = r.rows().order().iter().any(|id| {
                 r.rows()
                     .entity(id)
-                    .is_some_and(|e| e.read(cx).presentation.text == "ok")
+                    .is_some_and(|e| e.read(cx).presentation.content.stub_text() == "ok")
             });
             assert!(found, "orphan output must render without panic");
         });
@@ -4653,6 +4670,7 @@ mod tests {
                             full_text: "streaming".into(),
                             summary_text: String::new(),
                             encrypted: false,
+                            started_at_ms: None,
                         }),
                         ..Default::default()
                     })),

@@ -10,6 +10,7 @@ use lens_core::domain::item::{Item, ItemKind, MessageAcc, ReasoningAcc};
 use lens_core::domain::scalars::Role;
 use lens_core::reduce::ViewBlock;
 
+use super::content_key::ContentKey;
 use super::Marker;
 
 /// Stable row identity — keyed store, not list index.
@@ -48,12 +49,41 @@ impl SectionKey {
     }
 }
 
+/// Typed row payload — markdown rendering consumes this in T3 Tasks 2–5.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RowContent {
+    Stub { text: String },
+    AssistantMarkdown {
+        source: String,
+        content_key: ContentKey,
+    },
+    UserVerbatim { text: String },
+    Reasoning {
+        summary: String,
+        full: String,
+        encrypted: bool,
+        duration_secs: Option<u32>,
+        content_key: ContentKey,
+        live: bool,
+    },
+}
+
+impl RowContent {
+    pub fn stub_text(&self) -> &str {
+        match self {
+            RowContent::Stub { text } => text.as_str(),
+            RowContent::AssistantMarkdown { source, .. } => source.as_str(),
+            RowContent::UserVerbatim { text } => text.as_str(),
+            RowContent::Reasoning { full, .. } => full.as_str(),
+        }
+    }
+}
+
 /// Minimal owned presentation the stub renderer needs — not the whole `Item`.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RowPresentation {
     pub kind: RowKind,
-    pub text: String,
-    /// Derived collapse flag (Task 12); `false` = expanded.
+    pub content: RowContent,
     pub collapsed: bool,
     /// Optional height hint for the stub renderer (pixels).
     pub height_hint: Option<f32>,
@@ -417,8 +447,9 @@ impl RowStore {
         };
         let entity = self.entities.remove(&tail_id)?;
         entity.update(cx, |state, _| {
+            let stream_pres = state.presentation.clone();
             state.id = durable_id.clone();
-            state.presentation = pres;
+            state.presentation = preserve_content_key(&stream_pres, pres);
         });
         self.entities.insert(durable_id.clone(), entity);
         let entity_id = self.entity_id(&durable_id, cx);
@@ -479,7 +510,9 @@ impl RowStore {
 
         let reconnect_pres = RowPresentation {
             kind: RowKind::ReconnectBreak,
-            text: "reconnected".into(),
+            content: RowContent::Stub {
+                text: "reconnected".into(),
+            },
             collapsed: false,
             height_hint: None,
         };
@@ -635,21 +668,25 @@ impl RowStore {
         if !self.sections.contains_key(key) {
             let chip = RowPresentation {
                 kind: RowKind::SectionChip,
-                text: format!(
-                    "section {} @{}",
-                    key.response_id.as_str(),
-                    key.run_anchor.as_str()
-                ),
+                content: RowContent::Stub {
+                    text: format!(
+                        "section {} @{}",
+                        key.response_id.as_str(),
+                        key.run_anchor.as_str()
+                    ),
+                },
                 collapsed: false,
                 height_hint: None,
             };
             let rail = RowPresentation {
                 kind: RowKind::SectionRail,
-                text: format!(
-                    "rail {} @{}",
-                    key.response_id.as_str(),
-                    key.run_anchor.as_str()
-                ),
+                content: RowContent::Stub {
+                    text: format!(
+                        "rail {} @{}",
+                        key.response_id.as_str(),
+                        key.run_anchor.as_str()
+                    ),
+                },
                 collapsed: false,
                 height_hint: None,
             };
@@ -771,24 +808,14 @@ fn materialize_section_child_id(
 
 fn materialize_sibling_item(item: &Item, into: &mut RowStore, cx: &mut App) {
     let id = RowId::Sibling(item.id.clone());
-    let pres = RowPresentation {
-        kind: sibling_row_kind(item),
-        text: item_text_stub(item),
-        collapsed: false,
-        height_hint: None,
-    };
+    let pres = presentation_for_item(item);
     into.upsert(id.clone(), pres, cx);
     into.structure.push(StructureEntry::Sibling(id));
 }
 
 fn materialize_work_item(item: &Item, into: &mut RowStore, cx: &mut App) {
     let id = RowId::Work(item.id.clone());
-    let pres = RowPresentation {
-        kind: RowKind::WorkChild,
-        text: item_text_stub(item),
-        collapsed: false,
-        height_hint: None,
-    };
+    let pres = presentation_for_work_item(item);
     into.upsert(id, pres, cx);
 }
 
@@ -801,7 +828,7 @@ fn materialize_tool_span(call: &Item, output: Option<&Item>, into: &mut RowStore
     }
     let pres = RowPresentation {
         kind: RowKind::WorkChild,
-        text,
+        content: RowContent::Stub { text },
         collapsed: false,
         height_hint: None,
     };
@@ -810,9 +837,17 @@ fn materialize_tool_span(call: &Item, output: Option<&Item>, into: &mut RowStore
 
 fn materialize_streaming_reasoning(acc: &ReasoningAcc, into: &mut RowStore, cx: &mut App) {
     let id = RowId::StreamTail(acc.acc_id.clone());
+    let content_key = ContentKey::from_acc(&acc.acc_id);
     let pres = RowPresentation {
         kind: RowKind::StreamingReasoning,
-        text: acc.full_text.clone(),
+        content: RowContent::Reasoning {
+            summary: acc.summary_text.clone(),
+            full: acc.full_text.clone(),
+            encrypted: acc.encrypted,
+            duration_secs: None,
+            content_key,
+            live: true,
+        },
         collapsed: false,
         height_hint: None,
     };
@@ -821,9 +856,13 @@ fn materialize_streaming_reasoning(acc: &ReasoningAcc, into: &mut RowStore, cx: 
 
 fn materialize_streaming_message(acc: &MessageAcc, into: &mut RowStore, cx: &mut App) {
     let id = RowId::StreamTail(acc.acc_id.clone());
+    let content_key = ContentKey::from_acc(&acc.acc_id);
     let pres = RowPresentation {
         kind: RowKind::StreamingMessage,
-        text: acc.text.clone(),
+        content: RowContent::AssistantMarkdown {
+            source: acc.text.clone(),
+            content_key,
+        },
         collapsed: false,
         height_hint: None,
     };
@@ -859,10 +898,50 @@ pub(crate) fn item_text_stub(item: &Item) -> String {
     }
 }
 
+pub(crate) fn row_content_for_item(item: &Item) -> RowContent {
+    match &item.kind {
+        ItemKind::Message {
+            role: Role::User,
+            content,
+            ..
+        } => RowContent::UserVerbatim {
+            text: content
+                .iter()
+                .filter_map(|block| block.text.as_deref())
+                .collect::<Vec<_>>()
+                .join(""),
+        },
+        ItemKind::Message { content, .. } => RowContent::AssistantMarkdown {
+            source: content
+                .iter()
+                .filter_map(|block| block.text.as_deref())
+                .collect::<Vec<_>>()
+                .join(""),
+            content_key: ContentKey::from_acc(&AccId::new(item.id.as_str())),
+        },
+        ItemKind::Reasoning {
+            full_text,
+            summary_text,
+            encrypted,
+            duration_ms,
+        } => RowContent::Reasoning {
+            summary: summary_text.clone(),
+            full: full_text.clone(),
+            encrypted: *encrypted,
+            duration_secs: duration_ms.map(|ms| (ms / 1000) as u32),
+            content_key: ContentKey::from_acc(&AccId::new(item.id.as_str())),
+            live: false,
+        },
+        _ => RowContent::Stub {
+            text: item_text_stub(item),
+        },
+    }
+}
+
 pub(crate) fn presentation_for_item(item: &Item) -> RowPresentation {
     RowPresentation {
         kind: sibling_row_kind(item),
-        text: item_text_stub(item),
+        content: row_content_for_item(item),
         collapsed: false,
         height_hint: None,
     }
@@ -871,10 +950,27 @@ pub(crate) fn presentation_for_item(item: &Item) -> RowPresentation {
 pub(crate) fn presentation_for_work_item(item: &Item) -> RowPresentation {
     RowPresentation {
         kind: RowKind::WorkChild,
-        text: item_text_stub(item),
+        content: row_content_for_item(item),
         collapsed: false,
         height_hint: None,
     }
+}
+
+/// D11: streaming→finalize keeps the stream `content_key`; never retarget to item id.
+fn preserve_content_key(stream_pres: &RowPresentation, mut pres: RowPresentation) -> RowPresentation {
+    let stream_key = match &stream_pres.content {
+        RowContent::AssistantMarkdown { content_key, .. }
+        | RowContent::Reasoning { content_key, .. } => Some(content_key.clone()),
+        _ => None,
+    };
+    if let Some(key) = stream_key {
+        match &mut pres.content {
+            RowContent::AssistantMarkdown { content_key, .. }
+            | RowContent::Reasoning { content_key, .. } => *content_key = key,
+            _ => {}
+        }
+    }
+    pres
 }
 
 #[cfg(test)]
@@ -911,6 +1007,7 @@ mod tests {
                 full_text: "think".into(),
                 summary_text: String::new(),
                 encrypted: false,
+                duration_ms: None,
             },
         )
     }
@@ -1149,7 +1246,10 @@ mod tests {
                 &acc,
                 RowPresentation {
                     kind: RowKind::StreamingMessage,
-                    text: "staged".into(),
+                    content: RowContent::AssistantMarkdown {
+                        source: "staged".into(),
+                        content_key: ContentKey::from_acc(&acc),
+                    },
                     collapsed: false,
                     height_hint: None,
                 },
@@ -1211,7 +1311,9 @@ mod tests {
                 marker_id.clone(),
                 RowPresentation {
                     kind: RowKind::ReconnectBreak,
-                    text: "reconnect".into(),
+                    content: RowContent::Stub {
+                        text: "reconnect".into(),
+                    },
                     collapsed: false,
                     height_hint: None,
                 },
@@ -1257,7 +1359,9 @@ mod tests {
                 row_id.clone(),
                 RowPresentation {
                     kind: RowKind::WorkChild,
-                    text: "v1".into(),
+                    content: RowContent::Stub {
+                        text: "v1".into(),
+                    },
                     collapsed: false,
                     height_hint: None,
                 },
@@ -1272,7 +1376,9 @@ mod tests {
                 row_id.clone(),
                 RowPresentation {
                     kind: RowKind::WorkChild,
-                    text: "v2".into(),
+                    content: RowContent::Stub {
+                        text: "v2".into(),
+                    },
                     collapsed: false,
                     height_hint: None,
                 },
@@ -1302,7 +1408,10 @@ mod tests {
                 &acc,
                 RowPresentation {
                     kind: RowKind::StreamingMessage,
-                    text: "streaming".into(),
+                    content: RowContent::AssistantMarkdown {
+                        source: "streaming".into(),
+                        content_key: ContentKey::from_acc(&acc),
+                    },
                     collapsed: false,
                     height_hint: None,
                 },
@@ -1317,7 +1426,10 @@ mod tests {
                 &item_id,
                 RowPresentation {
                     kind: RowKind::Message,
-                    text: "final".into(),
+                    content: RowContent::AssistantMarkdown {
+                        source: "final".into(),
+                        content_key: ContentKey::from_acc(&AccId::new(item_id.as_str())),
+                    },
                     collapsed: false,
                     height_hint: None,
                 },
@@ -1330,9 +1442,88 @@ mod tests {
         cx.read(|cx| {
             let id = RowId::Sibling(item_id);
             assert_eq!(
-                store.entity(&id).unwrap().read(cx).presentation.text,
+                store.entity(&id).unwrap().read(cx).presentation.content.stub_text(),
                 "final"
             );
         });
+    }
+
+    #[gpui::test]
+    fn finalize_preserves_content_key(cx: &mut gpui::TestAppContext) {
+        let acc = AccId::new("acc_stream_1");
+        let key = ContentKey::from_acc(&acc);
+        let item_id = ItemId::new("item_1");
+        let mut store = RowStore::new();
+        cx.update(|cx| {
+            store.stage_stream_finalize(
+                &acc,
+                RowPresentation {
+                    kind: RowKind::StreamingMessage,
+                    content: RowContent::AssistantMarkdown {
+                        source: "hello".into(),
+                        content_key: key.clone(),
+                    },
+                    collapsed: false,
+                    height_hint: None,
+                },
+                None,
+                None,
+                cx,
+            );
+            store.commit_stream_finalize(
+                &acc,
+                &item_id,
+                RowPresentation {
+                    kind: RowKind::Message,
+                    content: RowContent::AssistantMarkdown {
+                        source: "hello world".into(),
+                        // Naive implementers would retarget to item id here — forbidden.
+                        content_key: ContentKey::from_acc(&AccId::new(item_id.as_str())),
+                    },
+                    collapsed: false,
+                    height_hint: None,
+                },
+                true,
+                None,
+                cx,
+            );
+        });
+        cx.read(|cx| {
+            let id = RowId::Sibling(item_id);
+            let final_pres = &store.entity(&id).unwrap().read(cx).presentation;
+            match &final_pres.content {
+                RowContent::AssistantMarkdown { source, content_key } => {
+                    assert_eq!(source, "hello world");
+                    assert_eq!(content_key, &key, "D11: content_key must stay the stream key");
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn finalized_reasoning_projects_duration_secs() {
+        let item = item(
+            "r1",
+            Some("resp_a"),
+            ItemKind::Reasoning {
+                full_text: "think".into(),
+                summary_text: "t".into(),
+                encrypted: false,
+                duration_ms: Some(4_500),
+            },
+        );
+        let pres = presentation_for_work_item(&item);
+        match pres.content {
+            RowContent::Reasoning {
+                duration_secs,
+                live,
+                ..
+            } => {
+                assert_eq!(duration_secs, Some(4));
+                assert!(!live);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }

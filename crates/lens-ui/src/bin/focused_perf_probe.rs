@@ -351,7 +351,7 @@ fn render_probe_row(pres: &lens_ui::focused::RowPresentation, ix: usize) -> gpui
                 .text_color(gpui::rgb(0x888888))
                 .child(kind_tag(pres.kind)),
         )
-        .child(pres.text.clone())
+        .child(pres.content.stub_text().to_owned())
         .when_some(pres.height_hint, |el, h| el.h(px(h)))
         .into_any_element()
 }

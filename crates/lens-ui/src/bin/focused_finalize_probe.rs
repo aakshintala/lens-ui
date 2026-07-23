@@ -458,7 +458,7 @@ impl Render for HarnessView {
             .rows()
             .id_at(row_ix)
             .and_then(|id| self.replica.read(cx).rows().entity(id))
-            .map(|e| e.read(cx).presentation.text.clone())
+            .map(|e| e.read(cx).presentation.content.stub_text().to_owned())
             .unwrap_or_default();
         let list_state = match self.list_binding {
             ListBinding::HarnessManual => self.list_state.clone(),
@@ -509,7 +509,7 @@ impl Render for HarnessView {
                 let Some(entity) = replica.read(cx).rows().entity(id) else {
                     return div().into_any_element();
                 };
-                let text = entity.read(cx).presentation.text.clone();
+                let text = entity.read(cx).presentation.content.stub_text().to_owned();
                 div().id(ix).child(text).into_any_element()
             })
             .size_full(),
