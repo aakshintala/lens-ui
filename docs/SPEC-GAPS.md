@@ -262,6 +262,18 @@ separate sort task). Order below is dependency order.
   (drag card onto card · "New group" · right-click "New group from selection"),
   context-menu moves (Move-to-group ▸, Move-to-board ▸, New-group, Pin, ungroup,
   archive group), ⌘1–⌘9 card-jump. Mutates B-1. Depends on B-1, B-2.
+  - **Op-wiring state (surfaced 2026-07-23, B-4c grill).** `BoardStore` exposes
+    ~9 persisted mutations; the replica wires only `Load` / `PlaceSessions` /
+    `SetCollapsed` (+ `MoveItem` in B-4c). The remaining group ops are **dead
+    plumbing** — domain + store built and round-trip to SQLite, but no `Op` and no
+    gesture — and split by the B-4a §8 non-idempotent-retry seam:
+    - **Idempotent (absolute-value field write; shippable anytime like
+      `SetCollapsed`, no seam):** `rename`, `set_color`. These can be pulled
+      forward independently of B-4d.
+    - **Non-idempotent (row insert/delete; gated on the §8 commit-phase seam
+      because transient-retry re-enqueues the whole op):** `create_group`,
+      `ungroup`, `archive`.
+    B-4d owns wiring the non-idempotent tier + the context-menu triggers.
 
 - **B-5 — Multiple boards + rail switcher** — *lens-ui + state.* §4.4 board-as-
   bounded + spin-up-new; nav-rail board entries (§6); ⌘⇧1–⌘⇧9 / ⌘K board switch;
@@ -279,6 +291,33 @@ separate sort task). Order below is dependency order.
 (§4.2 / §7.6 quick-add) belongs to the new-session-dialog surface (agent-
 definition seam), cross-referenced from B-1/B-3, not absorbed. The **coarse
 card-summary feed** (§9 `SummaryUpdate`) already exists.
+
+## Session & card lifecycle UI (create / end a session)
+
+*Surfaced 2026-07-23 during the B-4c drag grill.* A board card is a projection two
+levels down — omnigent server session → `FleetStore` `SessionCard` (via
+`fleet/poller.rs`) → board card row (via `PlaceSessions`/reconcile). The lifecycle
+write surface splits by layer, and the top layer is **genuinely unbuilt**:
+
+- **Create / end a session → app-shell + omnigent, NOT the board.** "New agent"
+  means telling the *server* (via omnigent) to create a session; the poller
+  observes it and the card auto-appears. Ending is symmetric (server ends it →
+  poller sees it vanish → card pruned). **This is the load-bearing gap: there is
+  no new-session or end-session gesture anywhere.** Today's only session-creation
+  path is `FakeFleet::spawn_session` (demo/tests); `FleetStore::{wake_session,
+  retry_session}` are stubs (`TODO(state-model P3+)`). You cannot start or stop an
+  agent from the UI. Ties into #6 (onboarding empty-state) and #10 ("new session"
+  shortcut), but neither owns the gesture + server round-trip.
+- **Board cards are add-only in production.** `BoardStore::{remove_session,
+  archive}` exist and persist to SQLite but are **never called outside tests** (the
+  `replica.rs:889/933` callers are the test `CountingStore`). Live card removal is
+  reload-driven only (read-time tombstone-prune on `Load`), not gesture-driven.
+- **Archive / pin / move a card → a board gesture** (B-4d op-wiring; surfaced on
+  the B-6 archive-as-board destination). The only lifecycle mutation that
+  legitimately belongs to the board write path.
+- **Rename a card → n/a by design** — a card label is session-derived; domain
+  `rename` is group-only (`board.rs:492` → `NotAGroup` for a card). Renaming a
+  *session* would again be an app-shell/omnigent concern.
 
 ## Parked contract dependencies (omnigent-side asks)
 

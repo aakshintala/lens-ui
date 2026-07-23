@@ -1,6 +1,8 @@
 # Board B-4c — drag-to-reorder / drag in-out of groups — design
 
-**Written:** 2026-07-23 · **Status:** LOCKED — brainstormed + settled ·
+**Written:** 2026-07-23 · **Status:** LOCKED — brainstormed + grilled + settled
+(4 decisions folded 2026-07-23: mid-drag concurrency, group-nesting, empty-group,
+resolver home) ·
 **Depends on:** B-4a (`BoardReplica` + serialized commit-gated `run_op` write seam,
 `c189d4c`), B-4b (`Op::SetCollapsed` template + the commit-gated-vs-optimistic decision
 handed forward, `c75cabf`…`70cc419`), B-3 (group chrome `absolute_group`, `board/rollup.rs`),
@@ -32,6 +34,12 @@ for free, used by B-5 — cross-board (change `new_board_id`).
 - **Cross-board move** → B-5 (the primitive lands here, the multi-board UI does not).
 - **"Append to end of board"** — **cut entirely.** It was a spike-era pixel→ordinal worry; under
   reflow-preview (§3) it evaporates (see §4.3). No append rule, no bottom drop zone.
+- **Group dissolution / deletion.** Dragging a card *out* of a group is **in scope** (§6) and can
+  leave an **empty group** behind. Cleaning that up — auto-dissolve, or a delete/ungroup gesture — is
+  **deferred to a group-lifecycle slice (the B-4d non-idempotent tier).** It is a *separate,
+  non-idempotent* write (`ungroup`/`archive` delete rows — both already round-trip to SQLite but are
+  unwired, cf. `SPEC-GAPS.md` "Session & card lifecycle"), so folding it into the move would drag in
+  the §8 commit-phase seam `Op::MoveItem` deliberately avoids (§2.1). **Empty groups persist for now.**
 
 ---
 
@@ -136,6 +144,40 @@ is `self.layout`, which changes solely on a `Wrote` reply. A crash, a lost reply
 `Err` mid-drag can only ever leave the *unchanged* committed layout on screen — never a diverged
 optimistic state that must be reconciled.
 
+### 3.4 External commits mid-drag (concurrency — decided 2026-07-23)
+
+`self.layout` is **not** mutated solely by this drag's own `MoveItem`. A `PlaceSessions` (fleet
+activity → `on_fleet_change` → `reconcile`, `replica.rs:486`) or a `Load { initial:false }` can
+commit a *changed* layout at any point during a drag — a background agent session spawning while the
+user drags is the concrete case. When that happens the frozen snapshot `S` (§4.1) is stale, so the
+drag is **abandoned, not reconciled:**
+
+- A `layout_generation` counter bumps on **every `Wrote`/`Loaded` that is not this drag's own
+  `MoveItem` reply.**
+- **During Dragging** — the instant the generation bumps, **tear the drag down immediately**: drop
+  the reflow-preview, abort → Idle. (Do *not* keep dragging against reshuffled geometry and then
+  silently fail at drop — that reads as a dropped interaction.)
+- **At drop** — belt-and-suspenders for a same-frame bump/drop race: if the generation changed
+  between drag-start and drop, **abort** instead of issuing the move.
+
+This is the same failure shape as §3.2's `Failed` arm — the committed layout is never a diverged
+optimistic state, so "abandon the derived view" is always safe. The yank is **rare at human drag
+durations (~1–3s)** and **accepted** (decided); a *defer-placements-during-drag* variant (queue
+`PlaceSessions`/`Load` until Idle) is a later polish option if the yank proves annoying on-device,
+not built now.
+
+**Note on Committing.** During the ~1ms Committing window an external `PlaceSessions` is safe without
+teardown: `pump` serializes on `in_flight` (`replica.rs:239`) and `PlaceSessions` is append-only (it
+does not renumber existing siblings), so the queued `MoveItem` still lands at its resolved ordinal.
+The only visible effect is a new card appearing — the §3.2 "invisible swap" is then "swap plus one
+new card," which is expected feedback, not a divergence.
+
+**gpui caveat (verify on-device).** In gpui `0.2.2` the framework owns the drag ghost until
+mouse-up; a state-driven abort can drop *our* preview immediately but may not cancel the framework
+ghost mid-flight. Expected interim behavior: on an external-commit abort the gap disappears and the
+ghost keeps following until the user releases, at which point `on_drop` sees the aborted state and
+no-ops. Confirm the exact ghost behavior in the real-window verify (§8).
+
 ---
 
 ## 4. Reverse hit-test resolver
@@ -145,17 +187,27 @@ shortest-column backfill) and ordinal order is **not spatially monotonic** (a la
 tile backfills a short column beside a tall group and sits physically *above* an earlier tile),
 **there is no closed-form inverse** — the resolver **scans placed tiles**.
 
+**Home (decided 2026-07-23).** `resolve_drop` + `to_move_ordinal` are **pure** and live in
+`lens_core::pack` (or a `pack::hit` sibling) — the resolver is definitionally the packer's *inverse*
+over the same `pack::Placed`, so co-locating forward-pack and reverse-hittest keeps the
+non-monotonic-backfill invariant honest in one place, and inherits the spike's UI-free unit tests
+verbatim. `board/drag.rs` (lens-ui) holds only the gpui-facing glue that genuinely needs the UI
+crate: the drag state machine (§3), `on_drag`/`on_drag_move`/`on_drop`, and edge auto-scroll (§5).
+
 ### 4.1 Frozen snapshot (loop-breaker)
 
 On drag-start, freeze snapshot `S` = the current `pack::Placed` **with the dragged item
 removed**. For the drag's entire duration, `resolve_drop` maps `cursor → DropTarget` against `S`
 — **never against the live reflow-preview**. This decouples target *resolution* from the
 displayed reshuffle: moving the cursor within the previewed (shifted) tiles cannot re-feed the
-resolver, so there is no reflow feedback loop.
+resolver, so there is no reflow feedback loop. `S`'s validity window is bounded by §3.4: any
+*external* commit during the drag bumps `layout_generation` and abandons the drag, so `S` is never
+silently consulted against a committed layout it no longer matches.
 
 ### 4.2 `resolve_drop(S, cursor) -> DropTarget { parent, ordinal }`
 
-1. **Into an expanded group's body?** If the cursor is below a group's header band and within
+1. **Into an expanded group's body? (card drags only — a dragged *group* skips this branch, §6.)**
+   If the cursor is below a group's header band and within
    its box, target that group's member list. Members are a clean row-major `fc × fr` grid (tight
    `CARD_H + GAP` stride, matching `absolute_group`), so ordinal there **is** monotonic — locate
    the cell; bias one past it if the cursor is right of the cell's horizontal center. A cursor in
@@ -200,8 +252,16 @@ nudge velocity are **on-device tuning** (the RUN is the only proof); the mechani
 
 ## 6. Group drop semantics
 
-- **Expanded group body** (below header band) → **into** the group.
-- **Group header** → **reorder the group** among its top-level siblings.
+**Invariant — groups do not nest via drag (decided 2026-07-23).** The domain `move_item` *permits* a
+group under a group (it rejects only cycles, `board.rs:380`), but B-4c's UI never offers it: a dragged
+**group** only reorders among its top-level siblings; the into-group branch (§4.2 step 1) is
+**card-only.** A group dragged over another group's expanded body falls through to the top-level
+resolver (§4.2 step 4), never nests. Nested groups are a rendering/packing project — B-2/B-3 and the
+packer's `fc × fr` member grid assume one level (top-level groups, card members) — and get their own
+future design if ever wanted.
+
+- **Expanded group body** (below header band), **card drag only** → **into** the group.
+- **Group header** (and *any* group drag) → **reorder the group** among its top-level siblings.
 - **Collapsed rollup** → **top-level only**.
 - Catch-region tuning at the ring-gutter seam (where two adjacent group tint boxes overlap by the
   ring-gutter overhang, ~8px on the demo board) is **on-device tuning**, not a spec constant.
@@ -220,10 +280,11 @@ group-reflow regression test.
 
 ## 8. Testing
 
-**Pure resolver (carried from the spike, 10/10 — re-home into `lens_core::pack` or a
-`board/drag.rs` unit):** before/after by center, **the non-monotonic backfill case explicitly**,
-into-group member slots, header-drop stays top-level, collapsed group has no drop zone,
-`to_move_ordinal` shift table, empty board, **partial-last-row empty-trailing-cell appends**.
+**Pure resolver (carried from the spike, 10/10 — home is `lens_core::pack`, §4):** before/after by
+center, **the non-monotonic backfill case explicitly**, into-group member slots, header-drop stays
+top-level, **dragged-group-over-group-body falls through to top-level (no nesting, §6)**, collapsed
+group has no drop zone, `to_move_ordinal` shift table, empty board, **partial-last-row
+empty-trailing-cell appends**.
 
 **Write path (mirror the `SetCollapsed` tests, `replica.rs:748`):** `Op::MoveItem` round-trips
 and persists (reorder + in/out-group); `Op::MoveItem` refused when `!is_writable`;
@@ -231,7 +292,8 @@ idempotent re-run is a no-op.
 
 **Drag state machine (pure/entity):** Dragging→Committing holds the preview; `Wrote`→invisible
 swap (committed == preview); `Failed`→discard preview, committed layout unchanged, banner shown;
-cancel→Idle.
+cancel→Idle; **external commit mid-drag (§3.4)→ generation bump abandons the drag** (torn down during
+Dragging; aborted at drop) with the committed layout intact.
 
 **Verify (real-window, "the RUN is the only proof"):** a real drag against the `--demo` board —
 reorder, into-group, out-of-group — plus edge auto-scroll tuning. A headless drag test would have
