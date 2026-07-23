@@ -43,7 +43,7 @@ impl TranscriptReader for SqliteTranscriptReader {
     }
 
     fn read_range(&self, range: ReadRange) -> Result<RangeRead> {
-        const SELECT_PREFIX: &str = "SELECT ordinal, length(payload), item_id, live_seq, kind, payload, agent, depth, created_at, response_id FROM items";
+        const SELECT_PREFIX: &str = "SELECT ordinal, length(CAST(payload AS BLOB)), item_id, live_seq, kind, payload, agent, depth, created_at, response_id FROM items";
         const ID_COL: usize = 2;
         let tx = self.conn.unchecked_transaction()?;
         let loaded = match range {
@@ -1001,6 +1001,42 @@ CREATE TABLE IF NOT EXISTS items (
         assert_eq!(read.rows.len(), 1);
         assert_eq!(read.rows[0].0, 0); // ordinal
         assert_eq!(read.rows[0].2.id.as_str(), "item_a");
+    }
+
+    fn stored_payload(s: &SqliteTranscriptStore, id: &str) -> String {
+        s.conn
+            .query_row("SELECT payload FROM items WHERE item_id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn read_range_payload_len_is_utf8_byte_count() {
+        let d = tempdir().unwrap();
+        let s = store(d.path());
+        let text = "🚀🔥💯✨ 日本語";
+        s.upsert_item(0, &item("item_emoji", None, text), false)
+            .unwrap();
+
+        let payload_json = stored_payload(&s, "item_emoji");
+        let byte_len = payload_json.len();
+        let char_len = payload_json.chars().count();
+        assert!(
+            byte_len > char_len,
+            "fixture must distinguish bytes from chars (byte_len={byte_len}, char_len={char_len})"
+        );
+
+        let r = SqliteTranscriptReader::open_read_only(
+            &d.path().join("conv_1.db"),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        let read = r.read_range(ReadRange::All).unwrap();
+        assert_eq!(read.rows.len(), 1);
+        assert_eq!(read.rows[0].0, 0);
+        assert_eq!(read.rows[0].1, byte_len);
+        assert_ne!(read.rows[0].1, char_len);
     }
 
     fn payload_len(s: &SqliteTranscriptStore, id: &str) -> usize {

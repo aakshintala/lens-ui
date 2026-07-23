@@ -170,7 +170,7 @@ pub fn row_to_item(r: &rusqlite::Row) -> rusqlite::Result<Item> {
 }
 
 /// Same as `row_to_item`, but column indices are shifted by `offset` (reader SELECT
-/// prepends `ordinal` and `length(payload)` before the `row_to_item` columns).
+/// prepends `ordinal` and `length(CAST(payload AS BLOB))` before the `row_to_item` columns).
 pub(crate) fn row_to_item_at_offset(r: &rusqlite::Row, offset: usize) -> rusqlite::Result<Item> {
     fn to_sql_err<E: std::error::Error + Send + Sync + 'static>(e: E) -> rusqlite::Error {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
@@ -191,7 +191,7 @@ pub(crate) fn row_to_item_at_offset(r: &rusqlite::Row, offset: usize) -> rusqlit
     })
 }
 
-/// Reader row: ordinal @0, length(payload) @1, then row_to_item columns @2..
+/// Reader row: ordinal @0, length(CAST(payload AS BLOB)) @1, then row_to_item columns @2..
 pub(crate) fn row_to_ordinal_len_item(r: &rusqlite::Row) -> rusqlite::Result<(i64, usize, Item)> {
     Ok((
         r.get(0)?,
