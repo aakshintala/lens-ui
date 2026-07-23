@@ -1,7 +1,30 @@
-# Handoff — Terminal Slice 5: B done, A grill paused mid-Q1
+# Handoff — Terminal Slice 5: B+C done, A grill paused mid-Q1
 
-**Date:** 2026-07-22 · **Branch:** `terminal-slice-5-fleetstore` · **Design:**
+**Authored:** 2026-07-22 · **Updated:** 2026-07-23 · **Branch:**
+`terminal-slice-5-fleetstore` · **Design:**
 `docs/specs/2026-07-22-terminal-slice-5-fleet-membership-design.md`
+
+## START HERE (cold-boot for a new session)
+
+State on branch `terminal-slice-5-fleetstore` (nothing pushed, tree clean):
+- **B done** (`1bbcdef`) + **C done** (`2c12a91`, incl. an Opus flaky-test fix) +
+  compile-unblock (`9b5c541`) + docs (`c4d25e7`, `1826cc3`). Workspace compiles
+  and per-crate gates are green.
+- **A** = the risky `lens-terminal` lifecycle slice — **grill paused mid-Q1**
+  (Q1 below is the first thing to answer). A gates D.
+
+**Do next, in order:**
+1. **Answer Q1** (adoption shape — recommendation: unified `adopt()`) → finish A
+   grill **Q2–Q6** (queued below) → write A plan (TDD tasks).
+2. **Cross-family review of B + C together** — codex `gpt-5.6`, `codex exec
+   -s read-only` (NEVER via Cursor). Both composer-authored; review is MANDATORY
+   before any merge to main. Validate B's 4 + C's 3 judgment calls (each listed in
+   its section). Can run in background while the A grill resumes.
+3. Execute A (composer author + Opus supervision on the frozen seam) →
+   whole-branch review → live rider → land. Then **D** (needs A + B + C).
+
+Everything below is the full grounding; the grill skill (`userSettings:grilling`)
+governs Q-by-Q, one question at a time with a recommended answer.
 
 ## Execution decision (settled this session)
 
@@ -185,5 +208,5 @@ as an unchecked invariant. **I favor unified.**
 
 ## Commits on branch this session (all on `terminal-slice-5-fleetstore`)
 - `1bbcdef` B (core-surface) · `c4d25e7` docs · `9b5c541` compile-unblock ·
-  `2c12a91` C (fleet-membership). Nothing pushed. **B + C owe cross-family review
-  before any merge to main.**
+  `2c12a91` C (fleet-membership) · `1826cc3` docs (C landed + B+C review batched).
+  Nothing pushed. **B + C owe cross-family review before any merge to main.**
