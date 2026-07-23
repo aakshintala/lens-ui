@@ -534,12 +534,38 @@ impl RowStore {
         }
     }
 
+    fn move_row_entity(&mut self, from: &RowId, to: &RowId, cx: &mut App) {
+        if from == to {
+            return;
+        }
+        if let Some(entity) = self.entities.remove(from) {
+            // Visible chrome lives on `from`; drop any placeholder at `to`.
+            self.entities.remove(to);
+            entity.update(cx, |state, _| {
+                state.id = to.clone();
+            });
+            self.entities.insert(to.clone(), entity);
+        }
+    }
+
     fn rekey_section(&mut self, from: &SectionKey, to: &SectionKey, cx: &mut App) {
         if from == to {
             return;
         }
-        if let Some(node) = self.sections.remove(from) {
-            self.sections.entry(to.clone()).or_insert(node);
+        if let Some(from_node) = self.sections.remove(from) {
+            use std::collections::hash_map::Entry;
+            match self.sections.entry(to.clone()) {
+                Entry::Occupied(mut e) => {
+                    for child in from_node.children {
+                        if !e.get().children.contains(&child) {
+                            e.get_mut().children.push(child);
+                        }
+                    }
+                }
+                Entry::Vacant(e) => {
+                    e.insert(from_node);
+                }
+            }
         }
         for entry in &mut self.structure {
             if let StructureEntry::Section(key) = entry
@@ -548,8 +574,19 @@ impl RowStore {
                 *key = to.clone();
             }
         }
-        self.entities.remove(&from.chip_id());
-        self.entities.remove(&from.rail_id());
+        let from_chip = from.chip_id();
+        let from_rail = from.rail_id();
+        let to_chip = to.chip_id();
+        let to_rail = to.rail_id();
+        self.move_row_entity(&from_chip, &to_chip, cx);
+        self.move_row_entity(&from_rail, &to_rail, cx);
+        for id in &mut self.order {
+            if *id == from_chip {
+                *id = to_chip.clone();
+            } else if *id == from_rail {
+                *id = to_rail.clone();
+            }
+        }
         self.ensure_section_node(to, cx);
         self.rebuild_flat_order();
     }
