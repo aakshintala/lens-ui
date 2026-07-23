@@ -96,13 +96,17 @@ impl FleetStore {
         &mut self,
         session_id: &SessionId,
         terminal_key: &TerminalKey,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
-        if let Some(map) = self.terminals.get_mut(session_id) {
-            map.remove(&TerminalKeyId::from_key(terminal_key));
-            if map.is_empty() {
-                self.terminals.remove(session_id);
-            }
+        let removed = self
+            .terminals
+            .get_mut(session_id)
+            .and_then(|map| map.remove(&TerminalKeyId::from_key(terminal_key)));
+        if let Some(member) = removed {
+            end_member_tab(&member, cx);
+        }
+        if self.terminals.get(session_id).is_some_and(|m| m.is_empty()) {
+            self.terminals.remove(session_id);
         }
     }
 
@@ -124,11 +128,15 @@ impl FleetStore {
     }
 
     pub fn cascade_wake(&mut self, session_id: &SessionId, cx: &mut Context<Self>) {
-        let Some(map) = self.terminals.get(session_id) else {
+        let Some(map) = self.terminals.get_mut(session_id) else {
             return;
         };
-        for member in map.values() {
+        for member in map.values_mut() {
             if !member.hidden {
+                // Cancel any sleep deferred by an earlier `cascade_sleep` while this
+                // member was still transient — otherwise it would sleep under an awake
+                // session once it reaches Live (see `on_terminal_presentation_changed`).
+                member.pending_sleep = false;
                 member.tab.update(cx, |tab, cx| {
                     tab.on_host_event(TerminalHostEvent::Wake, cx);
                 });
@@ -136,8 +144,12 @@ impl FleetStore {
         }
     }
 
-    pub fn cascade_end(&mut self, session_id: &SessionId, _cx: &mut Context<Self>) {
-        self.terminals.remove(session_id);
+    pub fn cascade_end(&mut self, session_id: &SessionId, cx: &mut Context<Self>) {
+        if let Some(map) = self.terminals.remove(session_id) {
+            for member in map.into_values() {
+                end_member_tab(&member, cx);
+            }
+        }
     }
 
     pub fn on_memory_pressure(&mut self, pressure: MemoryPressure, cx: &mut Context<Self>) {
@@ -187,6 +199,12 @@ impl FleetStore {
         }
     }
 
+    /// Sleep hidden terminals idle past [`TERMINAL_IDLE_SLEEP_THRESHOLD_MS`].
+    ///
+    /// DRIVER DEFERRED (codex B+C review, finding 5): this is the policy body only.
+    /// No production ~30s periodic caller exists yet — FleetStore's terminal API has
+    /// no production driver until Slice 6/D, which must install the bounded periodic
+    /// tick (and the OS memory-warning source) when it wires the fleet in.
     pub fn idle_tick(&mut self, cx: &mut Context<Self>) {
         let now = self.clock().now_millis().max(0) as u64;
         let threshold = TERMINAL_IDLE_SLEEP_THRESHOLD_MS;
@@ -234,10 +252,17 @@ impl FleetStore {
             pending_sleep: false,
             _sub: sub,
         };
-        self.terminals
+        // Re-opening the same logical key replaces the tracked member. Tear the
+        // previous tab down so it can't linger with a live engine/transport outside
+        // fleet accounting (codex finding 3).
+        let previous = self
+            .terminals
             .entry(session_id)
             .or_default()
             .insert(key_id, member);
+        if let Some(previous) = previous {
+            end_member_tab(&previous, cx);
+        }
     }
 
     fn on_terminal_presentation_changed(
@@ -345,6 +370,15 @@ impl FleetStore {
     }
 }
 
+/// Host-driven teardown of a member's tab: releases the engine + transport so a
+/// caller-held entity clone cannot keep the runtime alive after the member is
+/// dropped from fleet accounting.
+fn end_member_tab(member: &TerminalMember, cx: &mut Context<FleetStore>) {
+    member.tab.update(cx, |tab, cx| {
+        tab.on_host_event(TerminalHostEvent::End, cx);
+    });
+}
+
 fn session_id_from_target(target: &TerminalTarget) -> SessionId {
     match target {
         TerminalTarget::Existing { session_id, .. }
@@ -355,6 +389,15 @@ fn session_id_from_target(target: &TerminalTarget) -> SessionId {
 fn terminal_key_from_target(target: &TerminalTarget) -> TerminalKey {
     match target {
         TerminalTarget::OpenOrCreate { key, .. } => key.clone(),
+        // PROVISIONAL (codex B+C review, finding 7): an `Existing` target has no
+        // logical key, so we synthesize one with an empty `session_key`. This is a
+        // private sentinel — the public `TerminalKey`-addressed APIs
+        // (`set_terminal_visible`/`close_terminal`) cannot round-trip it, so an
+        // `Existing`-opened terminal is not addressable by logical metadata today.
+        // No production path opens an `Existing` target via `FleetStore` yet; Slice
+        // 6 must replace this + the inner map key with an honest identity enum
+        // (`Existing(TerminalId) | Logical(TerminalKey)`) once its addressing API is
+        // concrete. Deferred to avoid premature layer-boundary binding.
         TerminalTarget::Existing { terminal_id, .. } => TerminalKey {
             terminal_name: terminal_id.to_string(),
             session_key: String::new(),
@@ -720,6 +763,52 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn cascade_wake_cancels_pending_sleep_for_visible_starting(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let clock = Arc::new(ManualUiClock::new(0));
+        let sid = SessionId::new("s1");
+        let key = test_key("main", "k1");
+        let target = test_target(&sid, &key);
+        let fleet = cx.update(|cx| FleetStore::new(clock, cx));
+
+        let starting_tab = cx.update(|cx| {
+            lens_terminal::open(
+                target,
+                Arc::new(Client::stub_for_test()),
+                TerminalOpenOptions::default(),
+                cx,
+            )
+        });
+        assert_eq!(
+            starting_tab.read_with(cx, |tab, _| tab.presentation().lifecycle),
+            Lifecycle::Starting
+        );
+
+        cx.update(|cx| {
+            fleet.update(cx, |store, cx| {
+                store.insert_terminal_for_test(sid.clone(), key.clone(), starting_tab.clone(), cx);
+                // Session sleeps while the terminal is still Starting → sleep is deferred.
+                store.cascade_sleep(&sid, cx);
+                // Session wakes again *before* attach completes → the deferred sleep must be
+                // cancelled, else the member sleeps under an awake session when it reaches Live.
+                store.cascade_wake(&sid, cx);
+            });
+        });
+
+        cx.read(|cx| {
+            let store = fleet.read(cx);
+            let member = store
+                .terminal_member_for_test(&sid, &key, cx)
+                .expect("member");
+            assert!(
+                !member.pending_sleep,
+                "cascade_wake must cancel a deferred cascade sleep for a visible member"
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn memory_pressure_warning_fraction_freed(cx: &mut gpui::TestAppContext) {
         let clock = Arc::new(ManualUiClock::new(0));
         let sid = SessionId::new("s1");
@@ -920,6 +1009,95 @@ mod tests {
                 store.cascade_end(&sid, cx);
                 assert_eq!(store.terminal_count_for_test(), 0);
             });
+        });
+    }
+
+    #[gpui::test]
+    async fn close_terminal_tears_down_the_tab(cx: &mut gpui::TestAppContext) {
+        let clock = Arc::new(ManualUiClock::new(0));
+        let sid = SessionId::new("s1");
+        let key = test_key("main", "k1");
+        let fleet = cx.update(|cx| FleetStore::new(clock, cx));
+        // Caller holds a strong entity clone (as the UI would) alongside the store's.
+        let (_engine, tab) = spawn_tab_with_rows(cx, 0);
+
+        cx.update(|cx| {
+            fleet.update(cx, |store, cx| {
+                store.insert_terminal_for_test(sid.clone(), key.clone(), tab.clone(), cx);
+                store.close_terminal(&sid, &key, cx);
+                assert_eq!(store.terminal_count_for_test(), 0);
+            });
+        });
+        cx.run_until_parked();
+
+        // The caller-held tab must be torn down — membership removal alone leaves the
+        // engine/transport alive on the lingering entity (codex finding 3).
+        cx.read(|cx| {
+            assert_eq!(
+                tab.read(cx).presentation().lifecycle,
+                Lifecycle::Ended,
+                "close_terminal must tear the tab down, not just drop the map entry"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn cascade_end_tears_down_each_tab(cx: &mut gpui::TestAppContext) {
+        let clock = Arc::new(ManualUiClock::new(0));
+        let sid = SessionId::new("s1");
+        let k1 = test_key("a", "k1");
+        let k2 = test_key("b", "k2");
+        let fleet = cx.update(|cx| FleetStore::new(clock, cx));
+        let (_e1, tab1) = spawn_tab_with_rows(cx, 0);
+        let (_e2, tab2) = spawn_tab_with_rows(cx, 0);
+
+        cx.update(|cx| {
+            fleet.update(cx, |store, cx| {
+                store.insert_terminal_for_test(sid.clone(), k1.clone(), tab1.clone(), cx);
+                store.insert_terminal_for_test(sid.clone(), k2.clone(), tab2.clone(), cx);
+                store.cascade_end(&sid, cx);
+                assert_eq!(store.terminal_count_for_test(), 0);
+            });
+        });
+        cx.run_until_parked();
+
+        cx.read(|cx| {
+            assert_eq!(tab1.read(cx).presentation().lifecycle, Lifecycle::Ended);
+            assert_eq!(tab2.read(cx).presentation().lifecycle, Lifecycle::Ended);
+        });
+    }
+
+    #[gpui::test]
+    async fn double_open_ends_the_previous_tab(cx: &mut gpui::TestAppContext) {
+        let clock = Arc::new(ManualUiClock::new(0));
+        let sid = SessionId::new("s1");
+        let key = test_key("main", "k1");
+        let fleet = cx.update(|cx| FleetStore::new(clock, cx));
+        let (_e1, first) = spawn_tab_with_rows(cx, 0);
+        let (_e2, second) = spawn_tab_with_rows(cx, 0);
+
+        cx.update(|cx| {
+            fleet.update(cx, |store, cx| {
+                store.insert_terminal_for_test(sid.clone(), key.clone(), first.clone(), cx);
+                // Re-open the same logical key: the prior member must be torn down, not
+                // silently replaced and leaked outside fleet accounting.
+                store.insert_terminal_for_test(sid.clone(), key.clone(), second.clone(), cx);
+                assert_eq!(store.terminal_count_for_test(), 1);
+            });
+        });
+        cx.run_until_parked();
+
+        cx.read(|cx| {
+            assert_eq!(
+                first.read(cx).presentation().lifecycle,
+                Lifecycle::Ended,
+                "re-opening a live key must end the previous tab"
+            );
+            assert_ne!(
+                second.read(cx).presentation().lifecycle,
+                Lifecycle::Ended,
+                "the replacement tab must stay live"
+            );
         });
     }
 

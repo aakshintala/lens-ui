@@ -385,6 +385,11 @@ pub enum TerminalHostEvent {
     /// detach that sets `reattach_available`). Reuses the retained engine when
     /// present; else a fresh attach.
     Reattach,
+    /// Host-driven close: the fleet is removing this terminal. Releases the
+    /// engine + transport (full teardown) and moves to [`Lifecycle::Ended`] so a
+    /// caller-held entity that outlives fleet membership cannot keep the runtime
+    /// alive. Terminal sink — no reattach, no wake.
+    End,
     /// Host response to a typed permission request emitted on [`TerminalEvent`].
     HostRequestResponse {
         id: HostRequestId,
@@ -655,6 +660,7 @@ impl TerminalTab {
             TerminalHostEvent::Sleep => self.on_sleep(cx),
             TerminalHostEvent::Wake => self.on_wake(cx),
             TerminalHostEvent::Reattach => self.on_reattach(cx),
+            TerminalHostEvent::End => self.on_host_end(cx),
             TerminalHostEvent::ResourceCreated {
                 session_id,
                 terminal_id,
@@ -1673,6 +1679,28 @@ impl TerminalTab {
         self.presentation.detached_detail = Some(detail);
         self.presentation.reattach_available = reattach_available;
         self.input_enabled = false;
+    }
+
+    /// Host-driven close (`TerminalHostEvent::End`). Fully releases the runtime
+    /// (engine + transport) and moves to the terminal [`Lifecycle::Ended`] sink so
+    /// a caller-held entity outliving fleet membership cannot keep resources alive.
+    /// Idempotent: safe from any state, including an already-torn-down tab.
+    fn on_host_end(&mut self, cx: &mut Context<Self>) {
+        if self.lifecycle == Lifecycle::Ended {
+            return;
+        }
+        self.reconnect_epoch = self.reconnect_epoch.wrapping_add(1);
+        self.adopt_in_flight = false;
+        self.clear_input_composition_state();
+        self.teardown_runtime_full(cx); // release engine + scrollback + transport
+        self.input_enabled = false;
+        self.presentation.output_gap = false;
+        self.presentation.reattach_available = false;
+        self.presentation.detached_detail = None;
+        self.lifecycle = Lifecycle::Ended;
+        self.presentation.lifecycle = Lifecycle::Ended;
+        cx.emit(TerminalEvent::PresentationChanged);
+        cx.notify();
     }
 
     fn on_detach(&mut self, detail: DetachedDetail, cx: &mut Context<Self>) {

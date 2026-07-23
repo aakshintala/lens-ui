@@ -694,6 +694,10 @@ fn apply_reduced_batch(
         ctx.catchup_accum.clear();
         ctx.snapshot_pending_inputs.extend(inputs);
     }
+    // Lifecycle/ownership control signals (`Superseded`, `TerminalResource`) must
+    // never ride the drop-capable diagnostic ring — collect them here and deliver
+    // them reliably via the backpressured send loop after the ring drain below.
+    let mut control_outcomes: Vec<ActorOutcome> = Vec::new();
     match ctx.output.mode {
         OutputMode::Detailed => {
             let had_snapshot = batch
@@ -701,7 +705,7 @@ fn apply_reduced_batch(
                 .any(|u| matches!(u, StreamUpdate::SnapshotRestored(_)));
             for u in batch.iter() {
                 if let Some(outcome) = feed::control_outcome_from_update(u) {
-                    ctx.ring.push(outcome);
+                    control_outcomes.push(outcome);
                 }
             }
             for u in coalesce(feed::feed_updates(batch)) {
@@ -729,7 +733,7 @@ fn apply_reduced_batch(
         OutputMode::Summary => {
             for u in batch.iter() {
                 if let Some(outcome) = feed::control_outcome_from_update(u) {
-                    ctx.ring.push(outcome);
+                    control_outcomes.push(outcome);
                 }
             }
             if ctx
@@ -745,6 +749,13 @@ fn apply_reduced_batch(
         }
     }
     drain_outcome_ring(ctx.ring, &ctx.output.outcomes);
+    // Reliable, ordered, bounded-backpressure delivery for lifecycle/ownership
+    // signals — matches the `Parked` precedent below. `send_blocking` blocks only
+    // while the foreground is behind (never drops); `Err` means the consumer is
+    // gone, which the feed sends above already surface by breaking the loop.
+    for outcome in control_outcomes {
+        let _ = ctx.output.outcomes.send_blocking(outcome);
+    }
     if let Some(reason) = disconnect_reason {
         let park = match reason {
             DisconnectReason::Unauthorized => ParkReason::Unauthorized,
@@ -2032,6 +2043,97 @@ mod tests {
         }
 
         handle.stop_and_join();
+    }
+
+    /// Poll for an outcome up to `dur`. Deadline-bounded so a buggy (old) build
+    /// fails cleanly instead of hanging on a control signal stuck in the ring.
+    fn recv_outcome_with_deadline(
+        rx: &async_channel::Receiver<ActorOutcome>,
+        dur: std::time::Duration,
+    ) -> Option<ActorOutcome> {
+        let deadline = std::time::Instant::now() + dur;
+        loop {
+            match rx.try_recv() {
+                Ok(o) => return Some(o),
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Err(_) => return None,
+            }
+        }
+    }
+
+    /// Finding 1 (codex B+C review): lifecycle/ownership control signals
+    /// (`Superseded`, `TerminalResource`) must reach the foreground reliably, not
+    /// ride the drop-capable diagnostic `OutcomeRing`. With a saturated outcome
+    /// channel, the old ring path left the second control signal stuck (its
+    /// `try_send` failed and no later batch re-drained the ring) so it was never
+    /// delivered. The reliable path must deliver it once the channel drains.
+    #[test]
+    fn control_outcome_survives_outcome_channel_backpressure() {
+        let dir = tempfile::tempdir().unwrap();
+        let stores = test_stores(dir.path());
+        seed_connection(&stores);
+
+        let (ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (_cmd_tx, cmd_rx) = crossbeam_channel::bounded(64);
+        let (feed_tx, _feed_rx) = async_channel::bounded(64);
+        // cap-1 outcome channel: the first control outcome saturates it, so the
+        // second deterministically exercises the backpressure/drop path.
+        let (out_tx, out_rx) = async_channel::bounded(1);
+
+        let join = std::thread::spawn(move || {
+            run(
+                fresh_state(),
+                ev_rx,
+                cmd_rx,
+                ActorOutput {
+                    feed: feed_tx,
+                    outcomes: out_tx,
+                    mode: OutputMode::Detailed,
+                },
+                stores,
+                test_clock(),
+                noop_api(),
+            );
+        });
+
+        // Two lifecycle control events → two control outcomes. The first fills the
+        // cap-1 channel; the second must not be dropped.
+        ev_tx
+            .send(ServerStreamEvent::Session(SessionEvent::Superseded {
+                conversation_id: "conv_a".into(),
+                target_conversation_id: "conv_b".into(),
+                reason: "clear".into(),
+            }))
+            .unwrap();
+        ev_tx
+            .send(ServerStreamEvent::Session(SessionEvent::ResourceCreated {
+                resource_id: "terminal_tui_main".into(),
+                resource_type: "terminal".into(),
+                terminal_name: Some("tui".into()),
+                session_key: Some("main".into()),
+            }))
+            .unwrap();
+
+        // Drain everything the actor manages to deliver; each drain unblocks any
+        // pending reliable send. The old ring path never re-drains the stuck signal.
+        let mut delivered = Vec::new();
+        while let Some(o) =
+            recv_outcome_with_deadline(&out_rx, std::time::Duration::from_millis(500))
+        {
+            delivered.push(o);
+        }
+        assert!(
+            delivered
+                .iter()
+                .any(|o| matches!(o, ActorOutcome::TerminalResource(_))),
+            "terminal-resource control signal must survive outcome-channel backpressure; got {delivered:?}"
+        );
+
+        drop(ev_tx);
+        drop(_cmd_tx);
+        join.join().unwrap();
     }
 
     #[test]
