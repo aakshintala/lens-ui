@@ -1,15 +1,36 @@
 # Terminal Slice 5 — Fleet membership + fleet policy (design)
 
 **Date:** 2026-07-22 · **Branch:** `terminal-slice-5-fleetstore` (off `main` after the
-Slices 0–4 landing `514f96b`) · **Status:** design, pre-plan.
+Slices 0–4 landing `514f96b`) · **Status:** design, **grilled + revised 2026-07-22**
+(decision ledger Q1–Q10 below), pre-plan.
 
-Slice 5 is the first **lens-ui/lens-core-hosted** terminal slice. Slices 0–4 delivered
-the whole `lens-terminal` module (transport, engine, render, interaction, lifecycle
-*mechanisms*) plus the standalone `lens-terminal-demo` rig. Slice 5 makes a terminal a
-**member of the existing `FleetStore`** and adds the **fleet-level policy** that only a
-fleet host can own: memory-pressure eviction, idle auto-sleep, `session.superseded`
-redirect, and the host→terminal resource-signal forwarding that closes Slice 4's
-`4404`-first deferral.
+Slice 5 makes a terminal a **member of the existing `FleetStore`** and adds the
+**fleet-level policy** that only a fleet host can own: memory-pressure eviction, idle
+auto-sleep, `session.superseded` redirect, and the host→terminal resource-signal
+forwarding that closes Slice 4's `4404`-first deferral. Slices 0–4 delivered the whole
+`lens-terminal` module (transport, engine, render, interaction, lifecycle *mechanisms*)
+plus the standalone `lens-terminal-demo` rig.
+
+**Not a pure "headless model/policy layer" any more.** Grilling established that two of the
+seven items — `4404`-first (§9) and the `session.superseded` retain-engine redirect (§10) —
+**cannot** be done by host-side FleetStore code forwarding signals; they require deliberate
+`lens-terminal` **lifecycle state-machine** changes on the `ReplacementWaiting`/adopt seam
+that Slice 4 froze. See sub-slice **A** (§3) — landed and whole-branch-reviewed *before* the
+FleetStore policy work builds on it.
+
+## Decision ledger (grill Q1–Q10, 2026-07-22)
+
+| # | Decision | Home |
+| --- | --- | --- |
+| Q1 | Visibility stamping is a real `FleetStore::set_terminal_visible(...)` seam **Slice 6 wires**; policy is dormant-by-construction until then. | §5, §12 |
+| Q2 | Just-opened terminal = `hidden=false`, `last_viewed=now`. `open_terminal` touches only the new member (no single-visible invariant). Only `set_terminal_visible` + cascade/policy flip `hidden`. | §5 |
+| Q3 | `OpenOrCreate` `4404`/`TerminalNotFound` → `ReplacementWaiting` (not hard `Detached`); `Existing` keeps hard-detach. This is a **lens-terminal lifecycle change** (sub-slice A). | §9 |
+| Q4 | Pressure Warning = **ordinal fraction-freed** (LRV coldest-first); Critical = sleep-all-hidden. RSS can't attribute per-terminal (wrong tool for selection/stop); OS source = Slice-6 seam. | §7 |
+| Q5 | Cascade Sleep = all owned; **Wake = non-hidden only**. `Starting`-race closed by `pending_sleep` on `TerminalMember`. Idle tick ~30s. | §6, §8 |
+| Q6–Q8 | Supersede = FleetStore **loads B headlessly** + moves member A→B + **drives `TerminalHostEvent::Transfer { new_session:B }`**. `session_key` **not** rekeyed (retained `TerminalId` ⇒ retained key). | §10 |
+| Q7 | **Retain the engine** across `/clear` (scrollback survives); de-risked (no double-feed). Retain iff `session_id` changed; same-session agent-switch stays **fresh**. | §9, §10 |
+| Q9 | Re-split into A/B/C/D (see §3). | §3 |
+| Q10 | Policy eligibility = **`hidden && Live`** — transient lifecycles exempt (never destroy a mid-supersede retained engine). | §7, §8 |
 
 ## 1. Scope
 
@@ -19,9 +40,9 @@ redirect, and the host→terminal resource-signal forwarding that closes Slice 4
 2. Session→terminal lifecycle **cascade** (Sleep/Wake/End/Supersede fan out to owned terminals).
 3. Fleet memory-pressure **LRV eviction** (Sleep-only; see §7).
 4. Terminal **idle auto-sleep** (~10 m hidden-idle).
-5. **`session.superseded` redirect** (sub-slice **5-super**): lens-core surface first, then FleetStore re-parents owned terminals into the target session.
-6. **Resource-signal forwarding + `4404`-first adoption reconciliation** (sub-slice **5-resource** + 5-main): lens-client models the `resource.created`/`resource.deleted` payload; FleetStore forwards it to the owning terminal and reconciles it against the co-arriving bridge close.
-7. **Scrollback-cap correctness fix** (bytes rename + real default) — folds in because it defines the LRV budget ceiling (§11).
+5. **`session.superseded` redirect**: FleetStore loads the target session B, re-parents A's owned terminals into B, and **drives a retain-engine `Transfer`** so scrollback survives `/clear` (§10).
+6. **Resource-signal forwarding + `4404`-first adoption reconciliation**: lens-client models the `resource.created`/`resource.deleted` payload; a **lens-terminal lifecycle change** (`OpenOrCreate` `4404` → `ReplacementWaiting`) lets the tab re-adopt regardless of the `4404`↔`resource.deleted` race; FleetStore forwards/drives the signals (§9).
+7. **Scrollback-cap correctness fix** (bytes rename + real default) — a **latent-bug fix** (bytes-not-lines), independent of the LRV budget (§11).
 
 **Out of scope → Slice 6:** any on-screen terminal tile in the real lens-ui board; production
 placement/focus/theming; live E2E through lens-ui; integrated in-app perf sanity check. The
@@ -77,28 +98,50 @@ as a SPEC-GAP; the nested map is shaped so it drops into that `Session` struct l
 `TerminalHostEvent::Sleep`:
 
 1. **Cascade (ownership):** session lifecycle fans *down* to its terminals — session Sleep →
-   Sleep terminals; Wake → Wake; End/Archive → tear down; **superseded (A→B) → re-parent
-   `session_id` A→B, engine retained**.
-2. **Independent fleet policy:** a *hidden* terminal is Slept on its own under memory pressure
-   (§7) or idle timeout (§8), **even while its parent session stays live**. The focused terminal
-   is never slept by policy.
+   Sleep **all** owned terminals; Wake → Wake **only non-hidden** owned terminals (Q5 — waking
+   hidden ones just re-inflates memory policy reclaimed); End/Archive → tear down; **superseded
+   (A→B) → load B + re-parent + retain-engine `Transfer`** (§10).
+2. **Independent fleet policy:** a *hidden, `Live`* terminal is Slept on its own under memory
+   pressure (§7) or idle timeout (§8), **even while its parent session stays live**.
+   **Non-hidden terminals are never policy-slept**, and policy eligibility is
+   **`hidden && Live`** (Q10) — transient lifecycles (`Starting`, `ReplacementWaiting`,
+   `Reconnecting`) are exempt so policy never destroys a mid-supersede retained engine.
 
-## 3. Sub-slice decomposition
+**Cascade/`Starting` race (Q5):** `on_sleep` only fires from `Live | Reconnecting |
+ReplacementWaiting`, so a terminal caught in `Starting` when a Sleep cascade arrives would
+silently ignore it and come up `Live` under a slept session — a **leak** neither policy path
+reaps (both gate on `hidden==true`, and it opened `hidden=false`). Fix: `TerminalMember` carries
+`pending_sleep: bool`; a cascade Sleep against a not-yet-sleepable tab sets it instead of firing,
+and FleetStore's existing `TerminalEvent` subscription applies the deferred `Sleep` on the next
+transition into a sleepable state. Cleared on show/focus (`set_terminal_visible(true)`) and on
+End/Archive teardown.
 
-Built and reviewed as three coordinated sub-slices (workstream discipline: composer-2.5 author,
-≥1 cross-family review per seam, TDD, frequent commits).
+## 3. Sub-slice decomposition (re-split, Q9)
 
-| Sub-slice | Layers | Deliverable |
-| --- | --- | --- |
-| **5-super** | lens-client (done) → lens-core → lens-ui | `session.superseded` surfaced as an actor control outcome; FleetStore re-parents owned terminals into the target session. (T-0/transcript is now on `main`; its landing left the `folds.rs` Superseded arm untouched — no merge coordination needed.) |
-| **5-resource** | lens-client → lens-core | Model the `resource.created` payload (`terminal_id`/`terminal_name`/`session_key`) + surface `resource_id`+`session_id` on delete; forward both as actor control outcomes. Prerequisite for forwarding + `4404`-first. |
-| **5-main** | lens-ui `FleetStore` (+ small lens-terminal API fix) | Membership, cascade, pressure LRV, idle auto-sleep, resource-signal forwarding, `4404`-first reconciliation, scrollback-cap fix. |
+Built and reviewed as four coordinated sub-slices (workstream discipline: composer-2.5 author,
+≥1 cross-family review per seam, TDD, frequent commits). Re-split from the original
+`5-super`/`5-resource`/`5-main` because grilling surfaced two `lens-terminal` **lifecycle**
+changes that must be isolated + whole-branch-reviewed *before* FleetStore builds on them.
 
-Build order: **5-super and 5-resource first** (both are lens-core/client surface changes 5-main
-consumes), then 5-main. 5-super and 5-resource are independent of each other and can be built in
-either order / parallel.
+| Sub-slice | Layer | Deliverable | Proof |
+| --- | --- | --- | --- |
+| **A · terminal-lifecycle** | lens-terminal | • `OpenOrCreate` `4404`/`TerminalNotFound` → `ReplacementWaiting` (not hard `Detached`) **[Q3]**<br>• `enter_replacement_waiting` → transport-only teardown, **retain frozen engine** **[Q7]**<br>• cross-session re-attach op + `TerminalHostEvent::Transfer { new_session }`; retain engine iff `session_id` changed **[Q7]**<br>• scrollback-cap fix **[§11]** | unit + demo-driven host events; **whole-branch review** (S4 `ReplacementWaiting`/adopt/bridge seam) |
+| **B · core-surface** | lens-client + lens-core | • lens-client: extend `ResourceCreated` payload + surface `ResourceDeleted` `session_id`<br>• `Superseded` fold → `StreamUpdate::Superseded` → `ActorOutcome::Superseded`<br>• `TerminalResource{Created,Deleted}` fold → `ActorOutcome::TerminalResource`<br>• persisted-item path (`reduce/mod.rs map_item`) **only if D needs it** (see §10) | reducer + actor + parse tests |
+| **C · fleet-membership** | lens-ui `FleetStore` (self-contained) | • nested membership, `open_terminal`, `set_terminal_visible`, visible-on-open **[Q1/Q2]**<br>• lightweight `retained_bytes_estimate()` accessor (2 atomics)<br>• cascade Sleep-all / **Wake-non-hidden** + `pending_sleep` **[Q5]**<br>• pressure Warning=fraction-freed / Critical=all-hidden **[Q4]**<br>• idle auto-sleep, ~30s tick **[Q8/Q5]** | headless FleetStore tests (`ManualUiClock` + `open_with_engine_for_test`) — **no dep on A/B** |
+| **D · fleet-integration** | lens-ui `FleetStore` (cross-layer) | • resource-signal forwarding to owned terminals<br>• `4404`-first reconciliation driving **[Q3]**<br>• supersede: load B headlessly + move member A→B + drive `Transfer` **[Q6/Q7]** | injected-outcome tests + **live riders** (supersede scrollback, `4404`-first ordering); **whole-branch review** (actor-outcome + terminal-event cross-seam) |
 
-## 4. lens-core / lens-client surfaces (5-super, 5-resource)
+**Build order:** `A ∥ B ∥ C` (all independent — A/B are producer crates; C tests entirely against
+`open_with_engine_for_test`), then **D** (needs A + B + C). Live riders after D.
+
+```
+   ┌─ A (terminal-lifecycle) ─┐
+   ├─ B (core-surface) ───────┤   independent, parallel
+   └─ C (fleet-membership) ───┘
+                              ▼
+              D (fleet-integration) → live riders
+```
+
+## 4. lens-core / lens-client surfaces (sub-slice B)
 
 ### 4.1 Control-outcome channel
 
@@ -113,7 +156,7 @@ ActorOutcome::TerminalResource(TerminalResourceSignal)   // Created{…} | Delet
 
 The reducer already sees `SessionEvent::Superseded { conversation_id, target_conversation_id,
 reason }` (lens-client models it fully at `stream/event.rs:88`) but folds it to nothing
-(`folds.rs:135`). 5-super emits a value-carrying `StreamUpdate::Superseded { … }`; the actor
+(`folds.rs:135`). B emits a value-carrying `StreamUpdate::Superseded { … }`; the actor
 (`actor/feed.rs`) maps that StreamUpdate to the `ActorOutcome::Superseded` control outcome.
 
 **Routing to FleetStore:** the store-level hook already exists (transcript work) — the poller
@@ -123,12 +166,12 @@ the two new control outcomes attach to the **same outcome arm** via a new store 
 (`FleetStore::on_session_control(id, signal)`), leaving `apply_transport` and the card-bound
 outcomes untouched. No new routing plumbing — just a new match arm + store method.
 
-### 4.2 Resource-event modeling (5-resource)
+### 4.2 Resource-event modeling (sub-slice B)
 
 lens-client parses `session.resource.created` as a **bare marker** today (`event.rs:68`, no
 payload) and discards `session_id` on delete. Per memory `terminal-resource-event-granularity`,
 omnigent 0.5.1 `resource.created` carries the full resource + key; `.deleted` carries only the id.
-5-resource:
+Sub-slice B:
 
 - Extend `SessionEvent::ResourceCreated` to carry `{ resource_id, resource_type, terminal_name,
   session_key }` (parse the resource object; `terminal_*` present only when
@@ -143,16 +186,35 @@ The `TerminalResourceSignal` payload is shaped to feed `TerminalHostEvent::Resou
 session_id, terminal_id, terminal_name, session_key }` / `ResourceDeleted { terminal_id }`
 directly (the host event already exists, Slice 4). Map `resource_id → TerminalId`.
 
-## 5. FleetStore terminal membership (5-main)
+**Persisted-item path (open, resolve in D planning):** resource events are also persisted as
+`resource_event` conversation items, which today fold to the valueless `ResourcesChanged` marker
+(`reduce/mod.rs` `map_item → None`). This *only* matters if D discovers B's transferred terminal
+via B's **snapshot** rather than via the FleetStore-driven `Transfer` (§10). Since Q8 drives the
+`Transfer` from the `superseded` event directly, the item path is likely **unnecessary** — add the
+`map_item` extension to B only if D's plan actually depends on it.
+
+## 5. FleetStore terminal membership (sub-slice C)
 
 - **Open/register:** `FleetStore::open_terminal(target: TerminalTarget, options, host)` calls
   `lens_terminal::open(...)`, wraps the returned `Entity<TerminalTab>` in a `TerminalMember`, and
   inserts it under `terminals[session_id][terminal_key]` (creating the inner map on first
   terminal for that session), then subscribes to its `TerminalEvent` stream. `session_id` comes
-  from the `TerminalTarget`. Tests use the `open_with_engine_for_test` seam (no live transport).
-- **Visibility / LRV stamping:** focusing or showing a terminal stamps `last_viewed = clock.now`
-  and clears `hidden`; blurring/hiding sets `hidden`. LRV order = ascending `last_viewed` over
-  `hidden == true` members, flattened across all sessions' inner maps.
+  from the `TerminalTarget`. **A just-opened terminal is `hidden=false`, `last_viewed=clock.now`
+  (Q2)** — open is an explicit host action, so the user is about to use it. `open_terminal`
+  **touches only the new member** — showing a second terminal in a session does *not* background
+  the first; whether that becomes a single-visible invariant is Slice-6 tab-UI (Q2). Tests use the
+  `open_with_engine_for_test` seam (no live transport).
+- **Visibility / LRV stamping — the Slice-6 seam (Q1):** `FleetStore::set_terminal_visible(
+  session_id, terminal_key, visible)` stamps `last_viewed = clock.now` + clears `hidden` (true) or
+  sets `hidden` (false). **This is the one method Slice 6's board tile will call** — the analogue of
+  the board's existing `apply_visibility_gate → SessionCardView::set_visible`. Until Slice 6 calls
+  it, every member stays `hidden=false`, so pressure/idle policy is **dormant-by-construction**
+  (nothing is eligible). Exercised in Slice 5 via tests + a demo chord only. LRV order = ascending
+  `last_viewed` over `hidden == true` members, flattened across all sessions' inner maps.
+- **Estimate accessor:** LRV reads a new lightweight `EngineHandle::retained_bytes_estimate()`
+  (2 atomic loads) rather than cloning a full `EngineInspect` per member per tick. The estimate is
+  maintained by the worker unconditionally (no `set_inspect_enabled` needed); it is ordinal, stale
+  ≤16 ms, 0 until first sample, and undercounts alt-screen — all tolerable for ordinal LRV.
 - **Close:** removing a member drops the entity (Slice-1b teardown is off-foreground/panic-free)
   and unsubscribes.
 
@@ -165,10 +227,10 @@ A session-lifecycle signal fans out to `terminals.get(&session_id)` — the sess
 
 | Session signal | Fan-out to owned terminals |
 | --- | --- |
-| Sleep (seam / user) | `TerminalHostEvent::Sleep` |
-| Wake | `TerminalHostEvent::Wake` |
-| End / Archive | tear down + remove member |
-| Superseded (A→B) | move the inner terminal map A→B (§10), **no** Sleep — engine retained |
+| Sleep (seam / user) | `TerminalHostEvent::Sleep` to **all** owned (whole session dormant). Not-yet-sleepable (`Starting`) → set `pending_sleep` (Q5). |
+| Wake | `TerminalHostEvent::Wake` to **non-hidden** owned only (Q5) — hidden ones stay `Sleeping` (waking them just re-inflates memory policy reclaimed). |
+| End / Archive | tear down + remove member (clears `pending_sleep`). |
+| Superseded (A→B) | load B + move member A→B + drive retain-engine `Transfer` (§10) — **no** Sleep, scrollback retained. |
 
 The **session-sleep trigger itself stays a seam** (the existing no-op `FleetStore::wake_session`
 class): Slice 5 builds the *fan-out*, exercised in tests via an explicit "session slept/woke"
@@ -182,64 +244,118 @@ disconnect tabs" collapses to **one runtime lever: Sleep** (full engine + scroll
 final viewport retained, explicit reattach — Slice-4 `Sleep`). Warning and critical differ only
 in aggression:
 
-- **`MemoryPressure::Warning`** — Sleep hidden terminals in LRV order until estimated retained
-  bytes fall under a soft budget (tunable; provisional target derived from the fleet estimate).
-- **`MemoryPressure::Critical`** — Sleep **all** hidden terminals.
-- The **focused terminal is never slept** by pressure. If only the focused terminal remains and
-  pressure persists, Slice 5 does nothing further (never silently drops PTY bytes; keeping the
-  active tab connected is the spec's last-resort rule; true byte-trim stays the parked FFI
-  conditional).
+- **`MemoryPressure::Warning { free_fraction }`** (Q4) — Sleep **eligible** terminals in LRV order
+  (coldest `last_viewed` first) until `free_fraction` of the eligible-set estimate-sum is freed.
+  The fraction is an **explicit input** snapshotted at call time, *not* a self-referential
+  "budget derived from the fleet estimate" (that was circular / arbitrary). Selection **and** stop
+  live in ordinal estimate-space, which the ordinal estimate supports.
+- **`MemoryPressure::Critical`** — Sleep **all** eligible terminals.
+- **Eligibility = `hidden && Live` (Q10).** Non-hidden terminals are never policy-slept; transient
+  lifecycles (`Starting`, `ReplacementWaiting`, `Reconnecting`) are exempt so pressure never
+  destroys a mid-supersede **retained engine** (§10). If only non-hidden terminals remain and
+  pressure persists, Slice 5 does nothing further (never silently drops PTY bytes; keeping visible
+  tabs connected is the last-resort rule; true byte-trim stays the parked FFI conditional).
 
-**Signal source is a seam.** No `macOS didReceiveMemoryWarning` hook exists in the tree. Slice 5
-adds `FleetStore::on_memory_pressure(level)` driven by tests + a demo chord; wiring it to a real
-OS memory-warning source is Slice 6 / lens-app.
+**Why not RSS (Q4):** RSS is a *process-global* scalar — it cannot attribute memory to a specific
+terminal, which is exactly what selection ("which one?") and the stop condition ("freed enough?")
+need; and freed heap doesn't promptly return to the OS, so an RSS control loop lags and
+over-evicts. RSS is the right tool only for the *trigger* ("are we under pressure?"), which is the
+Slice-6 seam below. True per-terminal *bytes* would come from the parked libghostty byte-accounting
+FFI, never from RSS.
 
-**LRV ordering** uses the per-terminal **`retained_bytes_estimate`** (read live via `EngineInspect`,
-Slice 3) to pick which hidden terminals to sleep and to measure "under budget". Estimate is
-ordinal-reliable (Slice-3 Job B), which is all LRV needs.
+**Signal source is a seam.** No `macOS didReceiveMemoryWarning` / `DISPATCH_SOURCE_TYPE_MEMORYPRESSURE`
+hook exists in the tree. Slice 5 adds `FleetStore::on_memory_pressure(Warning{free_fraction} |
+Critical)` driven by tests + a demo chord (fraction supplied directly → deterministic); wiring it
+to a real OS memory-warning source — which decides what a real warning maps to — is Slice 6 / lens-app.
+
+**LRV ordering** uses the per-terminal ordinal **`retained_bytes_estimate`** (via the lightweight
+accessor, §5) to pick which eligible terminals to sleep and to measure "freed enough". Ordinal
+reliability (Slice-3 Job B) is all LRV needs.
 
 ## 8. Terminal idle auto-sleep
 
-A hidden terminal idle for a threshold (provisional ~10 m; STATUS open decision) auto-sleeps.
-Driven off `FleetStore`'s `clock`: a periodic idle tick compares `clock.now − last_viewed`
-against the threshold for each `hidden` member and Sleeps those over it. Deterministic under
-`ManualUiClock`. The focused terminal never idle-sleeps (its `last_viewed` is continuously
-refreshed while focused). Independent of the session's own idle/auto-sleep (deferred).
+A `hidden && Live` terminal idle for a **threshold** (provisional ~10 m; STATUS open decision)
+auto-sleeps. Driven off `FleetStore`'s `clock`: a periodic idle **tick** (cadence ~30 s — the
+threshold is minutes-scale, so no finer granularity is needed; distinct from the threshold)
+compares `clock.now − last_viewed` against the threshold for each **eligible** (`hidden && Live`,
+Q10) member and Sleeps those over it. Deterministic under `ManualUiClock` (advance clock + fire
+tick). Non-hidden terminals never idle-sleep (their `last_viewed` is refreshed on show/focus).
+Independent of the session's own idle/auto-sleep (deferred).
 
-## 9. Resource-signal forwarding + `4404`-first reconciliation
+## 9. Resource-signal forwarding + `4404`-first reconciliation (sub-slices A + D)
 
-**Forwarding:** on `ActorOutcome::TerminalResource(_)` for a session, `FleetStore` forwards it as
-`TerminalHostEvent::ResourceCreated/Deleted` to **every owned terminal in that session** (the tab
-filters to its own identity — Slice-4 contract). This is the "host forwards resource-generation
-signals" seam the generation guard + adoption were built against.
+**Forwarding (D):** on `ActorOutcome::TerminalResource(_)` for a session, `FleetStore` forwards it
+as `TerminalHostEvent::ResourceCreated/Deleted` to **every owned terminal in that session** (the
+tab filters to its own identity — Slice-4 contract).
 
-**`4404`-first reconciliation (closes the Slice-4 deferral):** the bridge close (a `4404` on
-agent reset, surfaced tab-side) and the host `resource.deleted` arrive on **independent
-transports**. Slice 4 fixed the *clobber* direction but left the case where a `4404` lands
-*before* `resource.deleted` on an `OpenOrCreate` reset → the tab goes `Detached` without
-re-adopting the successor. `FleetStore` is the single component that sees **both** the terminal's
-`TerminalEvent` (bridge/lifecycle) and the session's resource control outcomes, so it owns the
-ordering: it forwards the `resource.deleted`/`resource.created` pair to the tab so the tab's
-existing generation guard + `ReplacementWaiting` adoption fires regardless of which transport
-won the race. The exact reconciliation rule (buffer window vs. idempotent re-drive) is a plan
-decision; the tab's adoption machinery already exists — Slice 5 only guarantees the host delivers
-the resource signals in a form the tab can act on.
+**`4404`-first needs a lens-terminal LIFECYCLE change (Q3) — forwarding alone is insufficient.**
+Grilling verified the Slice-4 framing was wrong: once a `4404` lands *first*, the tab is already
+`Detached` (`apply_bridge_event` → `on_detach(TerminalGone)`, engine torn down), and in `Detached`
+`on_resource_signal` is a `_ => None` **no-op** — forwarding `resource.deleted`/`resource.created`
+afterward does nothing (`saw_delete` never set, `adopt_successor` never called; the only exit from
+`Detached` is `on_reattach`, gated to `ClientDetached`/4405). And `FleetStore` is **not** in the
+bridge path — the tab self-detaches autonomously — so the host cannot reorder the race.
 
-The **real ordering proof** is an opt-in live rider (P7/P8 class, needs live omnigent); the
-deterministic host-forwarding + reconciliation logic is unit-tested with injected outcomes. The
-standalone demo cannot synthesize the co-emitted `4404`, so it does not reproduce the race — same
-constraint documented in Slice 4.
+Fix (sub-slice A): for an `OpenOrCreate` target, a `4404`/`TerminalNotFound` bridge close enters
+**`ReplacementWaiting`** (the terminal is defined by its key and *will* be recreated), **not** hard
+`Detached`. `Existing` targets (key `None`, non-recreatable) keep hard-detach. Then **both** race
+orders — `4404`-first and `resource.deleted`-first — converge on `ReplacementWaiting`, and the
+subsequent matching `resource.created` adopts via the existing `AdoptSuccessor` path. The
+replacement timeout still bounds the wait. This is a deliberate deviation from Slice 4's frozen
+state machine and gets **A's whole-branch review**.
 
-## 10. `session.superseded` redirect (5-super)
+The **real ordering proof** is an opt-in live rider (P7/P8 class, needs live omnigent, sub-slice D);
+the deterministic forwarding + the tab lifecycle transition are unit-tested (both orders → adoption
+fires). The standalone demo cannot synthesize the co-emitted `4404`, so it does not reproduce the
+race — same constraint documented in Slice 4.
 
-On `ActorOutcome::Superseded { target_conversation_id, reason }` for session **A**, `FleetStore`
-moves A's inner terminal map to session **B** (`terminals.remove(&A)` → merge into
-`terminals[B]`), **retaining each engine** (the server moved the same PTY / `TerminalId` into B —
-spec lines 343–345). No Sleep, no fresh engine. Subsequent cascade/forwarding for B then reaches
-the re-parented terminals. Whether a terminal must re-key its `session_key` (part of its inner
-`TerminalKey`) on the move, or the redirect is transparent at the WS layer, is a plan decision to
-verify against the live contract (`reason` is currently always `"clear"`); if the key changes,
-the inner-map entry is re-inserted under the new `TerminalKey` during the move.
+## 10. `session.superseded` redirect (sub-slices A + D)
+
+**Ground truth (verified against omnigent 2026-07-22 — memory
+`terminal-supersede-vs-agentswitch-semantics`):** `/clear` rotates conversation **A** to a
+**brand-new** conversation **B**; the server **`transfer`s the terminal live** (same
+`terminal_id`, tmux pane keeps running, only the owning session changes). It emits, in order,
+`session.resource.deleted` on **A**, `session.resource.created` on **B** (same id), then
+`session.superseded { target: B, reason: "clear" }` on **A** — all persisted. A stays alive but
+loses the terminal + runner binding. omnigent's own web-app **auto-follows** (aborts A, binds B);
+it does *not* keep streaming A. So a client **must load B** to keep the (live, transferred)
+terminal — it cannot stay on A, and it cannot re-parent into a session that isn't loaded.
+
+**FleetStore handling (D), on `ActorOutcome::Superseded { target_conversation_id: B, .. }`:**
+
+1. **Load B headlessly** — adopt B as a live `FleetStore` session (poller + membership + card) so
+   B's control outcomes route and cascade reaches the terminal. (The *view* auto-follow — focus
+   moving to B — stays Slice 6; Slice 5 only makes B reachable.) Verify in planning that the
+   existing session-open path accepts "load B now" cleanly; if session-loading is UI-entangled,
+   the terminal follow slips to Slice 6.
+2. **Move the member** `terminals[A][key] → terminals[B][key]`. `session_key` is **not** rekeyed —
+   a retained `TerminalId` implies a retained `(terminal_name, session_key)`, so the inner
+   `TerminalKey` is unchanged and cannot collide with B's own terminals (session-scoped keys).
+3. **Drive a retain-engine `Transfer`** (Q7/Q8): send `TerminalHostEvent::Transfer { new_session:
+   B }` to the moved tab, which re-attaches under B keeping the **frozen engine** — so scrollback
+   survives `/clear` (the user can scroll back past the clear).
+
+**Retain-engine is a deliberate lens-terminal change (A), and it's de-risked.** A's delete drives
+the tab to `ReplacementWaiting`; **`enter_replacement_waiting` uses transport-only teardown** (keep
+the engine frozen) *instead of* today's `teardown_runtime_full`, because the delete precedes the
+`superseded` event — the engine must survive until `Transfer` arrives. `Transfer` reuses the
+existing engine-retaining reconnect machinery (`teardown_transport_off_foreground` +
+`on_reconnect_success`, retargeting `current_session = B`). **No double-feed:** the attach contract
+is a current-screen clear+redraw with *no byte-replay* (`docs/spikes/2026-07-15-pty-attach-contract.md`),
+and `engine/reconnect_seed.rs` tests already prove a retained engine + re-attach does not duplicate
+scrollback.
+
+**Retain vs. fresh discriminator = `session_id`-changed (Q7):** the tab retains the frozen engine
+through `ReplacementWaiting` unconditionally, then at adopt time — **`session_id` changed
+(cross-session) → reuse engine (supersede)**; **same `session_id` → fresh engine (in-session
+agent-switch)**. Agent switch `kill-server`s the pane server-side (omnigent), so its scrollback
+would describe a *dead* program — fresh is correct; and its successor create arrives next-turn,
+past the 30 s `REPLACEMENT_WAIT`, so it naturally times out → fresh. The two cases can't be
+confused. Same-session agent-switch keeps today's Slice-4 fresh-engine behavior.
+
+The **real proof** is an opt-in live rider (supersede scrollback preserved, sub-slice D). The demo
+can exercise `Transfer` via a direct host-event chord but cannot synthesize the real
+delete-then-superseded ordering.
 
 ## 11. Scrollback-cap correctness fix
 
@@ -249,8 +365,9 @@ memory `terminal-max-scrollback-bytes-and-worker-stack`). So the default is ~100
 rows** at 80 cols, and the public field `TerminalOpenOptions.scrollback_lines` feeds a "lines"
 number straight into a bytes parameter.
 
-Fix (folds into 5-main because it defines the LRV budget ceiling and makes cap/estimate/budget all
-byte-coherent):
+Fix (sub-slice A — same crate; a **latent-bug fix**, *not* budget-defining. Q4 made the Warning
+budget ordinal fraction-freed, so there is no absolute byte ceiling for it to define; the 10 MB is
+a per-terminal **cap**, not a preallocation, and the aggregate is managed by policy):
 
 - Rename public `TerminalOpenOptions::scrollback_lines` → `scrollback_bytes`
   (`#[non_exhaustive]` + `with_scrollback_bytes` setter; lens-ui is the only consumer, on-branch).
@@ -261,50 +378,72 @@ byte-coherent):
 
 | Concern | Slice 5 | Driven by |
 | --- | --- | --- |
-| Terminal membership / LRV / cascade fan-out | **built real** | tests + demo |
-| Pressure LRV eviction (Sleep-only) | **built real** | `on_memory_pressure(level)` seam (test/demo chord) |
-| Idle auto-sleep | **built real** | `ManualUiClock` tick (test) / demo |
-| Resource forwarding + `4404`-first reconciliation | **built real** | injected control outcomes (test) + live rider (real ordering) |
-| Superseded redirect | **built real** | injected `Superseded` outcome (test) + live rider |
+| Terminal membership / LRV / cascade fan-out | **built real** (C) | tests + demo |
+| **Terminal visibility (`hidden`/`last_viewed`)** | **seam `set_terminal_visible` (C)** — **Slice 6 wires** | test/demo chord (Q1) |
+| Pressure LRV eviction (Sleep-only, `hidden && Live`) | **built real** (C) | `on_memory_pressure(Warning{free_fraction}\|Critical)` seam (test/demo chord) |
+| Idle auto-sleep (~30 s tick, `hidden && Live`) | **built real** (C) | `ManualUiClock` tick (test) / demo |
+| `4404`-first: `OpenOrCreate` → `ReplacementWaiting` **lifecycle change** | **built real** (A) | unit + demo host events; live rider (real race) |
+| Resource forwarding + `4404`-first driving | **built real** (D) | injected control outcomes (test) + live rider |
+| Supersede: load B + move member + retain-engine `Transfer` | **built real** (A+D) | injected `Superseded` (test) + live rider (scrollback) |
 | Session-sleep **trigger** | seam (existing no-op class) | explicit "session slept" signal (test/demo) |
 | OS memory-warning **source** | seam | Slice 6 / lens-app |
+| **View auto-follow to B on supersede** (focus moves) | **not built** | Slice 6 |
 | On-screen terminal tile | **not built** | Slice 6 |
 
 ## 13. Testing strategy
 
-- **lens-core:** reducer tests for `StreamUpdate::Superseded` + `StreamUpdate::TerminalResource*`;
-  actor tests that the mapped `ActorOutcome` control variants emit.
-- **lens-client:** parse tests for the `resource.created` payload + `resource.deleted` `session_id`.
-- **lens-ui (`FleetStore`, headless, `ManualUiClock` + `open_with_engine_for_test`):**
-  membership register/close; LRV ordering; cascade fan-out per signal; pressure Warning/Critical
-  Sleep selection (focused exempt, budget honored); idle auto-sleep threshold; resource-signal
-  forwarding to the right owned terminals; `4404`-first reconciliation (both transport orders →
-  adoption fires); superseded re-parent (engine retained, subsequent signals reach B).
-- **Live riders (opt-in, live omnigent):** superseded redirect + `4404`-first real ordering
-  (P7/P8 class). Not in the headless gate.
+- **A · lens-terminal (unit + demo):** `OpenOrCreate` `4404` → `ReplacementWaiting` (both race
+  orders → `AdoptSuccessor` fires); `enter_replacement_waiting` retains the engine (transport-only
+  teardown — update the existing `runtime.is_none()` assertion); `Transfer` re-attaches under a new
+  `session_id` reusing the frozen engine (retain iff `session_id` changed, fresh if same); the
+  `reconnect_seed` no-double-feed invariants extend to the `Transfer` path; scrollback-cap
+  bytes/default.
+- **B · lens-core / lens-client:** reducer tests for `StreamUpdate::Superseded` +
+  `StreamUpdate::TerminalResource*`; actor tests that the mapped `ActorOutcome` variants emit;
+  parse tests for the `resource.created` payload + `resource.deleted` `session_id`.
+- **C · lens-ui (`FleetStore`, headless, `ManualUiClock` + `open_with_engine_for_test`):**
+  membership register/close; visible-on-open; `set_terminal_visible` stamping; LRV ordering;
+  cascade Sleep-all / **Wake-non-hidden**; `pending_sleep` deferred sleep (`Starting` → Live);
+  pressure Warning fraction-freed / Critical all (**`hidden && Live` eligibility**, non-hidden +
+  transient exempt); idle threshold + ~30 s tick.
+- **D · lens-ui (cross-layer):** resource forwarding to the right owned terminals; `4404`-first
+  driving (both orders → adoption fires); supersede load-B + member move + `Transfer` (engine
+  retained, subsequent signals reach B, `session_key` unchanged).
+- **Live riders (opt-in, live omnigent, sub-slice D):** supersede scrollback-survives-`/clear` +
+  `4404`-first real ordering (P7/P8 class). Not in the headless gate.
+- **Reviews:** whole-branch on **A** (S4 `ReplacementWaiting`/adopt/bridge seam) and **D**
+  (actor-outcome + terminal-event cross-seam), per the "new handler sharing state" discipline.
 - **Gate:** `cargo run -p xtask -- gate` (workspace clippy `-D warnings` + fmt + tests). No new
   real-window harness needed (no rendering in Slice 5).
 
 ## 14. Risks & coordination
 
-- **T-0 merge collision (5-super): RESOLVED.** T-0/transcript is now merged into `main` (this
-  branch is rebased on it), and its landing left the `folds.rs` `Superseded` arm untouched, so
-  5-super edits that block on top of the landed version — no coordination, no conflict.
-- **Actor control routing:** the fleet-level store hook already exists (`fold_session_feed` /
-  `apply_transport`, poller holds `WeakEntity<FleetStore>`). Adding the new control arm +
-  `on_session_control` must not perturb the card-bound outcome path or the focused-replica
-  routing (existing coalescing/decay + reconcile-epoch tests must stay green).
-- **Live-contract unknowns (verify in the rider, don't invent):** whether superseded re-keys
-  `session_key`; the exact `4404`↔`resource.deleted` interleaving on a real reset. The design
-  keeps both behind the tab's existing (live-proven) generation-guard/adoption machinery, so
-  Slice 5 forwards signals rather than re-implementing lifecycle.
+- **T-0 merge collision (sub-slice B): RESOLVED.** T-0/transcript is merged into `main` (this branch
+  is rebased on it), and its landing left the `folds.rs` `Superseded` arm untouched — B edits that
+  block on top of the landed version, no coordination, no conflict.
+- **Two deliberate `lens-terminal` lifecycle changes (A) on the S4-frozen seam.** `OpenOrCreate`
+  `4404` → `ReplacementWaiting` (§9) and the retain-engine transport-only teardown + `Transfer`
+  (§10) both touch the `ReplacementWaiting`/adopt/bridge state machine — the exact seam where S4's
+  whole-branch review caught the bridge-clobber Critical. Isolated in A, landed + whole-branch
+  reviewed + live-ridden **before** C/D build on it.
+- **Actor control routing (D):** the fleet-level store hook already exists (`fold_session_feed` /
+  `apply_transport`, poller holds `WeakEntity<FleetStore>`). The new control arm + `on_session_control`
+  must not perturb the card-bound outcome path or focused-replica routing (existing coalescing/decay
+  + reconcile-epoch tests stay green).
+- **Headless load-of-B (D):** supersede requires FleetStore to adopt a brand-new session B mid-stream
+  (poller + membership + card). Verify in D planning that the existing session-open path accepts this
+  cleanly; if it's UI-entangled, the terminal follow slips to Slice 6.
+- **Live-contract residuals (verify in the rider, don't invent):** the exact `4404`↔`resource.deleted`
+  interleaving on a real reset (A converges both orders on `ReplacementWaiting`, so either is safe);
+  the retain-engine `Transfer` viewport/scrollback behavior against a real `/clear`. `session_key`
+  rekey is **resolved** (retained `TerminalId` ⇒ retained key), no longer an unknown.
 
 ## 15. Completion-matrix mapping (anti-drop)
 
 | Design spec matrix row | Closed by |
 | --- | --- |
-| `session.superseded` redirect (retained engine follows `TerminalId`) | 5-super + §10 |
-| Fleet memory-pressure trim/disconnect (LRV) | §7 (Sleep-only, per FFI gap) |
-| lens-ui integration: terminal as `FleetStore` member (minimal) | §5 (membership; surface → Slice 6) |
-| Slice-4 deferral: `4404`-first adoption ordering | §9 |
-| (new) scrollback cap byte-correctness | §11 |
+| `session.superseded` redirect (retained engine follows `TerminalId`) | §10 (A retain-engine `Transfer` + D load-B/move) |
+| Fleet memory-pressure trim/disconnect (LRV) | §7 (Sleep-only per FFI gap; Warning=fraction-freed, `hidden && Live`) |
+| lens-ui integration: terminal as `FleetStore` member (minimal) | §5 (C membership; visibility seam + surface → Slice 6) |
+| Slice-4 deferral: `4404`-first adoption ordering | §9 (A lifecycle change + D driving) |
+| (new) scrollback cap byte-correctness | §11 (A) |
