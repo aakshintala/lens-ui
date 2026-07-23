@@ -6,7 +6,7 @@ mod inline;
 mod node;
 mod stream_flag;
 mod style;
-mod text_view;
+pub(crate) mod text_view;
 mod utils;
 
 use gpui::{App, EntityId, SharedString, Window};
@@ -68,6 +68,25 @@ pub fn markdown_state_entity_id(
         |_, cx| text_view::TextViewState::new(cx),
     );
     Some(state.entity_id())
+}
+
+pub fn markdown_probe_arm_selection(id: &str, window: &mut Window, cx: &mut App) {
+    let key = SharedString::from(format!("{id}/state"));
+    let state = window.use_keyed_state::<text_view::TextViewState>(key, cx, |_, cx| {
+        text_view::TextViewState::new(cx)
+    });
+    state.update(cx, |s, _| {
+        s.set_selection_for_test(gpui::point(gpui::px(1.), gpui::px(1.)));
+        s.mark_streaming_for_test();
+    });
+}
+
+pub fn markdown_probe_selection_is_some(id: &str, window: &mut Window, cx: &mut App) -> bool {
+    let key = SharedString::from(format!("{id}/state"));
+    let state = window.use_keyed_state::<text_view::TextViewState>(key, cx, |_, cx| {
+        text_view::TextViewState::new(cx)
+    });
+    state.read(cx).selection_is_some_for_test()
 }
 
 #[cfg(test)]

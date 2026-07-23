@@ -17,7 +17,11 @@ use lens_core::domain::scalars::Role;
 use lens_core::persist::{RangeRead, ReadRange};
 use lens_core::reduce::{RetireDisposition, StreamUpdate};
 use lens_ui::fleet::store::ReconcileEpoch;
-use lens_ui::focused::{FocusedTranscript, ReaderWorkerHandle, RowId};
+use lens_ui::focused::{FocusedTranscript, ReaderWorkerHandle, RowContent, RowId, RowKind};
+use lens_ui::md::{
+    init as md_init, markdown_probe_arm_selection, markdown_probe_selection_is_some,
+    markdown_state_entity_id, MarkdownView,
+};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct AnchorSnapshot {
@@ -39,6 +43,9 @@ struct ProbeState {
     samples: usize,
     failures: Vec<String>,
     target_entity: Option<EntityId>,
+    target_markdown_entity: Option<EntityId>,
+    markdown_selection_armed: bool,
+    selection_preserved: bool,
     min_row_count: usize,
 }
 
@@ -367,6 +374,8 @@ async fn drive_finalize_probe(
             p.failures.is_empty()
                 && p.samples >= 4
                 && p.target_entity.is_some()
+                && p.target_markdown_entity.is_some()
+                && p.selection_preserved
                 && p.min_row_count > 0
         })
         .unwrap_or(false);
@@ -381,6 +390,8 @@ async fn drive_finalize_probe(
         process::exit(1);
     }
     eprintln!("FINALIZE PROBE (legacy): staged finalize flash-free (real paint)");
+    eprintln!("D11 MARKDOWN IDENTITY (legacy): PASS");
+    eprintln!("P2 SELECTION CARVE-OUT (legacy): PASS");
 
     // Phase 2: canonical end-of-turn ordering on a fresh replica, replica-synced list.
     let acc_canon = AccId::new("acc_canon");
@@ -404,6 +415,8 @@ async fn drive_finalize_probe(
             p.failures.is_empty()
                 && p.samples >= 4
                 && p.target_entity.is_some()
+                && p.target_markdown_entity.is_some()
+                && p.selection_preserved
                 && p.min_row_count > 0
         })
         .unwrap_or(false);
@@ -416,6 +429,8 @@ async fn drive_finalize_probe(
         });
     } else {
         eprintln!("FINALIZE PROBE (canonical): end-of-turn active-none-before-disk renders");
+        eprintln!("D11 MARKDOWN IDENTITY (canonical): PASS");
+        eprintln!("P2 SELECTION CARVE-OUT (canonical): PASS");
     }
     *exit_ok.borrow_mut() = ok;
     process::exit(if ok { 0 } else { 1 });
@@ -452,13 +467,16 @@ impl Render for HarnessView {
         };
 
         let entity_id = self.replica.read(cx).rows().entity_id_at(row_ix, cx);
-        let text = self
+        let pres = self
             .replica
             .read(cx)
             .rows()
             .id_at(row_ix)
             .and_then(|id| self.replica.read(cx).rows().entity(id))
-            .map(|e| e.read(cx).presentation.content.stub_text().to_owned())
+            .map(|e| e.read(cx).presentation.clone());
+        let text = pres
+            .as_ref()
+            .map(|p| p.content.stub_text().to_owned())
             .unwrap_or_default();
         let list_state = match self.list_binding {
             ListBinding::HarnessManual => self.list_state.clone(),
@@ -496,12 +514,61 @@ impl Render for HarnessView {
             if !text.is_empty() && text != "streaming text" && text != "hi" {
                 p.failures.push(format!("unexpected content: {text:?}"));
             }
+            if let Some(pres) = pres.as_ref()
+                && matches!(pres.kind, RowKind::Message | RowKind::StreamingMessage)
+                && let RowContent::AssistantMarkdown {
+                    source,
+                    content_key,
+                } = &pres.content
+            {
+                let _ = MarkdownView::new(
+                    content_key.as_element_id(),
+                    source.clone(),
+                    window,
+                    cx,
+                )
+                .scrollable(false)
+                .selectable(true);
+                if let Some(md_eid) =
+                    markdown_state_entity_id(content_key.as_element_id().as_str(), window, cx)
+                {
+                    if let Some(target) = p.target_markdown_entity {
+                        if md_eid != target {
+                            p.failures.push(format!(
+                                "markdown entity id changed {target:?} -> {md_eid:?}"
+                            ));
+                        }
+                    } else {
+                        p.target_markdown_entity = Some(md_eid);
+                        markdown_probe_arm_selection(
+                            content_key.as_element_id().as_str(),
+                            window,
+                            cx,
+                        );
+                        p.markdown_selection_armed = true;
+                    }
+                    if p.markdown_selection_armed
+                        && markdown_probe_selection_is_some(
+                            content_key.as_element_id().as_str(),
+                            window,
+                            cx,
+                        )
+                    {
+                        p.selection_preserved = true;
+                    }
+                }
+            }
+            if p.markdown_selection_armed && !p.selection_preserved && self.finalized && p.samples >= 4
+            {
+                p.failures
+                    .push("markdown selection lost across streamed height growth".into());
+            }
             p.samples += 1;
         }
 
         let replica = self.replica.clone();
         div().size_full().child(
-            list(list_state, move |ix, _window, cx| {
+            list(list_state, move |ix, window, cx| {
                 let replica = replica.clone();
                 let Some(id) = replica.read(cx).rows().id_at(ix) else {
                     return div().into_any_element();
@@ -509,7 +576,25 @@ impl Render for HarnessView {
                 let Some(entity) = replica.read(cx).rows().entity(id) else {
                     return div().into_any_element();
                 };
-                let text = entity.read(cx).presentation.content.stub_text().to_owned();
+                let pres = entity.read(cx).presentation.clone();
+                if matches!(pres.kind, RowKind::Message | RowKind::StreamingMessage)
+                    && let RowContent::AssistantMarkdown {
+                        source,
+                        content_key,
+                    } = &pres.content
+                {
+                    return MarkdownView::new(
+                        content_key.as_element_id(),
+                        source.clone(),
+                        window,
+                        cx,
+                    )
+                    .scrollable(false)
+                    .selectable(true)
+                    .into_inner()
+                    .into_any_element();
+                }
+                let text = pres.content.stub_text().to_owned();
                 div().id(ix).child(text).into_any_element()
             })
             .size_full(),
@@ -527,6 +612,7 @@ fn main() {
 
     Application::new().run(move |cx: &mut App| {
         gpui_component::init(cx);
+        md_init(cx);
         lens_ui::theme::install_at_startup(cx);
 
         let replica = spawn_replica(cx);

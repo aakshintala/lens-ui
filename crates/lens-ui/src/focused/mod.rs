@@ -4,6 +4,7 @@
 pub mod reader;
 mod content_key;
 mod rowsource;
+mod streaming;
 pub mod view;
 
 use crate::fleet::store::{ReaderFactory, ReconcileEpoch};
@@ -22,6 +23,7 @@ pub use content_key::ContentKey;
 pub use rowsource::{
     RowContent, RowId, RowKind, RowPresentation, RowState, RowStore, SectionKey, UpsertEffect,
 };
+pub use streaming::StreamCoalescer;
 
 const LIST_OVERDRAW: Pixels = gpui::px(200.);
 const SYNC_DEBOUNCE_MS: u64 = 150;
@@ -86,6 +88,8 @@ pub struct FocusedTranscript {
     section_anchor: HashMap<ItemId, ItemId>,
     /// Single-in-flight guard for scroll-near-top `Backward` pages (§5).
     page_in_flight: bool,
+    /// Per-stream message coalescer — frame-budget mdstitch emits (D1).
+    message_coalescers: HashMap<AccId, StreamCoalescer>,
 }
 
 impl FocusedTranscript {
@@ -140,6 +144,7 @@ impl FocusedTranscript {
             settled_structure_len: 0,
             section_anchor: HashMap::new(),
             page_in_flight: false,
+            message_coalescers: HashMap::new(),
         };
         replica.enqueue_read(
             ReadRange::Tail {
@@ -192,6 +197,7 @@ impl FocusedTranscript {
             settled_structure_len: 0,
             section_anchor: HashMap::new(),
             page_in_flight: false,
+            message_coalescers: HashMap::new(),
         };
         cx.notify();
         replica
@@ -383,6 +389,8 @@ impl FocusedTranscript {
                 dirty = true;
             }
             StreamUpdate::ScratchChanged(scratch) => {
+                let old = Arc::clone(&self.scratch);
+                self.coalesce_message_scratch_delta(&old, &scratch, cx);
                 self.scratch = scratch;
                 self.reproject(false, cx);
                 dirty = true;
@@ -669,6 +677,44 @@ impl FocusedTranscript {
             .iter()
             .find(|(_, item)| item.ctx.response_id.as_ref() == Some(active))
             .map(|(ord, _)| *ord);
+    }
+
+    fn coalesce_message_scratch_delta(
+        &mut self,
+        old: &StreamScratch,
+        new: &StreamScratch,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(msg) = &new.open_message else {
+            self.message_coalescers.clear();
+            return;
+        };
+        let delta = match old.open_message.as_ref() {
+            Some(prev) if prev.acc_id == msg.acc_id && msg.text.starts_with(&prev.text) => {
+                msg.text[prev.text.len()..].to_string()
+            }
+            _ => {
+                self.message_coalescers.remove(&msg.acc_id);
+                msg.text.clone()
+            }
+        };
+        let coalescer = self
+            .message_coalescers
+            .entry(msg.acc_id.clone())
+            .or_default();
+        if let Some(source) = coalescer.push_delta(&delta) {
+            let id = RowId::StreamTail(msg.acc_id.clone());
+            let pres = RowPresentation {
+                kind: RowKind::StreamingMessage,
+                content: RowContent::AssistantMarkdown {
+                    source,
+                    content_key: ContentKey::from_acc(&msg.acc_id),
+                },
+                collapsed: false,
+                height_hint: None,
+            };
+            self.rows.upsert(id, pres, cx);
+        }
     }
 
     fn handle_retired(

@@ -855,12 +855,13 @@ fn materialize_streaming_reasoning(acc: &ReasoningAcc, into: &mut RowStore, cx: 
 }
 
 fn materialize_streaming_message(acc: &MessageAcc, into: &mut RowStore, cx: &mut App) {
-    let id = RowId::StreamTail(acc.acc_id.clone());
     let content_key = ContentKey::from_acc(&acc.acc_id);
+    let source = crate::md::safe_prefix(&acc.text);
+    let id = RowId::StreamTail(acc.acc_id.clone());
     let pres = RowPresentation {
         kind: RowKind::StreamingMessage,
         content: RowContent::AssistantMarkdown {
-            source: acc.text.clone(),
+            source,
             content_key,
         },
         collapsed: false,

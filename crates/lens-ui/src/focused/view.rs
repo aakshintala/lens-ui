@@ -1,6 +1,7 @@
 //! gpui `list()` render surface for the focused transcript (T-2 §7).
 
-use crate::focused::{FocusedTranscript, RowKind, RowPresentation};
+use crate::focused::{FocusedTranscript, RowContent, RowKind, RowPresentation};
+use crate::md::MarkdownView;
 use gpui::{
     App, ClickEvent, Context, Entity, FocusHandle, IntoElement, ListOffset, ListScrollEvent,
     ParentElement, Render, Styled, Window, div, list, prelude::*, px,
@@ -145,6 +146,18 @@ impl FocusedTranscriptView {
             .into_any_element()
     }
 
+    fn render_row(
+        pres: &RowPresentation,
+        ix: usize,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> gpui::AnyElement {
+        if matches!(pres.kind, RowKind::Message | RowKind::StreamingMessage) {
+            return render_assistant_markdown(&pres.content, window, cx);
+        }
+        Self::render_stub_row(pres, ix)
+    }
+
     #[doc(hidden)]
     pub fn follow_mode(&self) -> FollowMode {
         self.follow_mode
@@ -164,6 +177,21 @@ impl FocusedTranscriptView {
     pub fn jump_to_latest_for_test(&mut self, cx: &mut Context<Self>) {
         self.jump_to_latest(cx);
     }
+}
+
+pub(crate) fn render_assistant_markdown(
+    content: &RowContent,
+    window: &mut Window,
+    cx: &mut App,
+) -> gpui::AnyElement {
+    let RowContent::AssistantMarkdown { source, content_key } = content else {
+        return div().into_any_element();
+    };
+    MarkdownView::new(content_key.as_element_id(), source.clone(), window, cx)
+        .scrollable(false)
+        .selectable(true)
+        .into_inner()
+        .into_any_element()
 }
 
 fn kind_tag(kind: RowKind) -> &'static str {
@@ -196,7 +224,7 @@ impl Render for FocusedTranscriptView {
         });
 
         let replica = self.replica.clone();
-        let list_el = list(list_state, move |ix, _window, app| {
+        let list_el = list(list_state, move |ix, window, app| {
             let replica = replica.clone();
             let Some(id) = replica.read(app).rows().id_at(ix) else {
                 return div().into_any_element();
@@ -205,7 +233,7 @@ impl Render for FocusedTranscriptView {
                 return div().into_any_element();
             };
             let pres = entity.read(app).presentation.clone();
-            FocusedTranscriptView::render_stub_row(&pres, ix)
+            FocusedTranscriptView::render_row(&pres, ix, window, app)
         })
         .size_full();
 

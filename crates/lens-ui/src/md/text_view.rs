@@ -274,6 +274,35 @@ impl TextViewState {
         self.bounds = bounds;
     }
 
+    #[cfg(test)]
+    pub fn new_for_test() -> Self {
+        Self {
+            parent_entity: None,
+            tx: None,
+            parsed_result: None,
+            focus_handle: None,
+            bounds: Bounds::default(),
+            selection_positions: (None, None),
+            is_selecting: false,
+            is_selectable: false,
+            list_state: ListState::new(0, gpui::ListAlignment::Top, px(1000.)),
+            streaming: crate::md::stream_flag::StreamingFlag::new(),
+        }
+    }
+
+    pub(crate) fn selection_is_some_for_test(&self) -> bool {
+        self.selection_positions.0.is_some()
+    }
+
+    pub(crate) fn set_selection_for_test(&mut self, origin: Point<Pixels>) {
+        self.selection_positions = (Some(origin), Some(origin));
+        self.is_selecting = false;
+    }
+
+    pub(crate) fn mark_streaming_for_test(&mut self) {
+        self.streaming.mark_streaming();
+    }
+
     fn clear_selection(&mut self) {
         self.selection_positions = (None, None);
         self.is_selecting = false;
@@ -893,5 +922,25 @@ mod tests {
                 size: size(px(40.), px(40.))
             }
         );
+    }
+
+    #[test]
+    fn update_bounds_preserves_selection_when_flagged() {
+        let mut state = TextViewState::new_for_test();
+        state.set_selection_for_test(point(px(1.), px(1.)));
+        let grown = Bounds {
+            origin: point(px(0.), px(0.)),
+            size: size(px(400.), px(800.)),
+        };
+        state.update_bounds(grown, true);
+        assert!(state.selection_is_some_for_test());
+        state.update_bounds(
+            Bounds {
+                origin: grown.origin,
+                size: size(px(400.), px(900.)),
+            },
+            false,
+        );
+        assert!(!state.selection_is_some_for_test());
     }
 }
