@@ -558,6 +558,10 @@ mod tests {
             let v = view.read(cx);
             assert_eq!(v.follow_mode(), FollowMode::Following);
             assert!(!v.pill_visible_for_test(cx));
+            assert!(
+                replica.read(cx).is_following(),
+                "jump to latest must restore replica following"
+            );
         });
     }
 
@@ -610,7 +614,7 @@ mod tests {
 
     #[gpui::test]
     fn on_scroll_event_pauses_when_scrolled_up(cx: &mut gpui::TestAppContext) {
-        let (_replica, view) = view_with_rows(cx, 5);
+        let (replica, view) = view_with_rows(cx, 5);
         cx.update(|cx| {
             view.update(cx, |v, cx| {
                 v.note_row_count(5);
@@ -623,12 +627,16 @@ mod tests {
             assert_eq!(v.follow_mode(), FollowMode::Paused);
             // Pause captures the row count so the pill counts appends since.
             assert_eq!(v.new_since_pause_for_test(cx), 0);
+            assert!(
+                !replica.read(cx).is_following(),
+                "scroll pause must clear replica following"
+            );
         });
     }
 
     #[gpui::test]
     fn on_scroll_event_resumes_when_back_at_bottom(cx: &mut gpui::TestAppContext) {
-        let (_replica, view) = view_with_rows(cx, 5);
+        let (replica, view) = view_with_rows(cx, 5);
         cx.update(|cx| {
             view.update(cx, |v, cx| {
                 v.note_row_count(5);
@@ -639,12 +647,16 @@ mod tests {
         });
         cx.read(|cx| {
             assert_eq!(view.read(cx).follow_mode(), FollowMode::Following);
+            assert!(
+                replica.read(cx).is_following(),
+                "scroll resume must set replica following"
+            );
         });
     }
 
     #[gpui::test]
     fn on_scroll_event_at_bottom_stays_following(cx: &mut gpui::TestAppContext) {
-        let (_replica, view) = view_with_rows(cx, 5);
+        let (replica, view) = view_with_rows(cx, 5);
         cx.update(|cx| {
             view.update(cx, |v, cx| {
                 v.note_row_count(5);
@@ -653,6 +665,7 @@ mod tests {
         });
         cx.read(|cx| {
             assert_eq!(view.read(cx).follow_mode(), FollowMode::Following);
+            assert!(replica.read(cx).is_following());
         });
     }
 
@@ -665,7 +678,7 @@ mod tests {
         // mid-list range + is_scrolled=false. For a Bottom-aligned list that
         // means "pinned to bottom" → MUST resume Following. Keying resume on the
         // (stale) range would wrongly keep the reader paused. (Codex finding.)
-        let (_replica, view) = view_with_rows(cx, 5);
+        let (replica, view) = view_with_rows(cx, 5);
         cx.update(|cx| {
             view.update(cx, |v, cx| {
                 v.note_row_count(5);
@@ -676,6 +689,10 @@ mod tests {
         });
         cx.read(|cx| {
             assert_eq!(view.read(cx).follow_mode(), FollowMode::Following);
+            assert!(
+                replica.read(cx).is_following(),
+                "bottom landing must restore replica following"
+            );
         });
     }
 

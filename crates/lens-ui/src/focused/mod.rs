@@ -276,8 +276,10 @@ impl FocusedTranscript {
     }
 
     pub fn set_following(&mut self, following: bool, cx: &mut Context<Self>) {
-        self.following = following;
-        cx.notify();
+        if self.following != following {
+            self.following = following;
+            cx.notify();
+        }
     }
 
     pub fn fold_detailed(&mut self, u: StreamUpdate, cx: &mut Context<Self>) {
@@ -412,6 +414,7 @@ impl FocusedTranscript {
             cx.notify();
             return;
         }
+        let resident_hi_before = self.resident_hi;
         let full_replace = matches!(
             range,
             ReadRange::All
@@ -491,6 +494,7 @@ impl FocusedTranscript {
         if matches!(range, ReadRange::Delta { .. })
             && self.is_following()
             && self.resident_hi < self.known_committed
+            && self.resident_hi > resident_hi_before
         {
             let through =
                 (self.resident_hi + FORWARD_DELTA_PAGE_ORDINALS).min(self.known_committed);
@@ -3952,6 +3956,59 @@ mod tests {
             assert_eq!(r.known_committed_for_test(), hi_before + 5);
             assert!(!r.has_item_ordinal_for_test(hi_before + 1));
             assert!(!r.has_item_ordinal_for_test(hi_before + 2));
+        });
+    }
+
+    #[gpui::test]
+    async fn empty_forward_delta_does_not_spin_catchup(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    tail_read(
+                        vec![(0, message_item("m0", None)), (5, message_item("m5", None))],
+                        5,
+                    ),
+                    cx,
+                );
+            });
+            replica.update(cx, |r, _| {
+                r.known_committed = 10;
+            });
+        });
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Delta {
+                        after: 5,
+                        through: 10,
+                    },
+                    RangeRead {
+                        rows: vec![],
+                        skipped: vec![],
+                        watermark: Some(10),
+                    },
+                    cx,
+                );
+            });
+        });
+
+        assert!(
+            rx.try_recv().is_err(),
+            "empty forward Delta must not re-enqueue catch-up when resident_hi made no progress"
+        );
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert_eq!(r.resident_hi_for_test(), 5);
+            assert_eq!(r.known_committed_for_test(), 10);
         });
     }
 
