@@ -6,6 +6,7 @@ pub mod content_events;
 pub mod reader;
 mod content_key;
 mod rowsource;
+mod user_content;
 mod streaming;
 pub mod view;
 

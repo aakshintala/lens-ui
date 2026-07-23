@@ -920,7 +920,7 @@ pub(crate) fn row_content_for_item(item: &Item) -> RowContent {
                     .collect::<Vec<_>>()
                     .join(""),
             ),
-            content_key: ContentKey::from_acc(&AccId::new(item.id.as_str())),
+            content_key: ContentKey::from_label(item.id.as_str()),
         },
         ItemKind::Reasoning {
             full_text,
@@ -942,11 +942,49 @@ pub(crate) fn row_content_for_item(item: &Item) -> RowContent {
 }
 
 pub(crate) fn presentation_for_item(item: &Item) -> RowPresentation {
-    RowPresentation {
-        kind: sibling_row_kind(item),
-        content: row_content_for_item(item),
-        collapsed: false,
-        height_hint: None,
+    match &item.kind {
+        ItemKind::Message {
+            role: Role::User,
+            content,
+            ..
+        } => RowPresentation {
+            kind: RowKind::UserMessage,
+            content: RowContent::UserVerbatim {
+                text: content
+                    .iter()
+                    .filter_map(|b| b.text.as_deref())
+                    .collect::<Vec<_>>()
+                    .join(""),
+            },
+            collapsed: false,
+            height_hint: None,
+        },
+        ItemKind::Message { content, .. } => {
+            let source = crate::md::safe_prefix(
+                &content
+                    .iter()
+                    .filter_map(|b| b.text.as_deref())
+                    .collect::<Vec<_>>()
+                    .join(""),
+            );
+            RowPresentation {
+                kind: RowKind::Message,
+                content: RowContent::AssistantMarkdown {
+                    source,
+                    content_key: ContentKey::from_label(item.id.as_str()),
+                },
+                collapsed: false,
+                height_hint: None,
+            }
+        }
+        _ => RowPresentation {
+            kind: sibling_row_kind(item),
+            content: RowContent::Stub {
+                text: item_text_stub(item),
+            },
+            collapsed: false,
+            height_hint: None,
+        },
     }
 }
 

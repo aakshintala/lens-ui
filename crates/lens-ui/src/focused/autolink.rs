@@ -14,7 +14,11 @@ pub fn scan_prose_autolinks(prose: &str) -> Vec<AutolinkHit> {
     let mut hits = Vec::new();
     for (idx, token) in prose.split_whitespace().enumerate() {
         let _ = idx;
-        if token.starts_with("http://") || token.starts_with("https://") {
+        let lower = token.to_ascii_lowercase();
+        if lower.starts_with("http://")
+            || lower.starts_with("https://")
+            || token.contains("://")
+        {
             hits.push(AutolinkHit {
                 range: find_token_range(prose, token),
                 target: AutolinkTarget::Url(

@@ -152,10 +152,16 @@ impl FocusedTranscriptView {
         window: &mut Window,
         cx: &mut App,
     ) -> gpui::AnyElement {
-        if matches!(pres.kind, RowKind::Message | RowKind::StreamingMessage) {
-            return render_assistant_markdown(&pres.content, window, cx);
+        match &pres.content {
+            RowContent::AssistantMarkdown { .. } => {
+                render_assistant_markdown(&pres.content, window, cx)
+            }
+            RowContent::UserVerbatim { .. } => {
+                crate::focused::user_content::render_user_content(&pres.content, window, cx)
+            }
+            RowContent::Reasoning { .. } => Self::render_stub_row(pres, ix),
+            RowContent::Stub { .. } => Self::render_stub_row(pres, ix),
         }
-        Self::render_stub_row(pres, ix)
     }
 
     #[doc(hidden)]
