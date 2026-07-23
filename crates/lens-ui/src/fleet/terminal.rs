@@ -19,7 +19,11 @@ pub const TERMINAL_IDLE_SLEEP_THRESHOLD_MS: u64 = 10 * 60 * 1000;
 /// store never matches outcomes it does not own, and so the
 /// `target_conversation_id: String -> SessionId` conversion happens once.
 pub(crate) enum SessionControl {
-    Superseded { target: SessionId, reason: String },
+    Superseded {
+        target: SessionId,
+        #[allow(dead_code)] // Slice 6 view auto-follow consumes `reason`.
+        reason: String,
+    },
     TerminalResource(TerminalResourceSignal),
 }
 
@@ -173,8 +177,7 @@ impl FleetStore {
             SessionControl::TerminalResource(signal) => {
                 self.forward_terminal_resource(session_id, signal, cx);
             }
-            SessionControl::Superseded { target, reason } => {
-                let _ = reason;
+            SessionControl::Superseded { target, reason: _ } => {
                 self.on_supersede(session_id, target, cx);
             }
         }
@@ -1567,6 +1570,11 @@ mod tests {
         });
         cx.run_until_parked();
 
+        assert_eq!(
+            loader.loaded(),
+            vec![sess_b.clone()],
+            "load was attempted before the failure guard declined re-parent"
+        );
         cx.update(|cx| {
             let s = store.read(cx);
             assert!(
@@ -1574,6 +1582,10 @@ mod tests {
                 "load failed -> member stays under A, never orphaned into an unloaded B"
             );
             assert!(s.terminal_member_for_test(&sess_b, &key, cx).is_none());
+            assert!(
+                s.supersede_in_flight.is_empty(),
+                "failed load must not wedge supersede_in_flight"
+            );
         });
         cx.update(|cx| {
             assert!(
@@ -1583,6 +1595,67 @@ mod tests {
                     .any(|e| matches!(e, TerminalHostEvent::Transfer { .. })),
                 "no Transfer when B could not be loaded"
             );
+        });
+    }
+
+    #[gpui::test]
+    async fn supersede_skips_load_when_b_already_tracked(cx: &mut gpui::TestAppContext) {
+        let clock = Arc::new(ManualUiClock::new(5_000));
+        let store = cx.update(|cx| FleetStore::new(clock.clone(), cx));
+        let loader = Rc::new(FakeSessionLoader::new());
+        let sess_a = SessionId::new("conv_a");
+        let sess_b = SessionId::new("conv_b");
+        let key = test_key("main", "sk_a");
+        let (_e, tab) = spawn_tab_with_rows(cx, 0);
+
+        cx.update(|cx| {
+            store.update(cx, |store, cx| {
+                store.set_session_loader(loader.clone());
+                store.spawn_fake_session(sess_b.clone(), cx);
+                assert!(
+                    store.cards.contains_key(&sess_b),
+                    "B must already be tracked before the supersede signal"
+                );
+                store.insert_terminal_for_test(sess_a.clone(), key.clone(), tab.clone(), cx);
+                store.on_session_control(
+                    &sess_a,
+                    SessionControl::Superseded {
+                        target: sess_b.clone(),
+                        reason: "clear".into(),
+                    },
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        assert!(
+            loader.loaded().is_empty(),
+            "B already tracked -> load must be skipped"
+        );
+        cx.update(|cx| {
+            let s = store.read(cx);
+            assert!(
+                s.terminal_member_for_test(&sess_a, &key, cx).is_none(),
+                "member left A"
+            );
+            assert!(
+                s.terminal_member_for_test(&sess_b, &key, cx).is_some(),
+                "member re-parented to B under the SAME key (no rekey)"
+            );
+        });
+        cx.update(|cx| {
+            let events = tab.read(cx).host_events_for_test().to_vec();
+            let transfer = events
+                .iter()
+                .find(|e| matches!(e, TerminalHostEvent::Transfer { .. }))
+                .expect("Transfer was driven");
+            match transfer {
+                TerminalHostEvent::Transfer { new_session } => {
+                    assert_eq!(new_session, &sess_b, "Transfer retargets to B");
+                }
+                other => panic!("expected Transfer, got {other:?}"),
+            }
         });
     }
 
