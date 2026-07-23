@@ -923,7 +923,10 @@ mod tests {
         cx.run_until_parked();
         replica.read_with(cx, |r, _| {
             assert_eq!(r.state(), ReplicaState::Writable);
-            assert_eq!(top_level_card_ids(&r.layout()), vec![id1.clone(), id0.clone()]);
+            assert_eq!(
+                top_level_card_ids(&r.layout()),
+                vec![id1.clone(), id0.clone()]
+            );
         });
         let fleet2 = cx.update(test_fleet);
         let replica2 =
@@ -1041,8 +1044,14 @@ mod tests {
         cx.run_until_parked();
         let c = ConnectionId::new("conn_test");
         replica.update(cx, |r, cx| {
-            r.run_op(Op::PlaceSessions(vec![(c.clone(), SessionId::new("a"))]), cx);
-            r.run_op(Op::PlaceSessions(vec![(c.clone(), SessionId::new("b"))]), cx);
+            r.run_op(
+                Op::PlaceSessions(vec![(c.clone(), SessionId::new("a"))]),
+                cx,
+            );
+            r.run_op(
+                Op::PlaceSessions(vec![(c.clone(), SessionId::new("b"))]),
+                cx,
+            );
         });
         cx.run_until_parked();
         let (item_id, board_id, order_before) = replica.read_with(cx, |r, _| {

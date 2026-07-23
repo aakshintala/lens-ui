@@ -1,7 +1,5 @@
 use lens_core::domain::ids::{BoardId, BoardItemId};
-use lens_core::pack::{
-    resolve_drop, to_move_ordinal, DropTarget, DropTile, DraggedKind, Item,
-};
+use lens_core::pack::{DraggedKind, DropTarget, DropTile, Item, resolve_drop, to_move_ordinal};
 
 use crate::board::replica::Op;
 
@@ -26,6 +24,7 @@ pub struct DragSession {
     pub board_id: BoardId,
 }
 
+#[allow(clippy::too_many_arguments)] // locked drag-start signature (plan §3 Interfaces)
 pub fn start_drag(
     dragged_id: BoardItemId,
     dragged_kind: DraggedKind,
@@ -66,10 +65,7 @@ pub fn on_cursor_move(
     true
 }
 
-pub fn begin_commit(
-    session: &mut DragSession,
-    current_generation: u64,
-) -> Option<Op> {
+pub fn begin_commit(session: &mut DragSession, current_generation: u64) -> Option<Op> {
     if session.phase != DragPhase::Dragging {
         return None;
     }
@@ -168,7 +164,7 @@ impl Render for DragGhost {
 mod tests {
     use lens_core::domain::board::DEFAULT_BOARD_ID;
     use lens_core::domain::ids::{BoardId, BoardItemId};
-    use lens_core::pack::{pack, DropTile, DraggedKind, Item};
+    use lens_core::pack::{DraggedKind, DropTile, Item, pack};
 
     use super::*;
 
@@ -214,7 +210,10 @@ mod tests {
         let held = s.target.clone();
         assert!(begin_commit(&mut s, 1).is_some());
         assert_eq!(s.phase, DragPhase::Committing);
-        assert_eq!(s.target, held, "Committing holds last reflow-preview target");
+        assert_eq!(
+            s.target, held,
+            "Committing holds last reflow-preview target"
+        );
     }
 
     #[test]
@@ -251,7 +250,10 @@ mod tests {
     #[test]
     fn external_commit_aborts_at_drop() {
         let mut s = start_b();
-        assert!(begin_commit(&mut s, 2).is_none(), "generation changed → abort");
+        assert!(
+            begin_commit(&mut s, 2).is_none(),
+            "generation changed → abort"
+        );
         assert_eq!(s.phase, DragPhase::Idle);
     }
 

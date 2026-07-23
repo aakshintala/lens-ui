@@ -1,5 +1,5 @@
-pub mod replica;
 mod drag;
+pub mod replica;
 mod rollup;
 
 pub use replica::{BoardReplica, ReplicaState, WriteDisposition};
@@ -19,8 +19,8 @@ use gpui::{
 use lens_core::domain::board::{BoardItemKind, BoardNode};
 use lens_core::domain::ids::{BoardId, BoardItemId, SessionId};
 use lens_core::pack::{
-    self, DropTile, DraggedKind, Item, item_height, CARD_H, CARD_W, CELL_H, CELL_W, GAP, HEADER,
-    INSET,
+    self, CARD_H, CARD_W, CELL_H, CELL_W, DraggedKind, DropTile, GAP, HEADER, INSET, Item,
+    item_height,
 };
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -65,7 +65,13 @@ fn node_pack_row(node: &BoardNode<'_>) -> (BoardItemId, Item, bool) {
     match node {
         BoardNode::Card(item) => (item.id.clone(), Item::card(), false),
         BoardNode::Group { item, members } => {
-            let collapsed = matches!(item.kind, BoardItemKind::Group { collapsed: true, .. });
+            let collapsed = matches!(
+                item.kind,
+                BoardItemKind::Group {
+                    collapsed: true,
+                    ..
+                }
+            );
             let pack_item = if collapsed {
                 Item::group_collapsed(members.len())
             } else {
@@ -167,11 +173,11 @@ impl BoardView {
         cx: &mut Context<Self>,
     ) -> Self {
         cx.observe(&replica, |board: &mut BoardView, _, cx| {
-            if let Some(ref mut session) = board.drag {
-                if session.phase == drag::DragPhase::Committing {
-                    drag::on_wrote(session);
-                    board.drag = None;
-                }
+            if let Some(ref mut session) = board.drag
+                && session.phase == drag::DragPhase::Committing
+            {
+                drag::on_wrote(session);
+                board.drag = None;
             }
             if board.drag.is_some() && board.replica.read(cx).state() == ReplicaState::Stale {
                 if let Some(ref mut session) = board.drag {
@@ -426,9 +432,7 @@ impl BoardView {
             .filter(|i| i.parent_item_id.as_ref() == parent)
             .collect();
         siblings.sort_by_key(|i| i.ordinal);
-        siblings
-            .iter()
-            .position(|i| &i.id == item_id)
+        siblings.iter().position(|i| &i.id == item_id)
     }
 
     fn build_drop_snapshot(
@@ -568,9 +572,7 @@ impl BoardView {
                     BoardNode::Group { item, .. } => {
                         let (name, color_token) = match &item.kind {
                             BoardItemKind::Group {
-                                name,
-                                color_token,
-                                ..
+                                name, color_token, ..
                             } => (name.clone(), color_token.clone()),
                             _ => (String::new(), None),
                         };
@@ -718,27 +720,27 @@ impl BoardView {
                         f32::from(cursor.y) - f32::from(bounds.origin.y),
                     );
                     let layout_gen = board.replica.read(cx).layout_generation();
-                    if let Some(ref mut session) = board.drag {
-                        if session.phase == drag::DragPhase::Dragging {
-                            if !drag::on_cursor_move(session, local, layout_gen) {
-                                board.drag = None;
-                                cx.notify();
-                                return;
-                            }
-                            let dy = drag::edge_scroll_delta(
-                                f32::from(cursor.y),
-                                f32::from(bounds.origin.y),
-                                f32::from(bounds.size.height),
-                                EDGE_BAND_PX,
-                                EDGE_NUDGE_PX,
-                            );
-                            if dy != 0.0 {
-                                let mut off = scroll_for_drag.offset();
-                                off.y -= px(dy);
-                                scroll_for_drag.set_offset(off);
-                            }
+                    if let Some(ref mut session) = board.drag
+                        && session.phase == drag::DragPhase::Dragging
+                    {
+                        if !drag::on_cursor_move(session, local, layout_gen) {
+                            board.drag = None;
                             cx.notify();
+                            return;
                         }
+                        let dy = drag::edge_scroll_delta(
+                            f32::from(cursor.y),
+                            f32::from(bounds.origin.y),
+                            f32::from(bounds.size.height),
+                            EDGE_BAND_PX,
+                            EDGE_NUDGE_PX,
+                        );
+                        if dy != 0.0 {
+                            let mut off = scroll_for_drag.offset();
+                            off.y -= px(dy);
+                            scroll_for_drag.set_offset(off);
+                        }
+                        cx.notify();
                     }
                 },
             ))
@@ -908,6 +910,7 @@ impl BoardView {
     /// rollup. B-3 is runtime-dormant so this never executes live; when B-4 makes groups
     /// live, verify this does not re-trip the `.cached()` dirty-tracking freeze
     /// ([[viewport-reentry-freeze]]). If it does, hoist the fold into `sync_card_views`.
+    #[allow(clippy::too_many_arguments)] // render helper threading the drag preview target (B-4c §5)
     fn absolute_group(
         &self,
         placed: &pack::Placed,
@@ -1117,18 +1120,16 @@ impl BoardView {
             let member_item_id = layout
                 .items
                 .iter()
-                .find(|it| matches!(&it.kind, BoardItemKind::Card { session: s, .. } if s == session))
+                .find(
+                    |it| matches!(&it.kind, BoardItemKind::Card { session: s, .. } if s == session),
+                )
                 .map(|it| it.id.clone());
             let Some(member_item_id) = member_item_id else {
                 continue;
             };
-            if let Some(tile) = self.absolute_card(
-                session,
-                &member_item_id,
-                member_left,
-                member_top,
-                cx,
-            ) {
+            if let Some(tile) =
+                self.absolute_card(session, &member_item_id, member_left, member_top, cx)
+            {
                 out.push(tile);
             }
         }

@@ -261,11 +261,7 @@ pub fn to_move_ordinal(spatial_ordinal: usize, dragged_sibling_index: Option<usi
 }
 
 /// `snapshot` = frozen S: packed tiles with the dragged item already removed (§4.1).
-pub fn resolve_drop(
-    snapshot: &[DropTile],
-    cursor: (f32, f32),
-    dragged: DraggedKind,
-) -> DropTarget {
+pub fn resolve_drop(snapshot: &[DropTile], cursor: (f32, f32), dragged: DraggedKind) -> DropTarget {
     let (cx, cy) = cursor;
     // (1) into expanded group body — card drags only (§6).
     if dragged == DraggedKind::Card {
@@ -302,10 +298,9 @@ pub fn resolve_drop(
 fn member_ordinal(cx: f32, cy: f32, x0: f32, y0: f32, fc: usize, members: usize) -> usize {
     let body_top = y0 + HEADER;
     let rows = members.div_ceil(fc);
-    let col = (((cx - x0) / CELL_W).floor() as isize)
-        .clamp(0, fc as isize - 1) as usize;
-    let row = (((cy - body_top) / (CARD_H + GAP)).floor() as isize)
-        .clamp(0, rows as isize - 1) as usize;
+    let col = (((cx - x0) / CELL_W).floor() as isize).clamp(0, fc as isize - 1) as usize;
+    let row =
+        (((cy - body_top) / (CARD_H + GAP)).floor() as isize).clamp(0, rows as isize - 1) as usize;
     let raw = row * fc + col;
     if raw >= members {
         return members; // empty trailing cell → append (codex 2026-07-23)
@@ -384,10 +379,13 @@ mod tests {
         let s = snap(&items, &["a", "b", "c"], &[false; 3], 1);
         let py1 = CARD_H + GAP;
         let t = resolve_drop(&s, (CARD_W / 2.0, py1 + 4.0), DraggedKind::Card);
-        assert_eq!(t, DropTarget {
-            parent: None,
-            ordinal: 1
-        });
+        assert_eq!(
+            t,
+            DropTarget {
+                parent: None,
+                ordinal: 1
+            }
+        );
     }
 
     #[test]
@@ -396,10 +394,13 @@ mod tests {
         let s = snap(&items, &["a", "b", "c"], &[false; 3], 1);
         let py1 = CARD_H + GAP;
         let t = resolve_drop(&s, (CARD_W / 2.0, py1 + CARD_H - 4.0), DraggedKind::Card);
-        assert_eq!(t, DropTarget {
-            parent: None,
-            ordinal: 2
-        });
+        assert_eq!(
+            t,
+            DropTarget {
+                parent: None,
+                ordinal: 2
+            }
+        );
     }
 
     #[test]
@@ -407,10 +408,13 @@ mod tests {
         let items = [Item::card(), Item::card()];
         let s = snap(&items, &["a", "b"], &[false; 2], 1);
         let t = resolve_drop(&s, (CARD_W / 2.0, 10_000.0), DraggedKind::Card);
-        assert_eq!(t, DropTarget {
-            parent: None,
-            ordinal: 2
-        });
+        assert_eq!(
+            t,
+            DropTarget {
+                parent: None,
+                ordinal: 2
+            }
+        );
     }
 
     #[test]
@@ -419,16 +423,22 @@ mod tests {
         let s = snap(&items, &["g", "x", "y"], &[false; 3], 3);
         let x_col2 = 2.0 * CELL_W + CARD_W / 2.0;
         let t = resolve_drop(&s, (x_col2, 4.0), DraggedKind::Card);
-        assert_eq!(t, DropTarget {
-            parent: None,
-            ordinal: 1
-        });
+        assert_eq!(
+            t,
+            DropTarget {
+                parent: None,
+                ordinal: 1
+            }
+        );
         let py_y = CARD_H + GAP;
         let t_low = resolve_drop(&s, (x_col2, py_y + 4.0), DraggedKind::Card);
-        assert_eq!(t_low, DropTarget {
-            parent: None,
-            ordinal: 2
-        });
+        assert_eq!(
+            t_low,
+            DropTarget {
+                parent: None,
+                ordinal: 2
+            }
+        );
     }
 
     #[test]
@@ -436,16 +446,22 @@ mod tests {
         let items = [Item::group(4)];
         let s = snap(&items, &["g"], &[false], 3);
         let t = resolve_drop(&s, (4.0, HEADER + CARD_H / 2.0), DraggedKind::Card);
-        assert_eq!(t, DropTarget {
-            parent: Some(bid("g")),
-            ordinal: 0
-        });
+        assert_eq!(
+            t,
+            DropTarget {
+                parent: Some(bid("g")),
+                ordinal: 0
+            }
+        );
         let x_m1 = CELL_W + CARD_W - 4.0;
         let t2 = resolve_drop(&s, (x_m1, HEADER + CARD_H / 2.0), DraggedKind::Card);
-        assert_eq!(t2, DropTarget {
-            parent: Some(bid("g")),
-            ordinal: 2
-        });
+        assert_eq!(
+            t2,
+            DropTarget {
+                parent: Some(bid("g")),
+                ordinal: 2
+            }
+        );
     }
 
     #[test]
@@ -453,10 +469,13 @@ mod tests {
         let items = [Item::group(5)];
         let s = snap(&items, &["g"], &[false], 3);
         let t = resolve_drop(&s, (618.0, 218.0), DraggedKind::Card);
-        assert_eq!(t, DropTarget {
-            parent: Some(bid("g")),
-            ordinal: 5
-        });
+        assert_eq!(
+            t,
+            DropTarget {
+                parent: Some(bid("g")),
+                ordinal: 5
+            }
+        );
         let m4_center_x = CELL_W + CARD_W / 2.0;
         let y_row1 = HEADER + (CARD_H + GAP) + CARD_H / 2.0;
         assert_eq!(
@@ -488,11 +507,7 @@ mod tests {
     fn collapsed_group_has_no_member_drop_zone() {
         let items = [Item::group_collapsed(3)];
         let s = snap(&items, &["g"], &[true], 3);
-        let t = resolve_drop(
-            &s,
-            (CARD_W / 2.0, HEADER + CARD_H / 2.0),
-            DraggedKind::Card,
-        );
+        let t = resolve_drop(&s, (CARD_W / 2.0, HEADER + CARD_H / 2.0), DraggedKind::Card);
         assert_eq!(t.parent, None);
     }
 
@@ -500,12 +515,11 @@ mod tests {
     fn dragged_group_over_group_body_falls_through_to_top_level() {
         let items = [Item::group(4), Item::group(2)];
         let s = snap(&items, &["g0", "g1"], &[false; 2], 3);
-        let t = resolve_drop(
-            &s,
-            (4.0, HEADER + CARD_H / 2.0),
-            DraggedKind::Group,
+        let t = resolve_drop(&s, (4.0, HEADER + CARD_H / 2.0), DraggedKind::Group);
+        assert_eq!(
+            t.parent, None,
+            "group drag must not nest under another group"
         );
-        assert_eq!(t.parent, None, "group drag must not nest under another group");
     }
 
     #[test]
@@ -520,10 +534,13 @@ mod tests {
     fn empty_board_resolves_to_zero() {
         let s: [DropTile; 0] = [];
         let t = resolve_drop(&s, (100.0, 100.0), DraggedKind::Card);
-        assert_eq!(t, DropTarget {
-            parent: None,
-            ordinal: 0
-        });
+        assert_eq!(
+            t,
+            DropTarget {
+                parent: None,
+                ordinal: 0
+            }
+        );
     }
 
     #[test]
@@ -636,10 +653,7 @@ mod tests {
         assert_eq!(t.gx, 0);
         assert_eq!(t.py, 0.0);
         // Height = HEADER + 4*CARD_H + 3*GAP (tight 1×4 stack).
-        assert_eq!(
-            p.content_height,
-            HEADER + 4.0 * CARD_H + 3.0 * GAP
-        );
+        assert_eq!(p.content_height, HEADER + 4.0 * CARD_H + 3.0 * GAP);
     }
 
     #[test]
