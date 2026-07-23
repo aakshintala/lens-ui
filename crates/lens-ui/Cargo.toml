@@ -39,6 +39,11 @@ path = "src/bin/focused_finalize_probe.rs"
 required-features = ["probe"]
 
 [[bin]]
+name = "focused_reasoning_probe"
+path = "src/bin/focused_reasoning_probe.rs"
+required-features = ["probe"]
+
+[[bin]]
 name = "focused_scroll_probe"
 path = "src/bin/focused_scroll_probe.rs"
 

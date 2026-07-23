@@ -9,7 +9,7 @@ mod style;
 pub(crate) mod text_view;
 mod utils;
 
-use gpui::{App, EntityId, SharedString, Window};
+use gpui::{App, Entity, EntityId, ListOffset, SharedString, Window};
 use mdstitch::{stitch, StitchOptions};
 
 pub use style::*;
@@ -88,6 +88,35 @@ pub fn markdown_probe_selection_is_some(id: &str, window: &mut Window, cx: &mut 
         text_view::TextViewState::new(cx)
     });
     state.read(cx).selection_is_some_for_test()
+}
+
+#[cfg(feature = "probe")]
+fn markdown_probe_state(
+    id: &str,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<text_view::TextViewState> {
+    let key = SharedString::from(format!("{id}/state"));
+    window.use_keyed_state::<text_view::TextViewState>(key, cx, |_, cx| {
+        text_view::TextViewState::new(cx)
+    })
+}
+
+#[cfg(feature = "probe")]
+pub fn markdown_probe_logical_scroll_top(id: &str, window: &mut Window, cx: &mut App) -> ListOffset {
+    markdown_probe_state(id, window, cx)
+        .read(cx)
+        .list_logical_scroll_top()
+}
+
+#[cfg(feature = "probe")]
+pub fn markdown_probe_list_item_count(id: &str, window: &mut Window, cx: &mut App) -> usize {
+    markdown_probe_state(id, window, cx).read(cx).list_item_count()
+}
+
+#[cfg(feature = "probe")]
+pub fn markdown_probe_scroll_list_to(id: &str, offset: ListOffset, window: &mut Window, cx: &mut App) {
+    markdown_probe_state(id, window, cx).update(cx, |s, _| s.list_scroll_to(offset));
 }
 
 #[cfg(test)]

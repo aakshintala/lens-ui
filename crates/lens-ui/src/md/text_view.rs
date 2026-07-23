@@ -306,6 +306,21 @@ impl TextViewState {
         self.streaming.mark_streaming();
     }
 
+    #[cfg(any(test, feature = "probe"))]
+    pub(crate) fn list_logical_scroll_top(&self) -> gpui::ListOffset {
+        self.list_state.logical_scroll_top()
+    }
+
+    #[cfg(any(test, feature = "probe"))]
+    pub(crate) fn list_item_count(&self) -> usize {
+        self.list_state.item_count()
+    }
+
+    #[cfg(any(test, feature = "probe"))]
+    pub(crate) fn list_scroll_to(&mut self, offset: gpui::ListOffset) {
+        self.list_state.scroll_to(offset);
+    }
+
     fn clear_selection(&mut self) {
         self.selection_positions = (None, None);
         self.is_selecting = false;

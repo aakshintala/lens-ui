@@ -6,7 +6,7 @@ use std::{
 
 use gpui::{
     AnyElement, App, DefiniteLength, Div, Element, ElementId, FontStyle, FontWeight, Half,
-    HighlightStyle, InteractiveElement as _, IntoElement, Length, ListState,
+    HighlightStyle, InteractiveElement as _, IntoElement, Length, ListOffset, ListState,
     ParentElement, SharedString, SharedUri, StatefulInteractiveElement, Styled,
     Window, div, prelude::FluentBuilder as _, px, relative, rems,
 };
@@ -1128,9 +1128,19 @@ impl Node {
         let node_cx = node_cx.clone();
 
         if list_state.item_count() != children.len() {
+            let old_count = list_state.item_count();
             let prev_offset = list_state.logical_scroll_top();
-            list_state.reset(children.len());
-            list_state.scroll_to(prev_offset);
+            let at_bottom = old_count == 0 || prev_offset.item_ix + 1 >= old_count;
+            let new_count = children.len();
+            list_state.reset(new_count);
+            if at_bottom && new_count > 0 {
+                list_state.scroll_to(ListOffset {
+                    item_ix: new_count - 1,
+                    offset_in_item: px(f32::MAX),
+                });
+            } else {
+                list_state.scroll_to(prev_offset);
+            }
         }
 
         gpui::list(list_state, move |ix, window, cx| {
