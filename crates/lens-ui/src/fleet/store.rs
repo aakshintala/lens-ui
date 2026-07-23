@@ -3,6 +3,7 @@ use crate::clock::UiClock;
 use crate::fleet::fake::{FEED_CAPACITY, FakeFleet};
 use crate::fleet::live::{self, StreamBridge, WallClock};
 use crate::fleet::poller::spawn_session_poller;
+use crate::fleet::terminal;
 use crate::focused::FocusedTranscript;
 use gpui::{App, AppContext, Context, Entity, Task};
 use lens_client::{Client, Connection};
@@ -67,6 +68,8 @@ pub struct FleetStore {
     stream_bridges: HashMap<SessionId, StreamBridge>,
     reader_factories: HashMap<SessionId, ReaderFactory>,
     reconcile_epochs: HashMap<SessionId, ReconcileEpoch>,
+    pub(crate) terminals:
+        HashMap<SessionId, HashMap<terminal::TerminalKeyId, terminal::TerminalMember>>,
     focused_replica: Option<(SessionId, Entity<FocusedTranscript>)>,
     focus_generation: u64,
     #[cfg(test)]
@@ -87,6 +90,7 @@ impl FleetStore {
             stream_bridges: HashMap::new(),
             reader_factories: HashMap::new(),
             reconcile_epochs: HashMap::new(),
+            terminals: HashMap::new(),
             focused_replica: None,
             focus_generation: 0,
             #[cfg(test)]
@@ -107,6 +111,7 @@ impl FleetStore {
             stream_bridges: HashMap::new(),
             reader_factories: HashMap::new(),
             reconcile_epochs: HashMap::new(),
+            terminals: HashMap::new(),
             focused_replica: None,
             focus_generation: 0,
             #[cfg(test)]

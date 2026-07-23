@@ -25,7 +25,7 @@ url = "2"
 bench = []
 # Exposes `render_test_api` for the real-window harness. Integration tests link
 # the crate's normal build (not cfg(test)), so the harness runs with this on.
-test-util = []
+test-util = ["lens-client/test-util"]
 live-tests = ["lens-client/live-tests"]
 
 [dev-dependencies]

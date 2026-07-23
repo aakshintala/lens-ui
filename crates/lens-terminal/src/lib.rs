@@ -638,6 +638,14 @@ impl TerminalTab {
         self.presentation.clone()
     }
 
+    /// Ordinal retained-bytes estimate for fleet LRV (0 when no engine).
+    pub fn retained_bytes_estimate(&self) -> usize {
+        // TODO: lightweight 2-atomic fast path (defer full `EngineInspect` clone).
+        self.engine_handle()
+            .map(|engine| engine.inspect().retained_bytes_estimate)
+            .unwrap_or(0)
+    }
+
     /// The single typed inbound seam.
     pub fn on_host_event(&mut self, event: TerminalHostEvent, cx: &mut Context<Self>) {
         match event {

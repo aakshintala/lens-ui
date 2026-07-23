@@ -3484,6 +3484,7 @@ dependencies = [
  "gpui-component",
  "lens-client",
  "lens-core",
+ "lens-terminal",
  "rusqlite",
  "serde",
  "serde_json",
