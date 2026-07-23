@@ -26,15 +26,25 @@ State on branch `terminal-slice-5-fleetstore` (nothing pushed, tree clean):
   - Gate green: combined `--lib` (client 174 + core 311 + terminal 208 + ui 177),
     clippy `-D warnings` + fmt clean. Real-window bins no longer activate in the
     ordinary gate. (Did NOT run real-window harnesses — they hang headless.)
-- **A** = the risky `lens-terminal` lifecycle slice — **grill paused mid-Q1**
-  (Q1 below is the first thing to answer). A gates D.
+- **A grill DONE + A plan written (2026-07-23).** Q1–Q6 all answered; decisions
+  baked into the plan `docs/plans/2026-07-23-terminal-slice-5-A-lifecycle.md`:
+  - Q1 unified `adopt(session,tid)` (same→fresh/drop retained · changed→reuse).
+  - Q2 A's agent-switch scope = "don't regress + don't leak"; auto-reopen-after-
+    timeout → D. Q3 `Transfer { new_session }` through adopt()'s reuse branch +
+    a cross-session no-double-feed test. Q4 `Existing` 4404 stays hard-detach.
+    Q5 `scrollback_lines`→`scrollback_bytes`, default 10 MB, doc=bytes. Q6 whole
+    slice-5 (A+B+C+D) merges to main together after D + final review + live riders.
+  - Plan = 4 TDD tasks: (1) scrollback fix · (2) 4404→ReplacementWaiting · (3)
+    retain frozen engine + unified adopt() · (4) `TerminalHostEvent::Transfer` +
+    no-double-feed test. Every spawn epoch-guarded at apply (finding-3 lesson).
 
 **Do next, in order:**
-1. **Answer Q1** (adoption shape — recommendation: unified `adopt()`) → finish A
-   grill **Q2–Q6** (queued below) → write A plan (TDD tasks). A's Q1 is premised on
-   finding 1's reliable control path, which is now fixed + verified.
-2. Execute A (composer author + Opus supervision on the frozen seam) →
-   whole-branch review → live rider → land. Then **D** (needs A + B + C).
+1. **Execute the A plan** `docs/plans/2026-07-23-terminal-slice-5-A-lifecycle.md`
+   task-by-task: composer-2.5 authors each task, Opus reviews the diff between
+   tasks, then a fresh-Opus whole-slice-A review at the end. Start with Task 1
+   (scrollback fix — isolated/low-risk).
+2. Then **D** (fleet-integration, needs A+B+C) → live riders (supersede scrollback,
+   4404-first ordering) → final whole-branch Opus review → merge whole slice-5.
 
 **REVIEW ROUTING (2026-07-23):** codex/gpt-5.6 quota exhausted for the week — use a
 FRESH Opus subagent (builds+tests) or grok-4.5 via cursor-delegate for reviews, NOT
