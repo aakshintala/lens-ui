@@ -1,7 +1,7 @@
 //! §3 pure view-projection: canonical `&[Item]` (+ scratch + active_response) → `Vec<ViewBlock>`.
 //! Borrow-only; no clones in the block tree; no `pending`; no gpui (T-1 spec).
 
-use crate::domain::ids::{CallId, ResponseId};
+use crate::domain::ids::{CallId, ItemId, ResponseId};
 use crate::domain::item::{Item, ItemKind, MessageAcc, ReasoningAcc, StreamScratch};
 
 /// A projected render unit. Borrows the whole `&[Item]` slice / `&StreamScratch` for the frame.
@@ -14,10 +14,10 @@ pub enum ViewBlock<'a> {
         call: &'a Item,
         output: Option<&'a Item>,
     },
-    /// One contiguous agent-work run, keyed by `(response_id, run_index)` (T-6 attaches meta/expansion).
+    /// One contiguous agent-work run, keyed by `(response_id, run_anchor)` (T-6 attaches meta/expansion).
     WorkSection {
         response_id: &'a ResponseId,
-        run_index: u32,
+        run_anchor: ItemId,
         blocks: Vec<ViewBlock<'a>>,
     },
     /// Live in-flight reasoning tail (scratch.open_reasoning).
@@ -152,36 +152,55 @@ fn grouping_key<'a>(vb: &ViewBlock<'a>) -> Option<&'a ResponseId> {
     }
 }
 
+fn anchor_of<'a>(vb: &ViewBlock<'a>) -> Option<&'a ItemId> {
+    match vb {
+        ViewBlock::Item(i) => Some(&i.id),
+        ViewBlock::ToolSpan { call, .. } => Some(&call.id),
+        _ => None,
+    }
+}
+
 /// Stage 3: fold each CONTIGUOUS agent-work run into a `WorkSection`. A sibling (message,
 /// ResourceEvent, …) closes the current run and renders in place, so an interleaved turn
 /// stays chronological (multiple sections + the siblings between them). Each section carries
-/// `run_index` = the number of prior runs of the SAME `response_id`, giving finalize-stable
-/// `(response_id, run_index)` keys. `_active` is unused — the collapse decision is the renderer's
+/// `run_anchor` = the first work block's `ItemId`, giving window-invariant
+/// `(response_id, run_anchor)` keys. `_active` is unused — the collapse decision is the renderer's
 /// (derived per `response_id`, T-2 §6/§12).
 pub fn group_work_section<'a>(
     blocks: Vec<ViewBlock<'a>>,
     _active: Option<&'a ResponseId>,
 ) -> Vec<ViewBlock<'a>> {
-    use std::collections::HashMap;
     let mut out: Vec<ViewBlock<'a>> = Vec::with_capacity(blocks.len());
     let mut run: Vec<ViewBlock<'a>> = Vec::new();
     let mut run_key: Option<&'a ResponseId> = None;
-    let mut run_counts: HashMap<&'a ResponseId, u32> = HashMap::new();
 
     fn flush<'a>(
         out: &mut Vec<ViewBlock<'a>>,
         run: &mut Vec<ViewBlock<'a>>,
         run_key: &mut Option<&'a ResponseId>,
-        run_counts: &mut HashMap<&'a ResponseId, u32>,
     ) {
         if let Some(key) = run_key.take() {
-            let idx = run_counts.entry(key).or_insert(0);
-            out.push(ViewBlock::WorkSection {
-                response_id: key,
-                run_index: *idx,
-                blocks: std::mem::take(run),
-            });
-            *idx += 1;
+            if let Some(run_anchor) =
+                run.iter()
+                    .find_map(anchor_of)
+                    .map(|id| id.clone())
+                    .or_else(|| {
+                        run.iter().find_map(|block| match block {
+                            ViewBlock::StreamingReasoning { acc, .. } => {
+                                Some(ItemId::new(acc.acc_id.as_str()))
+                            }
+                            _ => None,
+                        })
+                    })
+            {
+                out.push(ViewBlock::WorkSection {
+                    response_id: key,
+                    run_anchor,
+                    blocks: std::mem::take(run),
+                });
+            } else {
+                out.extend(std::mem::take(run));
+            }
         }
         run.clear();
     }
@@ -190,17 +209,17 @@ pub fn group_work_section<'a>(
         match grouping_key(&vb) {
             Some(key) if run_key == Some(key) => run.push(vb),
             Some(key) => {
-                flush(&mut out, &mut run, &mut run_key, &mut run_counts);
+                flush(&mut out, &mut run, &mut run_key);
                 run_key = Some(key);
                 run.push(vb);
             }
             None => {
-                flush(&mut out, &mut run, &mut run_key, &mut run_counts);
+                flush(&mut out, &mut run, &mut run_key);
                 out.push(vb);
             }
         }
     }
-    flush(&mut out, &mut run, &mut run_key, &mut run_counts);
+    flush(&mut out, &mut run, &mut run_key);
     out
 }
 
@@ -484,22 +503,25 @@ mod tests {
         )
     }
 
-    fn assert_section_ri<'a>(vb: &'a ViewBlock<'a>, resp: &str) -> (&'a [ViewBlock<'a>], u32) {
+    fn assert_section_anchor<'a>(
+        vb: &'a ViewBlock<'a>,
+        resp: &str,
+    ) -> (&'a [ViewBlock<'a>], &'a ItemId) {
         match vb {
             ViewBlock::WorkSection {
                 response_id,
-                run_index,
+                run_anchor,
                 blocks,
             } => {
                 assert_eq!(response_id.as_str(), resp);
-                (blocks.as_slice(), *run_index)
+                (blocks.as_slice(), run_anchor)
             }
             other => panic!("expected WorkSection({resp}), got {other:?}"),
         }
     }
 
     fn assert_section<'a>(vb: &'a ViewBlock<'a>, resp: &str) -> &'a [ViewBlock<'a>] {
-        let (blocks, _) = assert_section_ri(vb, resp);
+        let (blocks, _) = assert_section_anchor(vb, resp);
         blocks
     }
 
@@ -735,15 +757,22 @@ mod tests {
         let refs: Vec<&Item> = items.iter().collect();
         let scratch = scratch_with(None, None);
         let out = group_work_section(project(&refs, &scratch, None), None);
-        // section(resp_a,#0){r1} | a1 sibling IN PLACE | section(resp_a,#1){r2} — order preserved.
+        // section(resp_a,@r1){r1} | a1 sibling IN PLACE | section(resp_a,@r2){r2} — order preserved.
         assert_eq!(out.len(), 3);
-        let (i0, ri0) = assert_section_ri(&out[0], "resp_a");
-        assert_eq!(ri0, 0);
+        let (i0, anchor0) = assert_section_anchor(&out[0], "resp_a");
+        assert_eq!(anchor0.as_str(), "r1");
         assert_item(&i0[0], "r1");
         assert_item(&out[1], "a1");
-        let (i1, ri1) = assert_section_ri(&out[2], "resp_a");
-        assert_eq!(ri1, 1);
+        let (i1, anchor1) = assert_section_anchor(&out[2], "resp_a");
+        assert_eq!(anchor1.as_str(), "r2");
         assert_item(&i1[0], "r2");
+
+        // Truncating to the later run alone must yield the same anchor as the full projection.
+        let later_only = [reasoning("r2", Some("resp_a"))];
+        let later_refs: Vec<&Item> = later_only.iter().collect();
+        let later_out = group_work_section(project(&later_refs, &scratch, None), None);
+        let (_, truncated_anchor) = assert_section_anchor(&later_out[0], "resp_a");
+        assert_eq!(truncated_anchor.as_str(), anchor1.as_str());
     }
 
     #[test]
