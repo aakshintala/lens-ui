@@ -1,0 +1,152 @@
+# Handoff — Terminal Slice 5: B done, A grill paused mid-Q1
+
+**Date:** 2026-07-22 · **Branch:** `terminal-slice-5-fleetstore` · **Design:**
+`docs/specs/2026-07-22-terminal-slice-5-fleet-membership-design.md`
+
+## Execution decision (settled this session)
+
+**Build sequentially, not in parallel.** Evaluated farming A/B/C to parallel
+Opus/composer streams. Verdict: **no real wall-clock gain** — A is the long pole
+*and* gates D (frozen-seam lifecycle rewrite + whole-branch review + live rider
+before D can start); B/C would just finish early and wait. Parallel adds gate
+contention (3 cargo gates oversubscribe one box), merge reconciliation, and
+divides attention on the one slice least tolerant of it (A). Reviews/merges
+serialize on me regardless.
+
+**Order:** `B` (done) → `A` (grilling) → `C` → `D` (+ live riders).
+The one cheap overlap taken: B was fired to composer in the background while we
+started grilling A.
+
+## Sub-slice B — DONE, committed, PENDING review
+
+- **Commit:** `1bbcdef` on `terminal-slice-5-fleetstore`. Authored by
+  **composer-2.5**. Tree clean.
+- **Gate green:** `cargo fmt --all -- --check` + `cargo clippy -p lens-client -p
+  lens-core --all-targets -- -D warnings` + `cargo test -p lens-client -p
+  lens-core`, all exit 0. **+10 tests (501→511)**: 2 lens-client parse, 4
+  reducer (`folds.rs`), 4 actor (`feed.rs`).
+- **Files:** `lens-client/src/stream/event.rs`; `lens-core/src/{reduce/update.rs,
+  reduce/folds.rs, actor/outcome.rs, actor/feed.rs, actor/runloop.rs, actor/mod.rs}`.
+
+**Public surface added (A/C/D authors depend on this):**
+```rust
+// lens-client
+SessionEvent::ResourceCreated { resource_id: String, resource_type: String,
+    terminal_name: Option<String>, session_key: Option<String> }  // terminal_* Some iff type=="terminal"
+SessionEvent::ResourceDeleted { resource_id: String, resource_type: String, session_id: String }
+
+// lens-core
+StreamUpdate::Superseded { target_conversation_id: String, reason: String }
+StreamUpdate::TerminalResourceCreated { terminal_id: TerminalId, terminal_name: String,
+    session_key: String, session_id: SessionId }
+StreamUpdate::TerminalResourceDeleted { terminal_id: TerminalId }
+
+pub enum TerminalResourceSignal {
+    Created { terminal_id: TerminalId, terminal_name: String, session_key: String, session_id: SessionId },
+    Deleted { terminal_id: TerminalId },
+}
+ActorOutcome::Superseded { target_conversation_id: String, reason: String }
+ActorOutcome::TerminalResource(TerminalResourceSignal)
+```
+Control routing: `feed::control_outcome_from_update` maps the 3 StreamUpdates →
+ActorOutcome; `runloop::apply_reduced_batch` pushes to the outcome ring;
+`feed::feed_updates` strips them before the ActorFeed FIFO. Payload is shaped to
+feed Slice-4's `TerminalHostEvent::ResourceCreated/Deleted` directly (map
+`resource_id → TerminalId`). `reduce/mod.rs map_item` left untouched (§4.2 defer).
+
+**⚠️ NEXT ACTION on B: cross-family review (codex `gpt-5.6`, `codex exec
+-s read-only`)** — composer authored, review diversity is MANDATORY before merge.
+Validate composer's 4 judgment calls:
+1. `session_id` on `TerminalResourceCreated` sourced from `state.id` (reducing
+   actor's session) — spec put it on the signal, not on the client event. Check
+   this is the right session on the supersede path (created fires on **B**).
+2. Terminal `ResourceCreated` missing `terminal_name`/`session_key` → falls back
+   to `ResourcesChanged` (fail-safe). Confirm acceptable.
+3. `map_item` left as-is (deferred). Correct per §4.2.
+4. `lens-ui` will not compile until D adds match arms for the new StreamUpdate/
+   ActorOutcome variants — expected, out of B scope. (So workspace gate is red
+   until D; per-crate gate for lens-client/lens-core is green.)
+
+## Sub-slice A — grill IN PROGRESS (paused mid-Q1)
+
+A = the risky `lens-terminal` lifecycle slice. Grill was grounded in the actual
+state machine before questioning. **Grounding established (verified in code):**
+
+- **ReplacementWaiting already exists and is already entered on the reset delete**
+  via `on_resource_signal` → `GenerationVerdict::AwaitReplacement` (`lib.rs:1883`).
+  The delete-first supersede/reset case is already handled. Slice 4 left open only
+  the **4404-first** case.
+- **`enter_replacement_waiting` currently `teardown_runtime_full`s the engine**
+  (`lib.rs:1897`). A's "retain frozen engine" = swap to
+  `teardown_transport_off_foreground` — but that's **global to every entry** into
+  ReplacementWaiting (today only the AwaitReplacement caller; A adds the 4404 caller).
+- **`apply_bridge_event` already early-returns for ReplacementWaiting/Sleeping/
+  Detached/Ended** (`lib.rs:2152`, the S4 bridge-clobber fix). A late 4404 is
+  already dropped. Gap is only a 4404 **while Live**: today → `on_close` →
+  `StopDetached{TerminalGone}` → `on_detach` → full teardown → `Detached`.
+- **`policy.on_close` is pure/target-agnostic** and `TerminalGone` in the bridge
+  path arises only from a 4404 → the OpenOrCreate-vs-Existing branch must live in
+  `apply_bridge_event` (on the `StopDetached{TerminalGone}` arm), not `policy.rs`.
+- **No `Transfer` host event exists yet** — A adds it. `current_session:
+  Option<SessionId>` (`lib.rs:460`) is the field the "session_id changed"
+  discriminator compares against. `adopt_successor` (`lib.rs:1914`) currently does
+  a fresh `discover_and_attach`. `REPLACEMENT_WAIT = 30s` (`lib.rs:1912`).
+
+**A reframed into 5 concrete changes:**
+1. Branch `StopDetached{TerminalGone}` on `self.target` kind in `apply_bridge_event`
+   (OpenOrCreate → `enter_replacement_waiting`; Existing → `on_detach`).
+2. `enter_replacement_waiting`: `teardown_runtime_full` → `teardown_transport_off_foreground`
+   (retain frozen engine). Global to all callers.
+3. Teach adoption reuse-vs-fresh (see Q1).
+4. Add `TerminalHostEvent::Transfer { new_session }` + handler.
+5. Scrollback-cap fix (§11): `TerminalOpenOptions::scrollback_lines` →
+   `scrollback_bytes` (`#[non_exhaustive]` + `with_scrollback_bytes`), default
+   `10_000_000`, fix `max_scrollback` doc to say **bytes**. (`policy.rs:250` default
+   is currently `1000` ≈ ~7 rows — latent prod bug.)
+
+### Q1 — PENDING USER ANSWER (adoption shape)
+
+Once step 2 retains the engine, the tab holds a live engine in ReplacementWaiting.
+Two adoption entry points:
+- **autonomous `adopt_successor`** (a `resource.created` for our key) — can *only*
+  be **same-session** (agent-switch), since the tab only gets signals for its own
+  session and supersede's create fires on B.
+- **host-driven `Transfer { new_session: B }`** — cross-session supersede (D-driven).
+
+**My recommendation:** unify both through one `adopt(session_id, terminal_id, cx)`
+that checks `session_id == self.current_session`: **same → fresh** (explicitly drop
+the retained engine, `discover_and_attach` as today); **changed → reuse**
+(transport-only re-attach on the frozen engine, retarget `current_session = B`).
+Makes "retain iff session_id changed" a real runtime check and forces us to close
+the **new engine-leak** step 2 introduces (adopt_successor's same-session path never
+had a retained engine to clean up before; now it does). Alternative: two separate
+paths with hardcoded fresh/reuse, leaning on "autonomous adopt is always same-session"
+as an unchecked invariant. **I favor unified.**
+
+### Remaining grill branches (queued, not yet asked)
+
+- **Q2** agent-switch >30s timeout interaction: successor create arriving past
+  `REPLACEMENT_WAIT` → `on_detach(ReplacementTimedOut)` → full teardown (drops
+  retained engine, no leak) → `Detached`. Confirm this preserves "today's Slice-4
+  fresh behavior" and clarify what makes agent-switch work end-to-end (FleetStore
+  re-open vs. adopt). Is making agent-switch *work* even in A's scope, or just
+  "don't regress + don't leak the retained engine"?
+- **Q3** `Transfer` shape: only needs `new_session` (server transfers live, same
+  `terminal_id` → keep `current_tid`)? Reuses `teardown_transport_off_foreground`
+  + `on_reconnect_success` retargeting `current_session=B`? Confirm no-double-feed
+  extends to this path (`engine/reconnect_seed.rs`).
+- **Q4** Existing-target 4404 stays hard-detach — confirm (trivial, it's the design).
+- **Q5** Scrollback-cap: default `10_000_000` bytes vs the 64 MiB worker stack
+  (memory `terminal-max-scrollback-bytes-and-worker-stack`) — safe? Only consumer
+  of `scrollback_lines` is lens-ui, on-branch? (quick grep before asking)
+- **Q6** Land discipline: does A merge to `main` before C/D build on it (spec says
+  "landed + whole-branch-reviewed *before*"), or stay on-branch with the whole
+  workstream merging together? (Note `integration-workflow`: solo merges straight
+  to main.)
+
+## Tomorrow, in order
+1. Answer Q1 → finish A grill (Q2–Q6) → write A plan (TDD tasks).
+2. Cross-family review of B via codex (see B section) — can run in background
+   while grilling A resumes.
+3. Execute A (composer author + Opus supervision on the frozen seam) → whole-branch
+   review → live rider → land.
