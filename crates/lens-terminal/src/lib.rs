@@ -1924,7 +1924,7 @@ impl TerminalTab {
             Some(generation::GenerationVerdict::AdoptSuccessor {
                 session_id,
                 terminal_id,
-            }) => self.adopt_successor(session_id, terminal_id, cx),
+            }) => self.adopt(session_id, terminal_id, cx),
             Some(generation::GenerationVerdict::Detach(detail)) => self.on_detach(detail, cx),
             Some(generation::GenerationVerdict::Unchanged) | None => {}
         }
@@ -1933,7 +1933,9 @@ impl TerminalTab {
     fn enter_replacement_waiting(&mut self, cx: &mut Context<Self>) {
         self.reconnect_epoch = self.reconnect_epoch.wrapping_add(1);
         self.clear_input_composition_state();
-        self.teardown_runtime_full(cx);
+        // Transport-only teardown: retain the frozen engine for possible same-session
+        // (fresh re-attach) or cross-session (reconnect-shape reuse) adoption.
+        self.teardown_transport_off_foreground(cx);
         self.input_enabled = false;
         self.presentation.output_gap = false;
         self.lifecycle = Lifecycle::ReplacementWaiting;
@@ -1950,45 +1952,91 @@ impl TerminalTab {
     #[cfg_attr(test, allow(dead_code))]
     const REPLACEMENT_WAIT: Duration = Duration::from_secs(30);
 
-    fn adopt_successor(
-        &mut self,
-        session_id: SessionId,
-        terminal_id: TerminalId,
-        cx: &mut Context<Self>,
-    ) {
+    fn adopt(&mut self, session_id: SessionId, terminal_id: TerminalId, cx: &mut Context<Self>) {
         if self.adopt_in_flight {
             return;
         }
+        let same_session = self.current_session.as_ref() == Some(&session_id);
         self.adopt_in_flight = true;
         // Cancel the replacement timeout; a successor is in hand.
         self.reconnect_epoch = self.reconnect_epoch.wrapping_add(1);
         let epoch = self.reconnect_epoch;
-        let client = Arc::clone(&self.client);
-        let options = self.options.clone();
-        let target = TerminalTarget::Existing {
-            session_id,
-            terminal_id,
-        };
-        cx.spawn(async move |weak, cx| {
-            let outcome = cx
-                .background_executor()
-                .spawn(async move { discover_and_attach(client, target, options) })
-                .await;
-            let _ = weak.update(cx, |tab, cx| {
-                if tab.reconnect_epoch != epoch {
-                    tab.adopt_in_flight = false;
-                    if let Ok(parts) = outcome {
-                        tab.close_parts_off_foreground(parts, cx);
+        let read_only = matches!(self.presentation.access, AccessMode::ReadOnly);
+
+        if same_session {
+            // Agent-switch: the retained engine belongs to the OLD generation; drop it and
+            // discover+attach a FRESH engine against the exact key (today's behavior — no reuse).
+            self.teardown_runtime_full(cx); // explicit drop closes the leak change 3a introduces
+            let client = Arc::clone(&self.client);
+            let options = self.options.clone();
+            let target = TerminalTarget::Existing {
+                session_id,
+                terminal_id,
+            };
+            cx.spawn(async move |weak, cx| {
+                let outcome = cx
+                    .background_executor()
+                    .spawn(async move { discover_and_attach(client, target, options) })
+                    .await;
+                let _ = weak.update(cx, |tab, cx| {
+                    if tab.reconnect_epoch != epoch {
+                        tab.adopt_in_flight = false;
+                        if let Ok(parts) = outcome {
+                            tab.close_parts_off_foreground(parts, cx);
+                        }
+                        return;
                     }
-                    return;
-                }
-                match outcome {
-                    Ok(parts) => tab.on_attached(parts, cx),
-                    Err(detail) => tab.on_detach(detail, cx),
-                }
-            });
-        })
-        .detach();
+                    tab.adopt_in_flight = false;
+                    match outcome {
+                        Ok(parts) => tab.on_attached(parts, cx),
+                        Err(detail) => tab.on_detach(detail, cx),
+                    }
+                });
+            })
+            .detach();
+        } else {
+            // Cross-session transfer: REUSE the retained frozen engine — transport-only
+            // re-attach against the new session (reconnect shape), retargeting current_session.
+            let client = Arc::clone(&self.client);
+            cx.spawn(async move |weak, cx| {
+                let attempt = cx
+                    .background_executor()
+                    .spawn({
+                        let client = Arc::clone(&client);
+                        let session = session_id.clone();
+                        let tid = terminal_id.clone();
+                        async move {
+                            let resource = preflight_reconnect(client.as_ref(), &session, &tid)?;
+                            let attach = attach(
+                                client.as_ref(),
+                                &session,
+                                &tid,
+                                AttachOptions { read_only },
+                            )
+                            .map_err(|_| DetachedDetail::DiscoveryFailed)?;
+                            Ok::<_, DetachedDetail>((resource, attach))
+                        }
+                    })
+                    .await;
+                let _ = weak.update(cx, |tab, cx| {
+                    if tab.reconnect_epoch != epoch {
+                        tab.adopt_in_flight = false;
+                        if let Ok((_r, attach)) = attempt {
+                            tab.close_attach_off_foreground(attach, cx);
+                        }
+                        return;
+                    }
+                    tab.adopt_in_flight = false;
+                    match attempt {
+                        // on_reconnect_success installs transport on the RETAINED engine and
+                        // retargets current_session = resource.session_id (= the new session B).
+                        Ok((resource, attach)) => tab.on_reconnect_success(resource, attach, cx),
+                        Err(detail) => tab.on_detach(detail, cx),
+                    }
+                });
+            })
+            .detach();
+        }
     }
 
     fn arm_replacement_timeout(&mut self, cx: &mut Context<Self>) {
@@ -2043,6 +2091,7 @@ impl TerminalTab {
             }
             return;
         }
+        self.adopt_in_flight = false;
         match outcome {
             Ok(parts) => self.on_attached(parts, cx),
             Err(detail) => self.on_detach(detail, cx),
@@ -3098,11 +3147,115 @@ mod tests {
             );
             assert_eq!(tab.lifecycle, Lifecycle::ReplacementWaiting);
             assert!(
-                tab.runtime.is_none(),
-                "dead engine must be released on reset"
+                tab.runtime.is_some(),
+                "reset must RETAIN the frozen engine (transport-only teardown) for possible reuse"
+            );
+            assert!(
+                tab.runtime.as_ref().and_then(|r| r.engine_ref()).is_some(),
+                "frozen engine must survive enter_replacement_waiting"
             );
         });
         let _ = engine;
+    }
+
+    #[gpui::test]
+    async fn same_session_adopt_drops_retained_engine_and_reattaches_fresh(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (_engine, tab) = live_tab_for_test(cx, true, "t1", "main", "k");
+        // Reset -> ReplacementWaiting retains the frozen engine.
+        tab.update(cx, |tab, cx| {
+            tab.on_host_event(
+                TerminalHostEvent::ResourceDeleted {
+                    terminal_id: TerminalId::new("t1"),
+                },
+                cx,
+            );
+            assert_eq!(tab.lifecycle, Lifecycle::ReplacementWaiting);
+            assert!(
+                tab.runtime.is_some(),
+                "engine retained in ReplacementWaiting"
+            );
+        });
+        // Same-session successor (agent-switch) -> adopt() takes the FRESH branch.
+        tab.update(cx, |tab, cx| {
+            let same = tab.current_session.clone().unwrap();
+            tab.adopt(same, TerminalId::new("t1"), cx);
+        });
+        cx.run_until_parked();
+        tab.read_with(cx, |tab, _| {
+            assert!(
+                !tab.adopt_in_flight,
+                "adopt must resolve (fresh path) — not leave adopt_in_flight set"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn replacement_timeout_drops_retained_engine_no_leak(cx: &mut gpui::TestAppContext) {
+        let (_engine, tab) = live_tab_for_test(cx, true, "t1", "main", "k");
+        tab.update(cx, |tab, cx| {
+            tab.on_host_event(
+                TerminalHostEvent::ResourceDeleted {
+                    terminal_id: TerminalId::new("t1"),
+                },
+                cx,
+            );
+            assert!(tab.runtime.is_some(), "engine retained pending successor");
+            tab.fire_replacement_timeout_now(cx); // deterministic timeout
+        });
+        cx.run_until_parked();
+        tab.read_with(cx, |tab, _| {
+            assert_eq!(tab.lifecycle, Lifecycle::Detached);
+            assert_eq!(
+                tab.presentation.detached_detail,
+                Some(DetachedDetail::ReplacementTimedOut)
+            );
+            assert!(
+                tab.runtime.is_none(),
+                "timeout must fully tear down the retained engine (no leak)"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn fourohfour_first_then_delete_create_adopts(cx: &mut gpui::TestAppContext) {
+        use lens_client::CloseCause;
+
+        let (_engine, tab) = live_tab_for_test(cx, true, "t1", "main", "k");
+        tab.update(cx, |tab, cx| {
+            tab.apply_bridge_event(BridgeEvent::Closed(CloseCause::TerminalNotFound), cx);
+            assert_eq!(tab.lifecycle, Lifecycle::ReplacementWaiting);
+        });
+        tab.update(cx, |tab, cx| {
+            tab.on_host_event(
+                TerminalHostEvent::ResourceDeleted {
+                    terminal_id: TerminalId::new("t1"),
+                },
+                cx,
+            );
+            tab.on_host_event(
+                TerminalHostEvent::ResourceCreated {
+                    session_id: SessionId::new("test_sess"),
+                    terminal_id: TerminalId::new("t1"),
+                    terminal_name: "main".into(),
+                    session_key: "k".into(),
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        tab.read_with(cx, |tab, _| {
+            assert!(
+                !tab.adopt_in_flight,
+                "4404-first delete+create must drive adopt() to completion"
+            );
+            assert_ne!(
+                tab.lifecycle,
+                Lifecycle::ReplacementWaiting,
+                "adoption must leave ReplacementWaiting (Live or Detached via stub attach)"
+            );
+        });
     }
 
     fn attached_parts_for_test(
@@ -3206,7 +3359,10 @@ mod tests {
             assert_ne!(tab.lifecycle, Lifecycle::Live);
             assert_eq!(tab.lifecycle, Lifecycle::ReplacementWaiting);
             assert!(!tab.adopt_in_flight);
-            assert!(tab.runtime.is_none());
+            assert!(
+                tab.runtime.is_some(),
+                "stale adopt must not drop the retained frozen engine"
+            );
         });
     }
 
@@ -3284,13 +3440,23 @@ mod tests {
                 cx,
             );
             assert_eq!(tab.lifecycle, Lifecycle::ReplacementWaiting);
-            assert!(tab.runtime.is_none());
+            assert!(
+                tab.runtime.is_some(),
+                "ReplacementWaiting retains the frozen engine"
+            );
+            assert!(
+                tab.runtime.as_ref().and_then(|r| r.engine_ref()).is_some(),
+                "frozen engine must survive enter_replacement_waiting"
+            );
             assert_ne!(tab.reconnect_epoch, stale_epoch);
         });
         tab.update(cx, |tab, cx| {
             tab.on_reconnect_exit_fatal(stale_epoch, DetachedDetail::TerminalGone, cx);
             assert_eq!(tab.lifecycle, Lifecycle::ReplacementWaiting);
-            assert!(tab.runtime.is_none());
+            assert!(
+                tab.runtime.is_some(),
+                "stale reconnect exit must not drop the retained engine"
+            );
         });
     }
 
@@ -3306,13 +3472,23 @@ mod tests {
                 cx,
             );
             assert_eq!(tab.lifecycle, Lifecycle::ReplacementWaiting);
-            assert!(tab.runtime.is_none());
+            assert!(
+                tab.runtime.is_some(),
+                "ReplacementWaiting retains the frozen engine"
+            );
+            assert!(
+                tab.runtime.as_ref().and_then(|r| r.engine_ref()).is_some(),
+                "frozen engine must survive enter_replacement_waiting"
+            );
             assert_ne!(tab.reconnect_epoch, stale_epoch);
         });
         tab.update(cx, |tab, cx| {
             tab.on_reconnect_exit_exhausted(stale_epoch, cx);
             assert_eq!(tab.lifecycle, Lifecycle::ReplacementWaiting);
-            assert!(tab.runtime.is_none());
+            assert!(
+                tab.runtime.is_some(),
+                "stale reconnect exit must not drop the retained engine"
+            );
         });
     }
 
