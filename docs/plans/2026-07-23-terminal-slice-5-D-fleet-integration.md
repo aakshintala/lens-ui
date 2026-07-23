@@ -27,7 +27,9 @@ The design deferred four items to "D planning". All four are resolved here — r
 1. **Headless load-B is reachable, but not free (§10 step 1, §14).** `spawn_live_session` (`crates/lens-ui/src/fleet/store.rs:353`) is **not** UI-entangled — no `Window`, focus, or user gesture; `crates/lens-app/src/fleet_verify.rs:73` already calls it headlessly. But two gaps make it uncallable from inside a store handler: (a) `FleetStore` retains **no** `Connection`/`Client`/`data_dir` (`store.rs:59-77`), and (b) a brand-new B must be seeded to the control store first — `scheduler.reconnect` does `load_session(...).ok_or(SessionNotFound)` (`crates/lens-core/src/actor/scheduler.rs:103-105`), and seeding needs a `SessionSnapshot` from `GET /v1/sessions/{id}` (`crates/lens-app/src/main.rs:454-459`, `632-644`). **Decision (user, 2026-07-23): full supersede in D behind a `SessionLoader` seam** — store-layer logic headless-tested with a fake loader; the real GET→seed→spawn impl lives in `lens-app` and is proven by the live rider.
 2. **The `GET` must not block the foreground.** `Sessions::get` is blocking (`crates/lens-client/src/sessions.rs:1281`). The loader therefore returns a `Task<Result<(), String>>` and does its blocking IO on `cx.background_executor()`. If `Client` is not `Send`, construct one inside the background task via `Client::new(conn.clone())` — the pattern `spawn_live_session` already uses at `store.rs:383-385`.
 3. **The persisted-item `map_item` path (§4.2) is NOT needed.** It would only matter if D discovered B's transferred terminal via B's snapshot. D drives `Transfer` directly off the `Superseded` outcome (Q8), so the item path stays unbuilt. Do not add it.
-4. **D does not re-prove "both race orders → adoption" (§9/§13).** `lens-ui` cannot synthesize a `4404` — it arrives on the transport/bridge path, which is `lens-terminal`-internal with no public seam. A already binds the real chain end-to-end (`fourohfour_first_then_delete_create_adopts`), and the real interleaving is a live rider. **D's testable obligation is forwarding fidelity:** the right host event reaches exactly the owned terminals of the signalling session, and no others.
+4. **D does not re-prove "both race orders → adoption" (§9/§13) — this is a deliberate DESIGN AMENDMENT, not an oversight.** `lens-ui` cannot synthesize a `4404`: it arrives on the transport/bridge path (`apply_bridge_event` is private, `live_tab_for_test` is crate-private in `lens-terminal`). Further, a tab from `open_with_engine_for_test` has `current_tid: None` / `generation: None`, and `on_resource_signal` early-returns when `generation` is `None` (`crates/lens-terminal/src/lib.rs:1917-1918`) — so even the `deleted`-first order cannot reach adoption at the lens-ui layer without a bound identity.
+
+   **Decision:** amend design §13's D bullet from *"4404-first driving (both orders → adoption fires)"* to **"forwarding fidelity at D; adoption remains A's e2e + the live rider."** Rationale: A's `fourohfour_first_then_delete_create_adopts` already binds the full chain using **production-authored** state, and the real interleaving is Task 7's rider. The rejected alternative — a `bind_identity_for_test` seam letting lens-ui hand-author `generation`/`current_tid` — would test the harness rather than the product (memory `false-green-probe-drives-production-path`) and would mostly re-run A's logic through a thin forwarding layer. **D's testable obligation is forwarding fidelity:** the right host event, with the right payload, reaches exactly the owned terminals of the signalling session and no others. Record this amendment in the Task 2 commit and the handoff so reviewers stop expecting both-order adoption at lens-ui.
 
 ## Known trap (do not miss)
 
@@ -53,7 +55,7 @@ The design deferred four items to "D planning". All four are resolved here — r
 D asserts *"the store forwarded the right host event to the right tabs"*. A tab built by `open_with_engine_for_test` has no `current_tid`, so it correctly **ignores** resource signals — meaning there is no observable side effect to assert on. This task adds a minimal, feature-gated recorder so forwarding is provable. It records only; it changes no behavior.
 
 **Files:**
-- Modify: `crates/lens-terminal/src/lib.rs` (the `TerminalTab` struct, its constructors, and `on_host_event` at ~`:663`)
+- Modify: `crates/lens-terminal/src/lib.rs` (the `TerminalTab` struct, its constructors, and `on_host_event` at `:664`)
 - Modify: `crates/lens-ui/Cargo.toml` (dev-dependencies)
 
 **Interfaces:**
@@ -114,7 +116,7 @@ Add the field to the `TerminalTab` struct definition:
     host_events_seen: Vec<TerminalHostEvent>,
 ```
 
-Initialize it to `Vec::new()` in **every** `TerminalTab` constructor / struct literal (search `lib.rs` for `TerminalTab {` — the real `open()` path and `open_with_engine_for_test` both build one; the compiler will name any you miss):
+Initialize it to `Vec::new()` in **every** `TerminalTab` constructor / struct literal. Constructors use `Self {` inside `impl TerminalTab` (the real `open()` path ~`:540` and `with_engine_for_test` ~`:585`), so search for `Self {` in that impl — searching `TerminalTab {` only finds the struct definition. The compiler will name any you miss:
 
 ```rust
             #[cfg(any(test, feature = "test-util"))]
@@ -148,20 +150,19 @@ Add the accessor in the same `impl TerminalTab` block:
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p lens-terminal --lib -- --test-threads=4`
-Expected: PASS — 217/217 (216 existing + 1 new).
+Expected: PASS — all existing tests plus 1 new (the branch tip was 216 at handoff time; assert "existing + 1", not a hard total).
 
-- [ ] **Step 5: Enable the seam for `lens-ui` tests**
+- [ ] **Step 5: Confirm the seam is already enabled for `lens-ui` tests**
 
-In `crates/lens-ui/Cargo.toml`, ensure the `[dev-dependencies]` entry for `lens-terminal` enables the feature. If `lens-terminal` is currently only a normal dependency, add a dev-dependency line alongside it:
+**No edit is expected here.** Verified against source: `crates/lens-ui/Cargo.toml:46` already carries
 
 ```toml
-[dev-dependencies]
 lens-terminal = { path = "../lens-terminal", features = ["test-util"] }
 ```
 
-Confirm `test-util` exists in `crates/lens-terminal/Cargo.toml` under `[features]`; if it does not, add `test-util = []`.
+under `[dev-dependencies]` (the plain dep without the feature stays at `:22`), and `test-util` already exists on `lens-terminal`. Just confirm both are still true; only add them if they have gone missing.
 
-⚠️ Per memory `feature-unification-gate-trap`, a dev-dep feature can unify into the ordinary build. After this step run the **multi-crate** gate, not just `-p lens-ui`.
+⚠️ Per memory `feature-unification-gate-trap`, a dev-dep feature can unify into the ordinary build. Run the **multi-crate** gate below regardless, not just `-p lens-ui`.
 
 - [ ] **Step 6: Run the multi-crate gate**
 
@@ -185,7 +186,7 @@ Record-only; no behavior change."
 
 ### Task 2: `SessionControl` routing + resource-signal forwarding
 
-Closes design §4.1 (routing) and §9 (forwarding). Today both control outcomes fall into the poller's `other =>` arm and are no-oped by `apply_outcome` (`poller.rs:145-148`).
+Closes design §4.1 (routing) and §9 (forwarding). Today both control outcomes fall into the poller's `other =>` arm (`poller.rs:100-107`), which **card-routes** them into `apply_outcome`, whose arms at `:145-148` no-op them. Note the no-op is in `apply_outcome`, *not* in the poller match — do not "fix" the wrong arm.
 
 **Files:**
 - Modify: `crates/lens-ui/src/fleet/poller.rs:90-108` (match arms) and `:145-148` (comment)
@@ -202,7 +203,23 @@ Closes design §4.1 (routing) and §9 (forwarding). Today both control outcomes 
 
 - [ ] **Step 1: Write the failing tests**
 
-Add to `#[cfg(test)] mod tests` in `crates/lens-ui/src/fleet/terminal.rs`. Reuse the existing helpers in that module (`spawn_tab_with_rows`, `test_key`, `test_target`, `ManualUiClock`) and follow how existing tests construct the store:
+Add to `#[cfg(test)] mod tests` in `crates/lens-ui/src/fleet/terminal.rs`. Reuse the existing helpers in that module (`spawn_tab_with_rows`, `test_key`, `test_target`, `ManualUiClock`) and follow how existing tests construct the store.
+
+**Imports this task needs.** The test module currently imports only `EngineConfig`, `EngineHandle`, `PER_CELL_BYTES` (plus `ManualUiClock`, `Arc`). Add to the test module:
+
+```rust
+    use lens_client::ids::TerminalId;
+    use lens_core::actor::TerminalResourceSignal;
+    use lens_terminal::TerminalHostEvent;
+```
+
+and to the **production** imports at the top of `terminal.rs`:
+
+```rust
+use lens_core::actor::TerminalResourceSignal;
+```
+
+Match the file's existing import grouping and the crate path it already uses for `TerminalId` (`terminal.rs` may reach it via `lens_core::domain::ids`; use whichever the file already uses for `SessionId`). Expect the first red run to fail on several unresolved imports, not only on `SessionControl`.
 
 ```rust
 #[gpui::test]
@@ -297,7 +314,7 @@ async fn resource_created_forwards_full_identity(cx: &mut gpui::TestAppContext) 
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p lens-ui --lib resource_signal_forwards -- --test-threads=4`
-Expected: FAIL to compile — `SessionControl` not found, `on_session_control` not found.
+Expected: FAIL to compile — unresolved `SessionControl`, `on_session_control`, and (until the imports above are added) `TerminalResourceSignal` / `TerminalId` / `TerminalHostEvent`.
 
 - [ ] **Step 3: Add `SessionControl` + `on_session_control` + forwarding**
 
@@ -384,7 +401,13 @@ Expected: PASS — both new tests green.
 
 - [ ] **Step 5: Wire the poller routing arm**
 
-In `crates/lens-ui/src/fleet/poller.rs`, inside the `for o in batch.drain(..)` match (currently `:90-108`), add two arms **before** the `other =>` arm:
+In `crates/lens-ui/src/fleet/poller.rs`, add to the imports at the top (matching local style — the file already does `use crate::fleet::store::FleetStore;`):
+
+```rust
+use crate::fleet::terminal::SessionControl;
+```
+
+Then inside the `for o in batch.drain(..)` match (currently `:90-108`), add two arms **before** the `other =>` arm:
 
 ```rust
                                     ActorOutcome::Superseded {
@@ -392,7 +415,7 @@ In `crates/lens-ui/src/fleet/poller.rs`, inside the `for o in batch.drain(..)` m
                                         reason,
                                     } => store.on_session_control(
                                         &session_id,
-                                        crate::fleet::terminal::SessionControl::Superseded {
+                                        SessionControl::Superseded {
                                             target: SessionId::new(target_conversation_id),
                                             reason,
                                         },
@@ -401,9 +424,7 @@ In `crates/lens-ui/src/fleet/poller.rs`, inside the `for o in batch.drain(..)` m
                                     ActorOutcome::TerminalResource(signal) => store
                                         .on_session_control(
                                             &session_id,
-                                            crate::fleet::terminal::SessionControl::TerminalResource(
-                                                signal,
-                                            ),
+                                            SessionControl::TerminalResource(signal),
                                             cx,
                                         ),
 ```
@@ -434,11 +455,17 @@ SessionControl and calls the new FleetStore::on_session_control. Resource
 signals fan out to every terminal owned by the signalling session; the tab
 filters to its own identity (Slice-4 contract).
 
-Superseded arm is a stub until Task 5. Resolved in planning: D does not
-re-prove both 4404 race orders (lens-ui cannot synthesize a 4404; A's
-fourohfour_first_then_delete_create_adopts binds the chain, live rider
-proves real ordering), and the persisted-item map_item path (design 4.2)
-is NOT needed since Transfer is driven off the Superseded outcome."
+Superseded arm is a stub until Task 5.
+
+DESIGN AMENDMENT (design 13, sub-slice D bullet): '4404-first driving
+(both orders -> adoption fires)' becomes 'forwarding fidelity at D;
+adoption remains A's e2e + the live rider'. lens-ui cannot synthesize a
+4404 (apply_bridge_event is private) and a for-test tab has
+generation: None, so on_resource_signal early-returns before adoption.
+A's fourohfour_first_then_delete_create_adopts already binds the chain
+with production-authored state. Also resolved: the persisted-item
+map_item path (design 4.2) is NOT needed since Transfer is driven off
+the Superseded outcome."
 ```
 
 ---
@@ -520,6 +547,11 @@ pub trait SessionLoader {
     /// blocking HTTP GET and must run it on `cx.background_executor()` before
     /// returning to the foreground to spawn. The returned task resolves once
     /// the session is reachable (its card + poller exist) or with an error.
+    ///
+    /// Implementations **must not synchronously `update` the store** from
+    /// inside `load`. gpui entity updates are not re-entrant, and the caller
+    /// may hold an active `FleetStore` update. Do store mutation inside a
+    /// spawned task (see `FakeSessionLoader` for the minimal shape).
     fn load(
         &self,
         session_id: SessionId,
@@ -570,10 +602,17 @@ impl SessionLoader for FakeSessionLoader {
             return Task::ready(Err("fake loader: forced failure".into()));
         }
         // Make B reachable the same way the fake fleet does elsewhere.
-        let result = store.update(cx, |store, cx| {
-            store.spawn_fake_session(session_id, cx);
-        });
-        Task::ready(result.map(|_| ()).map_err(|e| format!("{e:?}")))
+        //
+        // This MUST be done in a spawned task, never synchronously here: gpui
+        // entity updates are not re-entrant and `load` may be invoked while a
+        // `FleetStore` update is active. Mirrors the real loader's async shape.
+        cx.spawn(async move |cx| {
+            store
+                .update(cx, |store, cx| {
+                    store.spawn_fake_session(session_id, cx);
+                })
+                .map_err(|e| format!("store gone: {e:?}"))
+        })
     }
 }
 
@@ -595,13 +634,24 @@ Register the module — in `crates/lens-ui/src/fleet/mod.rs` add `pub mod loader
 In `crates/lens-ui/src/fleet/store.rs`, add to the `FleetStore` struct (`:59-77`):
 
 ```rust
-    session_loader: Option<std::rc::Rc<dyn crate::fleet::loader::SessionLoader>>,
+    pub(crate) session_loader: Option<std::rc::Rc<dyn crate::fleet::loader::SessionLoader>>,
+    /// Bumped on every supersede that starts a load; the async completion
+    /// no-ops unless it still matches. Same apply-time-guard discipline as
+    /// sub-slice A's `reconnect_epoch`.
+    pub(crate) supersede_epoch: u64,
+    /// Targets with a load in flight — prevents a duplicate/replayed
+    /// `Superseded` from double GET/seed/spawning the same session.
+    pub(crate) supersede_in_flight: std::collections::HashSet<SessionId>,
 ```
 
-Initialize it to `None` in **every** `FleetStore` struct literal (`FleetStore::new` at `:80`, and any other constructor the compiler flags):
+⚠️ **`pub(crate)` is required, not stylistic.** Task 5's `on_supersede` lives in the sibling module `terminal.rs`; a private field on `store.rs` is invisible there even inside an `impl FleetStore` block. This is exactly why `terminals` is already `pub(crate)` (`store.rs:71-72`).
+
+Initialize both in **every** `FleetStore` struct literal — there are two constructors, `FleetStore::new` (`:80`) **and** `FleetStore::new_live` (used by `lens-app` at `main.rs:97`); the compiler will name any you miss:
 
 ```rust
             session_loader: None,
+            supersede_epoch: 0,
+            supersede_in_flight: std::collections::HashSet::new(),
 ```
 
 Add the setter to `impl FleetStore`:
@@ -754,7 +804,7 @@ async fn moved_member_subscription_is_rebound_to_new_session(cx: &mut gpui::Test
 }
 ```
 
-If the tab's lifecycle from `open_with_engine_for_test` is not sleepable, `on_terminal_presentation_changed` will not clear `pending_sleep` and this test would false-pass its own premise. Verify by checking `is_sleepable` against the lifecycle `open_with_engine_for_test` produces; if it is **not** sleepable, assert the rebinding differently — assert that the callback reached B at all by checking `terminals[A]` is absent and adding a counter, rather than relying on the sleep side effect. **Confirm this before trusting the test** (memory `false-green-probe-drives-production-path`).
+**Premise confirmed against source — keep the `pending_sleep` assertion as written.** `with_engine_for_test` builds the tab with `lifecycle: Lifecycle::Live` and `presentation.lifecycle: Live` (`crates/lens-terminal/src/lib.rs:587-590`), and `is_sleepable` accepts `Live` (`crates/lens-ui/src/fleet/terminal.rs:47-51`), so the deferred sleep really does fire once the callback reaches B. The `cx.emit(TerminalEvent::PresentationChanged)` pattern is already used by an existing sub-slice-C test (`terminal.rs:746`). No redesign needed.
 
 - [ ] **Step 2: Run tests to verify they fail**
 
@@ -994,7 +1044,86 @@ async fn supersede_without_owned_terminals_does_not_load(cx: &mut gpui::TestAppC
           auto-follow is Slice 6)"
     );
 }
+
+#[gpui::test]
+async fn supersede_without_loader_is_a_noop(cx: &mut gpui::TestAppContext) {
+    let clock = Arc::new(ManualUiClock::new(5_000));
+    let store = cx.update(|cx| FleetStore::new(clock.clone(), cx));
+    let sess_a = SessionId::new("conv_a");
+    let sess_b = SessionId::new("conv_b");
+    let key = test_key("main", "sk_a");
+    let (_e, tab) = spawn_tab_with_rows(cx, 0);
+
+    // No set_session_loader call.
+    cx.update(|cx| {
+        store.update(cx, |store, cx| {
+            store.insert_terminal_for_test(sess_a.clone(), key.clone(), tab.clone(), cx);
+            store.on_session_control(
+                &sess_a,
+                SessionControl::Superseded {
+                    target: sess_b.clone(),
+                    reason: "clear".into(),
+                },
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+
+    cx.update(|cx| {
+        assert!(
+            store
+                .read(cx)
+                .terminal_member_for_test(&sess_a, &key, cx)
+                .is_some(),
+            "no loader -> member stays under A, never stranded"
+        );
+        assert!(
+            !tab.read(cx)
+                .host_events_for_test()
+                .iter()
+                .any(|e| matches!(e, TerminalHostEvent::Transfer { .. })),
+            "no loader -> no Transfer"
+        );
+    });
+}
+
+#[gpui::test]
+async fn duplicate_supersede_loads_b_once(cx: &mut gpui::TestAppContext) {
+    let clock = Arc::new(ManualUiClock::new(5_000));
+    let store = cx.update(|cx| FleetStore::new(clock.clone(), cx));
+    let loader = Rc::new(FakeSessionLoader::new());
+    let sess_a = SessionId::new("conv_a");
+    let sess_b = SessionId::new("conv_b");
+    let key = test_key("main", "sk_a");
+    let (_e, tab) = spawn_tab_with_rows(cx, 0);
+
+    cx.update(|cx| {
+        store.update(cx, |store, cx| {
+            store.set_session_loader(loader.clone());
+            store.insert_terminal_for_test(sess_a.clone(), key.clone(), tab.clone(), cx);
+            // Two Superseded signals for the same rotation, back to back, with
+            // no chance to park between them: the second must not start a
+            // second GET/seed/spawn of B.
+            let signal = || SessionControl::Superseded {
+                target: sess_b.clone(),
+                reason: "clear".into(),
+            };
+            store.on_session_control(&sess_a, signal(), cx);
+            store.on_session_control(&sess_a, signal(), cx);
+        });
+    });
+    cx.run_until_parked();
+
+    assert_eq!(
+        loader.loaded(),
+        vec![sess_b.clone()],
+        "B loaded exactly once despite a duplicate Superseded"
+    );
+}
 ```
+
+**Imports for this task's tests:** add `use crate::fleet::loader::{FakeSessionLoader, SessionLoader};` and `use std::rc::Rc;` to the `terminal.rs` test module (on top of Task 2's imports).
 
 - [ ] **Step 2: Run tests to verify they fail**
 
@@ -1032,16 +1161,31 @@ Add to `impl FleetStore`:
         let Some(loader) = self.session_loader.clone() else {
             return;
         };
-        let task = loader.load(to.clone(), cx.entity().downgrade(), &mut *cx);
+        // Dedup: a load for B is already running.
+        if !self.supersede_in_flight.insert(to.clone()) {
+            return;
+        }
+        self.supersede_epoch = self.supersede_epoch.saturating_add(1);
+        let epoch = self.supersede_epoch;
         let from = from.clone();
         cx.spawn(async move |store, cx| {
-            if task.await.is_err() {
-                // Leave the member under A rather than orphaning it into a
-                // session that does not exist. A's replacement timeout still
-                // bounds the tab's wait.
-                return;
-            }
+            // NOTE: this runs AFTER the outer `FleetStore` update has returned,
+            // so `load` is invoked with no active entity update. gpui entity
+            // updates are not re-entrant — invoking `load` inline from
+            // `on_supersede` would panic for any loader that touches the store.
+            let loaded = match cx.update(|cx| loader.load(to.clone(), store.clone(), cx)) {
+                Ok(task) => task.await.is_ok(),
+                Err(_) => false,
+            };
             let _ = store.update(cx, |store, cx| {
+                store.supersede_in_flight.remove(&to);
+                // Apply-time guard: a newer supersede supersedes this one, and
+                // a failed load must not re-parent into a session that does not
+                // exist. In both cases the member stays under A, where A's
+                // replacement timeout still bounds the tab's wait.
+                if !loaded || store.supersede_epoch != epoch {
+                    return;
+                }
                 store.complete_supersede(&from, &to, cx);
             });
         })
@@ -1082,7 +1226,8 @@ If clippy rejects `is_none_or` on the installed toolchain, use `self.terminals.g
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p lens-ui --lib supersede_ -- --test-threads=4`
-Expected: PASS — all three.
+Then: `cargo test -p lens-ui --lib duplicate_supersede_loads_b_once -- --test-threads=4`
+Expected: PASS — all five.
 
 - [ ] **Step 5: Run the gate**
 
@@ -1103,8 +1248,14 @@ TerminalHostEvent::Transfer { new_session: B } so A's retained frozen engine
 is reused and scrollback survives /clear.
 
 Guards: no owned terminals -> no load; B already tracked -> skip load;
+no loader -> no-op; duplicate Superseded -> single load (in-flight set);
+apply-time supersede_epoch guard so a stale completion cannot re-parent;
 load failure -> member stays under A (never orphaned into an unloaded
-session), A's replacement timeout still bounds the wait."
+session), A's replacement timeout still bounds the wait.
+
+The loader is invoked from inside the spawned task, never inline from
+on_supersede: gpui entity updates are not re-entrant and the poller calls
+on_session_control under an active FleetStore update."
 ```
 
 ---
@@ -1118,9 +1269,9 @@ session), A's replacement timeout still bounds the wait."
 **Interfaces:**
 - Consumes: `SessionLoader` (Task 3), `FleetStore::spawn_live_session` (`store.rs:353`), `seed_disk` (`main.rs:632`), `Sessions::get` (`lens-client/src/sessions.rs:1281`).
 
-- [ ] **Step 1: Make `seed_disk` reachable from the loader module**
+- [ ] **Step 1: Confirm `seed_disk` is reachable from the loader module**
 
-In `crates/lens-app/src/main.rs`, change `fn seed_disk(` (`:632`) to `pub(crate) fn seed_disk(`. Do the same for `seed_connection`/`seed_session` only if the compiler requires it.
+`seed_disk` is a crate-root private `fn` at `main.rs:632`, and child modules already see it — `fleet_verify` calls it today (`fleet_verify.rs:68`). So **no change is strictly required**. Marking it `pub(crate) fn seed_disk(` is harmless self-documentation; do it only if you prefer the explicitness. `seed_connection`/`seed_session` need no change.
 
 - [ ] **Step 2: Write the loader**
 
@@ -1137,7 +1288,8 @@ Create `crates/lens-app/src/loader.rs`:
 //! the foreground.
 
 use gpui::{App, AsyncApp, Task, WeakEntity};
-use lens_client::{Client, Connection, GetOpts};
+use lens_client::sessions::GetOpts; // NOT re-exported at the lens_client crate root
+use lens_client::{Client, Connection};
 use lens_core::domain::ids::SessionId;
 use lens_ui::fleet::loader::SessionLoader;
 use lens_ui::fleet::store::FleetStore;
@@ -1200,24 +1352,31 @@ impl SessionLoader for AppSessionLoader {
 
 `Client` is rebuilt inside the background task rather than captured, mirroring `spawn_live_session`'s own `Client::new(conn.clone())` (`store.rs:383-385`) — this avoids requiring `Client: Send`.
 
-Adjust imports to the crate's actual paths: check how `main.rs` imports `Connection`, `Client`, `GetOpts`, and whether `lens_ui::fleet::loader` / `lens_ui::fleet::store` are publicly reachable. If `fleet::loader` is not `pub`, re-export it from `crates/lens-ui/src/lib.rs` (the file already re-exports fleet items at `:17`).
+`GetOpts` is **not** in `lens_client`'s crate-root `pub use` list; it lives at `lens_client::sessions::GetOpts`, which is how `main.rs:6` already imports it. Verify `lens_ui::fleet::loader` and `lens_ui::fleet::store` are publicly reachable from `lens-app`; if `fleet::loader` is not `pub`, re-export it from `crates/lens-ui/src/lib.rs` (that file already re-exports fleet items at `:17`).
 
 - [ ] **Step 3: Wire it in `main.rs`**
 
-Add `mod loader;` near the other module declarations. After the fleet store is created and before/around the `spawn_live_session` loop at `:104`, inject the loader:
+Add `mod loader;` near the other module declarations.
+
+The real shape at `main.rs:96-115` is: the store is built at `:97` (`FleetStore::new_live`, **outside** the window), then inside `cx.open_window(...)` there is `if let Some(prep) = live_prep {` at `:101`, a `fleet.update(cx, |fleet, cx| {` at `:102`, and a `for sid in prep.session_ids` loop at `:103` calling `spawn_live_session(&prep.conn, &prep.client, sid, &prep.data_dir, cx)`.
+
+So the connection and data dir are **`prep.conn` / `prep.data_dir`**, not `config.*`. Inject the loader inside that same `fleet.update`, **before** the spawn loop:
 
 ```rust
-                            fleet.update(cx, |fleet, _cx| {
-                                fleet.set_session_loader(std::rc::Rc::new(
-                                    crate::loader::AppSessionLoader::new(
-                                        conn.clone(),
-                                        config.data_dir.clone(),
-                                    ),
-                                ));
-                            });
+                    fleet.update(cx, |fleet, cx| {
+                        fleet.set_session_loader(std::rc::Rc::new(
+                            crate::loader::AppSessionLoader::new(
+                                prep.conn.clone(),
+                                prep.data_dir.clone(),
+                            ),
+                        ));
+                        for sid in prep.session_ids {
+                            // ... existing spawn_live_session loop, unchanged ...
+                        }
+                    });
 ```
 
-Place it so it runs once per store, before any session is spawned. Match the surrounding closure's variable names (`fleet`, `conn`, `config`) — read `:95-115` and adapt.
+Watch the move semantics: `prep.session_ids` is consumed by the loop, so clone `prep.conn` / `prep.data_dir` **before** it. If the borrow checker complains about partial moves out of `prep`, bind `let conn = prep.conn.clone(); let data_dir = prep.data_dir.clone();` above the `fleet.update`.
 
 - [ ] **Step 4: Verify it compiles and the workspace gate passes**
 
@@ -1259,6 +1418,8 @@ Use the `installing-omnigent-from-source` skill. Confirm `omnigent --version` re
 
 Open a terminal in a session, write recognizable output, `/clear` the conversation, then assert the terminal is still live under B **and** the pre-`/clear` output is still scrollable. This is the only real proof of the retain-engine `Transfer` (design §10; A's cross-session success path was explicitly deferred to this rider).
 
+**Also assert the live event sequence itself** — capture the SSE bytes (memory `live-event-recapture-findings`) and confirm A really emits `session.superseded` (with `target_conversation_id` = B), not just that scrollback survived. D deliberately does **not** build the persisted-item `map_item` fallback (design §4.2), so the entire supersede follow depends on that in-memory outcome arriving. If the live server ever rotates without a usable `superseded` outcome, D has no fallback and §4.2 must be reopened — this rider is what would catch it.
+
 - [ ] **Step 3: Rider — `4404`-first real ordering**
 
 Force the `4404` ↔ `resource.deleted` race and confirm the tab adopts regardless of order. A converges both orders on `ReplacementWaiting`; this rider proves the real interleaving.
@@ -1280,6 +1441,9 @@ Dispatch a fresh cross-family reviewer (Opus subagent, or `grok-4.5` via cursor-
   4. No path bypasses `on_host_event` to reach engine internals (A's frozen seam intact).
   5. The recorder seam is `test-util`-gated and cannot inflate a production build.
   6. No unbounded growth in `host_events_seen` in any long-lived non-test build.
+  7. No `SessionLoader` impl synchronously `update`s the store from `load` (gpui updates are not re-entrant, and the poller calls `on_session_control` under an active `FleetStore` update).
+  8. `supersede_in_flight` is cleared on **every** exit (success, load failure, stale epoch, store-gone) — no wedge that permanently blocks a later supersede of the same target.
+  9. The `supersede_epoch` apply-time guard cannot be bypassed, and a stale completion can never re-parent members or drive a `Transfer`.
 
 - [ ] **Step 7: Final commit**
 
@@ -1302,6 +1466,14 @@ git commit -m "docs(terminal-5-D): live-rider results + whole-branch review outc
 **Type consistency:** `SessionControl` (Task 2) is consumed unchanged in Task 5. `move_terminal_members -> Vec<TerminalKeyId>` (Task 4) is consumed by `complete_supersede` (Task 5). `SessionLoader::load` (Task 3) is implemented in Task 6 with the identical signature. `host_events_for_test` (Task 1) is used in Tasks 2 and 5.
 
 **Known soft spots the executor must confirm, not assume:**
-- Task 4's rebinding test depends on the lifecycle `open_with_engine_for_test` yields being sleepable. Verify before trusting it (flagged inline).
-- Task 6's import paths and the `main.rs` injection site are described from a read of the surrounding code; adapt to what is actually there.
-- `Rc<dyn SessionLoader>` assumes `FleetStore` stays single-threaded. It does today (gpui entity).
+- Task 6's `AppSessionLoader` has **no headless test** — it needs a live server. The Task 7 rider is its only proof. Do not fabricate a passing test for it.
+- `Rc<dyn SessionLoader>` assumes `FleetStore` stays single-threaded. It does today (gpui entity); `Arc` would wrongly imply cross-thread loader sharing.
+- The exact `cx.spawn` closure shape must match existing lens-ui usage (`board/replica.rs:262` is the `Context<Self>` precedent: `cx.spawn(async move |this, cx| { … })`).
+
+**Resolved by the grok-4.5 plan review (`docs/reviews/2026-07-23-terminal-5-D-plan-review-grok.md`), no longer open:**
+- Task 4's rebinding test premise (`open_with_engine_for_test` is `Live` → sleepable) — **confirmed**, hedge removed.
+- `move_terminal_members`' `drop(member)` after `member.tab.clone()` — compiles; the other fields are `Copy`.
+- The `lens-ui` `test-util` dev-dep already exists (`Cargo.toml:46`) — Task 1 Step 5 is a confirmation, not an edit.
+- All cited `file:line` claims were verified accurate; the poller wording and the `main.rs` wiring site were corrected.
+
+**Review history:** grok-4.5 returned NEEDS-REVISION with 2 Critical + 6 Important/Minor findings. C1 (private `session_loader` invisible across sibling modules), C2 (fake loader re-entrantly updating the store under an active `FleetStore` update), I1 (no staleness/dedup guard on the async load), I2/I3 (Task 6 wiring + `GetOpts` path), I4 (design §13 amendment) and the Minors are all folded into this revision.
