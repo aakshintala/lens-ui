@@ -335,6 +335,23 @@ mod tests {
     }
 
     #[test]
+    fn focused_rail_group_reflows_to_one_col() {
+        // Spec §7 / B-4b carried minor: focused rail is pack_and_render at cols=1.
+        // A natural 2×2 (4 members) must reshape to 1×4 and store the clamped fc on
+        // Placed.item so absolute_group lays members into the narrow stack.
+        let p = pack(&[Item::group(4)], 1);
+        let t = &p.tiles[0];
+        assert_eq!((t.item.fc, t.item.fr), (1, 4));
+        assert_eq!(t.gx, 0);
+        assert_eq!(t.py, 0.0);
+        // Height = HEADER + 4*CARD_H + 3*GAP (tight 1×4 stack).
+        assert_eq!(
+            p.content_height,
+            HEADER + 4.0 * CARD_H + 3.0 * GAP
+        );
+    }
+
+    #[test]
     fn group_reflows_to_two_cols() {
         // A 9-member group is 3×3 at full width; in a 2-col container it reshapes to
         // 2×5 (⌈9/2⌉ = 5 rows), the last row half-full.
