@@ -446,8 +446,28 @@ impl BoardView {
         let cols = pack::cols_for_width(avail_width).min(max_cols);
         let packing = pack::pack(&items, cols);
 
-        // Last frame's painted offset (one-frame lag → overdraw covers it, §8).
-        let scroll_top = (-f32::from(scroll.offset().y)).max(0.0);
+        // Vertical mirror of `center_offset` (see the horizontal block below): when the whole
+        // board is shorter than the viewport, center it vertically; otherwise it overflows and
+        // this is 0. A short board's block drifts up and hard-snaps to top-aligned as sessions
+        // push `content_height` past the viewport (accepted trade-off).
+        let block_height = 2.0 * PAD + 2.0 * GUTTER + packing.content_height;
+        let fits_viewport = block_height <= viewport_h;
+        let v_center_offset = if fits_viewport {
+            (viewport_h - block_height) / 2.0
+        } else {
+            0.0
+        };
+
+        // Last frame's painted offset (one-frame lag → overdraw covers it, §8). When the block
+        // fits the viewport the board cannot scroll, so pin the cull band to the top: a stale
+        // negative offset (e.g. a tall scrolled board that just shrank below the viewport, not
+        // yet clamped by gpui) would otherwise ride `v_center_offset > 0` and cull the now-short
+        // block's tiles for a frame — vertical culling has no horizontal analog to lean on.
+        let scroll_top = if fits_viewport {
+            0.0
+        } else {
+            (-f32::from(scroll.offset().y)).max(0.0)
+        };
         let overdraw = CELL_H;
         let lo = scroll_top - overdraw;
         let hi = scroll_top + viewport_h + overdraw;
@@ -474,7 +494,7 @@ impl BoardView {
         let mut content = div()
             .absolute()
             .left(px(PAD + GUTTER + center_offset))
-            .top(px(PAD + GUTTER))
+            .top(px(PAD + GUTTER + v_center_offset))
             .w(px(used_cols as f32 * CELL_W))
             .h(px(packing.content_height));
 
@@ -528,10 +548,12 @@ impl BoardView {
         // and the masonry height. When the pane is wider (centered), span the full pane so the
         // block sits at `center_offset` without horizontal-scroll slack; when narrower, the
         // extent governs and the vertical-only scroll clips the horizontal overflow as before.
+        // Height mirrors this: span the full viewport when the block fits (so `v_center_offset`
+        // has room to center it), else the block height governs and the board scrolls.
         let padded = div()
             .relative()
             .w(px(content_extent.max(pane_width)))
-            .h(px(2.0 * PAD + 2.0 * GUTTER + packing.content_height))
+            .h(px(block_height.max(viewport_h)))
             .child(content);
         let el = div()
             .id("board-scroll")
