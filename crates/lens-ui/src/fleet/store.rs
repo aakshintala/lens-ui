@@ -34,6 +34,14 @@ pub struct ReaderFactory {
 }
 
 impl ReaderFactory {
+    pub fn new(data_dir: PathBuf, conn_id: ConnectionId, session_id: SessionId) -> Self {
+        Self {
+            data_dir,
+            conn_id,
+            session_id,
+        }
+    }
+
     pub fn session_id(&self) -> &SessionId {
         &self.session_id
     }

@@ -3,6 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::process::Command;
 
+mod focused_seed;
+
 const SPEC: &str = "vendor/omnigent-0.5.1/openapi.json";
 const OUT: &str = "crates/lens-client/src/generated.rs";
 const SIBLING_DEFAULT: &str = "../omnigent/openapi.json";
@@ -188,9 +190,10 @@ fn main() -> Result<()> {
         "codegen" => codegen(),
         "drift" => drift(std::env::args().skip(2)),
         "gate" => gate(),
+        "focused-seed" => focused_seed::focused_seed(&std::env::args().skip(2).collect::<Vec<_>>()),
         "terminal-rss-sweep" => terminal_rss_sweep(),
         other => bail!(
-            "unknown xtask command: {other:?} (expected: codegen | drift | gate | terminal-rss-sweep)"
+            "unknown xtask command: {other:?} (expected: codegen | drift | gate | focused-seed | terminal-rss-sweep)"
         ),
     }
 }

@@ -8078,6 +8078,7 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "lens-core",
  "prettyplease",
  "quote",
  "schemars 0.8.22",

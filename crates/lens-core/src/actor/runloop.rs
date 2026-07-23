@@ -1543,6 +1543,68 @@ mod tests {
         }
     }
 
+    /// D19 guard: `run_catchup` must use bounded upserts, never `reconcile(&[Item])`.
+    struct ReconcilePanickingTranscriptStore {
+        inner: SqliteTranscriptStore,
+    }
+
+    impl TranscriptStore for ReconcilePanickingTranscriptStore {
+        fn mode(&self) -> StoreMode {
+            self.inner.mode()
+        }
+
+        fn identity(&self) -> crate::persist::Result<(ConnectionId, SessionId)> {
+            self.inner.identity()
+        }
+
+        fn upsert_item(
+            &self,
+            ordinal: i64,
+            item: &Item,
+            provisional: bool,
+        ) -> crate::persist::Result<i64> {
+            self.inner.upsert_item(ordinal, item, provisional)
+        }
+
+        fn load_items(&self) -> crate::persist::Result<Loaded<Item>> {
+            self.inner.load_items()
+        }
+
+        fn reconcile(&self, _items: &[Item]) -> crate::persist::Result<()> {
+            panic!("D19: run_catchup must not call TranscriptStore::reconcile");
+        }
+
+        fn store_frontier(&self) -> crate::persist::Result<Option<(i64, ItemId)>> {
+            self.inner.store_frontier()
+        }
+
+        fn next_ordinal_seed(&self) -> crate::persist::Result<i64> {
+            self.inner.next_ordinal_seed()
+        }
+
+        fn reconcile_store_item(
+            &self,
+            store_item: &Item,
+            live_key: &crate::persist::LiveKey,
+        ) -> crate::persist::Result<crate::persist::ReconcileOutcome> {
+            self.inner.reconcile_store_item(store_item, live_key)
+        }
+    }
+
+    fn reconcile_panicking_stores(dir: &Path) -> ActorStores {
+        let control = SqliteControlStore::open(&dir.join("lens.db")).unwrap();
+        let transcript = SqliteTranscriptStore::open(
+            &dir.join("conv_1.db"),
+            &ConnectionId::new("conn_1"),
+            &SessionId::new("conv_1"),
+        )
+        .unwrap();
+        ActorStores {
+            control: Box::new(control),
+            transcript: Box::new(ReconcilePanickingTranscriptStore { inner: transcript }),
+        }
+    }
+
     /// Control role that always fails `upsert_session` — persist introspection test stub.
     struct FailingControlStore {
         inner: SqliteControlStore,
@@ -4512,6 +4574,37 @@ mod tests {
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].pending_id, "lens_pend_1");
         assert_eq!(after[0].server_pending_id.as_deref(), Some("p_stale"));
+        handle.stop_and_join();
+    }
+
+    #[test]
+    fn catchup_never_calls_transcript_reconcile() {
+        let dir = tempfile::tempdir().unwrap();
+        let stores = reconcile_panicking_stores(dir.path());
+        seed_connection(&stores);
+        for (id, ord) in [("item_0", 0), ("item_1", 1)] {
+            seed_message_item(&*stores.transcript, ord, id, id);
+        }
+        assert_eq!(
+            stores.transcript.store_frontier().unwrap(),
+            Some((1, ItemId::new("item_1")))
+        );
+
+        let page = item_list_from_messages(&["item_2", "item_3"], false);
+        let (api, _mock) = MockApi::with_fetch_script(VecDeque::from([Ok(page)]));
+
+        let (_ev_tx, ev_rx) = crossbeam_channel::bounded(64);
+        let (feed_tx, feed_rx) = async_channel::bounded(64);
+        let handle = spawn_actor(fresh_state(), ev_rx, feed_tx, stores, test_clock(), api);
+
+        loop {
+            match feed_rx.recv_blocking().unwrap() {
+                ActorFeed::Detailed(StreamUpdate::TranscriptAdvanced {
+                    committed_ordinal: 3,
+                }) => break,
+                ActorFeed::Detailed(_) | ActorFeed::Summary(_) => {}
+            }
+        }
         handle.stop_and_join();
     }
 

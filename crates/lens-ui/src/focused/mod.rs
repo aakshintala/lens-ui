@@ -1828,7 +1828,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn reconcile_epoch_settled_enqueues_all_when_overlapped(cx: &mut gpui::TestAppContext) {
+    async fn reconcile_epoch_settled_enqueues_span_when_overlapped(cx: &mut gpui::TestAppContext) {
         let (replica, rx) = new_replica(
             cx,
             ReconcileEpoch {
@@ -1854,6 +1854,49 @@ mod tests {
             }
         );
         assert_eq!(reconcile.priority, Priority::Reconcile);
+    }
+
+    /// D19: baseline `new_with_reader` and reconcile-epoch settle must never enqueue
+    /// `ReadRange::All` — only bounded `Tail` / `Span` reads.
+    #[gpui::test]
+    async fn baseline_and_reconcile_settle_never_enqueue_read_range_all(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (replica, rx) = new_replica(
+            cx,
+            ReconcileEpoch {
+                epoch: 3,
+                in_flight: true,
+            },
+            1,
+        );
+
+        let mut ranges = vec![rx.try_recv().expect("baseline read").range];
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.on_reconcile_epoch_settled(3, cx);
+            });
+        });
+        ranges.push(rx.try_recv().expect("reconcile read").range);
+
+        for range in &ranges {
+            match range {
+                ReadRange::Tail { .. } | ReadRange::Span { .. } => {}
+                ReadRange::All => {
+                    panic!("D19: focused replica must not enqueue ReadRange::All");
+                }
+                other => panic!("unexpected enqueued read range: {other:?}"),
+            }
+        }
+        assert!(
+            ranges.iter().any(|r| matches!(r, ReadRange::Tail { .. })),
+            "baseline must enqueue Tail"
+        );
+        assert!(
+            ranges.iter().any(|r| matches!(r, ReadRange::Span { .. })),
+            "overlapped reconcile settle must enqueue Span"
+        );
     }
 
     #[gpui::test]
