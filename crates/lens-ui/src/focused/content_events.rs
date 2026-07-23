@@ -1,5 +1,7 @@
+#[cfg(test)]
 use std::cell::RefCell;
 
+#[cfg(test)]
 thread_local! {
     static SINK: RefCell<Vec<ContentUiEvent>> = const { RefCell::new(Vec::new()) };
 }
@@ -16,10 +18,19 @@ pub enum ContentUiEvent {
 }
 
 pub fn emit_navigate_to_file(path: String, line: Option<u32>, _cx: &mut gpui::App) {
-    SINK.with(|s| {
-        s.borrow_mut()
-            .push(ContentUiEvent::NavigateToFile(NavigateToFile { path, line }));
-    });
+    #[cfg(test)]
+    {
+        SINK.with(|s| {
+            s.borrow_mut()
+                .push(ContentUiEvent::NavigateToFile(NavigateToFile { path, line }));
+        });
+    }
+    #[cfg(not(test))]
+    {
+        let _ = (path, line);
+        // TODO(T-4/nav): route to the real navigation event bus
+        tracing::debug!("emit_navigate_to_file noop (navigation bus deferred)");
+    }
 }
 
 #[cfg(test)]

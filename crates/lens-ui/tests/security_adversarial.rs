@@ -131,6 +131,30 @@ fn no_unvalidated_img_calls_in_node_rs() {
 }
 
 #[test]
+fn hostile_file_refs_stripped_at_boundary() {
+    for url in [
+        "../.ssh/id_rsa",
+        "//evil.example/a",
+        "ftp://evil/x",
+        "/etc/passwd",
+        "custom:foo/bar",
+        "\\\\server\\share\\f.rs",
+    ] {
+        assert!(
+            matches!(validate_link_url(url), LinkVerdict::Strip),
+            "expected Strip for {url:?}"
+        );
+    }
+    match validate_link_url("src/parser.rs:42") {
+        LinkVerdict::NavigateToFile { path, line } => {
+            assert_eq!(path, "src/parser.rs");
+            assert_eq!(line, Some(42));
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
 fn p6_link_paint_gate_strips_dangerous_urls() {
     fn link_would_paint(url: &str) -> bool {
         !matches!(validate_link_url(url), LinkVerdict::Strip)

@@ -40,14 +40,16 @@ pub fn validate_link_url(url: &str) -> LinkVerdict {
         }
         return LinkVerdict::AllowOpenUrl;
     }
-    if looks_like_file_path(url) {
-        let (path, line) = split_path_line(url);
+    if let Some((path, line)) = parse_workspace_file_ref(url) {
         return LinkVerdict::NavigateToFile { path, line };
     }
     LinkVerdict::Strip
 }
 
 pub fn validate_image_ref(url: &str) -> ImageVerdict {
+    if url.len() > MAX_URL_LEN {
+        return ImageVerdict::Strip;
+    }
     if url.contains("..") || url.starts_with('/') {
         return ImageVerdict::Strip;
     }
@@ -68,21 +70,28 @@ pub fn validate_image_ref(url: &str) -> ImageVerdict {
     ImageVerdict::Strip
 }
 
-fn looks_like_file_path(url: &str) -> bool {
-    url.starts_with("./")
-        || url.starts_with("../")
-        || url.contains('/')
-        || url.ends_with(".rs")
-        || url.ends_with(".md")
-}
-
-fn split_path_line(url: &str) -> (String, Option<u32>) {
-    if let Some((path, line)) = url.rsplit_once(':')
-        && let Ok(n) = line.parse::<u32>()
+fn parse_workspace_file_ref(url: &str) -> Option<(String, Option<u32>)> {
+    let (base, line) = match url.rsplit_once(':') {
+        Some((p, n)) if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) => {
+            (p, n.parse::<u32>().ok())
+        }
+        _ => (url, None),
+    };
+    if base.is_empty()
+        || base.starts_with('/')
+        || base.starts_with("//")
+        || base.contains("://")
+        || base.contains(':')
+        || base.contains('\\')
+        || base.split('/').any(|seg| seg == "..")
     {
-        return (path.to_string(), Some(n));
+        return None;
     }
-    (url.to_string(), None)
+    let looks_file = base.contains('/') || base.ends_with(".rs") || base.ends_with(".md");
+    if !looks_file {
+        return None;
+    }
+    Some((base.to_string(), line))
 }
 
 #[cfg(test)]
@@ -192,5 +201,58 @@ mod tests {
             validate_image_ref("lens-artifact://session/abc/img.png"),
             ImageVerdict::AllowArtifactImg { .. }
         ));
+    }
+
+    #[test]
+    fn strips_hostile_file_refs() {
+        for url in [
+            "../.ssh/id_rsa",
+            "//evil.example/a",
+            "ftp://evil/x",
+            "/etc/passwd",
+            "custom:foo/bar",
+            "\\\\server\\share\\f.rs",
+        ] {
+            assert!(
+                matches!(validate_link_url(url), LinkVerdict::Strip),
+                "expected Strip for {url:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_file_refs_navigate() {
+        match validate_link_url("src/parser.rs:42") {
+            LinkVerdict::NavigateToFile { path, line } => {
+                assert_eq!(path, "src/parser.rs");
+                assert_eq!(line, Some(42));
+            }
+            other => panic!("{other:?}"),
+        }
+        match validate_link_url("src/parser.rs") {
+            LinkVerdict::NavigateToFile { path, line } => {
+                assert_eq!(path, "src/parser.rs");
+                assert_eq!(line, None);
+            }
+            other => panic!("{other:?}"),
+        }
+        match validate_link_url("README.md") {
+            LinkVerdict::NavigateToFile { path, line } => {
+                assert_eq!(path, "README.md");
+                assert_eq!(line, None);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn strips_oversized_image_refs() {
+        let artifact = format!("lens-artifact://{}", "a".repeat(MAX_URL_LEN));
+        assert!(matches!(
+            validate_image_ref(&artifact),
+            ImageVerdict::Strip
+        ));
+        let data = format!("data:image/png;base64,{}", "a".repeat(MAX_URL_LEN));
+        assert!(matches!(validate_image_ref(&data), ImageVerdict::Strip));
     }
 }
