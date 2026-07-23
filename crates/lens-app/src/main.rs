@@ -95,6 +95,7 @@ fn main() {
         .with_assets(lens_ui::assets::LensAssets)
         .run(move |cx: &mut App| {
             gpui_component::init(cx);
+            lens_ui::md::init(cx);
             lens_ui::theme::install_at_startup(cx);
 
             let clock = Arc::new(WallUiClock) as Arc<dyn UiClock>;
@@ -422,6 +423,7 @@ fn run_demo() {
             // short-lived; the OS reclaims the temp dir on exit.
             std::mem::forget(demo_dir);
             gpui_component::init(cx);
+            lens_ui::md::init(cx);
             // Demo defaults to the dark palette; `LENS_THEME=light` still overrides.
             lens_ui::theme::install_at_startup_with_default(gpui_component::ThemeMode::Dark, cx);
 

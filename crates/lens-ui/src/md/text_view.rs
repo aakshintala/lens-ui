@@ -124,6 +124,9 @@ struct UpdateFuture {
     tx_result: smol::channel::Sender<Result<ParsedContent, SharedString>>,
     delay: Duration,
     code_block_actions: Option<Arc<CodeBlockActionsFn>>,
+    throttle_armed: bool,
+    pending_parse: bool,
+    streaming: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl UpdateFuture {
@@ -137,6 +140,7 @@ impl UpdateFuture {
         tx_result: smol::channel::Sender<Result<ParsedContent, SharedString>>,
         delay: Duration,
         code_block_actions: Option<Arc<CodeBlockActionsFn>>,
+        streaming: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         Self {
             type_,
@@ -148,6 +152,9 @@ impl UpdateFuture {
             tx_result,
             delay,
             code_block_actions,
+            throttle_armed: false,
+            pending_parse: false,
+            streaming,
         }
     }
 }
@@ -162,6 +169,8 @@ impl Future for UpdateFuture {
                     let changed = match update {
                         Update::Text(text) if self.current_text != text => {
                             self.current_text = text;
+                            self.streaming
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
                             true
                         }
                         Update::Style(style) if self.current_style != *style => {
@@ -171,8 +180,12 @@ impl Future for UpdateFuture {
                         _ => false,
                     };
                     if changed {
-                        let delay = self.delay;
-                        self.timer.set_after(delay);
+                        self.pending_parse = true;
+                        if !self.throttle_armed {
+                            self.throttle_armed = true;
+                            let delay = self.delay;
+                            self.timer.set_after(delay);
+                        }
                     }
                     continue;
                 }
@@ -190,6 +203,16 @@ impl Future for UpdateFuture {
                         &self.code_block_actions.clone(),
                     );
                     _ = self.tx_result.try_send(res);
+                    if self.pending_parse {
+                        self.pending_parse = false;
+                        self.throttle_armed = true;
+                        let delay = self.delay;
+                        self.timer.set_after(delay);
+                    } else {
+                        self.throttle_armed = false;
+                        self.streaming
+                            .store(false, std::sync::atomic::Ordering::Relaxed);
+                    }
                     continue;
                 }
                 Poll::Ready(None) | Poll::Pending => return Poll::Pending,
@@ -224,10 +247,11 @@ pub(crate) struct TextViewState {
     is_selecting: bool,
     is_selectable: bool,
     list_state: ListState,
+    streaming: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl TextViewState {
-    fn new(cx: &mut Context<TextViewState>) -> Self {
+    pub(crate) fn new(cx: &mut Context<TextViewState>) -> Self {
         let focus_handle = cx.focus_handle();
         Self {
             parent_entity: None,
@@ -239,14 +263,15 @@ impl TextViewState {
             is_selecting: false,
             is_selectable: false,
             list_state: ListState::new(0, gpui::ListAlignment::Top, px(1000.)),
+            streaming: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 }
 
 impl TextViewState {
     /// Save bounds and unselect if bounds changed.
-    fn update_bounds(&mut self, bounds: Bounds<Pixels>) {
-        if self.bounds.size != bounds.size {
+    fn update_bounds(&mut self, bounds: Bounds<Pixels>, preserve_selection_on_resize: bool) {
+        if self.bounds.size != bounds.size && !preserve_selection_on_resize {
             self.clear_selection();
         }
         self.bounds = bounds;
@@ -571,7 +596,7 @@ impl Element for TextView {
                                     let app = &mut **cx;
                                     app.notify(parent_entity);
                                 }
-                                state.clear_selection();
+                                // (selection intentionally preserved across reparse — P2)
                             });
                         } else {
                             // state released, stopping processing
@@ -582,6 +607,7 @@ impl Element for TextView {
             })
             .detach();
 
+            let streaming = self.state.read(cx).streaming.clone();
             cx.background_spawn(UpdateFuture::new(
                 type_,
                 style,
@@ -589,8 +615,9 @@ impl Element for TextView {
                 highlight_theme,
                 rx,
                 tx_result,
-                Duration::from_millis(200),
+                Duration::from_millis(100),
                 code_block_actions,
+                streaming,
             ))
             .detach();
 
@@ -657,9 +684,14 @@ impl Element for TextView {
         let entity_id = window.current_view();
         let is_selectable = self.selectable;
 
+        let preserve_selection_on_resize = self
+            .state
+            .read(cx)
+            .streaming
+            .load(std::sync::atomic::Ordering::Relaxed);
         self.state.update(cx, |state, _| {
             state.parent_entity = Some(entity_id);
-            state.update_bounds(bounds);
+            state.update_bounds(bounds, preserve_selection_on_resize);
             state.is_selectable = is_selectable;
         });
 

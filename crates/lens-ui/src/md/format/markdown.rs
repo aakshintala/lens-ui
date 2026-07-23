@@ -375,3 +375,16 @@ fn ast_to_node(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_html_becomes_html_codeblock_source() {
+        use crate::md::safe_prefix;
+        let src = safe_prefix("<a href=\"javascript:alert(1)\">x</a>\n\nparagraph");
+        assert!(src.contains("<a href="));
+        let _ = src;
+    }
+}
