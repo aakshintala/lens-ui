@@ -15,13 +15,13 @@ use lens_core::domain::session::SessionState;
 use lens_core::domain::usage::Cost;
 use lens_core::persist::{
     BoardStore, ConnectionRecord, ControlStore, SqliteBoardStore, SqliteControlStore,
-    SqliteTranscriptStore,
+    SqliteTranscriptStore, TranscriptStore,
 };
 use lens_ui::board::{BoardReplica, BoardView};
 #[cfg(feature = "demo")]
 use lens_ui::card::model::SessionCard;
 use lens_ui::clock::{UiClock, WallUiClock};
-use lens_ui::fleet::store::FleetStore;
+use lens_ui::fleet::store::{FleetStore, ReaderFactory};
 use lens_ui::slot::placeholder_tab;
 use std::path::{Path, PathBuf};
 use std::process;
@@ -233,6 +233,105 @@ fn seed_demo_groups(
     Some(Box::new(store) as _)
 }
 
+/// Deterministic bimodal transcript seed for `LENS_DEMO_FOCUSED` (mirrors `xtask focused-seed`).
+#[cfg(feature = "demo")]
+fn seed_demo_transcript(dir: &Path, conn: &ConnectionId, session: &SessionId, count: usize) {
+    use lens_core::domain::ids::{CallId, ItemId, ResponseId};
+    use lens_core::domain::item::{BlockContext, ContentBlock, Item, ItemKind};
+    use lens_core::domain::scalars::Role;
+
+    const LARGE_EVERY: i64 = 20;
+    const LARGE_PAYLOAD_BYTES: usize = 8_192;
+    const SMALL_PAYLOAD_BYTES: usize = 200;
+    const RESPONSE_IDS: [&str; 4] = ["resp_a", "resp_b", "resp_c", "resp_d"];
+    const SEED: u64 = 0x6A09_E667_F3BC_C908;
+
+    struct DeterministicRng {
+        state: u64,
+    }
+
+    impl DeterministicRng {
+        fn new(seed: u64) -> Self {
+            Self { state: seed.max(1) }
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.state;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.state = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+    }
+
+    fn payload_bytes(i: i64, rng: &mut DeterministicRng) -> usize {
+        if i % LARGE_EVERY == 0 {
+            LARGE_PAYLOAD_BYTES
+        } else {
+            SMALL_PAYLOAD_BYTES + (rng.next_u64() as usize % 64)
+        }
+    }
+
+    fn make_item(i: i64, rng: &mut DeterministicRng) -> Item {
+        let nbytes = payload_bytes(i, rng);
+        let response_id = RESPONSE_IDS[(i as usize) % RESPONSE_IDS.len()];
+        if i % LARGE_EVERY == 0 {
+            let text = "D".repeat(nbytes);
+            Item {
+                id: ItemId::new(format!("item_{i:08}")),
+                seq: Some(i as u64),
+                ctx: BlockContext {
+                    agent: Some("coder".into()),
+                    depth: 0,
+                    response_id: Some(ResponseId::new(response_id)),
+                },
+                created_at: 1_700_000_000_000 + i,
+                kind: ItemKind::FunctionCallOutput {
+                    call_id: CallId::new(format!("call_{i:08}")),
+                    output: text,
+                    arguments: Default::default(),
+                },
+            }
+        } else {
+            let text = format!("m{:0width$}", i, width = nbytes.saturating_sub(8));
+            Item {
+                id: ItemId::new(format!("item_{i:08}")),
+                seq: Some(i as u64),
+                ctx: BlockContext {
+                    agent: Some("coder".into()),
+                    depth: 0,
+                    response_id: Some(ResponseId::new(response_id)),
+                },
+                created_at: 1_700_000_000_000 + i,
+                kind: ItemKind::Message {
+                    role: if i % 7 == 0 {
+                        Role::User
+                    } else {
+                        Role::Assistant
+                    },
+                    content: vec![ContentBlock {
+                        kind: "text".into(),
+                        text: Some(text),
+                        data: Default::default(),
+                    }],
+                },
+            }
+        }
+    }
+
+    let db_path = dir.join(format!("{session}.db"));
+    let store = SqliteTranscriptStore::open(&db_path, conn, session)
+        .unwrap_or_else(|e| panic!("seed_demo_transcript open {}: {e}", db_path.display()));
+    let mut rng = DeterministicRng::new(SEED);
+    for ordinal in 0..count {
+        let item = make_item(ordinal as i64, &mut rng);
+        store
+            .upsert_item(ordinal as i64, &item, false)
+            .unwrap_or_else(|e| panic!("seed_demo_transcript upsert {ordinal}: {e}"));
+    }
+}
+
 /// `--demo`: paint six cards in the six wave states (no live server needed) so the
 /// status language is visible at a glance. Cards carry no poller/commands — clicking
 /// one still toggles focus (and suppresses that card's glow while focused).
@@ -242,14 +341,20 @@ fn run_demo() {
     // BEFORE Application::run (compliant — no cx.new SQLite) so B-3 group chrome renders
     // live over the demo cards; extra replicas reconcile loose.
     let demo_dir = tempfile::tempdir().expect("demo tempdir");
-    let demo_db = demo_dir.path().join("board.db");
+    let demo_data_dir = demo_dir.path().to_path_buf();
+    let demo_db = demo_data_dir.join("board.db");
     let demo_conn = ConnectionId::new("lens-app");
+    let focus_id = SessionId::new("demo-focus");
+    let demo_focused = std::env::var("LENS_DEMO_FOCUSED").is_ok();
     let mut demo_store = seed_demo_groups(&demo_db, &demo_conn);
+    if demo_focused {
+        seed_demo_transcript(&demo_data_dir, &demo_conn, &focus_id, 2000);
+    }
 
     Application::new()
         .with_assets(lens_ui::assets::LensAssets)
         .run(move |cx: &mut App| {
-            let _demo_dir = &demo_dir; // hold the TempDir for the app's lifetime
+            let _demo_dir = demo_dir; // hold the TempDir for the app's lifetime
             gpui_component::init(cx);
             // Demo defaults to the dark palette; `LENS_THEME=light` still overrides.
             lens_ui::theme::install_at_startup_with_default(gpui_component::ThemeMode::Dark, cx);
@@ -285,6 +390,19 @@ fn run_demo() {
                         let id = card.session_id.clone();
                         let entity = cx.new(|_| card);
                         f.cards.insert(id, entity);
+                    }
+                    if demo_focused {
+                        f.register_reader_factory(ReaderFactory::new(
+                            demo_data_dir.clone(),
+                            demo_conn.clone(),
+                            focus_id.clone(),
+                        ));
+                        let mut focus_card = demo_preset_cards(now)[2].clone();
+                        focus_card.session_id = focus_id.clone();
+                        focus_card.title = Some("Disk-windowing transcript".into());
+                        let entity = cx.new(|_| focus_card);
+                        f.cards.insert(focus_id.clone(), entity);
+                        f.focus_session(focus_id.clone(), cx);
                     }
                     cx.notify();
                 });

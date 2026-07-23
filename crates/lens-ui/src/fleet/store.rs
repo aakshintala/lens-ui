@@ -166,6 +166,12 @@ impl FleetStore {
         self.reader_factories.get(id)
     }
 
+    pub fn register_reader_factory(&mut self, factory: ReaderFactory) {
+        let id = factory.session_id().clone();
+        self.reconcile_epochs.entry(id.clone()).or_default();
+        self.reader_factories.insert(id, factory);
+    }
+
     pub fn reconcile_epoch(&self, id: &SessionId) -> ReconcileEpoch {
         self.reconcile_epochs.get(id).cloned().unwrap_or_default()
     }
