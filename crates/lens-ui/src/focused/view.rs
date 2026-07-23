@@ -105,11 +105,17 @@ impl FocusedTranscriptView {
             FollowMode::Paused
         };
         self.set_follow_mode(mode, self.last_row_count);
-        self.replica
-            .update(cx, |r, cx| r.set_following(following, cx));
+        self.replica.update(cx, |r, cx| {
+            r.set_following(following, cx);
+            r.page_older_if_near_top(event.visible_range.start, cx);
+        });
     }
 
     fn jump_to_latest(&mut self, cx: &mut Context<Self>) {
+        self.replica.update(cx, |r, cx| {
+            r.set_following(true, cx);
+            r.request_tail_reload();
+        });
         let count = self.row_count(cx);
         self.replica.read(cx).list_state().scroll_to(ListOffset {
             item_ix: count,
@@ -118,7 +124,6 @@ impl FocusedTranscriptView {
         self.follow_mode = FollowMode::Following;
         self.rows_at_pause = count;
         self.last_row_count = count;
-        self.replica.update(cx, |r, cx| r.set_following(true, cx));
         cx.notify();
     }
 
@@ -172,6 +177,7 @@ fn kind_tag(kind: RowKind) -> &'static str {
         RowKind::StreamingReasoning => "StreamingReasoning",
         RowKind::StreamingMessage => "StreamingMessage",
         RowKind::ReconnectBreak => "ReconnectBreak",
+        RowKind::LoadOlder => "LoadOlder",
     }
 }
 
@@ -274,7 +280,9 @@ pub fn mount_focused_transcript_view(
 mod tests {
     use super::*;
     use crate::fleet::store::ReconcileEpoch;
-    use crate::focused::{ReaderWorkerHandle, RowId, RowKind, RowPresentation, RowStore};
+    use crate::focused::{
+        FocusedTranscript, ReaderWorkerHandle, RowId, RowKind, RowPresentation, RowStore,
+    };
     use gpui::{ListAlignment, ListState};
     use lens_core::domain::ids::{AccId, CallId, ItemId, ResponseId};
     use lens_core::domain::item::{
@@ -708,6 +716,7 @@ mod tests {
             RowKind::StreamingReasoning,
             RowKind::StreamingMessage,
             RowKind::ReconnectBreak,
+            RowKind::LoadOlder,
         ] {
             let _ = FocusedTranscriptView::render_stub_row(
                 &RowPresentation {
@@ -719,5 +728,133 @@ mod tests {
                 0,
             );
         }
+    }
+
+    #[gpui::test]
+    fn jump_to_latest_enqueues_tail_reload_when_evicted(cx: &mut gpui::TestAppContext) {
+        use crate::focused::reader::Priority;
+        use lens_core::persist::ReadRange;
+
+        let (reader, rx) = ReaderWorkerHandle::new_test();
+        let session_id = lens_core::domain::ids::SessionId::new("sess_jump_tail");
+        let replica = cx.update(|cx| {
+            cx.new(|cx| {
+                FocusedTranscript::new_test_no_baseline(
+                    reader,
+                    session_id,
+                    ReconcileEpoch::default(),
+                    1,
+                    cx,
+                )
+            })
+        });
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                for i in 0..3 {
+                    let id = RowId::Sibling(ItemId::new(format!("m{i}")));
+                    r.rows_mut().upsert(
+                        id.clone(),
+                        RowPresentation {
+                            kind: RowKind::Message,
+                            text: format!("row {i}"),
+                            collapsed: false,
+                            height_hint: None,
+                        },
+                        cx,
+                    );
+                    r.rows_mut()
+                        .structure
+                        .push(crate::focused::rowsource::StructureEntry::Sibling(id));
+                }
+                r.rows_mut().rebuild_flat_order();
+                r.known_committed = 10;
+                r.resident_hi = 7;
+            });
+        });
+        let view = cx.update(|cx| cx.new(|cx| FocusedTranscriptView::new(replica.clone(), cx)));
+
+        cx.update(|cx| {
+            view.update(cx, |v, cx| v.jump_to_latest_for_test(cx));
+        });
+
+        let tail = rx.try_recv().expect("tail reload on evicted jump");
+        assert!(matches!(tail.range, ReadRange::Tail { .. }));
+        assert_eq!(tail.priority, Priority::Delta);
+        cx.read(|cx| {
+            assert!(replica.read(cx).is_following());
+        });
+    }
+
+    #[gpui::test]
+    fn on_scroll_near_top_enqueues_single_backward_page(cx: &mut gpui::TestAppContext) {
+        use crate::focused::reader::Priority;
+        use lens_core::persist::ReadRange;
+
+        let (reader, rx) = ReaderWorkerHandle::new_test();
+        let session_id = lens_core::domain::ids::SessionId::new("sess_page_older");
+        let replica = cx.update(|cx| {
+            cx.new(|cx| {
+                FocusedTranscript::new_test_no_baseline(
+                    reader,
+                    session_id,
+                    ReconcileEpoch::default(),
+                    1,
+                    cx,
+                )
+            })
+        });
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                for i in 5..10 {
+                    let id = RowId::Sibling(ItemId::new(format!("m{i}")));
+                    r.rows_mut().upsert(
+                        id.clone(),
+                        RowPresentation {
+                            kind: RowKind::Message,
+                            text: format!("row {i}"),
+                            collapsed: false,
+                            height_hint: None,
+                        },
+                        cx,
+                    );
+                    r.rows_mut()
+                        .structure
+                        .push(crate::focused::rowsource::StructureEntry::Sibling(id));
+                }
+                r.rows_mut().rebuild_flat_order();
+                r.resident_lo = 5;
+                r.resident_hi = 9;
+            });
+        });
+        let view = cx.update(|cx| cx.new(|cx| FocusedTranscriptView::new(replica.clone(), cx)));
+
+        cx.update(|cx| {
+            view.update(cx, |v, cx| {
+                v.on_scroll_event(&scroll_event(2, 6, true), cx);
+            });
+        });
+
+        let page = rx.try_recv().expect("backward page near top");
+        assert_eq!(
+            page.range,
+            ReadRange::Backward {
+                before: 5,
+                byte_budget: 4 * 1024 * 1024,
+            }
+        );
+        assert_eq!(page.priority, Priority::Page);
+        cx.read(|cx| {
+            assert!(replica.read(cx).page_in_flight_for_test());
+        });
+
+        cx.update(|cx| {
+            view.update(cx, |v, cx| {
+                v.on_scroll_event(&scroll_event(1, 6, true), cx);
+            });
+        });
+        assert!(
+            rx.try_recv().is_err(),
+            "second near-top scroll must not enqueue while page in flight"
+        );
     }
 }

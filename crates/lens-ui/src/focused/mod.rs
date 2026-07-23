@@ -24,9 +24,10 @@ pub use rowsource::{
 const LIST_OVERDRAW: Pixels = gpui::px(200.);
 const SYNC_DEBOUNCE_MS: u64 = 150;
 const TAIL_BUDGET_BYTES: usize = 8 * 1024 * 1024;
-#[cfg_attr(not(test), allow(dead_code))]
 const PAGE_BUDGET_BYTES: usize = 4 * 1024 * 1024;
 const RESIDENT_CAP_BYTES: usize = 24 * 1024 * 1024;
+/// Rows from the top of the visible window that trigger a backward page (§5).
+const NEAR_TOP_ROWS: usize = 5;
 /// Max committed ordinals pulled per forward `Delta` read while following (§4.2).
 const FORWARD_DELTA_PAGE_ORDINALS: i64 = 512;
 
@@ -40,6 +41,24 @@ pub struct Marker {
     pub after_ordinal: i64,
     pub seq: u64,
     pub kind: MarkerKind,
+}
+
+/// Scroll-near-top decision for backward paging (§5) — unit-testable outside gpui scroll injection.
+pub fn should_page_older(visible_start: usize, resident_lo: i64, page_in_flight: bool) -> bool {
+    resident_lo > 0 && !page_in_flight && visible_start <= NEAR_TOP_ROWS
+}
+
+/// After prepending `inserted_rows` at the front of a bottom-aligned list, shift the logical
+/// scroll anchor so the same content stays visible (gpui `splice(0..0, n)` adjusts `item_ix`
+/// the same way; this pure fn documents and unit-tests that contract).
+pub fn prepend_scroll_compensation(
+    anchor: gpui::ListOffset,
+    inserted_rows: usize,
+) -> gpui::ListOffset {
+    gpui::ListOffset {
+        item_ix: anchor.item_ix.saturating_add(inserted_rows),
+        offset_in_item: anchor.offset_in_item,
+    }
 }
 
 pub struct FocusedTranscript {
@@ -76,6 +95,8 @@ pub struct FocusedTranscript {
     settled_structure_len: usize,
     /// Run-member item id → sticky section `run_anchor` (window-invariant across Backward prepend).
     section_anchor: HashMap<ItemId, ItemId>,
+    /// Single-in-flight guard for scroll-near-top `Backward` pages (§5).
+    page_in_flight: bool,
 }
 
 impl FocusedTranscript {
@@ -129,6 +150,7 @@ impl FocusedTranscript {
             live_section_projection_count: 0,
             settled_structure_len: 0,
             section_anchor: HashMap::new(),
+            page_in_flight: false,
         };
         replica.enqueue_read(
             ReadRange::Tail {
@@ -180,6 +202,7 @@ impl FocusedTranscript {
             live_section_projection_count: 0,
             settled_structure_len: 0,
             section_anchor: HashMap::new(),
+            page_in_flight: false,
         };
         cx.notify();
         replica
@@ -244,6 +267,11 @@ impl FocusedTranscript {
         self.resident_hi
     }
 
+    #[allow(dead_code)] // focused_scroll_probe reads the live cursor
+    pub fn resident_lo(&self) -> i64 {
+        self.resident_lo
+    }
+
     pub(crate) fn known_committed(&self) -> i64 {
         self.known_committed
     }
@@ -282,13 +310,48 @@ impl FocusedTranscript {
         }
     }
 
+    /// Enqueue a tail reload when the committed frontier is ahead of the resident band (§4.4).
+    pub(crate) fn request_tail_reload(&mut self) {
+        if self.resident_hi >= 0 && self.known_committed > self.resident_hi {
+            self.enqueue_read(
+                ReadRange::Tail {
+                    byte_budget: TAIL_BUDGET_BYTES,
+                },
+                Priority::Delta,
+                self.focus_generation,
+            );
+        }
+    }
+
+    /// Scroll-near-top trigger — one `Backward` page in flight at a time (§5).
+    pub(crate) fn page_older_if_near_top(&mut self, visible_start: usize, cx: &mut Context<Self>) {
+        if !should_page_older(visible_start, self.resident_lo, self.page_in_flight) {
+            return;
+        }
+        self.page_in_flight = true;
+        self.enqueue_read(
+            ReadRange::Backward {
+                before: self.resident_lo,
+                byte_budget: PAGE_BUDGET_BYTES,
+            },
+            Priority::Page,
+            self.focus_generation,
+        );
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn page_in_flight_for_test(&self) -> bool {
+        self.page_in_flight
+    }
+
     pub fn fold_detailed(&mut self, u: StreamUpdate, cx: &mut Context<Self>) {
         let mut dirty = false;
         match u {
             StreamUpdate::Rebased(state) => {
                 self.active_response = state.active_response.clone();
                 self.recompute_live_section_lo();
-                self.reproject(true, cx);
+                self.reproject(true, false, cx);
                 dirty = true;
             }
             StreamUpdate::TranscriptAdvanced {
@@ -323,12 +386,12 @@ impl FocusedTranscript {
                 self.recompute_live_section_lo();
                 self.recompute_settled_prefix();
                 self.apply_expansion_flags(cx);
-                self.reproject(false, cx);
+                self.reproject(false, false, cx);
                 dirty = true;
             }
             StreamUpdate::ScratchChanged(scratch) => {
                 self.scratch = scratch;
-                self.reproject(false, cx);
+                self.reproject(false, false, cx);
                 dirty = true;
             }
             StreamUpdate::Retired {
@@ -369,7 +432,7 @@ impl FocusedTranscript {
                         seq,
                         kind: MarkerKind::ReconnectBreak,
                     });
-                    self.reproject(false, cx);
+                    self.reproject(false, false, cx);
                     dirty = true;
                 }
             }
@@ -404,6 +467,9 @@ impl FocusedTranscript {
             return;
         }
         self.reader_error = None;
+        if matches!(range, ReadRange::Backward { .. }) {
+            self.page_in_flight = false;
+        }
         if matches!(range, ReadRange::Delta { .. }) && !self.is_following() {
             if let ReadRange::Delta { through, .. } = range {
                 self.known_committed = self.known_committed.max(through);
@@ -484,12 +550,13 @@ impl FocusedTranscript {
         self.recompute_live_section_lo();
         self.recompute_settled_prefix();
         let full = full_replace || evicted_any;
+        let prepend_sync = matches!(range, ReadRange::Backward { .. });
         if full {
             self.settled_structure_len = 0;
-            self.reproject(true, cx);
+            self.reproject(true, prepend_sync, cx);
         } else {
             self.apply_expansion_flags(cx);
-            self.reproject(false, cx);
+            self.reproject(false, false, cx);
         }
         if matches!(range, ReadRange::Delta { .. })
             && self.is_following()
@@ -740,7 +807,7 @@ impl FocusedTranscript {
         self.settled_structure_len = blocks.len();
     }
 
-    fn reproject(&mut self, full: bool, cx: &mut Context<Self>) {
+    fn reproject(&mut self, full: bool, prepend_sync: bool, cx: &mut Context<Self>) {
         let expansion = self.compute_expansion_flags();
         let prev_len = self.rows.len();
         self.rows.set_all_response_expansion(&expansion, None);
@@ -792,11 +859,18 @@ impl FocusedTranscript {
 
         self.rows
             .reinsert_markers(&self.markers, &self.item_ordinals, cx);
+        self.sync_load_older_sentinel(cx);
 
         self.overlay_pending_finalize(cx);
         let pending_accs: HashSet<AccId> = self.pending_finalize.keys().cloned().collect();
         self.rows.gc_entities(&pending_accs);
-        self.rows.sync_list_count(&self.list_state, prev_len);
+        let new_len = self.rows.len();
+        if prepend_sync && new_len > prev_len {
+            self.rows
+                .sync_list_prepend(&self.list_state, new_len - prev_len);
+        } else {
+            self.rows.sync_list_count(&self.list_state, prev_len);
+        }
         let live_refs: Vec<&Item> = match self.live_section_lo {
             Some(lo) => self.items.range(lo..).map(|(_, item)| item).collect(),
             None => Vec::new(),
@@ -807,6 +881,25 @@ impl FocusedTranscript {
             self.active_response.as_ref(),
         )
         .len();
+    }
+
+    fn sync_load_older_sentinel(&mut self, cx: &mut Context<Self>) {
+        self.rows
+            .structure
+            .retain(|e| !matches!(e, rowsource::StructureEntry::LoadOlder));
+        if self.resident_lo > 0 {
+            let pres = RowPresentation {
+                kind: RowKind::LoadOlder,
+                text: "Load older".into(),
+                collapsed: false,
+                height_hint: None,
+            };
+            self.rows.upsert(RowId::LoadOlder, pres, cx);
+            self.rows
+                .structure
+                .insert(0, rowsource::StructureEntry::LoadOlder);
+            self.rows.rebuild_flat_order();
+        }
     }
 
     fn overlay_pending_finalize(&mut self, cx: &mut Context<Self>) {
@@ -1695,7 +1788,7 @@ mod tests {
                 r.live_section_lo = Some(0);
             });
             replica.update(cx, |r, cx| {
-                r.reproject(false, cx);
+                r.reproject(false, false, cx);
             });
         });
         let before = cx.read(|cx| replica.read(cx).live_section_projection_count);
@@ -4246,7 +4339,7 @@ mod tests {
 
         cx.update(|cx| {
             replica.update(cx, |r, cx| {
-                r.reproject(false, cx);
+                r.reproject(false, false, cx);
             });
         });
 
@@ -4260,6 +4353,144 @@ mod tests {
                 entity_before, entity_after,
                 "pending_finalize tail must survive gc_entities in reproject"
             );
+        });
+    }
+
+    #[test]
+    fn should_page_older_decision_branches() {
+        assert!(!should_page_older(0, -1, false));
+        assert!(!should_page_older(0, 0, false));
+        assert!(should_page_older(0, 5, false));
+        assert!(should_page_older(NEAR_TOP_ROWS, 5, false));
+        assert!(!should_page_older(NEAR_TOP_ROWS + 1, 5, false));
+        assert!(!should_page_older(0, 5, true));
+    }
+
+    #[test]
+    fn prepend_scroll_compensation_shifts_item_ix() {
+        let anchor = gpui::ListOffset {
+            item_ix: 12,
+            offset_in_item: gpui::px(4.),
+        };
+        let compensated = prepend_scroll_compensation(anchor, 5);
+        assert_eq!(compensated.item_ix, 17);
+        assert_eq!(compensated.offset_in_item, gpui::px(4.));
+    }
+
+    #[gpui::test]
+    async fn load_older_sentinel_present_iff_resident_lo_positive(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert!(
+                !r.rows().order().iter().any(|id| *id == RowId::LoadOlder),
+                "no sentinel when resident_lo absent"
+            );
+        });
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    tail_read(
+                        vec![(0, message_item("m0", None)), (1, message_item("m1", None))],
+                        1,
+                    ),
+                    cx,
+                );
+            });
+        });
+
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert_eq!(r.resident_lo_for_test(), 0);
+            assert!(
+                !r.rows().order().iter().any(|id| *id == RowId::LoadOlder),
+                "resident_lo == 0 must not show sentinel"
+            );
+        });
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    tail_read(
+                        vec![(5, message_item("m5", None)), (6, message_item("m6", None))],
+                        6,
+                    ),
+                    cx,
+                );
+            });
+        });
+
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert!(r.resident_lo_for_test() > 0);
+            assert_eq!(r.rows().order().first(), Some(&RowId::LoadOlder));
+            assert_eq!(
+                r.rows().kind_at(0, cx),
+                Some(RowKind::LoadOlder),
+                "first row must be LoadOlder sentinel"
+            );
+        });
+    }
+
+    fn tool_output_item(id: &str, resp: &str, call_id: &str) -> Item {
+        use lens_core::domain::ids::CallId;
+        Item {
+            id: ItemId::new(id),
+            seq: None,
+            ctx: lens_core::domain::item::BlockContext {
+                agent: None,
+                depth: 0,
+                response_id: Some(ResponseId::new(resp)),
+            },
+            created_at: 1,
+            kind: ItemKind::FunctionCallOutput {
+                call_id: CallId::new(call_id),
+                output: "ok".into(),
+                arguments: serde_json::Value::Null,
+            },
+        }
+    }
+
+    /// Boundary UX: call above `resident_lo`, output resident → transient orphan row
+    /// (`pair_tool_spans` passthrough) without panic.
+    #[gpui::test]
+    async fn tool_output_orphan_when_call_above_resident_lo(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    tail_read(vec![(10, tool_output_item("o1", "resp_a", "call_1"))], 10),
+                    cx,
+                );
+            });
+        });
+
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert_eq!(r.resident_lo_for_test(), 10);
+            let found = r.rows().order().iter().any(|id| {
+                r.rows()
+                    .entity(id)
+                    .is_some_and(|e| e.read(cx).presentation.text == "ok")
+            });
+            assert!(found, "orphan output must render without panic");
         });
     }
 }

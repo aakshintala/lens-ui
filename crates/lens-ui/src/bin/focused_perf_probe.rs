@@ -334,6 +334,7 @@ fn kind_tag(kind: RowKind) -> &'static str {
         RowKind::StreamingReasoning => "StreamingReasoning",
         RowKind::StreamingMessage => "StreamingMessage",
         RowKind::ReconnectBreak => "ReconnectBreak",
+        RowKind::LoadOlder => "LoadOlder",
     }
 }
 

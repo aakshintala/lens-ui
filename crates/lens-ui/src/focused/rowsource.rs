@@ -27,6 +27,8 @@ pub enum RowId {
     SectionRail(ResponseId, ItemId),
     /// Reconnect-break marker (Task 14).
     Marker(u64),
+    /// Top-of-list scroll-back sentinel (T-2b §5).
+    LoadOlder,
 }
 
 /// Section identity — finalize-stable `(response_id, run_anchor)`.
@@ -69,6 +71,7 @@ pub enum RowKind {
     StreamingReasoning,
     StreamingMessage,
     ReconnectBreak,
+    LoadOlder,
 }
 
 /// Per-row retained state. Backends render a handle into this store.
@@ -91,6 +94,7 @@ pub(crate) enum StructureEntry {
     Sibling(RowId),
     #[allow(dead_code)] // constructed in Task 14 (ReconnectBreak markers)
     Marker(RowId),
+    LoadOlder,
 }
 
 /// Owned child list for a work section (Level 2).
@@ -242,6 +246,14 @@ impl RowStore {
         }
     }
 
+    /// Prepend splice — shifts `logical_scroll_top.item_ix` by `inserted` without resetting
+    /// anchors inside the replaced band (gpui `ListState::splice(0..0, n)`).
+    pub fn sync_list_prepend(&self, list: &ListState, inserted: usize) {
+        if inserted > 0 {
+            self.splice_into(list, 0..0, inserted);
+        }
+    }
+
     /// Height-invalidate a content-mutated row (spike `invalidate_row_height`).
     pub fn invalidate_row_height(&self, list: &ListState, index: usize) {
         self.splice_into(list, index..index + 1, 1);
@@ -382,7 +394,7 @@ impl RowStore {
         }
         self.structure.retain(|e| match e {
             StructureEntry::Sibling(row) | StructureEntry::Marker(row) => row != &id,
-            StructureEntry::Section(_) => true,
+            StructureEntry::Section(_) | StructureEntry::LoadOlder => true,
         });
         self.entities.remove(&id);
         let prev_len = self.order.len();
@@ -512,6 +524,7 @@ impl RowStore {
                 StructureEntry::Sibling(id) | StructureEntry::Marker(id) => {
                     self.order.push(id.clone());
                 }
+                StructureEntry::LoadOlder => self.order.push(RowId::LoadOlder),
             }
         }
     }
@@ -537,8 +550,14 @@ impl RowStore {
             retain.insert(RowId::StreamTail(acc.clone()));
         }
         for entry in &self.structure {
-            if let StructureEntry::Marker(id) = entry {
-                retain.insert(id.clone());
+            match entry {
+                StructureEntry::Marker(id) => {
+                    retain.insert(id.clone());
+                }
+                StructureEntry::LoadOlder => {
+                    retain.insert(RowId::LoadOlder);
+                }
+                StructureEntry::Section(_) | StructureEntry::Sibling(_) => {}
             }
         }
         self.entities.retain(|id, _| retain.contains(id));
@@ -659,6 +678,7 @@ fn child_ord(row_id: &RowId, item_ordinals: &HashMap<ItemId, i64>) -> i64 {
     match row_id {
         RowId::Work(id) | RowId::Sibling(id) => item_ordinals.get(id).copied().unwrap_or(i64::MAX),
         RowId::StreamTail(_) => i64::MAX,
+        RowId::LoadOlder => i64::MIN,
         _ => i64::MIN,
     }
 }
@@ -680,7 +700,7 @@ fn entry_repr(
             })
             .unwrap_or(i64::MIN),
         StructureEntry::Sibling(id) => child_ord(id, item_ordinals),
-        StructureEntry::Marker(_) => i64::MIN,
+        StructureEntry::Marker(_) | StructureEntry::LoadOlder => i64::MIN,
     }
 }
 

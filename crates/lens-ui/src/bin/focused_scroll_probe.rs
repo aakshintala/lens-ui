@@ -18,7 +18,7 @@ use lens_core::persist::{RangeRead, ReadRange};
 use lens_core::reduce::{RetireDisposition, StreamUpdate};
 use lens_ui::fleet::store::ReconcileEpoch;
 use lens_ui::focused::view::{FocusedTranscriptView, FollowMode};
-use lens_ui::focused::{FocusedTranscript, ReaderWorkerHandle};
+use lens_ui::focused::{FocusedTranscript, ReaderWorkerHandle, prepend_scroll_compensation};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct AnchorSnapshot {
@@ -43,6 +43,7 @@ struct ProbeState {
     saw_stick_while_following: bool,
     finalize_anchor_stable: Option<bool>,
     paused_anchor_stable: Option<bool>,
+    prepend_anchor_stable: Option<bool>,
 }
 
 struct HarnessView {
@@ -310,12 +311,88 @@ async fn drive_scroll_probe(
         })
         .unwrap();
 
+    // Prepend-anchor contract: backward page must not yank visible content.
+    let _ = weak.update_in(&mut wcx, |view, _, cx| {
+        let tail_rows: Vec<_> = (50..90)
+            .map(|i| {
+                row_with_len(
+                    i,
+                    message_item(&format!("tail{i}"), &format!("tail row {i}")),
+                )
+            })
+            .collect();
+        view.replica.update(cx, |r, cx| {
+            r.apply_read(
+                1,
+                ReadRange::All,
+                RangeRead {
+                    rows: tail_rows,
+                    skipped: vec![],
+                    watermark: Some(89),
+                },
+                cx,
+            );
+        });
+        cx.notify();
+    });
+    wait_frames(&mut wcx, 4).await;
+
+    let anchor_before_prepend = weak
+        .update_in(&mut wcx, |view, _, cx| {
+            let list = view.replica.read(cx).list_state();
+            list.scroll_by(px(-500.));
+            AnchorSnapshot::from(list.logical_scroll_top())
+        })
+        .unwrap();
+
+    let resident_lo = weak
+        .update_in(&mut wcx, |view, _, cx| view.replica.read(cx).resident_lo())
+        .unwrap();
+
+    let prepend_rows: Vec<_> = (40..49)
+        .map(|i| row_with_len(i, message_item(&format!("pre{i}"), &format!("pre row {i}"))))
+        .collect();
+    let inserted = prepend_rows.len();
+    let _ = weak.update_in(&mut wcx, |view, _, cx| {
+        view.replica.update(cx, |r, cx| {
+            r.apply_read(
+                1,
+                ReadRange::Backward {
+                    before: resident_lo,
+                    byte_budget: 4 * 1024 * 1024,
+                },
+                RangeRead {
+                    rows: prepend_rows,
+                    skipped: vec![],
+                    watermark: Some(89),
+                },
+                cx,
+            );
+        });
+        cx.notify();
+    });
+    wait_frames(&mut wcx, 4).await;
+
+    let anchor_after_prepend = weak
+        .update_in(&mut wcx, |view, _, cx| {
+            AnchorSnapshot::from(view.replica.read(cx).list_state().logical_scroll_top())
+        })
+        .unwrap();
+    let expected_after = AnchorSnapshot::from(prepend_scroll_compensation(
+        gpui::ListOffset {
+            item_ix: anchor_before_prepend.top_item_index,
+            offset_in_item: anchor_before_prepend.sub_offset,
+        },
+        inserted,
+    ));
+
     let ok = weak
         .update_in(&mut wcx, |view, _, _| {
             let mut p = view.probe.borrow_mut();
             p.finalize_anchor_stable = Some(anchor_before_finalize == anchor_after_finalize);
             p.paused_anchor_stable =
                 Some(anchor_before_paused_appends == anchor_after_paused_appends);
+            p.prepend_anchor_stable = Some(anchor_after_prepend == expected_after);
             if !p.saw_initial_bottom {
                 p.failures
                     .push("contract 4: new session did not land at bottom".into());
@@ -334,6 +411,12 @@ async fn drive_scroll_probe(
                 p.failures.push(format!(
                     "paused-not-yanked: anchor shifted {:?} -> {:?}",
                     anchor_before_paused_appends, anchor_after_paused_appends
+                ));
+            }
+            if p.prepend_anchor_stable != Some(true) {
+                p.failures.push(format!(
+                    "prepend-anchor: visible content shifted {:?} -> {:?} (expected {:?})",
+                    anchor_before_prepend, anchor_after_prepend, expected_after
                 ));
             }
             if anchor_before_pause == anchor_after_paused_appends {
