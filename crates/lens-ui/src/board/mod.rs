@@ -704,63 +704,13 @@ impl BoardView {
         // side, so a tile at cell (0,0) would paint at (-GUTTER, -GUTTER) and clip against
         // the scroll viewport (on-device: "Group card clipped on the left and top"; the ring
         // reach also clipped loose top-left cards). `content` stays a positioning context.
-        let scroll_for_drag = scroll.clone();
-        let mut content = div()
+        let content = div()
             .absolute()
             .left(px(PAD + GUTTER + center_offset))
             .top(px(PAD + GUTTER + v_center_offset))
             .w(px(used_cols as f32 * CELL_W))
-            .h(px(packing.content_height))
-            .on_drag_move(cx.listener(
-                move |board, event: &DragMoveEvent<BoardItemId>, _window, cx| {
-                    let bounds = event.bounds;
-                    let cursor = event.event.position;
-                    let local = (
-                        f32::from(cursor.x) - f32::from(bounds.origin.x),
-                        f32::from(cursor.y) - f32::from(bounds.origin.y),
-                    );
-                    let layout_gen = board.replica.read(cx).layout_generation();
-                    if let Some(ref mut session) = board.drag
-                        && session.phase == drag::DragPhase::Dragging
-                    {
-                        if !drag::on_cursor_move(session, local, layout_gen) {
-                            board.drag = None;
-                            cx.notify();
-                            return;
-                        }
-                        let dy = drag::edge_scroll_delta(
-                            f32::from(cursor.y),
-                            f32::from(bounds.origin.y),
-                            f32::from(bounds.size.height),
-                            EDGE_BAND_PX,
-                            EDGE_NUDGE_PX,
-                        );
-                        if dy != 0.0 {
-                            let mut off = scroll_for_drag.offset();
-                            off.y -= px(dy);
-                            scroll_for_drag.set_offset(off);
-                        }
-                        cx.notify();
-                    }
-                },
-            ))
-            .on_drop(cx.listener(|board, id: &BoardItemId, _window, cx| {
-                let layout_gen = board.replica.read(cx).layout_generation();
-                let Some(ref mut session) = board.drag else {
-                    return;
-                };
-                if &session.dragged_id != id {
-                    return;
-                }
-                if let Some(op) = drag::begin_commit(session, layout_gen) {
-                    board.replica.update(cx, |r, cx| {
-                        r.write(op, cx);
-                    });
-                } else {
-                    board.drag = None;
-                }
-                cx.notify();
-            }));
+            .h(px(packing.content_height));
+        let mut content = content;
 
         let dragged_session = drag_preview.and_then(|s| {
             layout.item(&s.dragged_id).and_then(|it| match &it.kind {
@@ -843,11 +793,75 @@ impl BoardView {
             .w(px(content_extent.max(pane_width)))
             .h(px(block_height.max(viewport_h)))
             .child(content);
+        // Drag handlers live on the SCROLL VIEWPORT (`el`, size_full), not the tightly-sized
+        // `content` box — a drop released below the last row or in the side/bottom margin is
+        // outside `content`'s hitbox, so gpui's hitbox-based drop dispatch would never fire
+        // `on_drop` and the drag would strand in `Dragging` (card renders as a permanent gap).
+        // Cursor is viewport-local here (`el` does not scroll), so translate to content-local by
+        // subtracting the content origin (PAD+GUTTER+center offsets) and the live scroll offset.
+        let scroll_for_drag = scroll.clone();
+        let dx_off = PAD + GUTTER + center_offset;
+        let dy_off = PAD + GUTTER + v_center_offset;
         let el = div()
             .id("board-scroll")
             .size_full()
             .overflow_y_scroll()
             .track_scroll(&scroll)
+            .on_drag_move(cx.listener(
+                move |board, event: &DragMoveEvent<BoardItemId>, _window, cx| {
+                    let bounds = event.bounds; // el = the viewport (unscrolled)
+                    let cursor = event.event.position;
+                    let vp_y = f32::from(cursor.y) - f32::from(bounds.origin.y);
+                    // content-local: gpui scroll offset.y is ≤ 0 when scrolled down, so
+                    // subtracting it adds the scrolled distance back.
+                    let scroll_y = f32::from(scroll_for_drag.offset().y);
+                    let local = (
+                        f32::from(cursor.x) - f32::from(bounds.origin.x) - dx_off,
+                        vp_y - scroll_y - dy_off,
+                    );
+                    let layout_gen = board.replica.read(cx).layout_generation();
+                    if let Some(ref mut session) = board.drag
+                        && session.phase == drag::DragPhase::Dragging
+                    {
+                        if !drag::on_cursor_move(session, local, layout_gen) {
+                            board.drag = None;
+                            cx.notify();
+                            return;
+                        }
+                        // Edge auto-scroll keys on the true viewport band (vp_y ∈ [0, height]).
+                        let dy = drag::edge_scroll_delta(
+                            vp_y,
+                            0.0,
+                            f32::from(bounds.size.height),
+                            EDGE_BAND_PX,
+                            EDGE_NUDGE_PX,
+                        );
+                        if dy != 0.0 {
+                            let mut off = scroll_for_drag.offset();
+                            off.y -= px(dy);
+                            scroll_for_drag.set_offset(off);
+                        }
+                        cx.notify();
+                    }
+                },
+            ))
+            .on_drop(cx.listener(|board, id: &BoardItemId, _window, cx| {
+                let layout_gen = board.replica.read(cx).layout_generation();
+                let Some(ref mut session) = board.drag else {
+                    return;
+                };
+                if &session.dragged_id != id {
+                    return;
+                }
+                if let Some(op) = drag::begin_commit(session, layout_gen) {
+                    board.replica.update(cx, |r, cx| {
+                        r.write(op, cx);
+                    });
+                } else {
+                    board.drag = None;
+                }
+                cx.notify();
+            }))
             .child(padded)
             .into_any_element();
         (el, visible)
