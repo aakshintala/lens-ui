@@ -1,5 +1,7 @@
 use lens_core::domain::ids::{BoardId, BoardItemId, SessionId};
-use lens_core::pack::{DraggedKind, DropTarget, DropTile, Item, resolve_drop, to_move_ordinal};
+use lens_core::pack::{
+    DraggedKind, DropTarget, DropTile, Item, Kind, resolve_drop, to_move_ordinal,
+};
 
 use crate::board::replica::Op;
 
@@ -188,8 +190,19 @@ pub fn apply_reflow_preview(
         Some(group_id) => {
             let same_group = start_parent == Some(group_id);
             if !same_group && let Some(row) = out.iter_mut().find(|r| r.item_id == *group_id) {
-                let n = row.sessions.len();
-                row.item = Item::group(n + 1);
+                // Grow the group DOWNWARD only: keep the committed column width (`fc`) and add
+                // rows to fit the incoming card. Re-running `foot(n+1)` could change `fc` (a full
+                // 2×2 → 3×2, or 3×1 → 2×2), which shifts `used_cols` → `center_offset` → the whole
+                // content block, making the group jump under the cursor and re-triggering the
+                // reflow feedback loop the frozen snapshot exists to prevent (§4.1).
+                let fc = row.item.fc.max(1);
+                let members = row.sessions.len() + 1;
+                let fr = members.div_ceil(fc).max(1);
+                row.item = Item {
+                    kind: Kind::Group { members },
+                    fc,
+                    fr,
+                };
             }
         }
     }
@@ -413,7 +426,9 @@ mod tests {
         assert!(gap.is_none());
         assert_eq!(out.len(), 1);
         let grown = &out[0].item;
-        assert_eq!((grown.fc, grown.fr), (3, 2));
+        // Grows DOWNWARD: keeps the committed 2-col width and adds a row (2×2 → 2×3),
+        // never re-running foot() (which would widen to 3×2 and shift the block).
+        assert_eq!((grown.fc, grown.fr), (2, 3));
         assert!(matches!(grown.kind, Kind::Group { members: 5 }));
     }
 
