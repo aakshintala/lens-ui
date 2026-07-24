@@ -1274,39 +1274,84 @@ impl BoardView {
             .border_1()
             .border_color(accent)
             .bg(accent.opacity(0.12)); // SSOT color-mix ~12% body wash (matches expanded box)
-        let header = div()
-            .absolute()
-            .left(px(x))
-            .top(px(y))
-            .w(px(block_w))
-            .h(px(HEADER))
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_1p5()
-            .px_1p5()
-            .child(div().size(px(8.0)).rounded_full().bg(accent))
-            .child(div().text_color(gpui::rgb(0xd6d6de)).child(name.clone()))
-            .child(
-                div()
-                    .flex_grow()
-                    .text_color(gpui::rgb(0x8a8a94))
-                    .child(spend_age.clone()),
-            )
-            .child({
-                let gid = group_id.clone();
-                div()
-                    .id(("group-caret", placed.item_index))
-                    .cursor_pointer()
-                    .text_color(gpui::rgb(0x8a8a94))
-                    .child("▸")
-                    .on_click(cx.listener(move |board, _ev, _win, cx| {
-                        cx.stop_propagation();
-                        if let Some(gid) = gid.clone() {
-                            board.toggle_group_collapsed(gid, cx);
-                        }
-                    }))
-            });
+        let header_x = x;
+        let header_y = y;
+        let weak = cx.weak_entity();
+        let caret = {
+            let gid = group_id.clone();
+            div()
+                .id(("group-caret", placed.item_index))
+                .cursor_pointer()
+                .text_color(gpui::rgb(0x8a8a94))
+                .child("▸")
+                .on_click(cx.listener(move |board, _ev, _win, cx| {
+                    cx.stop_propagation();
+                    if let Some(gid) = gid.clone() {
+                        board.toggle_group_collapsed(gid, cx);
+                    }
+                }))
+        };
+        let header = match group_id.clone() {
+            Some(gid) => div()
+                .absolute()
+                .left(px(x))
+                .top(px(y))
+                .w(px(block_w))
+                .h(px(HEADER))
+                .id(("collapsed-group-drag", placed.item_index))
+                .cursor_move()
+                .on_drag(
+                    gid,
+                    move |id: &BoardItemId, offset, _window, cx: &mut App| {
+                        let cursor = (
+                            header_x + f32::from(offset.x),
+                            header_y + f32::from(offset.y),
+                        );
+                        weak.update(cx, |board, cx| {
+                            board.begin_item_drag(id.clone(), DraggedKind::Group, cursor, cx);
+                        })
+                        .ok();
+                        cx.new(|_| drag::DragGhost { id: id.clone() })
+                    },
+                )
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1p5()
+                .px_1p5()
+                .child(div().size(px(8.0)).rounded_full().bg(accent))
+                .child(div().text_color(gpui::rgb(0xd6d6de)).child(name.clone()))
+                .child(
+                    div()
+                        .flex_grow()
+                        .text_color(gpui::rgb(0x8a8a94))
+                        .child(spend_age.clone()),
+                )
+                .child(caret)
+                .into_any_element(),
+            None => div()
+                .absolute()
+                .left(px(x))
+                .top(px(y))
+                .w(px(block_w))
+                .h(px(HEADER))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1p5()
+                .px_1p5()
+                .cursor_move()
+                .child(div().size(px(8.0)).rounded_full().bg(accent))
+                .child(div().text_color(gpui::rgb(0xd6d6de)).child(name.clone()))
+                .child(
+                    div()
+                        .flex_grow()
+                        .text_color(gpui::rgb(0x8a8a94))
+                        .child(spend_age.clone()),
+                )
+                .child(caret)
+                .into_any_element(),
+        };
 
         let tile = div()
             .child(ring)
