@@ -504,6 +504,37 @@ impl BoardView {
         ));
     }
 
+    fn card_ghost(&self, session_id: &SessionId, id: BoardItemId, cx: &App) -> drag::DragGhost {
+        let fleet = self.fleet.read(cx);
+        let theme = cx.lens_theme();
+        let now_ms = fleet.clock().now_millis();
+        let (title, status_color) = fleet
+            .cards
+            .get(session_id)
+            .map(|entity| {
+                let card = entity.read(cx);
+                let title = card.title.clone().unwrap_or_else(|| "—".into());
+                let wave = derive_wave(card, now_ms, false);
+                (title, wave.status_color(theme))
+            })
+            .unwrap_or_else(|| ("—".into(), gpui::rgb(0x6b7280).into()));
+        drag::DragGhost::card(id, title, status_color)
+    }
+
+    fn group_ghost(&self, id: BoardItemId, cx: &App) -> drag::DragGhost {
+        let layout = self.replica.read(cx).layout();
+        let (name, accent) = layout
+            .item(&id)
+            .and_then(|it| match &it.kind {
+                BoardItemKind::Group {
+                    name, color_token, ..
+                } => Some((name.clone(), group_accent(color_token.as_deref()))),
+                _ => None,
+            })
+            .unwrap_or_else(|| (String::new(), group_accent(None)));
+        drag::DragGhost::group(id, name, accent)
+    }
+
     fn gap_placeholder_element(placed: &pack::Placed) -> AnyElement {
         let (fc, _fr) = drag::reflow_preview_placeholder_footprint(&placed.item);
         let w = fc as f32 * CELL_W - GAP;
@@ -882,6 +913,7 @@ impl BoardView {
         let sid = session_id.clone();
         let drag_id = item_id.clone();
         let weak = cx.weak_entity();
+        let sid_for_ghost = sid.clone();
         Some(
             div()
                 .absolute()
@@ -902,11 +934,21 @@ impl BoardView {
                             card_left + f32::from(offset.x),
                             card_top + f32::from(offset.y),
                         );
-                        weak.update(cx, |board, cx| {
-                            board.begin_item_drag(id.clone(), DraggedKind::Card, cursor, cx);
+                        let ghost = weak
+                            .update(cx, |board, cx| {
+                                board.begin_item_drag(id.clone(), DraggedKind::Card, cursor, cx);
+                                board.card_ghost(&sid_for_ghost, id.clone(), cx)
+                            })
+                            .ok();
+                        cx.new(|_| {
+                            ghost.unwrap_or_else(|| {
+                                drag::DragGhost::card(
+                                    id.clone(),
+                                    "—".into(),
+                                    gpui::rgb(0x6b7280).into(),
+                                )
+                            })
                         })
-                        .ok();
-                        cx.new(|_| drag::DragGhost { id: id.clone() })
                     }
                 })
                 .child(cached)
@@ -1040,11 +1082,21 @@ impl BoardView {
                             header_x + f32::from(offset.x),
                             header_y + f32::from(offset.y),
                         );
-                        weak.update(cx, |board, cx| {
-                            board.begin_item_drag(id.clone(), DraggedKind::Group, cursor, cx);
+                        let ghost = weak
+                            .update(cx, |board, cx| {
+                                board.begin_item_drag(id.clone(), DraggedKind::Group, cursor, cx);
+                                board.group_ghost(id.clone(), cx)
+                            })
+                            .ok();
+                        cx.new(|_| {
+                            ghost.unwrap_or_else(|| {
+                                drag::DragGhost::group(
+                                    id.clone(),
+                                    String::new(),
+                                    group_accent(None),
+                                )
+                            })
                         })
-                        .ok();
-                        cx.new(|_| drag::DragGhost { id: id.clone() })
                     },
                 )
                 .flex()
@@ -1307,11 +1359,21 @@ impl BoardView {
                             header_x + f32::from(offset.x),
                             header_y + f32::from(offset.y),
                         );
-                        weak.update(cx, |board, cx| {
-                            board.begin_item_drag(id.clone(), DraggedKind::Group, cursor, cx);
+                        let ghost = weak
+                            .update(cx, |board, cx| {
+                                board.begin_item_drag(id.clone(), DraggedKind::Group, cursor, cx);
+                                board.group_ghost(id.clone(), cx)
+                            })
+                            .ok();
+                        cx.new(|_| {
+                            ghost.unwrap_or_else(|| {
+                                drag::DragGhost::group(
+                                    id.clone(),
+                                    String::new(),
+                                    group_accent(None),
+                                )
+                            })
                         })
-                        .ok();
-                        cx.new(|_| drag::DragGhost { id: id.clone() })
                     },
                 )
                 .flex()

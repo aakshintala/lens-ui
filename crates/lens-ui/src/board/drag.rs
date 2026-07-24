@@ -140,23 +140,87 @@ pub fn edge_scroll_delta(
     }
 }
 
-use gpui::{Context, Render, div, prelude::*, px};
+use gpui::{Context, Hsla, Render, div, prelude::*, px};
 
-/// Lightweight ghost following the cursor during drag (real chrome is Task 6 polish).
-pub struct DragGhost {
-    #[allow(dead_code)] // payload identity; ghost chrome is Task 6 polish
-    pub id: BoardItemId,
+/// Lightweight ghost following the cursor during drag — data-only `Render`, no entity timers.
+#[derive(Clone)]
+pub enum DragGhost {
+    Card {
+        #[allow(dead_code)]
+        id: BoardItemId,
+        title: String,
+        status_color: Hsla,
+    },
+    Group {
+        #[allow(dead_code)]
+        id: BoardItemId,
+        name: String,
+        accent: Hsla,
+    },
+}
+
+impl DragGhost {
+    pub fn card(id: BoardItemId, title: String, status_color: Hsla) -> Self {
+        Self::Card {
+            id,
+            title,
+            status_color,
+        }
+    }
+
+    pub fn group(id: BoardItemId, name: String, accent: Hsla) -> Self {
+        Self::Group { id, name, accent }
+    }
 }
 
 impl Render for DragGhost {
     fn render(&mut self, _: &mut gpui::Window, _: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .w(px(lens_core::pack::CARD_W))
-            .h(px(lens_core::pack::CARD_H))
-            .rounded(px(8.0))
-            .bg(gpui::rgb(0x3a3a44))
-            .border_1()
-            .border_color(gpui::rgb(0x6a6a74))
+        match self {
+            DragGhost::Card {
+                title,
+                status_color,
+                ..
+            } => div()
+                .w(px(lens_core::pack::CARD_W))
+                .h(px(lens_core::pack::CARD_H))
+                .rounded(px(8.0))
+                .bg(gpui::rgb(0x1a1a22))
+                .border_1()
+                .border_color(gpui::rgb(0x3a3a44))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .child(div().size(px(8.0)).rounded_full().bg(*status_color))
+                .child(
+                    div()
+                        .flex_grow()
+                        .text_color(gpui::rgb(0xd6d6de))
+                        .overflow_hidden()
+                        .child(title.clone()),
+                ),
+            DragGhost::Group { name, accent, .. } => div()
+                .h(px(lens_core::pack::HEADER))
+                .min_w(px(120.0))
+                .max_w(px(lens_core::pack::CARD_W))
+                .rounded(px(6.0))
+                .bg(gpui::rgb(0x1a1a22))
+                .border_1()
+                .border_color(gpui::rgb(0x3a3a44))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1p5()
+                .px_2()
+                .child(div().size(px(8.0)).rounded_full().bg(*accent))
+                .child(
+                    div()
+                        .text_color(gpui::rgb(0xd6d6de))
+                        .overflow_hidden()
+                        .child(name.clone()),
+                ),
+        }
     }
 }
 
