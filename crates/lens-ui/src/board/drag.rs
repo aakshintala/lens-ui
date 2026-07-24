@@ -1,4 +1,4 @@
-use lens_core::domain::ids::{BoardId, BoardItemId};
+use lens_core::domain::ids::{BoardId, BoardItemId, SessionId};
 use lens_core::pack::{DraggedKind, DropTarget, DropTile, Item, resolve_drop, to_move_ordinal};
 
 use crate::board::replica::Op;
@@ -122,6 +122,81 @@ pub fn reflow_preview_placeholder_footprint(item: &Item) -> (usize, usize) {
     (item.fc.max(1), item.fr.max(1))
 }
 
+/// One committed top-level pack row before drag reflow preview.
+#[derive(Clone, Debug)]
+pub struct ReflowPreviewInput {
+    pub item: Item,
+    pub item_id: BoardItemId,
+    pub sessions: Vec<SessionId>,
+}
+
+/// One row after drag reflow preview (gap rows carry `is_gap: true`).
+#[derive(Clone, Debug)]
+pub struct ReflowPreviewRow {
+    pub item: Item,
+    pub item_id: BoardItemId,
+    pub sessions: Vec<SessionId>,
+    pub is_gap: bool,
+}
+
+/// Pure transform for drag reflow preview: remove the dragged top-level tile, insert a
+/// top-level gap row, and/or grow an into-group target so packing reserves the slot.
+/// Returns transformed rows and, for top-level targets, the gap row index.
+pub fn apply_reflow_preview(
+    rows: &[ReflowPreviewInput],
+    dragged_id: &BoardItemId,
+    target: &DropTarget,
+    dragged_footprint: Item,
+    start_parent: Option<&BoardItemId>,
+) -> (Vec<ReflowPreviewRow>, Option<usize>) {
+    let mut out: Vec<ReflowPreviewRow> = rows
+        .iter()
+        .map(|r| ReflowPreviewRow {
+            item: r.item,
+            item_id: r.item_id.clone(),
+            sessions: r.sessions.clone(),
+            is_gap: false,
+        })
+        .collect();
+
+    let removed = out
+        .iter()
+        .position(|r| r.item_id == *dragged_id)
+        .map(|pos| out.remove(pos));
+
+    let mut gap_index = None;
+
+    match &target.parent {
+        None => {
+            let item = removed
+                .as_ref()
+                .map(|r| r.item)
+                .unwrap_or(dragged_footprint);
+            let sessions = removed.map(|r| r.sessions).unwrap_or_default();
+            let ord = target.ordinal.min(out.len());
+            out.insert(
+                ord,
+                ReflowPreviewRow {
+                    item,
+                    item_id: dragged_id.clone(),
+                    sessions,
+                    is_gap: true,
+                },
+            );
+            gap_index = Some(ord);
+        }
+        Some(group_id) => {
+            let same_group = start_parent == Some(group_id);
+            if !same_group && let Some(row) = out.iter_mut().find(|r| r.item_id == *group_id) {
+                let n = row.sessions.len();
+                row.item = Item::group(n + 1);
+            }
+        }
+    }
+
+    (out, gap_index)
+}
+
 /// Positive delta scrolls content down (cursor near bottom); negative toward top.
 pub fn edge_scroll_delta(
     cursor_y: f32,
@@ -228,7 +303,7 @@ impl Render for DragGhost {
 mod tests {
     use lens_core::domain::board::DEFAULT_BOARD_ID;
     use lens_core::domain::ids::{BoardId, BoardItemId};
-    use lens_core::pack::{DraggedKind, DropTile, Item, pack};
+    use lens_core::pack::{DraggedKind, DropTile, Item, Kind, pack};
 
     use super::*;
 
@@ -334,5 +409,97 @@ mod tests {
         assert_eq!(reflow_preview_placeholder_footprint(&card), (1, 1));
         let g = Item::group(4);
         assert_eq!(reflow_preview_placeholder_footprint(&g), (g.fc, g.fr));
+    }
+
+    fn sid(s: &str) -> SessionId {
+        SessionId::new(s)
+    }
+
+    #[test]
+    fn reflow_preview_into_group_grows_footprint() {
+        let group_id = bid("g");
+        let rows = vec![ReflowPreviewInput {
+            item: Item::group(4),
+            item_id: group_id.clone(),
+            sessions: (0..4).map(|i| sid(&format!("s{i}"))).collect(),
+        }];
+        let (out, gap) = apply_reflow_preview(
+            &rows,
+            &bid("card"),
+            &DropTarget {
+                parent: Some(group_id),
+                ordinal: 2,
+            },
+            Item::card(),
+            None,
+        );
+        assert!(gap.is_none());
+        assert_eq!(out.len(), 1);
+        let grown = &out[0].item;
+        assert_eq!((grown.fc, grown.fr), (3, 2));
+        assert!(matches!(grown.kind, Kind::Group { members: 5 }));
+    }
+
+    #[test]
+    fn reflow_preview_top_level_inserts_gap_at_ordinal() {
+        let rows = vec![
+            ReflowPreviewInput {
+                item: Item::card(),
+                item_id: bid("a"),
+                sessions: vec![sid("s0")],
+            },
+            ReflowPreviewInput {
+                item: Item::card(),
+                item_id: bid("b"),
+                sessions: vec![sid("s1")],
+            },
+            ReflowPreviewInput {
+                item: Item::card(),
+                item_id: bid("c"),
+                sessions: vec![sid("s2")],
+            },
+        ];
+        let (out, gap) = apply_reflow_preview(
+            &rows,
+            &bid("b"),
+            &DropTarget {
+                parent: None,
+                ordinal: 0,
+            },
+            Item::card(),
+            None,
+        );
+        assert_eq!(gap, Some(0));
+        assert_eq!(out.len(), 3);
+        assert!(out[0].is_gap);
+        assert_eq!(out[0].item_id, bid("b"));
+        assert!(!out[1].is_gap);
+        assert_eq!(out[1].item_id, bid("a"));
+    }
+
+    #[test]
+    fn reflow_preview_same_group_reorder_does_not_grow() {
+        let group_id = bid("g");
+        let sessions: Vec<_> = (0..3).map(|i| sid(&format!("s{i}"))).collect();
+        let rows = vec![ReflowPreviewInput {
+            item: Item::group(3),
+            item_id: group_id.clone(),
+            sessions: sessions.clone(),
+        }];
+        let (out, gap) = apply_reflow_preview(
+            &rows,
+            &bid("card-in-g"),
+            &DropTarget {
+                parent: Some(group_id.clone()),
+                ordinal: 1,
+            },
+            Item::card(),
+            Some(&group_id),
+        );
+        assert!(gap.is_none());
+        assert_eq!(out.len(), 1);
+        let unchanged = &out[0].item;
+        assert_eq!((unchanged.fc, unchanged.fr), (3, 1));
+        assert!(matches!(unchanged.kind, Kind::Group { members: 3 }));
     }
 }

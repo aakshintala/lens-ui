@@ -634,48 +634,50 @@ impl BoardView {
         });
         if let Some(session) = drag_preview {
             let dragged_id = session.dragged_id.clone();
-            if let Some(pos) = rows.iter().position(|r| r.item_id == dragged_id) {
-                let removed = rows.remove(pos);
-                if session.target.parent.is_none() {
-                    let ord = session.target.ordinal.min(rows.len());
-                    rows.insert(
-                        ord,
-                        PackRow {
-                            item: removed.item,
-                            item_id: dragged_id,
-                            sessions: Vec::new(),
-                            meta: None,
-                            is_gap: true,
-                        },
-                    );
-                }
-            } else if session.target.parent.is_none() {
-                let footprint = layout
-                    .item(&dragged_id)
-                    .map(|it| match &it.kind {
-                        BoardItemKind::Card { .. } => Item::card(),
-                        BoardItemKind::Group { .. } => {
-                            let n = layout
-                                .items
-                                .iter()
-                                .filter(|i| i.parent_item_id.as_ref() == Some(&dragged_id))
-                                .count();
-                            Item::group(n.max(1))
-                        }
-                    })
-                    .unwrap_or(Item::card());
-                let ord = session.target.ordinal.min(rows.len());
-                rows.insert(
-                    ord,
-                    PackRow {
-                        item: footprint,
-                        item_id: dragged_id,
-                        sessions: Vec::new(),
-                        meta: None,
-                        is_gap: true,
-                    },
-                );
-            }
+            let dragged_footprint = layout
+                .item(&dragged_id)
+                .map(|it| match &it.kind {
+                    BoardItemKind::Card { .. } => Item::card(),
+                    BoardItemKind::Group { .. } => {
+                        let n = layout
+                            .items
+                            .iter()
+                            .filter(|i| i.parent_item_id.as_ref() == Some(&dragged_id))
+                            .count();
+                        Item::group(n.max(1))
+                    }
+                })
+                .unwrap_or(Item::card());
+
+            let meta_by_id: HashMap<BoardItemId, Option<GroupMeta>> = rows
+                .iter()
+                .map(|r| (r.item_id.clone(), r.meta.clone()))
+                .collect();
+            let inputs: Vec<drag::ReflowPreviewInput> = rows
+                .iter()
+                .map(|r| drag::ReflowPreviewInput {
+                    item: r.item,
+                    item_id: r.item_id.clone(),
+                    sessions: r.sessions.clone(),
+                })
+                .collect();
+            let (preview_rows, _) = drag::apply_reflow_preview(
+                &inputs,
+                &dragged_id,
+                &session.target,
+                dragged_footprint,
+                session.start_parent.as_ref(),
+            );
+            rows = preview_rows
+                .into_iter()
+                .map(|r| PackRow {
+                    item: r.item,
+                    item_id: r.item_id.clone(),
+                    sessions: r.sessions,
+                    meta: meta_by_id.get(&r.item_id).cloned().flatten(),
+                    is_gap: r.is_gap,
+                })
+                .collect();
         }
 
         let items: Vec<Item> = rows.iter().map(|r| r.item).collect();
