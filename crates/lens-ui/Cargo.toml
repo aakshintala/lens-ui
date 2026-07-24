@@ -20,7 +20,6 @@ gpui-component = "0.5.1"
 lens-client = { path = "../lens-client" }
 lens-core = { path = "../lens-core" }
 lens-terminal = { path = "../lens-terminal" }
-rusqlite = { version = "0.32" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 smallvec = "1"
@@ -41,9 +40,11 @@ path = "src/bin/focused_scroll_probe.rs"
 name = "focused_perf_probe"
 path = "src/bin/focused_perf_probe.rs"
 
+[[bin]]
+name = "focused_sweep_probe"
+path = "src/bin/focused_sweep_probe.rs"
+
 [dev-dependencies]
 gpui = { version = "0.2.2", features = ["test-support"] }
+lens-core = { path = "../lens-core", features = ["test-util"] }
 lens-terminal = { path = "../lens-terminal", features = ["test-util"] }
-# test-only: the FlakyStore double constructs a SQLITE_BUSY PersistError to exercise
-# the replica's transient-retry path. Production lens-ui does not depend on rusqlite.
-rusqlite = { version = "0.32", features = ["bundled"] }

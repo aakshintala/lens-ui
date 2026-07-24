@@ -7,12 +7,12 @@ use crate::domain::ids::{ConnectionId, ItemId, SessionId};
 use crate::domain::item::{Item, ItemKind};
 use crate::persist::db::{open_db, open_db_read_only};
 use crate::persist::map::{
-    collect_skipping, item_kind_token, json_string, row_to_item, row_to_ordinal_item,
+    collect_skipping, item_kind_token, json_string, row_to_item, row_to_ordinal_len_item,
 };
 use crate::persist::schema::{SCHEMA_VERSION, TRANSCRIPT_DDL};
 use crate::persist::{
-    LiveKey, Loaded, PersistError, RangeRead, ReadRange, ReconcileOutcome, Result, StoreMode,
-    TranscriptReader, TranscriptStore,
+    LiveKey, Loaded, PersistError, RangeRead, ReadRange, ReconcileOutcome, Result, SkippedRow,
+    StoreMode, TranscriptReader, TranscriptStore,
 };
 use rusqlite::{Connection, OptionalExtension};
 use std::path::Path;
@@ -43,27 +43,50 @@ impl TranscriptReader for SqliteTranscriptReader {
     }
 
     fn read_range(&self, range: ReadRange) -> Result<RangeRead> {
-        const SELECT_PREFIX: &str = "SELECT ordinal, item_id, live_seq, kind, payload, agent, depth, created_at, response_id FROM items";
+        const SELECT_PREFIX: &str = "SELECT ordinal, length(CAST(payload AS BLOB)), item_id, live_seq, kind, payload, agent, depth, created_at, response_id FROM items";
+        const ID_COL: usize = 2;
         let tx = self.conn.unchecked_transaction()?;
         let loaded = match range {
             ReadRange::All => {
                 let mut stmt = tx.prepare(&format!("{SELECT_PREFIX} ORDER BY ordinal"))?;
                 let mut rows = stmt.query([])?;
-                collect_skipping(&mut rows, 1, row_to_ordinal_item)?
+                collect_skipping(&mut rows, ID_COL, row_to_ordinal_len_item)?
             }
             ReadRange::Delta { after, through } => {
                 let mut stmt = tx.prepare(&format!(
                     "{SELECT_PREFIX} WHERE ordinal > ?1 AND ordinal <= ?2 ORDER BY ordinal"
                 ))?;
                 let mut rows = stmt.query(rusqlite::params![after, through])?;
-                collect_skipping(&mut rows, 1, row_to_ordinal_item)?
+                collect_skipping(&mut rows, ID_COL, row_to_ordinal_len_item)?
             }
             ReadRange::One { ordinal } => {
                 let mut stmt = tx.prepare(&format!(
                     "{SELECT_PREFIX} WHERE ordinal = ?1 ORDER BY ordinal"
                 ))?;
                 let mut rows = stmt.query([ordinal])?;
-                collect_skipping(&mut rows, 1, row_to_ordinal_item)?
+                collect_skipping(&mut rows, ID_COL, row_to_ordinal_len_item)?
+            }
+            ReadRange::Tail { byte_budget } => {
+                let mut stmt = tx.prepare(&format!("{SELECT_PREFIX} ORDER BY ordinal DESC"))?;
+                let mut rows = stmt.query([])?;
+                collect_budget_bounded(&mut rows, ID_COL, byte_budget)?
+            }
+            ReadRange::Backward {
+                before,
+                byte_budget,
+            } => {
+                let mut stmt = tx.prepare(&format!(
+                    "{SELECT_PREFIX} WHERE ordinal < ?1 ORDER BY ordinal DESC"
+                ))?;
+                let mut rows = stmt.query([before])?;
+                collect_budget_bounded(&mut rows, ID_COL, byte_budget)?
+            }
+            ReadRange::Span { from, through } => {
+                let mut stmt = tx.prepare(&format!(
+                    "{SELECT_PREFIX} WHERE ordinal >= ?1 AND ordinal <= ?2 ORDER BY ordinal"
+                ))?;
+                let mut rows = stmt.query(rusqlite::params![from, through])?;
+                collect_skipping(&mut rows, ID_COL, row_to_ordinal_len_item)?
             }
         };
         let watermark = tx
@@ -80,6 +103,39 @@ impl TranscriptReader for SqliteTranscriptReader {
             watermark,
         })
     }
+}
+
+/// Newest-first scan until the running payload sum exceeds `byte_budget` (≥1 row kept).
+fn collect_budget_bounded(
+    rows: &mut rusqlite::Rows<'_>,
+    id_col: usize,
+    byte_budget: usize,
+) -> Result<Loaded<(i64, usize, Item)>> {
+    let mut out = Vec::new();
+    let mut skipped = Vec::new();
+    let mut sum = 0usize;
+    while let Some(row) = rows.next()? {
+        match row_to_ordinal_len_item(row) {
+            Ok((ordinal, len, item)) => {
+                out.push((ordinal, len, item));
+                sum += len;
+                if sum > byte_budget {
+                    break;
+                }
+            }
+            Err(e) => {
+                let id = row
+                    .get::<_, String>(id_col)
+                    .unwrap_or_else(|_| "<unreadable-id>".to_string());
+                skipped.push(SkippedRow {
+                    id,
+                    reason: e.to_string(),
+                });
+            }
+        }
+    }
+    out.reverse();
+    Ok(Loaded { rows: out, skipped })
 }
 
 fn item_call_id(item: &Item) -> Option<&str> {
@@ -944,7 +1000,198 @@ CREATE TABLE IF NOT EXISTS items (
         let read = r.read_range(ReadRange::All).unwrap();
         assert_eq!(read.rows.len(), 1);
         assert_eq!(read.rows[0].0, 0); // ordinal
-        assert_eq!(read.rows[0].1.id.as_str(), "item_a");
+        assert_eq!(read.rows[0].2.id.as_str(), "item_a");
+    }
+
+    fn stored_payload(s: &SqliteTranscriptStore, id: &str) -> String {
+        s.conn
+            .query_row("SELECT payload FROM items WHERE item_id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn read_range_payload_len_is_utf8_byte_count() {
+        let d = tempdir().unwrap();
+        let s = store(d.path());
+        let text = "🚀🔥💯✨ 日本語";
+        s.upsert_item(0, &item("item_emoji", None, text), false)
+            .unwrap();
+
+        let payload_json = stored_payload(&s, "item_emoji");
+        let byte_len = payload_json.len();
+        let char_len = payload_json.chars().count();
+        assert!(
+            byte_len > char_len,
+            "fixture must distinguish bytes from chars (byte_len={byte_len}, char_len={char_len})"
+        );
+
+        let r = SqliteTranscriptReader::open_read_only(
+            &d.path().join("conv_1.db"),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        let read = r.read_range(ReadRange::All).unwrap();
+        assert_eq!(read.rows.len(), 1);
+        assert_eq!(read.rows[0].0, 0);
+        assert_eq!(read.rows[0].1, byte_len);
+        assert_ne!(read.rows[0].1, char_len);
+    }
+
+    fn payload_len(s: &SqliteTranscriptStore, id: &str) -> usize {
+        s.conn
+            .query_row(
+                "SELECT length(CAST(payload AS BLOB)) FROM items WHERE item_id = ?1",
+                [id],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap() as usize
+    }
+
+    #[test]
+    fn read_range_tail_breaks_on_byte_budget() {
+        let d = tempdir().unwrap();
+        let s = store(d.path());
+        s.upsert_item(0, &item("item_a", None, "aaaa"), false)
+            .unwrap();
+        s.upsert_item(1, &item("item_b", None, "bbbbbbbb"), false)
+            .unwrap();
+        s.upsert_item(2, &item("item_c", None, "cc"), false)
+            .unwrap();
+        s.upsert_item(3, &function_call("fc_live", "c1"), true)
+            .unwrap(); // provisional — newest ordinal, not the watermark
+
+        let len_c = payload_len(&s, "item_c");
+        let len_fc = payload_len(&s, "fc_live");
+        // DESC: 3, 2 fit within budget; adding ordinal 1 overshoots — excludes 0 and keeps [1,2,3].
+        let byte_budget = len_c + len_fc + 1;
+
+        let r = SqliteTranscriptReader::open_read_only(
+            &d.path().join("conv_1.db"),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        let read = r.read_range(ReadRange::Tail { byte_budget }).unwrap();
+
+        let ords: Vec<i64> = read.rows.iter().map(|(o, _, _)| *o).collect();
+        assert_eq!(ords, vec![1, 2, 3]);
+        assert_eq!(read.watermark, Some(2)); // newest non-provisional
+
+        let total_payload: usize = read.rows.iter().map(|(_, len, _)| *len).sum();
+        assert!(total_payload > byte_budget);
+    }
+
+    #[test]
+    fn read_range_tail_undersized_budget_yields_newest_row_only() {
+        let d = tempdir().unwrap();
+        let s = store(d.path());
+        s.upsert_item(0, &item("item_a", None, "aaaa"), false)
+            .unwrap();
+        s.upsert_item(1, &item("item_b", None, "bbbbbbbb"), false)
+            .unwrap();
+        s.upsert_item(2, &item("item_c", None, "cc"), false)
+            .unwrap();
+
+        let r = SqliteTranscriptReader::open_read_only(
+            &d.path().join("conv_1.db"),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        let read = r.read_range(ReadRange::Tail { byte_budget: 0 }).unwrap();
+
+        let ords: Vec<i64> = read.rows.iter().map(|(o, _, _)| *o).collect();
+        assert_eq!(ords, vec![2]); // newest only, even though its payload exceeds budget
+        assert_eq!(read.rows.len(), 1);
+    }
+
+    #[test]
+    fn read_range_backward_is_budget_bounded_and_excludes_from_before() {
+        let d = tempdir().unwrap();
+        let s = store(d.path());
+        s.upsert_item(0, &item("item_a", None, "aaaa"), false)
+            .unwrap();
+        s.upsert_item(1, &item("item_b", None, "bbbbbbbb"), false)
+            .unwrap();
+        s.upsert_item(2, &item("item_c", None, "cc"), false)
+            .unwrap();
+        s.upsert_item(3, &item("item_d", None, "dddddddddd"), false)
+            .unwrap();
+
+        let len_c = payload_len(&s, "item_c");
+        let len_d = payload_len(&s, "item_d");
+        // Eligible: ordinals < 4. DESC 3,2 fit; adding 1 overshoots — excludes 0, keeps [1,2,3].
+        let byte_budget = len_c + len_d + 1;
+
+        let r = SqliteTranscriptReader::open_read_only(
+            &d.path().join("conv_1.db"),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        let read = r
+            .read_range(ReadRange::Backward {
+                before: 4,
+                byte_budget,
+            })
+            .unwrap();
+
+        let ords: Vec<i64> = read.rows.iter().map(|(o, _, _)| *o).collect();
+        assert_eq!(ords, vec![1, 2, 3]);
+        assert!(read.rows.iter().all(|(ord, _, _)| *ord < 4));
+
+        let total_payload: usize = read.rows.iter().map(|(_, len, _)| *len).sum();
+        assert!(total_payload > byte_budget);
+    }
+
+    #[test]
+    fn read_range_backward_before_all_ordinals_returns_empty() {
+        let d = tempdir().unwrap();
+        let s = store(d.path());
+        s.upsert_item(0, &item("item_a", None, "a"), false).unwrap();
+
+        let r = SqliteTranscriptReader::open_read_only(
+            &d.path().join("conv_1.db"),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        let read = r
+            .read_range(ReadRange::Backward {
+                before: 0,
+                byte_budget: 1024,
+            })
+            .unwrap();
+        assert!(read.rows.is_empty());
+    }
+
+    #[test]
+    fn read_range_span_returns_inclusive_band_ascending() {
+        let d = tempdir().unwrap();
+        let s = store(d.path());
+        s.upsert_item(0, &item("item_a", None, "a"), false).unwrap();
+        s.upsert_item(1, &item("item_b", None, "b"), false).unwrap();
+        s.upsert_item(2, &item("item_c", None, "c"), false).unwrap();
+        s.upsert_item(3, &item("item_d", None, "d"), false).unwrap();
+
+        let r = SqliteTranscriptReader::open_read_only(
+            &d.path().join("conv_1.db"),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        let read = r
+            .read_range(ReadRange::Span {
+                from: 1,
+                through: 2,
+            })
+            .unwrap();
+
+        let ords: Vec<i64> = read.rows.iter().map(|(o, _, _)| *o).collect();
+        assert_eq!(ords, vec![1, 2]);
+        let ids: Vec<_> = read
+            .rows
+            .iter()
+            .map(|(_, _, item)| item.id.as_str().to_string())
+            .collect();
+        assert_eq!(ids, vec!["item_b", "item_c"]);
     }
 
     #[test]
@@ -966,7 +1213,7 @@ CREATE TABLE IF NOT EXISTS items (
                 through: 2,
             })
             .unwrap();
-        let ords: Vec<i64> = read.rows.iter().map(|(o, _)| *o).collect();
+        let ords: Vec<i64> = read.rows.iter().map(|(o, _, _)| *o).collect();
         assert_eq!(ords, vec![1, 2]); // (0, 2]
         assert_eq!(read.watermark, Some(1)); // newest non-provisional
     }
@@ -1008,7 +1255,7 @@ CREATE TABLE IF NOT EXISTS items (
         let read = r.read_range(ReadRange::All).unwrap();
         assert_eq!(read.rows.len(), 1);
         assert_eq!(read.rows[0].0, 0);
-        assert_eq!(read.rows[0].1.id.as_str(), "item_a");
+        assert_eq!(read.rows[0].2.id.as_str(), "item_a");
 
         writer_conn.execute("COMMIT", []).unwrap();
     }

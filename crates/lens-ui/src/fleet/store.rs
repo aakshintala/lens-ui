@@ -35,6 +35,14 @@ pub struct ReaderFactory {
 }
 
 impl ReaderFactory {
+    pub fn new(data_dir: PathBuf, conn_id: ConnectionId, session_id: SessionId) -> Self {
+        Self {
+            data_dir,
+            conn_id,
+            session_id,
+        }
+    }
+
     pub fn session_id(&self) -> &SessionId {
         &self.session_id
     }
@@ -187,6 +195,12 @@ impl FleetStore {
 
     pub fn reader_factory(&self, id: &SessionId) -> Option<&ReaderFactory> {
         self.reader_factories.get(id)
+    }
+
+    pub fn register_reader_factory(&mut self, factory: ReaderFactory) {
+        let id = factory.session_id().clone();
+        self.reconcile_epochs.entry(id.clone()).or_default();
+        self.reader_factories.insert(id, factory);
     }
 
     pub fn reconcile_epoch(&self, id: &SessionId) -> ReconcileEpoch {

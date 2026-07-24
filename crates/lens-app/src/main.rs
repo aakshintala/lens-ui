@@ -14,6 +14,8 @@ use lens_core::domain::scalars::{ErrorInfo, SessionLifecycle};
 use lens_core::domain::session::SessionState;
 #[cfg(feature = "demo")]
 use lens_core::domain::usage::Cost;
+#[cfg(feature = "demo")]
+use lens_core::persist::TranscriptStore;
 use lens_core::persist::{
     BoardStore, ConnectionRecord, ControlStore, SqliteBoardStore, SqliteControlStore,
     SqliteTranscriptStore,
@@ -23,6 +25,8 @@ use lens_ui::board::{BoardReplica, BoardView};
 use lens_ui::card::model::SessionCard;
 use lens_ui::clock::{UiClock, WallUiClock};
 use lens_ui::fleet::store::FleetStore;
+#[cfg(feature = "demo")]
+use lens_ui::fleet::store::ReaderFactory;
 use lens_ui::slot::placeholder_tab;
 use std::path::{Path, PathBuf};
 use std::process;
@@ -98,7 +102,13 @@ fn main() {
             let fleet = FleetStore::new_live(clock, cx);
             lens_ui::shortcuts::register(&fleet, cx);
 
-            cx.open_window(WindowOptions::default(), move |window, cx| {
+            let window_options = WindowOptions {
+                // Transparent native titlebar + an in-app themed TitleBar (rendered by
+                // BoardView) so the dark theme's title bar replaces the white system strip.
+                titlebar: Some(gpui_component::TitleBar::title_bar_options()),
+                ..Default::default()
+            };
+            cx.open_window(window_options, move |window, cx| {
                 if let Some(prep) = live_prep {
                     let conn = prep.conn.clone();
                     let data_dir = prep.data_dir.clone();
@@ -184,9 +194,10 @@ fn demo_session_ids() -> Vec<String> {
 /// Open a temp board store and seed TWO adjacent, distinctly-colored 2×2 groups over the
 /// first 8 demo stems (conn `lens-app`, matching the replica) so the loaded board renders
 /// B-3 group chrome AND exercises two group tiles meeting in the inter-tile gap:
-/// - "Demo group A" (blue): the loud pair — needs-input, ready, working, failed (failed
-///   lands bottom-right, on the shared edge, so its attention ring reaches toward group B).
-/// - "Demo group B" (orange): the quiet four — slept, neutral, scheduled, awaiting-review.
+/// - "Demo group A" (blue, 2×2): the loud four — needs-input, ready, working, failed.
+/// - "Demo group B" (orange, 2×1): a quiet pair — slept, neutral.
+/// - loose (no group): scheduled + awaiting-review — so the board exercises the grouped +
+///   loose mix (loose tiles hole-backfill beside/below the groups).
 ///
 /// Adjacency is what makes the on-device check meaningful: now that the ring-gutter (12) >
 /// half the inter-tile gap (8), two group tint boxes overlap ~8px in the seam. At
@@ -206,11 +217,13 @@ fn seed_demo_groups(
 
     let groups: [(&str, &str, &[String]); 2] = [
         ("Demo group A", "blue", &ids[..ids.len().min(4)]),
+        // Group B trimmed to 2 members (slept, neutral) so the board also exercises the
+        // grouped + loose mix: scheduled and awaiting-review are placed loose below.
         (
             "Demo group B",
             "orange",
             if ids.len() > 4 {
-                &ids[4..ids.len().min(8)]
+                &ids[4..ids.len().min(6)]
             } else {
                 &[]
             },
@@ -236,7 +249,154 @@ fn seed_demo_groups(
             );
         }
     }
+    // Loose cards: the remaining stems (scheduled, awaiting-review) placed at board
+    // top-level (no parent group), ordinals after the two groups — a grouped + loose mix.
+    for (i, sid) in ids.iter().enumerate().skip(6).take(2) {
+        let _ = store.place_session(
+            conn,
+            &SessionId::new(sid.clone()),
+            &PlacementTarget {
+                board_id: Some(board.clone()),
+                parent_item_id: None,
+                ordinal: Some((groups.len() + (i - 6)) as i32),
+            },
+        );
+    }
     Some(Box::new(store) as _)
+}
+
+/// Deterministic bimodal transcript seed for `LENS_DEMO_FOCUSED` (mirrors `xtask focused-seed`).
+#[cfg(feature = "demo")]
+fn seed_demo_transcript(dir: &Path, conn: &ConnectionId, session: &SessionId, count: usize) {
+    use lens_core::domain::ids::{CallId, ItemId, ResponseId};
+    use lens_core::domain::item::{BlockContext, ContentBlock, Item, ItemKind};
+    use lens_core::domain::scalars::Role;
+
+    const LARGE_EVERY: i64 = 20;
+    const LARGE_PAYLOAD_BYTES: usize = 8_192;
+    const SMALL_PAYLOAD_BYTES: usize = 200;
+    const RESPONSE_IDS: [&str; 4] = ["resp_a", "resp_b", "resp_c", "resp_d"];
+    const SEED: u64 = 0x6A09_E667_F3BC_C908;
+
+    struct DeterministicRng {
+        state: u64,
+    }
+
+    impl DeterministicRng {
+        fn new(seed: u64) -> Self {
+            Self { state: seed.max(1) }
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.state;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.state = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+    }
+
+    fn payload_bytes(i: i64, rng: &mut DeterministicRng) -> usize {
+        if i % LARGE_EVERY == 0 {
+            LARGE_PAYLOAD_BYTES
+        } else {
+            SMALL_PAYLOAD_BYTES + (rng.next_u64() as usize % 64)
+        }
+    }
+
+    const USER_LINES: [&str; 6] = [
+        "Can you take a look at the disk-windowing reader and confirm the byte budget is honoured?",
+        "The transcript feels slow to open on the big sessions — what's the cold-focus latency now?",
+        "Let's page older history in on scroll instead of loading the whole thing up front.",
+        "Walk me through how eviction picks which end of the window to drop.",
+        "Add a regression test so we never re-introduce the full-history reconcile.",
+        "Ship it once the sweep shows resident RAM staying under the cap at 50k items.",
+    ];
+    const ASSISTANT_LINES: [&str; 6] = [
+        "The resident window is a bounded BTreeMap keyed by ordinal; the tail read stops accumulating once it hits the 8 MiB budget, so cold focus is O(window) rather than O(history).",
+        "Scrolling near the top enqueues a single Backward page at Priority::Page; a page-in-flight guard keeps it to one outstanding read, and the LoadOlder sentinel shows while it lands.",
+        "Eviction trims the far end from the follow direction — when you're paused near the top it drops the newest resident rows, and the scroll anchor is re-pinned by row identity so nothing yanks.",
+        "At 50k items the sweep measured ~33 ms cold focus and ~12.6 MB resident after a backward page — comfortably under the 24 MB cap, so no constant tuning was needed.",
+        "I split the read primitives into Tail, Backward, and Span so the in-band reconcile replaces exactly the resident rows without ghosting, and the watermark tracks committed ordinals.",
+        "Done — tests are green, the real-window probe holds the prepend anchor, and the D19 guard asserts run_catchup never calls the full reconcile path.",
+    ];
+
+    fn fill(seed_line: &str, nbytes: usize) -> String {
+        let mut out = String::with_capacity(nbytes + seed_line.len());
+        while out.len() < nbytes {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(seed_line);
+        }
+        out
+    }
+
+    fn make_item(i: i64, rng: &mut DeterministicRng) -> Item {
+        let nbytes = payload_bytes(i, rng);
+        let response_id = RESPONSE_IDS[(i as usize) % RESPONSE_IDS.len()];
+        if i % LARGE_EVERY == 0 {
+            let text = fill(
+                ASSISTANT_LINES[(i as usize / 3) % ASSISTANT_LINES.len()],
+                nbytes,
+            );
+            Item {
+                id: ItemId::new(format!("item_{i:08}")),
+                seq: Some(i as u64),
+                ctx: BlockContext {
+                    agent: Some("coder".into()),
+                    depth: 0,
+                    response_id: Some(ResponseId::new(response_id)),
+                },
+                created_at: 1_700_000_000_000 + i,
+                kind: ItemKind::FunctionCallOutput {
+                    call_id: CallId::new(format!("call_{i:08}")),
+                    output: text,
+                    arguments: Default::default(),
+                },
+            }
+        } else {
+            let is_user = i % 7 == 0;
+            let text = if is_user {
+                USER_LINES[(i as usize / 7) % USER_LINES.len()].to_string()
+            } else {
+                fill(
+                    ASSISTANT_LINES[(i as usize / 2) % ASSISTANT_LINES.len()],
+                    nbytes,
+                )
+            };
+            Item {
+                id: ItemId::new(format!("item_{i:08}")),
+                seq: Some(i as u64),
+                ctx: BlockContext {
+                    agent: Some("coder".into()),
+                    depth: 0,
+                    response_id: Some(ResponseId::new(response_id)),
+                },
+                created_at: 1_700_000_000_000 + i,
+                kind: ItemKind::Message {
+                    role: if is_user { Role::User } else { Role::Assistant },
+                    content: vec![ContentBlock {
+                        kind: "text".into(),
+                        text: Some(text),
+                        data: Default::default(),
+                    }],
+                },
+            }
+        }
+    }
+
+    let db_path = dir.join(format!("{session}.db"));
+    let store = SqliteTranscriptStore::open(&db_path, conn, session)
+        .unwrap_or_else(|e| panic!("seed_demo_transcript open {}: {e}", db_path.display()));
+    let mut rng = DeterministicRng::new(SEED);
+    for ordinal in 0..count {
+        let item = make_item(ordinal as i64, &mut rng);
+        store
+            .upsert_item(ordinal as i64, &item, false)
+            .unwrap_or_else(|e| panic!("seed_demo_transcript upsert {ordinal}: {e}"));
+    }
 }
 
 /// `--demo`: paint six cards in the six wave states (no live server needed) so the
@@ -248,14 +408,25 @@ fn run_demo() {
     // BEFORE Application::run (compliant — no cx.new SQLite) so B-3 group chrome renders
     // live over the demo cards; extra replicas reconcile loose.
     let demo_dir = tempfile::tempdir().expect("demo tempdir");
-    let demo_db = demo_dir.path().join("board.db");
+    let demo_data_dir = demo_dir.path().to_path_buf();
+    let demo_db = demo_data_dir.join("board.db");
     let demo_conn = ConnectionId::new("lens-app");
+    let focus_id = SessionId::new("demo-focus");
+    let demo_focused = std::env::var("LENS_DEMO_FOCUSED").is_ok();
     let mut demo_store = seed_demo_groups(&demo_db, &demo_conn);
+    if demo_focused {
+        seed_demo_transcript(&demo_data_dir, &demo_conn, &focus_id, 2000);
+    }
 
     Application::new()
         .with_assets(lens_ui::assets::LensAssets)
         .run(move |cx: &mut App| {
-            let _demo_dir = &demo_dir; // hold the TempDir for the app's lifetime
+            // Leak the TempDir so the seeded dbs outlive this setup closure. The focused
+            // transcript reader opens its db LAZILY (async, after this closure returns), so a
+            // TempDir dropped at closure-end would be deleted before the first read (the board
+            // store tolerated it only because it opens eagerly and holds the fd). The process is
+            // short-lived; the OS reclaims the temp dir on exit.
+            std::mem::forget(demo_dir);
             gpui_component::init(cx);
             // Demo defaults to the dark palette; `LENS_THEME=light` still overrides.
             lens_ui::theme::install_at_startup_with_default(gpui_component::ThemeMode::Dark, cx);
@@ -265,10 +436,12 @@ fn run_demo() {
             let fleet = FleetStore::new_live(clock, cx);
             lens_ui::shortcuts::register(&fleet, cx);
 
-            // Size the demo window so the 8 cards land as a centered 4×2 grid
-            // (4×280 card + 3×28 gap + 56 padding + 48 nav rail ≈ 1300px wide).
+            // Size the demo window just above the 4-column breakpoint
+            // (`max_cols_for_width` ≥ 1400 → 4 cols) so the demo cards land as a
+            // centered 4-wide masonry. Below 1400 the board caps to 3 cols (still
+            // centered); on the real screens it steps 1800→4, 2056→5, 3840→6.
             let mut bounds =
-                gpui::Bounds::centered(None, gpui::size(gpui::px(1340.0), gpui::px(860.0)), cx);
+                gpui::Bounds::centered(None, gpui::size(gpui::px(1440.0), gpui::px(900.0)), cx);
             // Stagger + title so two demo windows can be told apart in an A/B (LENS_DEMO_LABEL).
             if let Some(dx) = std::env::var("LENS_DEMO_DX")
                 .ok()
@@ -279,10 +452,10 @@ fn run_demo() {
             }
             let window_options = WindowOptions {
                 window_bounds: Some(gpui::WindowBounds::Windowed(bounds)),
-                titlebar: Some(gpui::TitlebarOptions {
-                    title: std::env::var("LENS_DEMO_LABEL").ok().map(Into::into),
-                    ..Default::default()
-                }),
+                // Transparent native titlebar; BoardView renders the in-app themed TitleBar
+                // so the dark strip replaces the white system titlebar (label dropped — the
+                // transparent bar shows no OS title anyway).
+                titlebar: Some(gpui_component::TitleBar::title_bar_options()),
                 ..Default::default()
             };
             cx.open_window(window_options, move |window, cx| {
@@ -291,6 +464,19 @@ fn run_demo() {
                         let id = card.session_id.clone();
                         let entity = cx.new(|_| card);
                         f.cards.insert(id, entity);
+                    }
+                    if demo_focused {
+                        f.register_reader_factory(ReaderFactory::new(
+                            demo_data_dir.clone(),
+                            demo_conn.clone(),
+                            focus_id.clone(),
+                        ));
+                        let mut focus_card = demo_preset_cards(now)[2].clone();
+                        focus_card.session_id = focus_id.clone();
+                        focus_card.title = Some("Disk-windowing transcript".into());
+                        let entity = cx.new(|_| focus_card);
+                        f.cards.insert(focus_id.clone(), entity);
+                        f.focus_session(focus_id.clone(), cx);
                     }
                     cx.notify();
                 });

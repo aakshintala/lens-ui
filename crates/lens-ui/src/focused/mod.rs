@@ -6,13 +6,13 @@ mod rowsource;
 pub mod view;
 
 use crate::fleet::store::{ReaderFactory, ReconcileEpoch};
-use gpui::{Context, ListAlignment, ListState, Pixels};
+use gpui::{Context, ListAlignment, ListOffset, ListState, Pixels};
 use lens_core::domain::ids::{AccId, ItemId, ResponseId, SessionId};
 use lens_core::domain::item::{Item, ItemKind, StreamScratch};
 use lens_core::domain::scalars::Role;
 use lens_core::persist::{RangeRead, ReadRange};
-use lens_core::reduce::{RetireDisposition, StreamUpdate, group_work_section, project};
-use std::collections::HashMap;
+use lens_core::reduce::{RetireDisposition, StreamUpdate, ViewBlock, group_work_section, project};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,6 +23,13 @@ pub use rowsource::{
 
 const LIST_OVERDRAW: Pixels = gpui::px(200.);
 const SYNC_DEBOUNCE_MS: u64 = 150;
+const TAIL_BUDGET_BYTES: usize = 8 * 1024 * 1024;
+const PAGE_BUDGET_BYTES: usize = 4 * 1024 * 1024;
+const RESIDENT_CAP_BYTES: usize = 24 * 1024 * 1024;
+/// Rows from the top of the visible window that trigger a backward page (§5).
+const NEAR_TOP_ROWS: usize = 5;
+/// Max committed ordinals pulled per forward `Delta` read while following (§4.2).
+const FORWARD_DELTA_PAGE_ORDINALS: i64 = 512;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MarkerKind {
@@ -36,12 +43,23 @@ pub struct Marker {
     pub kind: MarkerKind,
 }
 
+/// Scroll-near-top decision for backward paging (§5) — unit-testable outside gpui scroll injection.
+pub fn should_page_older(visible_start: usize, resident_lo: i64, page_in_flight: bool) -> bool {
+    resident_lo > 0 && !page_in_flight && visible_start <= NEAR_TOP_ROWS
+}
+
 pub struct FocusedTranscript {
-    items: Vec<Item>,
+    items: BTreeMap<i64, Item>,
+    item_bytes: HashMap<ItemId, usize>,
     scratch: Arc<StreamScratch>,
     active_response: Option<ResponseId>,
     last_rendered_ordinal: i64,
-    live_section_start: usize,
+    resident_lo: i64,
+    resident_hi: i64,
+    known_committed: i64,
+    resident_bytes: usize,
+    following: bool,
+    live_section_lo: Option<i64>,
     rows: RowStore,
     list_state: ListState,
     pending_finalize: HashMap<AccId, RowPresentation>,
@@ -62,6 +80,10 @@ pub struct FocusedTranscript {
     live_section_projection_count: usize,
     /// Top-level structure entries materialized from settled prefix (D-1 cache index).
     settled_structure_len: usize,
+    /// Run-member item id → sticky section `run_anchor` (window-invariant across Backward prepend).
+    section_anchor: HashMap<ItemId, ItemId>,
+    /// Single-in-flight guard for scroll-near-top `Backward` pages (§5).
+    page_in_flight: bool,
 }
 
 impl FocusedTranscript {
@@ -85,11 +107,17 @@ impl FocusedTranscript {
         cx: &mut Context<Self>,
     ) -> Self {
         let replica = Self {
-            items: Vec::new(),
+            items: BTreeMap::new(),
+            item_bytes: HashMap::new(),
             scratch: Arc::new(StreamScratch::default()),
             active_response: None,
             last_rendered_ordinal: -1,
-            live_section_start: 0,
+            resident_lo: -1,
+            resident_hi: -1,
+            known_committed: -1,
+            resident_bytes: 0,
+            following: true,
+            live_section_lo: None,
             rows: RowStore::new(),
             list_state: ListState::new(0, ListAlignment::Bottom, LIST_OVERDRAW),
             pending_finalize: HashMap::new(),
@@ -108,8 +136,16 @@ impl FocusedTranscript {
             sync_debounce_task: None,
             live_section_projection_count: 0,
             settled_structure_len: 0,
+            section_anchor: HashMap::new(),
+            page_in_flight: false,
         };
-        replica.enqueue_read(ReadRange::All, Priority::Baseline, focus_generation);
+        replica.enqueue_read(
+            ReadRange::Tail {
+                byte_budget: TAIL_BUDGET_BYTES,
+            },
+            Priority::Baseline,
+            focus_generation,
+        );
         cx.notify();
         replica
     }
@@ -123,11 +159,17 @@ impl FocusedTranscript {
         cx: &mut Context<Self>,
     ) -> Self {
         let replica = Self {
-            items: Vec::new(),
+            items: BTreeMap::new(),
+            item_bytes: HashMap::new(),
             scratch: Arc::new(StreamScratch::default()),
             active_response: None,
             last_rendered_ordinal: -1,
-            live_section_start: 0,
+            resident_lo: -1,
+            resident_hi: -1,
+            known_committed: -1,
+            resident_bytes: 0,
+            following: true,
+            live_section_lo: None,
             rows: RowStore::new(),
             list_state: ListState::new(0, ListAlignment::Bottom, LIST_OVERDRAW),
             pending_finalize: HashMap::new(),
@@ -146,6 +188,8 @@ impl FocusedTranscript {
             sync_debounce_task: None,
             live_section_projection_count: 0,
             settled_structure_len: 0,
+            section_anchor: HashMap::new(),
+            page_in_flight: false,
         };
         cx.notify();
         replica
@@ -187,8 +231,45 @@ impl FocusedTranscript {
     }
 
     #[cfg(test)]
-    pub(crate) fn live_section_start_for_test(&self) -> usize {
-        self.live_section_start
+    pub(crate) fn live_section_lo_for_test(&self) -> Option<i64> {
+        self.live_section_lo
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resident_lo_for_test(&self) -> i64 {
+        self.resident_lo
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resident_hi_for_test(&self) -> i64 {
+        self.resident_hi
+    }
+
+    #[cfg(test)]
+    pub(crate) fn known_committed_for_test(&self) -> i64 {
+        self.known_committed
+    }
+
+    pub(crate) fn resident_hi(&self) -> i64 {
+        self.resident_hi
+    }
+
+    #[allow(dead_code)] // focused_scroll_probe reads the live cursor
+    pub fn resident_lo(&self) -> i64 {
+        self.resident_lo
+    }
+
+    pub(crate) fn known_committed(&self) -> i64 {
+        self.known_committed
+    }
+
+    pub fn resident_bytes(&self) -> usize {
+        self.resident_bytes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resident_bytes_for_test(&self) -> usize {
+        self.resident_bytes
     }
 
     #[cfg(test)]
@@ -198,7 +279,61 @@ impl FocusedTranscript {
 
     #[cfg(test)]
     pub(crate) fn live_slice_len_for_test(&self) -> usize {
-        self.items.len().saturating_sub(self.live_section_start)
+        match self.live_section_lo {
+            Some(lo) => self.items.range(lo..).count(),
+            None => 0,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_item_ordinal_for_test(&self, ord: i64) -> bool {
+        self.items.contains_key(&ord)
+    }
+
+    pub fn is_following(&self) -> bool {
+        self.following
+    }
+
+    pub fn set_following(&mut self, following: bool, cx: &mut Context<Self>) {
+        if self.following != following {
+            self.following = following;
+            cx.notify();
+        }
+    }
+
+    /// Enqueue a tail reload when the committed frontier is ahead of the resident band (§4.4).
+    pub(crate) fn request_tail_reload(&mut self) {
+        if self.resident_hi >= 0 && self.known_committed > self.resident_hi {
+            self.enqueue_read(
+                ReadRange::Tail {
+                    byte_budget: TAIL_BUDGET_BYTES,
+                },
+                Priority::Delta,
+                self.focus_generation,
+            );
+        }
+    }
+
+    /// Scroll-near-top trigger — one `Backward` page in flight at a time (§5).
+    pub fn page_older_if_near_top(&mut self, visible_start: usize, cx: &mut Context<Self>) {
+        if !should_page_older(visible_start, self.resident_lo, self.page_in_flight) {
+            return;
+        }
+        self.page_in_flight = true;
+        self.enqueue_read(
+            ReadRange::Backward {
+                before: self.resident_lo,
+                byte_budget: PAGE_BUDGET_BYTES,
+            },
+            Priority::Page,
+            self.focus_generation,
+        );
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn page_in_flight_for_test(&self) -> bool {
+        self.page_in_flight
     }
 
     pub fn fold_detailed(&mut self, u: StreamUpdate, cx: &mut Context<Self>) {
@@ -206,22 +341,28 @@ impl FocusedTranscript {
         match u {
             StreamUpdate::Rebased(state) => {
                 self.active_response = state.active_response.clone();
-                self.recompute_live_section_start();
+                self.recompute_live_section_lo();
                 self.reproject(true, cx);
                 dirty = true;
             }
             StreamUpdate::TranscriptAdvanced {
                 committed_ordinal: ord,
             } => {
-                if ord > self.last_rendered_ordinal {
+                if !self.is_following() {
+                    self.known_committed = self.known_committed.max(ord);
+                    dirty = true;
+                } else if ord > self.last_rendered_ordinal {
+                    self.known_committed = self.known_committed.max(ord);
+                    let through = (self.resident_hi + FORWARD_DELTA_PAGE_ORDINALS).min(ord);
                     self.enqueue_read(
                         ReadRange::Delta {
-                            after: self.last_rendered_ordinal,
-                            through: ord,
+                            after: self.resident_hi,
+                            through,
                         },
                         Priority::Delta,
                         self.focus_generation,
                     );
+                    dirty = true;
                 }
             }
             StreamUpdate::TranscriptRewritten { ordinal: ord } => {
@@ -233,7 +374,7 @@ impl FocusedTranscript {
             }
             StreamUpdate::ActiveResponseChanged(r) => {
                 self.active_response = r;
-                self.recompute_live_section_start();
+                self.recompute_live_section_lo();
                 self.recompute_settled_prefix();
                 self.apply_expansion_flags(cx);
                 self.reproject(false, cx);
@@ -298,7 +439,14 @@ impl FocusedTranscript {
 
     pub fn on_reconcile_epoch_settled(&mut self, epoch: u64, cx: &mut Context<Self>) {
         if self.epoch_overlapped_baseline(epoch) {
-            self.enqueue_read(ReadRange::All, Priority::Reconcile, self.focus_generation);
+            self.enqueue_read(
+                ReadRange::Span {
+                    from: self.resident_lo,
+                    through: self.resident_hi,
+                },
+                Priority::Reconcile,
+                self.focus_generation,
+            );
             cx.notify();
         }
     }
@@ -314,35 +462,131 @@ impl FocusedTranscript {
             return;
         }
         self.reader_error = None;
-        let full_replace = matches!(range, ReadRange::All);
+        if matches!(range, ReadRange::Backward { .. }) {
+            self.page_in_flight = false;
+        }
+        if matches!(range, ReadRange::Delta { .. }) && !self.is_following() {
+            if let ReadRange::Delta { through, .. } = range {
+                self.known_committed = self.known_committed.max(through);
+                if let Some(watermark) = read.watermark {
+                    self.known_committed = self.known_committed.max(watermark);
+                }
+            }
+            cx.notify();
+            return;
+        }
+        let resident_hi_before = self.resident_hi;
+        let full_replace = matches!(
+            range,
+            ReadRange::All
+                | ReadRange::Span { .. }
+                | ReadRange::Tail { .. }
+                | ReadRange::Backward { .. }
+        );
         match range {
-            ReadRange::All => self.replace_read_rows(&read.rows),
-            ReadRange::Delta { .. } | ReadRange::One { .. } => {
+            ReadRange::All | ReadRange::Tail { .. } => self.replace_read_rows(&read.rows),
+            ReadRange::Span { from, through } => self.replace_span_rows(from, through, &read.rows),
+            ReadRange::Delta { .. } | ReadRange::One { .. } | ReadRange::Backward { .. } => {
                 self.upsert_read_rows(&read.rows);
             }
         }
+        if let Some((min_ord, max_ord)) = read_ordinal_bounds(&read.rows) {
+            match range {
+                // Replacement reads set the band from `items` below (recompute), which also
+                // handles the empty-read case correctly (→ -1/-1) — see F3.
+                ReadRange::All | ReadRange::Tail { .. } | ReadRange::Span { .. } => {}
+                ReadRange::Backward { .. } => {
+                    self.resident_lo = self.resident_lo.min(min_ord);
+                }
+                ReadRange::Delta { through, .. } => {
+                    self.resident_hi = self.resident_hi.max(max_ord).max(through);
+                }
+                ReadRange::One { ordinal } => {
+                    self.resident_hi = self.resident_hi.max(ordinal);
+                }
+            }
+        }
+        // A replacement read (All/Tail/Span) makes the resident band EXACTLY what is now in
+        // `items`; recompute unconditionally so an empty read collapses the band to -1/-1
+        // instead of leaving a stale, nonexistent band (F3).
+        if matches!(
+            range,
+            ReadRange::All | ReadRange::Tail { .. } | ReadRange::Span { .. }
+        ) {
+            self.recompute_resident_bounds_from_items();
+        }
+        // `known_committed` and `last_rendered_ordinal` are monotonic frontiers: never let a
+        // read regress them (a concurrent stream event may have advanced `known_committed`
+        // past this read's watermark before it applied) — F4.
         match range {
-            ReadRange::All => {
+            ReadRange::All | ReadRange::Tail { .. } => {
                 if let Some(watermark) = read.watermark {
-                    self.last_rendered_ordinal = watermark;
+                    self.known_committed = self.known_committed.max(watermark);
+                    self.last_rendered_ordinal = self.last_rendered_ordinal.max(watermark);
+                }
+            }
+            ReadRange::Span { .. } => {
+                if let Some(watermark) = read.watermark {
+                    self.known_committed = self.known_committed.max(watermark);
+                }
+                if let Some((_, max_ord)) = read_ordinal_bounds(&read.rows) {
+                    self.last_rendered_ordinal = self.last_rendered_ordinal.max(max_ord);
                 }
             }
             ReadRange::Delta { through, .. } => {
                 if through > self.last_rendered_ordinal {
                     self.last_rendered_ordinal = through;
                 }
+                if let Some(watermark) = read.watermark {
+                    self.known_committed = self.known_committed.max(watermark);
+                }
             }
-            ReadRange::One { .. } => {}
+            ReadRange::Backward { .. } | ReadRange::One { .. } => {
+                if let Some(watermark) = read.watermark {
+                    self.known_committed = self.known_committed.max(watermark);
+                }
+            }
         }
-        self.recompute_live_section_start();
-        self.recompute_settled_prefix();
         self.commit_pending_disk_rows(&read.rows, cx);
-        if full_replace {
+        let evicted_any = self.evict_if_over_cap(cx);
+        self.recompute_live_section_lo();
+        self.recompute_settled_prefix();
+        // The incremental live-tail reproject only rebuilds the live section on top of a frozen
+        // settled prefix. A non-replacement read (Delta/One) that adds or rewrites a row in the
+        // SETTLED band — below `live_section_lo`, or ANY row when there is no live section (e.g. a
+        // committed item arriving while no response is active) — would be silently dropped by it
+        // (materialized into `items` but never into `rows`), so force a full reproject (F1).
+        let touched_settled = !full_replace
+            && read
+                .rows
+                .iter()
+                .any(|(ord, _, _)| match self.live_section_lo {
+                    Some(lo) => *ord < lo,
+                    None => true,
+                });
+        let full = full_replace || evicted_any || touched_settled;
+        if full {
             self.settled_structure_len = 0;
             self.reproject(true, cx);
         } else {
             self.apply_expansion_flags(cx);
             self.reproject(false, cx);
+        }
+        if matches!(range, ReadRange::Delta { .. })
+            && self.is_following()
+            && self.resident_hi < self.known_committed
+            && self.resident_hi > resident_hi_before
+        {
+            let through =
+                (self.resident_hi + FORWARD_DELTA_PAGE_ORDINALS).min(self.known_committed);
+            self.enqueue_read(
+                ReadRange::Delta {
+                    after: self.resident_hi,
+                    through,
+                },
+                Priority::Delta,
+                self.focus_generation,
+            );
         }
         cx.notify();
     }
@@ -351,11 +595,13 @@ impl FocusedTranscript {
         if generation != self.focus_generation {
             return;
         }
+        self.page_in_flight = false;
         self.reader_error = Some(err);
         cx.notify();
     }
 
     pub(crate) fn on_reader_fatal(&mut self, err: String, cx: &mut Context<Self>) {
+        self.page_in_flight = false;
         self.reader_error = Some(err);
         // Staged rows in pending_finalize stay visible — recovery path, not orphan.
         cx.notify();
@@ -415,16 +661,16 @@ impl FocusedTranscript {
         epoch > self.baseline_epoch
     }
 
-    fn recompute_live_section_start(&mut self) {
+    fn recompute_live_section_lo(&mut self) {
         let Some(active) = &self.active_response else {
-            self.live_section_start = self.items.len();
+            self.live_section_lo = None;
             return;
         };
-        self.live_section_start = self
+        self.live_section_lo = self
             .items
             .iter()
-            .position(|item| item.ctx.response_id.as_ref() == Some(active))
-            .unwrap_or(self.items.len());
+            .find(|(_, item)| item.ctx.response_id.as_ref() == Some(active))
+            .map(|(ord, _)| *ord);
     }
 
     fn handle_retired(
@@ -436,7 +682,8 @@ impl FocusedTranscript {
         let prev_len = self.rows.len();
         match disposition {
             RetireDisposition::Finalizing { item_id } => {
-                self.pending_item_ids.insert(item_id, acc_id.clone());
+                self.pending_item_ids
+                    .insert(item_id.clone(), acc_id.clone());
                 let pres =
                     self.stream_presentation(&acc_id, cx)
                         .unwrap_or_else(|| RowPresentation {
@@ -446,12 +693,21 @@ impl FocusedTranscript {
                             height_hint: None,
                         });
                 self.pending_finalize.insert(acc_id.clone(), pres.clone());
-                self.rows.stage_stream_finalize(&acc_id, pres, cx);
+                let provisional = ItemId::new(acc_id.as_str());
+                self.migrate_provisional_member(&provisional, &item_id);
+                self.rows.stage_stream_finalize(
+                    &acc_id,
+                    pres,
+                    Some(item_id.clone()),
+                    self.active_response.clone(),
+                    cx,
+                );
                 self.rows.sync_list_count(&self.list_state, prev_len);
             }
             RetireDisposition::Discarded => {
                 self.pending_finalize.remove(&acc_id);
                 self.pending_item_ids.retain(|_, a| a != &acc_id);
+                self.section_anchor.remove(&ItemId::new(acc_id.as_str()));
                 self.rows
                     .discard_stream_tail(&acc_id, Some(&self.list_state), cx);
             }
@@ -465,8 +721,8 @@ impl FocusedTranscript {
             .map(|e| e.read(cx).presentation.clone())
     }
 
-    fn commit_pending_disk_rows(&mut self, rows: &[(i64, Item)], cx: &mut Context<Self>) {
-        for (_, item) in rows {
+    fn commit_pending_disk_rows(&mut self, rows: &[(i64, usize, Item)], cx: &mut Context<Self>) {
+        for (_, _, item) in rows {
             let Some(acc_id) = self.pending_item_ids.remove(&item.id) else {
                 continue;
             };
@@ -507,7 +763,7 @@ impl FocusedTranscript {
     fn compute_expansion_flags(&self) -> HashMap<ResponseId, bool> {
         let latest_settled = self.latest_settled_before_next_user();
         let mut flags = HashMap::new();
-        for item in &self.items {
+        for item in self.items.values() {
             if let Some(r) = &item.ctx.response_id {
                 flags.entry(r.clone()).or_insert_with(|| {
                     self.active_response.as_ref() == Some(r) || latest_settled.as_ref() == Some(r)
@@ -522,39 +778,43 @@ impl FocusedTranscript {
 
     fn latest_settled_before_next_user(&self) -> Option<ResponseId> {
         let active = self.active_response.as_ref();
-        let last_user_idx = self
+        let last_user_ord = self
             .items
             .iter()
-            .enumerate()
-            .rposition(|(_, item)| is_user_message(item));
+            .rev()
+            .find_map(|(ord, item)| is_user_message(item).then_some(*ord));
 
-        let mut last_idx_per_resp: HashMap<&ResponseId, usize> = HashMap::new();
-        for (i, item) in self.items.iter().enumerate() {
+        let mut last_ord_per_resp: HashMap<&ResponseId, i64> = HashMap::new();
+        for (ord, item) in &self.items {
             if let Some(r) = &item.ctx.response_id {
-                last_idx_per_resp.insert(r, i);
+                last_ord_per_resp.insert(r, *ord);
             }
         }
 
-        let mut best: Option<(ResponseId, usize)> = None;
-        for (resp, &idx) in &last_idx_per_resp {
+        let mut best: Option<(ResponseId, i64)> = None;
+        for (resp, &ord) in &last_ord_per_resp {
             if active == Some(*resp) {
                 continue;
             }
-            if let Some(u_idx) = last_user_idx
-                && u_idx > idx
+            if let Some(u_ord) = last_user_ord
+                && u_ord > ord
             {
                 continue;
             }
-            if best.as_ref().is_none_or(|(_, b)| idx > *b) {
-                best = Some(((*resp).clone(), idx));
+            if best.as_ref().is_none_or(|(_, b)| ord > *b) {
+                best = Some(((*resp).clone(), ord));
             }
         }
         best.map(|(r, _)| r)
     }
 
+    fn settled_item_refs(&self) -> Vec<&Item> {
+        let lo = self.live_section_lo.unwrap_or(i64::MAX);
+        self.items.range(..lo).map(|(_, item)| item).collect()
+    }
+
     fn recompute_settled_prefix(&mut self) {
-        let slice = &self.items[..self.live_section_start.min(self.items.len())];
-        let refs: Vec<&Item> = slice.iter().collect();
+        let refs = self.settled_item_refs();
         let empty_scratch = StreamScratch::default();
         let blocks = group_work_section(
             project(&refs, &empty_scratch, self.active_response.as_ref()),
@@ -566,38 +826,134 @@ impl FocusedTranscript {
     fn reproject(&mut self, full: bool, cx: &mut Context<Self>) {
         let expansion = self.compute_expansion_flags();
         let prev_len = self.rows.len();
+        // Capture the exact row the scroll anchor references, so we can re-pin it after the
+        // rebuild WHEREVER it lands. This preserves the viewport across ANY reproject that moves
+        // rows — a backward-page prepend (± hi eviction), a forward append that goes through a
+        // full reproject, or a settled-band change — instead of resetting the scroll. It is
+        // robust to a non-uniform shift (anchor at the LoadOlder sentinel shifts 0; anchor at
+        // content shifts by the rows inserted above it), which insert-count arithmetic gets
+        // wrong. When the viewport is at the bottom (follow mode) the anchor is `item_ix == count`
+        // → `order.get` is None → no re-pin → the list stays pinned to the bottom. `anchor_at` is
+        // (RowId, sub-offset, fallback successor RowId); the fallback pins the row just below the
+        // anchor when the anchor itself vanishes after the rebuild (e.g. the sentinel at ordinal
+        // 0, F7).
+        let anchor_at: Option<(RowId, Pixels, Option<RowId>)> = {
+            let a = self.list_state.logical_scroll_top();
+            let order = self.rows.order();
+            order.get(a.item_ix).map(|r| {
+                let fallback = order.get(a.item_ix + 1).cloned();
+                (r.clone(), a.offset_in_item, fallback)
+            })
+        };
         self.rows.set_all_response_expansion(&expansion, None);
 
         self.rows.strip_markers();
 
         if full {
-            let refs: Vec<&Item> = self.items.iter().collect();
-            let blocks = group_work_section(
+            let refs: Vec<&Item> = self.items.values().collect();
+            let mut blocks = group_work_section(
                 project(&refs, self.scratch.as_ref(), self.active_response.as_ref()),
                 self.active_response.as_ref(),
             );
+            let member_ids = collect_projection_member_ids(&blocks);
+            let updates = collect_sticky_updates(&self.section_anchor, &blocks);
+            apply_sticky_to_blocks(&updates, &mut blocks);
             RowStore::materialize_full(&blocks, &mut self.rows, cx);
+            for update in updates {
+                for member in update.members {
+                    self.section_anchor.insert(member, update.sticky.clone());
+                }
+            }
+            self.purge_orphan_section_anchors(&member_ids);
             self.recompute_settled_prefix();
         } else {
             let prefix = self.settled_structure_len;
-            let slice = &self.items[self.live_section_start..];
-            let refs: Vec<&Item> = slice.iter().collect();
-            let blocks = group_work_section(
-                project(&refs, self.scratch.as_ref(), self.active_response.as_ref()),
+            let live_refs: Vec<&Item> = match self.live_section_lo {
+                Some(lo) => self.items.range(lo..).map(|(_, item)| item).collect(),
+                None => Vec::new(),
+            };
+            let mut blocks = group_work_section(
+                project(
+                    &live_refs,
+                    self.scratch.as_ref(),
+                    self.active_response.as_ref(),
+                ),
                 self.active_response.as_ref(),
             );
+            let member_ids = collect_projection_member_ids(&blocks);
+            let updates = collect_sticky_updates(&self.section_anchor, &blocks);
+            apply_sticky_to_blocks(&updates, &mut blocks);
             RowStore::materialize_live_tail(prefix, &blocks, &mut self.rows, cx);
+            for update in updates {
+                for member in update.members {
+                    self.section_anchor.insert(member, update.sticky.clone());
+                }
+            }
+            self.purge_orphan_section_anchors(&member_ids);
         }
 
         self.rows
             .reinsert_markers(&self.markers, &self.item_ordinals, cx);
+        self.sync_load_older_sentinel(cx);
 
         self.overlay_pending_finalize(cx);
-        self.rows.sync_list_count(&self.list_state, prev_len);
-        let slice = &self.items[self.live_section_start..];
-        let refs: Vec<&Item> = slice.iter().collect();
-        self.live_section_projection_count =
-            project(&refs, self.scratch.as_ref(), self.active_response.as_ref()).len();
+        let pending_accs: HashSet<AccId> = self.pending_finalize.keys().cloned().collect();
+        self.rows.gc_entities(&pending_accs);
+        if let Some((anchor_row, offset, fallback)) = &anchor_at {
+            // Fix the total count first (this may reset the scroll), then re-pin the
+            // anchor to the captured row's new index. Correct whether or not hi-side
+            // eviction co-occurred, and regardless of how many rows landed above it.
+            self.rows.sync_list_count(&self.list_state, prev_len);
+            let new_ix = self
+                .rows
+                .order()
+                .iter()
+                .position(|r| r == anchor_row)
+                .or_else(|| {
+                    // Anchor row vanished (e.g. the LoadOlder sentinel at the top of history);
+                    // pin the row that was just below it so the view does not yank (F7).
+                    fallback
+                        .as_ref()
+                        .and_then(|f| self.rows.order().iter().position(|r| r == f))
+                });
+            if let Some(new_ix) = new_ix {
+                self.list_state.scroll_to(ListOffset {
+                    item_ix: new_ix,
+                    offset_in_item: *offset,
+                });
+            }
+        } else {
+            self.rows.sync_list_count(&self.list_state, prev_len);
+        }
+        let live_refs: Vec<&Item> = match self.live_section_lo {
+            Some(lo) => self.items.range(lo..).map(|(_, item)| item).collect(),
+            None => Vec::new(),
+        };
+        self.live_section_projection_count = project(
+            &live_refs,
+            self.scratch.as_ref(),
+            self.active_response.as_ref(),
+        )
+        .len();
+    }
+
+    fn sync_load_older_sentinel(&mut self, cx: &mut Context<Self>) {
+        self.rows
+            .structure
+            .retain(|e| !matches!(e, rowsource::StructureEntry::LoadOlder));
+        if self.resident_lo > 0 {
+            let pres = RowPresentation {
+                kind: RowKind::LoadOlder,
+                text: "Load older".into(),
+                collapsed: false,
+                height_hint: None,
+            };
+            self.rows.upsert(RowId::LoadOlder, pres, cx);
+            self.rows
+                .structure
+                .insert(0, rowsource::StructureEntry::LoadOlder);
+            self.rows.rebuild_flat_order();
+        }
     }
 
     fn overlay_pending_finalize(&mut self, cx: &mut Context<Self>) {
@@ -611,26 +967,138 @@ impl FocusedTranscript {
         }
     }
 
-    fn replace_read_rows(&mut self, rows: &[(i64, Item)]) {
-        let mut sorted: Vec<_> = rows.iter().collect();
-        sorted.sort_by_key(|(ordinal, _)| *ordinal);
-        self.items = sorted.into_iter().map(|(_, item)| item.clone()).collect();
-        self.item_ordinals.clear();
-        for (ordinal, item) in rows {
-            self.item_ordinals.insert(item.id.clone(), *ordinal);
+    fn evict_if_over_cap(&mut self, _cx: &mut Context<Self>) -> bool {
+        let mut evicted_any = false;
+        while self.resident_bytes > RESIDENT_CAP_BYTES
+            && self.resident_lo >= 0
+            && self.resident_lo <= self.resident_hi
+        {
+            let evicted = if self.is_following() {
+                self.items.pop_first()
+            } else {
+                self.items.pop_last()
+            };
+            let Some((_, item)) = evicted else {
+                break;
+            };
+            evicted_any = true;
+            self.remove_item_accounting(&item.id);
+            if self.items.is_empty() {
+                self.resident_lo = -1;
+                self.resident_hi = -1;
+            } else if self.is_following() {
+                self.resident_lo = *self.items.keys().next().expect("non-empty band");
+            } else {
+                self.resident_hi = *self.items.keys().next_back().expect("non-empty band");
+            }
+        }
+        evicted_any
+    }
+
+    fn purge_orphan_section_anchors(&mut self, member_ids: &HashSet<ItemId>) {
+        self.section_anchor
+            .retain(|key, _| self.item_ordinals.contains_key(key) || member_ids.contains(key));
+    }
+
+    fn remove_item_accounting(&mut self, item_id: &ItemId) {
+        if let Some(bytes) = self.item_bytes.remove(item_id) {
+            self.resident_bytes = self.resident_bytes.saturating_sub(bytes);
+        }
+        self.item_ordinals.remove(item_id);
+        self.section_anchor.remove(item_id);
+    }
+
+    fn recompute_resident_bounds_from_items(&mut self) {
+        if let (Some(&lo), Some(&hi)) = (self.items.keys().next(), self.items.keys().next_back()) {
+            self.resident_lo = lo;
+            self.resident_hi = hi;
+        } else {
+            self.resident_lo = -1;
+            self.resident_hi = -1;
         }
     }
 
-    fn upsert_read_rows(&mut self, rows: &[(i64, Item)]) {
-        for (ordinal, item) in rows {
-            self.items.retain(|existing| existing.id != item.id);
-            let ord = *ordinal as usize;
-            if ord >= self.items.len() {
-                self.items.push(item.clone());
-            } else {
-                self.items.insert(ord, item.clone());
+    /// Re-register a stream-only member under its durable `ItemId`, preserving the
+    /// run's sticky anchor. When the provisional id was the anchor itself, retarget
+    /// all members to the durable id.
+    fn migrate_provisional_member(&mut self, provisional: &ItemId, durable: &ItemId) {
+        if provisional == durable {
+            return;
+        }
+        let Some(sticky) = self.section_anchor.remove(provisional) else {
+            self.section_anchor.insert(durable.clone(), durable.clone());
+            return;
+        };
+        let provisional_was_anchor = sticky == *provisional;
+        let new_sticky = if provisional_was_anchor {
+            durable.clone()
+        } else {
+            sticky
+        };
+        self.section_anchor
+            .insert(durable.clone(), new_sticky.clone());
+        if provisional_was_anchor {
+            let keys: Vec<_> = self.section_anchor.keys().cloned().collect();
+            for key in keys {
+                if self.section_anchor.get(&key) == Some(provisional) {
+                    self.section_anchor.insert(key, new_sticky.clone());
+                }
             }
+        }
+    }
+
+    fn replace_read_rows(&mut self, rows: &[(i64, usize, Item)]) {
+        self.section_anchor.clear();
+        self.items.clear();
+        self.item_ordinals.clear();
+        self.item_bytes.clear();
+        self.resident_bytes = 0;
+        for (ordinal, len, item) in rows {
+            self.item_bytes.insert(item.id.clone(), *len);
+            self.resident_bytes += *len;
             self.item_ordinals.insert(item.id.clone(), *ordinal);
+            self.items.insert(*ordinal, item.clone());
+        }
+    }
+
+    fn replace_span_rows(&mut self, from: i64, through: i64, rows: &[(i64, usize, Item)]) {
+        let read_ordinals: HashSet<i64> = rows.iter().map(|(ord, _, _)| *ord).collect();
+        let to_remove: Vec<i64> = self
+            .items
+            .range(from..=through)
+            .filter(|(ord, _)| !read_ordinals.contains(ord))
+            .map(|(ord, _)| *ord)
+            .collect();
+        for ord in to_remove {
+            if let Some(item) = self.items.remove(&ord) {
+                self.remove_item_accounting(&item.id);
+            }
+        }
+        self.upsert_read_rows(rows);
+    }
+
+    fn upsert_read_rows(&mut self, rows: &[(i64, usize, Item)]) {
+        for (ordinal, len, item) in rows {
+            if let Some(existing) = self.items.values().find(|existing| existing.id == item.id) {
+                let existing_id = existing.id.clone();
+                if let Some(old_ord) = self.item_ordinals.get(&existing_id).copied() {
+                    self.items.remove(&old_ord);
+                }
+                self.remove_item_accounting(&existing_id);
+            }
+            // A DIFFERENT id occupying the target ordinal is displaced by this insert; drop its
+            // byte/ordinal/anchor accounting first or `resident_bytes` drifts up permanently and
+            // defeats the cap (F2).
+            if let Some(displaced) = self.items.get(ordinal)
+                && displaced.id != item.id
+            {
+                let displaced_id = displaced.id.clone();
+                self.remove_item_accounting(&displaced_id);
+            }
+            self.item_bytes.insert(item.id.clone(), *len);
+            self.resident_bytes += *len;
+            self.item_ordinals.insert(item.id.clone(), *ordinal);
+            self.items.insert(*ordinal, item.clone());
         }
     }
 
@@ -641,11 +1109,141 @@ impl FocusedTranscript {
     }
 
     #[cfg(test)]
-    fn seed_item(&mut self, ordinal: usize, item: Item) {
-        if ordinal >= self.items.len() {
-            self.items.push(item);
-        } else {
-            self.items.insert(ordinal, item);
+    fn seed_item(&mut self, ordinal: i64, item: Item) {
+        let len = test_payload_len(&item);
+        if let Some(existing) = self.items.remove(&ordinal) {
+            self.remove_item_accounting(&existing.id);
+        }
+        self.item_bytes.insert(item.id.clone(), len);
+        self.resident_bytes += len;
+        self.item_ordinals.insert(item.id.clone(), ordinal);
+        self.items.insert(ordinal, item);
+        if self.resident_lo < 0 || ordinal < self.resident_lo {
+            self.resident_lo = ordinal;
+        }
+        if ordinal > self.resident_hi {
+            self.resident_hi = ordinal;
+        }
+    }
+}
+
+#[cfg(test)]
+fn test_payload_len(item: &Item) -> usize {
+    rowsource::item_text_stub(item).len().max(1)
+}
+
+fn read_ordinal_bounds(rows: &[(i64, usize, Item)]) -> Option<(i64, i64)> {
+    rows.iter()
+        .map(|(ord, _, _)| *ord)
+        .min()
+        .zip(rows.iter().map(|(ord, _, _)| *ord).max())
+}
+
+fn collect_projection_member_ids(blocks: &[ViewBlock<'_>]) -> HashSet<ItemId> {
+    let mut members = Vec::new();
+    for block in blocks {
+        collect_block_member_ids(block, &mut members);
+    }
+    members.into_iter().collect()
+}
+
+fn collect_block_member_ids(block: &ViewBlock<'_>, out: &mut Vec<ItemId>) {
+    match block {
+        ViewBlock::Item(item) => out.push(item.id.clone()),
+        ViewBlock::ToolSpan { call, output } => {
+            out.push(call.id.clone());
+            if let Some(out_item) = output {
+                out.push(out_item.id.clone());
+            }
+        }
+        ViewBlock::WorkSection { blocks: inner, .. } => {
+            collect_work_section_member_ids(inner, out);
+        }
+        ViewBlock::StreamingReasoning { acc, .. } => {
+            out.push(ItemId::new(acc.acc_id.as_str()));
+        }
+        ViewBlock::StreamingMessage(acc) => {
+            if let Some(id) = &acc.message_id {
+                out.push(ItemId::new(id.as_str()));
+            } else {
+                out.push(ItemId::new(acc.acc_id.as_str()));
+            }
+        }
+    }
+}
+
+fn collect_sticky_updates(
+    section_anchor: &HashMap<ItemId, ItemId>,
+    blocks: &[ViewBlock<'_>],
+) -> Vec<StickyAnchorUpdate> {
+    let mut out = Vec::new();
+    for block in blocks {
+        let ViewBlock::WorkSection {
+            run_anchor,
+            blocks: inner,
+            ..
+        } = block
+        else {
+            continue;
+        };
+        let members = work_section_member_ids(inner);
+        let sticky = members
+            .iter()
+            .find_map(|id| section_anchor.get(id))
+            .cloned()
+            .unwrap_or_else(|| run_anchor.clone());
+        out.push(StickyAnchorUpdate { members, sticky });
+    }
+    out
+}
+
+fn apply_sticky_to_blocks(updates: &[StickyAnchorUpdate], blocks: &mut [ViewBlock<'_>]) {
+    let mut update_ix = 0;
+    for block in blocks.iter_mut() {
+        let ViewBlock::WorkSection { run_anchor, .. } = block else {
+            continue;
+        };
+        if let Some(update) = updates.get(update_ix) {
+            *run_anchor = update.sticky.clone();
+            update_ix += 1;
+        }
+    }
+}
+
+struct StickyAnchorUpdate {
+    members: Vec<ItemId>,
+    sticky: ItemId,
+}
+
+fn work_section_member_ids(blocks: &[ViewBlock<'_>]) -> Vec<ItemId> {
+    let mut out = Vec::new();
+    collect_work_section_member_ids(blocks, &mut out);
+    out
+}
+
+fn collect_work_section_member_ids(blocks: &[ViewBlock<'_>], out: &mut Vec<ItemId>) {
+    for block in blocks {
+        match block {
+            ViewBlock::Item(item) => out.push(item.id.clone()),
+            ViewBlock::ToolSpan { call, output } => {
+                out.push(call.id.clone());
+                if let Some(out_item) = output {
+                    out.push(out_item.id.clone());
+                }
+            }
+            ViewBlock::WorkSection { blocks: inner, .. } => {
+                collect_work_section_member_ids(inner, out);
+            }
+            ViewBlock::StreamingReasoning { acc, .. } => {
+                out.push(ItemId::new(acc.acc_id.as_str()));
+            }
+            ViewBlock::StreamingMessage(acc) => {
+                if let Some(id) = &acc.message_id {
+                    out.push(ItemId::new(id.as_str()));
+                } else {
+                    out.push(ItemId::new(acc.acc_id.as_str()));
+                }
+            }
         }
     }
 }
@@ -762,17 +1360,345 @@ mod tests {
 
     fn range_read(rows: Vec<(i64, Item)>, watermark: i64) -> RangeRead {
         RangeRead {
-            rows,
+            rows: rows
+                .into_iter()
+                .map(|(ord, item)| {
+                    let len = test_payload_len(&item);
+                    (ord, len, item)
+                })
+                .collect(),
             skipped: vec![],
             watermark: Some(watermark),
         }
+    }
+
+    fn tail_read(rows: Vec<(i64, Item)>, watermark: i64) -> RangeRead {
+        range_read(rows, watermark)
+    }
+
+    #[gpui::test]
+    async fn baseline_tail_sets_cursors(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        let rows: Vec<_> = (0..=5)
+            .map(|o| (o, message_item(&format!("m{o}"), None)))
+            .collect();
+        let min_ordinal = 0;
+        let max_ordinal = 5;
+        let watermark = 0;
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    tail_read(rows.clone(), watermark),
+                    cx,
+                );
+            });
+        });
+
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert_eq!(r.resident_lo_for_test(), min_ordinal);
+            assert_eq!(r.resident_hi_for_test(), max_ordinal);
+            assert_eq!(r.known_committed_for_test(), watermark);
+            assert_eq!(r.items_len_for_test(), rows.len());
+        });
+    }
+
+    #[gpui::test]
+    async fn span_de_ghost_fc_live_at_5(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        let msg_store = message_item("msg_store", None);
+        let fc_live = reasoning_item("fc_live", "resp_a");
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    tail_read(vec![(0, msg_store.clone()), (5, fc_live.clone())], 0),
+                    cx,
+                );
+            });
+        });
+
+        let (resident_lo, resident_hi) = cx.read(|cx| {
+            let r = replica.read(cx);
+            (r.resident_lo_for_test(), r.resident_hi_for_test())
+        });
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Span {
+                        from: resident_lo,
+                        through: resident_hi,
+                    },
+                    range_read(vec![(0, msg_store.clone())], 0),
+                    cx,
+                );
+            });
+        });
+
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert!(
+                !r.has_item_ordinal_for_test(5),
+                "fold-deleted provisional must leave items"
+            );
+            assert!(
+                !r.rows()
+                    .order()
+                    .iter()
+                    .any(|id| matches!(id, RowId::Work(id) if id.as_str() == "fc_live")),
+                "no ghost Work row for fc_live"
+            );
+            assert_eq!(
+                r.resident_hi_for_test(),
+                0,
+                "Span de-ghost must recompute resident_hi from items"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn section_chrome_entity_id_stable_across_stream_finalize(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        let acc = AccId::new("acc_chrome_fin");
+        let item_id = ItemId::new("r_chrome_fin");
+        let resp = ResponseId::new("resp_a");
+        let stream_key = SectionKey {
+            response_id: resp.clone(),
+            run_anchor: ItemId::new(acc.as_str()),
+        };
+
+        cx.update(|cx| {
+            replica.update(cx, |r, _| {
+                r.active_response = Some(resp.clone());
+                r.recompute_live_section_lo();
+                r.recompute_settled_prefix();
+                r.live_section_lo = Some(0);
+            });
+            replica.update(cx, |r, cx| {
+                r.fold_detailed(
+                    StreamUpdate::ScratchChanged(Arc::new(StreamScratch {
+                        open_reasoning: Some(lens_core::domain::item::ReasoningAcc {
+                            acc_id: acc.clone(),
+                            full_text: "streaming chrome".into(),
+                            summary_text: String::new(),
+                            encrypted: false,
+                        }),
+                        ..Default::default()
+                    })),
+                    cx,
+                );
+            });
+        });
+
+        let (chip_before, rail_before) = cx.read(|cx| {
+            let r = replica.read(cx);
+            (
+                r.rows()
+                    .entity_id(&stream_key.chip_id(), cx)
+                    .or_else(|| r.rows().entity_id(&stream_key.rail_id(), cx))
+                    .expect("section chrome before finalize"),
+                r.rows()
+                    .entity_id(&stream_key.rail_id(), cx)
+                    .expect("section rail before finalize"),
+            )
+        });
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.fold_detailed(
+                    StreamUpdate::Retired {
+                        acc_id: acc.clone(),
+                        disposition: RetireDisposition::Finalizing {
+                            item_id: item_id.clone(),
+                        },
+                    },
+                    cx,
+                );
+                r.fold_detailed(
+                    StreamUpdate::ScratchChanged(Arc::new(StreamScratch::default())),
+                    cx,
+                );
+            });
+        });
+
+        let final_key = SectionKey {
+            response_id: resp,
+            run_anchor: item_id,
+        };
+
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            let chip_after = r
+                .rows()
+                .entity_id(&final_key.chip_id(), cx)
+                .or_else(|| r.rows().entity_id(&final_key.rail_id(), cx))
+                .expect("section chrome after finalize");
+            let rail_after = r
+                .rows()
+                .entity_id(&final_key.rail_id(), cx)
+                .expect("section rail after finalize");
+            assert_eq!(
+                chip_before, chip_after,
+                "section chip EntityId must survive provisional→durable rekey"
+            );
+            assert_eq!(
+                rail_before, rail_after,
+                "section rail EntityId must survive provisional→durable rekey"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn backward_prepend_materializes_rows(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        let tail_rows: Vec<_> = (10..=20)
+            .map(|o| (o, reasoning_item(&format!("r{o}"), "resp_a")))
+            .collect();
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    tail_read(tail_rows, 20),
+                    cx,
+                );
+            });
+        });
+
+        let section_key = SectionKey {
+            response_id: ResponseId::new("resp_a"),
+            run_anchor: ItemId::new("r10"),
+        };
+        let (chip_before, rail_before) = cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                let chip = r
+                    .rows()
+                    .entity_id(&section_key.chip_id(), cx)
+                    .or_else(|| r.rows().entity_id(&section_key.rail_id(), cx));
+                let rail = r.rows().entity_id(&section_key.rail_id(), cx);
+                (chip, rail)
+            })
+        });
+        assert!(
+            chip_before.is_some() || rail_before.is_some(),
+            "post-Tail section chrome must exist at sticky anchor r10"
+        );
+
+        let prepend_rows: Vec<_> = (5..=9)
+            .map(|o| (o, reasoning_item(&format!("r{o}"), "resp_a")))
+            .collect();
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Backward {
+                        before: 10,
+                        byte_budget: PAGE_BUDGET_BYTES,
+                    },
+                    tail_read(prepend_rows, 20),
+                    cx,
+                );
+            });
+        });
+
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert_eq!(r.resident_lo_for_test(), 5);
+            assert_eq!(r.resident_hi_for_test(), 20);
+            for ord in 5..=9 {
+                let id = ItemId::new(format!("r{ord}"));
+                assert!(
+                    r.rows()
+                        .order()
+                        .iter()
+                        .any(|row_id| row_id == &RowId::Work(id.clone())),
+                    "prepended ordinal {ord} must materialize in RowStore order"
+                );
+            }
+            let chip_after = r
+                .rows()
+                .entity_id(&section_key.chip_id(), cx)
+                .or_else(|| r.rows().entity_id(&section_key.rail_id(), cx));
+            let rail_after = r.rows().entity_id(&section_key.rail_id(), cx);
+            assert_eq!(
+                chip_before, chip_after,
+                "sticky run_anchor r10: section chip EntityId must survive backward prepend"
+            );
+            assert_eq!(
+                rail_before, rail_after,
+                "sticky run_anchor r10: section rail EntityId must survive backward prepend"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn reconcile_uses_span(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    tail_read(
+                        vec![(3, message_item("m3", None)), (4, message_item("m4", None))],
+                        3,
+                    ),
+                    cx,
+                );
+            });
+        });
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.on_reconcile_epoch_settled(1, cx);
+            });
+        });
+
+        let reconcile = rx.try_recv().expect("reconcile span read");
+        assert_eq!(
+            reconcile.range,
+            ReadRange::Span {
+                from: 3,
+                through: 4,
+            }
+        );
+        assert_eq!(reconcile.priority, Priority::Reconcile);
     }
 
     #[gpui::test]
     async fn rebased_updates_scalars_never_clears_items(cx: &mut gpui::TestAppContext) {
         let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
         let baseline = rx.try_recv().expect("baseline read at new");
-        assert_eq!(baseline.range, ReadRange::All);
+        assert_eq!(
+            baseline.range,
+            ReadRange::Tail {
+                byte_budget: TAIL_BUDGET_BYTES
+            }
+        );
         assert_eq!(baseline.priority, Priority::Baseline);
 
         let resp = ResponseId::new("resp_a");
@@ -780,6 +1706,8 @@ mod tests {
             replica.update(cx, |r, _| {
                 r.seed_item(0, message_item("item_a", Some("resp_a")));
                 r.active_response = Some(resp.clone());
+                r.recompute_live_section_lo();
+                r.recompute_settled_prefix();
             });
             replica.update(cx, |r, cx| {
                 r.fold_detailed(
@@ -808,6 +1736,7 @@ mod tests {
         cx.update(|cx| {
             replica.update(cx, |r, _| {
                 r.last_rendered_ordinal = 2;
+                r.resident_hi = 2;
             });
             replica.update(cx, |r, cx| {
                 r.fold_detailed(
@@ -858,7 +1787,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn active_response_changed_recomputes_live_section_start(cx: &mut gpui::TestAppContext) {
+    async fn active_response_changed_recomputes_live_section_lo(cx: &mut gpui::TestAppContext) {
         let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
         let _ = rx.try_recv().expect("baseline");
 
@@ -879,7 +1808,7 @@ mod tests {
 
         cx.read(|cx| {
             let r = replica.read(cx);
-            assert_eq!(r.live_section_start, 1);
+            assert_eq!(r.live_section_lo_for_test(), Some(1));
             assert_eq!(r.active_response.as_ref(), Some(&resp_b));
         });
 
@@ -890,7 +1819,7 @@ mod tests {
         });
         cx.read(|cx| {
             let r = replica.read(cx);
-            assert_eq!(r.live_section_start, 3);
+            assert_eq!(r.live_section_lo_for_test(), None);
         });
 
         cx.update(|cx| {
@@ -906,7 +1835,7 @@ mod tests {
         });
         cx.read(|cx| {
             let r = replica.read(cx);
-            assert_eq!(r.live_section_start, 0);
+            assert_eq!(r.live_section_lo_for_test(), None);
         });
         assert!(rx.try_recv().is_err());
     }
@@ -919,7 +1848,7 @@ mod tests {
         cx.update(|cx| {
             replica.update(cx, |r, _| {
                 r.seed_item(0, message_item("m0", Some("resp_a")));
-                r.live_section_start = 0;
+                r.live_section_lo = Some(0);
             });
             replica.update(cx, |r, cx| {
                 r.reproject(false, cx);
@@ -951,7 +1880,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn reconcile_epoch_settled_enqueues_all_when_overlapped(cx: &mut gpui::TestAppContext) {
+    async fn reconcile_epoch_settled_enqueues_span_when_overlapped(cx: &mut gpui::TestAppContext) {
         let (replica, rx) = new_replica(
             cx,
             ReconcileEpoch {
@@ -969,8 +1898,57 @@ mod tests {
         });
 
         let reconcile = rx.try_recv().expect("reconcile re-read");
-        assert_eq!(reconcile.range, ReadRange::All);
+        assert_eq!(
+            reconcile.range,
+            ReadRange::Span {
+                from: -1,
+                through: -1,
+            }
+        );
         assert_eq!(reconcile.priority, Priority::Reconcile);
+    }
+
+    /// D19: baseline `new_with_reader` and reconcile-epoch settle must never enqueue
+    /// `ReadRange::All` — only bounded `Tail` / `Span` reads.
+    #[gpui::test]
+    async fn baseline_and_reconcile_settle_never_enqueue_read_range_all(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (replica, rx) = new_replica(
+            cx,
+            ReconcileEpoch {
+                epoch: 3,
+                in_flight: true,
+            },
+            1,
+        );
+
+        let mut ranges = vec![rx.try_recv().expect("baseline read").range];
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.on_reconcile_epoch_settled(3, cx);
+            });
+        });
+        ranges.push(rx.try_recv().expect("reconcile read").range);
+
+        for range in &ranges {
+            match range {
+                ReadRange::Tail { .. } | ReadRange::Span { .. } => {}
+                ReadRange::All => {
+                    panic!("D19: focused replica must not enqueue ReadRange::All");
+                }
+                other => panic!("unexpected enqueued read range: {other:?}"),
+            }
+        }
+        assert!(
+            ranges.iter().any(|r| matches!(r, ReadRange::Tail { .. })),
+            "baseline must enqueue Tail"
+        );
+        assert!(
+            ranges.iter().any(|r| matches!(r, ReadRange::Span { .. })),
+            "overlapped reconcile settle must enqueue Span"
+        );
     }
 
     #[gpui::test]
@@ -1008,9 +1986,10 @@ mod tests {
         });
         cx.read(|cx| {
             let r = replica.read(cx);
+            let ids: Vec<_> = r.items.values().map(|i| i.id.clone()).collect();
             assert_eq!(r.items.len(), 2, "deleted row b must not ghost");
-            assert_eq!(r.items[0].id, a.id);
-            assert_eq!(r.items[1].id, c_reord.id);
+            assert_eq!(ids[0], a.id);
+            assert_eq!(ids[1], c_reord.id);
         });
         assert!(rx.try_recv().is_err());
     }
@@ -1035,7 +2014,7 @@ mod tests {
         cx.read(|cx| {
             let r = replica.read(cx);
             assert_eq!(r.items.len(), 1, "rekey must not leave stale twin");
-            assert_eq!(r.items[0].id, y.id);
+            assert_eq!(r.items.values().next().unwrap().id, y.id);
         });
         assert!(rx.try_recv().is_err());
     }
@@ -1067,9 +2046,10 @@ mod tests {
         });
         cx.read(|cx| {
             let r = replica.read(cx);
+            let ids: Vec<_> = r.items.values().map(|i| i.id.clone()).collect();
             assert_eq!(r.items.len(), 2);
-            assert_eq!(r.items[0].id, a.id);
-            assert_eq!(r.items[1].id, b.id);
+            assert_eq!(ids[0], a.id);
+            assert_eq!(ids[1], b.id);
         });
         assert!(rx.try_recv().is_err());
     }
@@ -1086,7 +2066,7 @@ mod tests {
                     99,
                     ReadRange::All,
                     RangeRead {
-                        rows: vec![(0, item.clone())],
+                        rows: vec![(0, test_payload_len(&item), item.clone())],
                         skipped: vec![],
                         watermark: Some(0),
                     },
@@ -1104,7 +2084,7 @@ mod tests {
                     1,
                     ReadRange::All,
                     RangeRead {
-                        rows: vec![(0, item)],
+                        rows: vec![(0, test_payload_len(&item), item)],
                         skipped: vec![],
                         watermark: Some(0),
                     },
@@ -1140,7 +2120,13 @@ mod tests {
         });
 
         let reconcile = rx.try_recv().expect("Imp-4 reconcile re-read");
-        assert_eq!(reconcile.range, ReadRange::All);
+        assert_eq!(
+            reconcile.range,
+            ReadRange::Span {
+                from: -1,
+                through: -1,
+            }
+        );
         assert_eq!(reconcile.generation, 7);
         assert_eq!(reconcile.priority, Priority::Reconcile);
     }
@@ -1155,7 +2141,9 @@ mod tests {
         cx.update(|cx| {
             replica.update(cx, |r, _| {
                 r.active_response = Some(resp.clone());
-                r.live_section_start = 0;
+                r.recompute_live_section_lo();
+                r.recompute_settled_prefix();
+                r.live_section_lo = Some(0);
             });
             replica.update(cx, |r, cx| {
                 r.fold_detailed(
@@ -1232,7 +2220,9 @@ mod tests {
                     cx,
                 );
                 r.active_response = Some(resp_c.clone());
-                r.recompute_live_section_start();
+                r.recompute_live_section_lo();
+                r.recompute_settled_prefix();
+                r.recompute_live_section_lo();
                 r.apply_expansion_flags(cx);
             });
         });
@@ -1294,7 +2284,9 @@ mod tests {
                     cx,
                 );
                 r.active_response = Some(ResponseId::new("resp_live"));
-                r.recompute_live_section_start();
+                r.recompute_live_section_lo();
+                r.recompute_settled_prefix();
+                r.recompute_live_section_lo();
                 r.apply_expansion_flags(cx);
             });
         });
@@ -1365,6 +2357,8 @@ mod tests {
                     cx,
                 );
                 r.active_response = Some(resp.clone());
+                r.recompute_live_section_lo();
+                r.recompute_settled_prefix();
             });
         });
 
@@ -1518,14 +2512,18 @@ mod tests {
         let resp_b = ResponseId::new("resp_b");
         // StreamingReasoning is spliced after settled items, so with
         // [r_a, r_b] + stream(active=resp_a) the tail opens a new resp_a run
-        // (run_index 1) that is NOT the last section (resp_b is).
+        // run_anchor r_a0) that is NOT the last section (resp_b is).
+        let stream_key = SectionKey {
+            response_id: resp_a.clone(),
+            run_anchor: ItemId::new(acc.as_str()),
+        };
         let key_a = SectionKey {
             response_id: resp_a.clone(),
-            run_index: 1,
+            run_anchor: item_id.clone(),
         };
         let key_b = SectionKey {
             response_id: resp_b.clone(),
-            run_index: 0,
+            run_anchor: ItemId::new("r_b0"),
         };
 
         cx.update(|cx| {
@@ -1570,14 +2568,14 @@ mod tests {
             let r = replica.read(cx);
             assert_eq!(
                 r.rows().section_containing_child(&tail),
-                Some(&key_a),
-                "precondition: live reasoning tail under resp_a run 1 (not last)"
+                Some(&stream_key),
+                "precondition: live reasoning tail under resp_a stream run (not last)"
             );
             assert!(
                 r.rows()
                     .order()
                     .iter()
-                    .any(|id| matches!(id, RowId::SectionRail(r, 0) | RowId::Section(r, 0) if r == &resp_b)),
+                    .any(|id| matches!(id, RowId::SectionRail(r, anchor) | RowId::Section(r, anchor) if r == &resp_b && anchor.as_str() == "r_b0")),
                 "precondition: resp_b section exists after resp_a's stream run"
             );
             r.rows().entity_id(&tail, cx)
@@ -1906,15 +2904,21 @@ mod tests {
         let acc = AccId::new("acc_r_vanish");
         let item_id = ItemId::new("r_local_vanish");
         let resp_a = ResponseId::new("resp_a");
+        let stream_key = SectionKey {
+            response_id: resp_a.clone(),
+            run_anchor: ItemId::new(acc.as_str()),
+        };
         let key_a = SectionKey {
             response_id: resp_a.clone(),
-            run_index: 0,
+            run_anchor: item_id.clone(),
         };
 
         let entity_before = cx.update(|cx| {
             replica.update(cx, |r, _| {
                 r.active_response = Some(resp_a.clone());
-                r.live_section_start = 0;
+                r.recompute_live_section_lo();
+                r.recompute_settled_prefix();
+                r.live_section_lo = Some(0);
             });
             replica.update(cx, |r, cx| {
                 r.fold_detailed(
@@ -1934,7 +2938,7 @@ mod tests {
             let r = replica.read(cx);
             assert_eq!(
                 r.rows().section_containing_child(&tail),
-                Some(&key_a),
+                Some(&stream_key),
                 "precondition: reasoning-only section owns the live tail"
             );
             r.rows().entity_id(&tail, cx)
@@ -2037,6 +3041,8 @@ mod tests {
                     cx,
                 );
                 r.active_response = Some(resp_b.clone());
+                r.recompute_live_section_lo();
+                r.recompute_settled_prefix();
             });
         });
 
@@ -2115,7 +3121,9 @@ mod tests {
         let entity_before = cx.update(|cx| {
             replica.update(cx, |r, _| {
                 r.active_response = Some(resp.clone());
-                r.live_section_start = 0;
+                r.recompute_live_section_lo();
+                r.recompute_settled_prefix();
+                r.live_section_lo = Some(0);
             });
             replica.update(cx, |r, cx| {
                 r.fold_detailed(
@@ -2301,6 +3309,8 @@ mod tests {
         cx.update(|cx| {
             replica.update(cx, |r, _| {
                 r.active_response = Some(resp.clone());
+                r.recompute_live_section_lo();
+                r.recompute_settled_prefix();
             });
             replica.update(cx, |r, cx| {
                 r.fold_detailed(
@@ -2368,9 +3378,13 @@ mod tests {
                         through: 1,
                     },
                     RangeRead {
-                        rows: vec![(1, message_item("m1", Some("resp_a")))],
+                        rows: vec![(
+                            1,
+                            test_payload_len(&message_item("m1", Some("resp_a"))),
+                            message_item("m1", Some("resp_a")),
+                        )],
                         skipped: vec![],
-                        watermark: Some(5),
+                        watermark: Some(1),
                     },
                     cx,
                 );
@@ -2411,7 +3425,11 @@ mod tests {
                     1,
                     ReadRange::One { ordinal: 0 },
                     RangeRead {
-                        rows: vec![(0, user_item("u0", "rewrite"))],
+                        rows: vec![(
+                            0,
+                            test_payload_len(&user_item("u0", "rewrite")),
+                            user_item("u0", "rewrite"),
+                        )],
                         skipped: vec![],
                         watermark: Some(9),
                     },
@@ -2599,6 +3617,8 @@ mod tests {
                 r.last_rendered_ordinal = 0;
                 r.fold_detailed(StreamUpdate::Reconnected { gap: Some(5) }, cx);
                 r.active_response = Some(ResponseId::new("resp_b"));
+                r.recompute_live_section_lo();
+                r.recompute_settled_prefix();
             });
         });
 
@@ -2890,11 +3910,11 @@ mod tests {
             let small_r = small.read(cx);
             let large_r = large.read(cx);
             assert!(
-                small_r.live_section_start_for_test() < small_r.items_len_for_test(),
+                small_r.live_slice_len_for_test() > 0,
                 "small: live section must not be empty"
             );
             assert!(
-                large_r.live_section_start_for_test() < large_r.items_len_for_test(),
+                large_r.live_slice_len_for_test() > 0,
                 "large: live section must not be empty"
             );
             assert_eq!(
@@ -2926,6 +3946,1312 @@ mod tests {
             assert!(
                 small_r.items_len_for_test() < large_r.items_len_for_test(),
                 "precondition: large resident has more items than small"
+            );
+        });
+    }
+
+    const EVICTION_ROW_BYTES: usize = 10 * 1024 * 1024;
+
+    fn oversized_read(rows: Vec<(i64, &str)>) -> RangeRead {
+        let watermark = rows.last().map(|(o, _)| *o);
+        RangeRead {
+            rows: rows
+                .into_iter()
+                .map(|(ord, id)| (ord, EVICTION_ROW_BYTES, message_item(id, None)))
+                .collect(),
+            skipped: vec![],
+            watermark,
+        }
+    }
+
+    fn items_ordinals_contiguous(items: &BTreeMap<i64, Item>) -> bool {
+        let mut keys = items.keys().copied();
+        let Some(first) = keys.next() else {
+            return true;
+        };
+        keys.enumerate().all(|(i, ord)| ord == first + i as i64 + 1)
+    }
+
+    #[gpui::test]
+    async fn eviction_while_following_trims_top_keeps_tail(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.set_following(true, cx);
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    oversized_read(vec![(0, "m0"), (1, "m1"), (2, "m2")]),
+                    cx,
+                );
+            });
+        });
+
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert!(
+                r.resident_bytes_for_test() <= RESIDENT_CAP_BYTES,
+                "resident_bytes must stay under cap"
+            );
+            assert!(
+                items_ordinals_contiguous(&r.items),
+                "resident band must stay contiguous"
+            );
+            assert_eq!(r.resident_lo_for_test(), 1);
+            assert_eq!(r.resident_hi_for_test(), 2);
+            assert!(
+                r.has_item_ordinal_for_test(2),
+                "tail ordinal must remain resident"
+            );
+            assert!(
+                !r.has_item_ordinal_for_test(0),
+                "oldest ordinal must be evicted"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn eviction_while_scrolled_up_trims_bottom_keeps_top(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.set_following(false, cx);
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    oversized_read(vec![(0, "m0"), (1, "m1"), (2, "m2")]),
+                    cx,
+                );
+            });
+        });
+
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert!(
+                r.resident_bytes_for_test() <= RESIDENT_CAP_BYTES,
+                "resident_bytes must stay under cap"
+            );
+            assert_eq!(r.resident_lo_for_test(), 0);
+            assert_eq!(r.resident_hi_for_test(), 1);
+            assert!(
+                r.has_item_ordinal_for_test(0),
+                "top ordinal must remain resident"
+            );
+            assert!(
+                !r.has_item_ordinal_for_test(2),
+                "tail ordinal must be evicted"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn delta_eviction_frees_ghost_row_entities(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.set_following(true, cx);
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    oversized_read(vec![(0, "m0"), (1, "m1"), (2, "m2")]),
+                    cx,
+                );
+            });
+        });
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Delta {
+                        after: 2,
+                        through: 3,
+                    },
+                    oversized_read(vec![(3, "m3")]),
+                    cx,
+                );
+            });
+        });
+
+        let evicted_m1 = RowId::Sibling(ItemId::new("m1"));
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert!(
+                !r.has_item_ordinal_for_test(1),
+                "m1 ordinal must be evicted from items"
+            );
+            assert!(
+                !r.rows().order().contains(&evicted_m1),
+                "evicted row must not appear in order"
+            );
+            assert!(
+                r.rows().entity_id(&evicted_m1, cx).is_none(),
+                "evicted row entity must be freed from RowStore"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn forward_delta_discarded_when_not_following(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    tail_read(
+                        vec![(0, message_item("m0", None)), (5, message_item("m5", None))],
+                        5,
+                    ),
+                    cx,
+                );
+            });
+        });
+
+        let hi_before = cx.read(|cx| replica.read(cx).resident_hi_for_test());
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.set_following(false, cx);
+            });
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Delta {
+                        after: hi_before,
+                        through: hi_before + 5,
+                    },
+                    tail_read(
+                        vec![
+                            (hi_before + 1, message_item("n1", None)),
+                            (hi_before + 2, message_item("n2", None)),
+                        ],
+                        hi_before + 5,
+                    ),
+                    cx,
+                );
+            });
+        });
+
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert_eq!(r.resident_hi_for_test(), hi_before);
+            assert_eq!(r.known_committed_for_test(), hi_before + 5);
+            assert!(!r.has_item_ordinal_for_test(hi_before + 1));
+            assert!(!r.has_item_ordinal_for_test(hi_before + 2));
+        });
+    }
+
+    #[gpui::test]
+    async fn empty_forward_delta_does_not_spin_catchup(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    tail_read(
+                        vec![(0, message_item("m0", None)), (5, message_item("m5", None))],
+                        5,
+                    ),
+                    cx,
+                );
+            });
+            replica.update(cx, |r, _| {
+                r.known_committed = 10;
+            });
+        });
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Delta {
+                        after: 5,
+                        through: 10,
+                    },
+                    RangeRead {
+                        rows: vec![],
+                        skipped: vec![],
+                        watermark: Some(10),
+                    },
+                    cx,
+                );
+            });
+        });
+
+        assert!(
+            rx.try_recv().is_err(),
+            "empty forward Delta must not re-enqueue catch-up when resident_hi made no progress"
+        );
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert_eq!(r.resident_hi_for_test(), 5);
+            assert_eq!(r.known_committed_for_test(), 10);
+        });
+    }
+
+    #[gpui::test]
+    async fn transcript_advanced_page_clamps_delta_and_catchup_enqueues(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        const GAP: i64 = 1000;
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    tail_read(
+                        vec![(0, message_item("m0", None)), (2, message_item("m2", None))],
+                        2,
+                    ),
+                    cx,
+                );
+            });
+        });
+
+        let hi = cx.read(|cx| replica.read(cx).resident_hi_for_test());
+        let target = hi + GAP;
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.fold_detailed(
+                    StreamUpdate::TranscriptAdvanced {
+                        committed_ordinal: target,
+                    },
+                    cx,
+                );
+            });
+        });
+
+        let delta = rx.try_recv().expect("first page delta");
+        assert_eq!(
+            delta.range,
+            ReadRange::Delta {
+                after: hi,
+                through: hi + FORWARD_DELTA_PAGE_ORDINALS,
+            }
+        );
+        cx.read(|cx| {
+            assert_eq!(replica.read(cx).known_committed_for_test(), target);
+        });
+
+        let page_end = hi + FORWARD_DELTA_PAGE_ORDINALS;
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    delta.range,
+                    RangeRead {
+                        rows: vec![(page_end, 1, message_item("page_end", None))],
+                        skipped: vec![],
+                        watermark: Some(target),
+                    },
+                    cx,
+                );
+            });
+        });
+
+        let catchup = rx.try_recv().expect("catch-up delta after partial page");
+        assert_eq!(
+            catchup.range,
+            ReadRange::Delta {
+                after: page_end,
+                through: target,
+            }
+        );
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert!(
+                r.resident_hi_for_test() <= page_end,
+                "first page must not load the full gap"
+            );
+            assert_eq!(r.known_committed_for_test(), target);
+        });
+    }
+
+    #[gpui::test]
+    async fn transcript_advanced_gated_when_not_following(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    tail_read(
+                        vec![(0, message_item("m0", None)), (5, message_item("m5", None))],
+                        5,
+                    ),
+                    cx,
+                );
+                r.set_following(false, cx);
+            });
+        });
+
+        let hi = cx.read(|cx| replica.read(cx).resident_hi_for_test());
+        assert!(hi < 15);
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.fold_detailed(
+                    StreamUpdate::TranscriptAdvanced {
+                        committed_ordinal: hi + 10,
+                    },
+                    cx,
+                );
+            });
+        });
+
+        assert!(
+            rx.try_recv().is_err(),
+            "gated advance must not enqueue forward Delta"
+        );
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert_eq!(r.known_committed_for_test(), hi + 10);
+            assert_eq!(r.resident_hi_for_test(), hi);
+        });
+    }
+
+    #[gpui::test]
+    async fn discarded_provisional_section_anchor_does_not_leak(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        let resp = ResponseId::new("resp_a");
+        cx.update(|cx| {
+            replica.update(cx, |r, _| {
+                r.active_response = Some(resp.clone());
+                r.live_section_lo = Some(0);
+            });
+        });
+
+        for i in 0..5 {
+            let acc = AccId::new(format!("acc_discard_{i}"));
+            cx.update(|cx| {
+                replica.update(cx, |r, cx| {
+                    r.fold_detailed(
+                        StreamUpdate::ScratchChanged(Arc::new(StreamScratch {
+                            open_reasoning: Some(lens_core::domain::item::ReasoningAcc {
+                                acc_id: acc.clone(),
+                                full_text: format!("stream {i}"),
+                                summary_text: String::new(),
+                                encrypted: false,
+                            }),
+                            ..Default::default()
+                        })),
+                        cx,
+                    );
+                    r.fold_detailed(
+                        StreamUpdate::Retired {
+                            acc_id: acc,
+                            disposition: RetireDisposition::Discarded,
+                        },
+                        cx,
+                    );
+                });
+            });
+        }
+
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert!(
+                r.section_anchor.len() <= 1,
+                "discarded provisional keys must not accumulate: {:?}",
+                r.section_anchor
+            );
+        });
+    }
+
+    /// Proves `pending_finalize` / `live_stream_tails` retain-set completeness for
+    /// mid-finalize `StreamTail` entities across `reproject` + `gc_entities`.
+    /// GC-after-`overlay_pending_finalize` ordering is a structural invariant in
+    /// `reproject` but is **not** exercised here — the retain set alone covers this path.
+    #[gpui::test]
+    async fn pending_finalize_tail_survives_gc_via_retain_set(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        let acc = AccId::new("acc_mid_gc");
+        let item_id = ItemId::new("r_mid_gc");
+        let resp = ResponseId::new("resp_a");
+
+        cx.update(|cx| {
+            replica.update(cx, |r, _| {
+                r.active_response = Some(resp);
+                r.live_section_lo = Some(0);
+            });
+            replica.update(cx, |r, cx| {
+                r.fold_detailed(
+                    StreamUpdate::ScratchChanged(Arc::new(StreamScratch {
+                        open_reasoning: Some(lens_core::domain::item::ReasoningAcc {
+                            acc_id: acc.clone(),
+                            full_text: "staged".into(),
+                            summary_text: String::new(),
+                            encrypted: false,
+                        }),
+                        ..Default::default()
+                    })),
+                    cx,
+                );
+                r.fold_detailed(
+                    StreamUpdate::Retired {
+                        acc_id: acc.clone(),
+                        disposition: RetireDisposition::Finalizing {
+                            item_id: item_id.clone(),
+                        },
+                    },
+                    cx,
+                );
+            });
+        });
+
+        let entity_before = cx.read(|cx| {
+            replica
+                .read(cx)
+                .rows()
+                .entity_id(&RowId::StreamTail(acc.clone()), cx)
+                .expect("staged tail before reproject")
+        });
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.reproject(false, cx);
+            });
+        });
+
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            let entity_after = r
+                .rows()
+                .entity_id(&RowId::StreamTail(acc), cx)
+                .expect("staged tail after reproject+gc");
+            assert_eq!(
+                entity_before, entity_after,
+                "pending_finalize tail must survive gc_entities in reproject"
+            );
+        });
+    }
+
+    #[test]
+    fn should_page_older_decision_branches() {
+        assert!(!should_page_older(0, -1, false));
+        assert!(!should_page_older(0, 0, false));
+        assert!(should_page_older(0, 5, false));
+        assert!(should_page_older(NEAR_TOP_ROWS, 5, false));
+        assert!(!should_page_older(NEAR_TOP_ROWS + 1, 5, false));
+        assert!(!should_page_older(0, 5, true));
+    }
+
+    #[gpui::test]
+    async fn load_older_sentinel_present_iff_resident_lo_positive(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert!(
+                !r.rows().order().contains(&RowId::LoadOlder),
+                "no sentinel when resident_lo absent"
+            );
+        });
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    tail_read(
+                        vec![(0, message_item("m0", None)), (1, message_item("m1", None))],
+                        1,
+                    ),
+                    cx,
+                );
+            });
+        });
+
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert_eq!(r.resident_lo_for_test(), 0);
+            assert!(
+                !r.rows().order().contains(&RowId::LoadOlder),
+                "resident_lo == 0 must not show sentinel"
+            );
+        });
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    tail_read(
+                        vec![(5, message_item("m5", None)), (6, message_item("m6", None))],
+                        6,
+                    ),
+                    cx,
+                );
+            });
+        });
+
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert!(r.resident_lo_for_test() > 0);
+            assert_eq!(r.rows().order().first(), Some(&RowId::LoadOlder));
+            assert_eq!(
+                r.rows().kind_at(0, cx),
+                Some(RowKind::LoadOlder),
+                "first row must be LoadOlder sentinel"
+            );
+        });
+    }
+
+    fn tool_output_item(id: &str, resp: &str, call_id: &str) -> Item {
+        use lens_core::domain::ids::CallId;
+        Item {
+            id: ItemId::new(id),
+            seq: None,
+            ctx: lens_core::domain::item::BlockContext {
+                agent: None,
+                depth: 0,
+                response_id: Some(ResponseId::new(resp)),
+            },
+            created_at: 1,
+            kind: ItemKind::FunctionCallOutput {
+                call_id: CallId::new(call_id),
+                output: "ok".into(),
+                arguments: serde_json::Value::Null,
+            },
+        }
+    }
+
+    /// Boundary UX: call above `resident_lo`, output resident → transient orphan row
+    /// (`pair_tool_spans` passthrough) without panic.
+    #[gpui::test]
+    async fn tool_output_orphan_when_call_above_resident_lo(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    tail_read(vec![(10, tool_output_item("o1", "resp_a", "call_1"))], 10),
+                    cx,
+                );
+            });
+        });
+
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert_eq!(r.resident_lo_for_test(), 10);
+            let found = r.rows().order().iter().any(|id| {
+                r.rows()
+                    .entity(id)
+                    .is_some_and(|e| e.read(cx).presentation.text == "ok")
+            });
+            assert!(found, "orphan output must render without panic");
+        });
+    }
+
+    const LARGE_ROW_BYTES: usize = 4 * 1024 * 1024;
+
+    fn large_byte_read(rows: Vec<(i64, Item)>, watermark: i64) -> RangeRead {
+        RangeRead {
+            rows: rows
+                .into_iter()
+                .map(|(ord, item)| (ord, LARGE_ROW_BYTES, item))
+                .collect(),
+            skipped: vec![],
+            watermark: Some(watermark),
+        }
+    }
+
+    /// C1: incremental live-tail reproject must not drop the last settled block when
+    /// `LoadOlder` occupies structure index 0.
+    #[gpui::test]
+    async fn load_older_sentinel_survives_incremental_live_tail_reproject(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        let resp = ResponseId::new("resp_live");
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    tail_read(
+                        vec![
+                            (5, user_item("u5", "settled-a")),
+                            (6, user_item("u6", "settled-b")),
+                            (7, reasoning_item("r7", "resp_live")),
+                            (8, reasoning_item("r8", "resp_live")),
+                            (9, reasoning_item("r9", "resp_live")),
+                        ],
+                        9,
+                    ),
+                    cx,
+                );
+                r.active_response = Some(resp.clone());
+                r.recompute_live_section_lo();
+                r.recompute_settled_prefix();
+            });
+        });
+
+        let settled_before = cx.read(|cx| {
+            let r = replica.read(cx);
+            assert!(r.resident_lo_for_test() > 0);
+            assert_eq!(r.rows().order().first(), Some(&RowId::LoadOlder));
+            assert_eq!(r.live_section_lo_for_test(), Some(7));
+            vec![
+                RowId::Sibling(ItemId::new("u5")),
+                RowId::Sibling(ItemId::new("u6")),
+            ]
+        });
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.fold_detailed(
+                    StreamUpdate::ScratchChanged(Arc::new(StreamScratch {
+                        open_reasoning: Some(lens_core::domain::item::ReasoningAcc {
+                            acc_id: AccId::new("acc_live"),
+                            full_text: "streaming".into(),
+                            summary_text: String::new(),
+                            encrypted: false,
+                        }),
+                        ..Default::default()
+                    })),
+                    cx,
+                );
+            });
+        });
+
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert_eq!(r.rows().order().first(), Some(&RowId::LoadOlder));
+            let order = r.rows().order();
+            for (i, id) in settled_before.iter().enumerate() {
+                assert_eq!(
+                    order.iter().position(|r| r == id),
+                    Some(i + 1),
+                    "settled row {id:?} must remain at index {} after incremental reproject",
+                    i + 1
+                );
+            }
+        });
+    }
+
+    /// C2: a backward prepend with hi-side eviction must re-pin the scroll anchor to the
+    /// SAME row it referenced (wherever that row lands) and keep the gpui list count aligned
+    /// with the RowStore. Shifting by an insert-count proxy gets this wrong (the LoadOlder
+    /// sentinel offsets the count, and an anchor sitting at/above the insertion point should
+    /// not move at all).
+    #[gpui::test]
+    async fn backward_prepend_with_eviction_keeps_list_count_synced(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        let anchor = gpui::ListOffset {
+            item_ix: 1,
+            offset_in_item: gpui::px(0.),
+        };
+        const INSERTED: usize = 4;
+
+        let anchor_row = RowId::Sibling(ItemId::new("m10"));
+        let tail_rows: Vec<_> = (10..=14)
+            .map(|o| (o, message_item(&format!("m{o}"), None)))
+            .collect();
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.set_following(false, cx);
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    large_byte_read(tail_rows, 14),
+                    cx,
+                );
+                r.list_state.scroll_to(anchor);
+            });
+        });
+
+        let hi_before = cx.read(|cx| {
+            let r = replica.read(cx);
+            assert_eq!(r.resident_hi_for_test(), 14);
+            assert_eq!(r.list_state().logical_scroll_top().item_ix, anchor.item_ix);
+            r.resident_hi_for_test()
+        });
+
+        let prepend_rows: Vec<_> = (6..=9)
+            .map(|o| (o, message_item(&format!("p{o}"), None)))
+            .collect();
+        assert_eq!(prepend_rows.len(), INSERTED);
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Backward {
+                        before: 10,
+                        byte_budget: PAGE_BUDGET_BYTES,
+                    },
+                    large_byte_read(prepend_rows, 14),
+                    cx,
+                );
+            });
+        });
+
+        let anchor_new_ix = cx.read(|cx| {
+            let r = replica.read(cx);
+            assert!(
+                r.resident_hi_for_test() < hi_before,
+                "backward prepend must evict from hi side when over cap"
+            );
+            assert!(
+                !r.has_item_ordinal_for_test(14),
+                "evicted hi ordinal must be gone from items"
+            );
+            let ix = r
+                .rows()
+                .order()
+                .iter()
+                .position(|id| id == &anchor_row)
+                .expect("anchor row must survive backward prepend");
+            // Precondition: the anchor row moved DOWN (older rows prepended above it) and
+            // by more than the net row delta — i.e. this exercises the eviction path.
+            assert!(
+                ix > anchor.item_ix + INSERTED.saturating_sub(1),
+                "precondition: anchor row must shift past the net delta when hi evicts"
+            );
+            ix
+        });
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert_eq!(
+                r.list_state().logical_scroll_top().item_ix,
+                anchor_new_ix,
+                "anchor must be re-pinned to the SAME row after prepend + eviction"
+            );
+            assert_eq!(
+                r.list_state().item_count(),
+                r.rows().len(),
+                "prepend + tail-trim must keep gpui count aligned with RowStore"
+            );
+        });
+    }
+
+    /// I1: read errors must clear `page_in_flight` so paging can resume.
+    #[gpui::test]
+    async fn read_error_clears_page_in_flight(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    tail_read(
+                        vec![(0, message_item("m0", None)), (1, message_item("m1", None))],
+                        1,
+                    ),
+                    cx,
+                );
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    tail_read(
+                        vec![(5, message_item("m5", None)), (6, message_item("m6", None))],
+                        6,
+                    ),
+                    cx,
+                );
+                r.page_older_if_near_top(0, cx);
+            });
+        });
+        let _ = rx.try_recv().expect("backward page enqueued");
+        cx.read(|cx| {
+            assert!(replica.read(cx).page_in_flight_for_test());
+        });
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.on_read_error(1, "busy".into(), cx);
+            });
+        });
+        cx.read(|cx| {
+            assert!(!replica.read(cx).page_in_flight_for_test());
+        });
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.page_older_if_near_top(0, cx);
+            });
+        });
+        let _ = rx
+            .try_recv()
+            .expect("second backward page after error recovery");
+        cx.read(|cx| {
+            assert!(replica.read(cx).page_in_flight_for_test());
+        });
+    }
+
+    /// I1 (fatal twin): a reader-fatal error must also clear `page_in_flight` so paging
+    /// is not permanently latched off after a fatal I/O failure on a backward page.
+    #[gpui::test]
+    async fn reader_fatal_clears_page_in_flight(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    tail_read(
+                        vec![(5, message_item("m5", None)), (6, message_item("m6", None))],
+                        6,
+                    ),
+                    cx,
+                );
+                r.page_older_if_near_top(0, cx);
+            });
+        });
+        let _ = rx.try_recv().expect("backward page enqueued");
+        cx.read(|cx| {
+            assert!(replica.read(cx).page_in_flight_for_test());
+        });
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.on_reader_fatal("fatal io".into(), cx);
+            });
+        });
+        cx.read(|cx| {
+            assert!(!replica.read(cx).page_in_flight_for_test());
+        });
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.page_older_if_near_top(0, cx);
+            });
+        });
+        let _ = rx
+            .try_recv()
+            .expect("second backward page after fatal recovery");
+    }
+
+    /// I2: successful `apply_read(Backward)` must clear `page_in_flight`.
+    #[gpui::test]
+    async fn backward_apply_read_clears_page_in_flight(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    tail_read(
+                        vec![
+                            (10, reasoning_item("r10", "resp_a")),
+                            (11, reasoning_item("r11", "resp_a")),
+                        ],
+                        11,
+                    ),
+                    cx,
+                );
+                r.page_older_if_near_top(0, cx);
+            });
+        });
+        let _ = rx.try_recv().expect("backward page enqueued");
+        cx.read(|cx| {
+            assert!(replica.read(cx).page_in_flight_for_test());
+        });
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Backward {
+                        before: 10,
+                        byte_budget: PAGE_BUDGET_BYTES,
+                    },
+                    tail_read(vec![(8, reasoning_item("r8", "resp_a"))], 11),
+                    cx,
+                );
+            });
+        });
+        cx.read(|cx| {
+            assert!(!replica.read(cx).page_in_flight_for_test());
+        });
+
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.page_older_if_near_top(0, cx);
+            });
+        });
+        let _ = rx.try_recv().expect("backward page after successful apply");
+        cx.read(|cx| {
+            assert!(replica.read(cx).page_in_flight_for_test());
+        });
+    }
+
+    /// Codex F1 (Critical): a committed item arriving via Delta while NO response is active
+    /// (`live_section_lo == None`) lands in the settled band; the incremental live-tail reproject
+    /// would drop it. It must be materialized into `rows`.
+    #[gpui::test]
+    async fn delta_with_no_live_section_materializes_settled_item(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    tail_read(
+                        vec![(0, user_item("u0", "a")), (1, user_item("u1", "b"))],
+                        1,
+                    ),
+                    cx,
+                );
+                assert!(
+                    r.live_section_lo_for_test().is_none(),
+                    "precondition: no active response -> no live section"
+                );
+                r.apply_read(
+                    1,
+                    ReadRange::Delta {
+                        after: 1,
+                        through: 2,
+                    },
+                    range_read(vec![(2, user_item("u2", "c"))], 2),
+                    cx,
+                );
+            });
+        });
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert!(r.has_item_ordinal_for_test(2), "item resident");
+            assert!(
+                r.rows()
+                    .order()
+                    .contains(&RowId::Sibling(ItemId::new("u2"))),
+                "committed settled item must be materialized, not dropped by the incremental path"
+            );
+        });
+    }
+
+    /// Codex F2: upserting a DIFFERENT id at an already-occupied ordinal must free the displaced
+    /// item's byte accounting, or `resident_bytes` drifts up permanently.
+    #[gpui::test]
+    async fn upsert_displaced_ordinal_frees_bytes(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    tail_read(vec![(5, message_item("x5", None))], 5),
+                    cx,
+                );
+            });
+        });
+        let bytes_single = cx.read(|cx| replica.read(cx).resident_bytes_for_test());
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::One { ordinal: 5 },
+                    range_read(vec![(5, message_item("y5", None))], 5),
+                    cx,
+                );
+            });
+        });
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert_eq!(
+                r.resident_bytes_for_test(),
+                bytes_single,
+                "displaced x5 bytes must be freed; not x5+y5 accumulated"
+            );
+            assert!(
+                r.rows()
+                    .order()
+                    .contains(&RowId::Sibling(ItemId::new("y5")))
+            );
+            assert!(
+                !r.rows()
+                    .order()
+                    .contains(&RowId::Sibling(ItemId::new("x5")))
+            );
+        });
+    }
+
+    /// Codex F3: an empty replacement read (Tail) must collapse the resident band to -1/-1,
+    /// not leave a stale nonexistent band that paging/the sentinel then act on.
+    #[gpui::test]
+    async fn empty_tail_collapses_resident_band(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    tail_read(
+                        vec![(3, message_item("m3", None)), (4, message_item("m4", None))],
+                        4,
+                    ),
+                    cx,
+                );
+            });
+        });
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert_eq!(r.resident_lo_for_test(), 3);
+            assert_eq!(r.resident_hi_for_test(), 4);
+        });
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    tail_read(vec![], 4),
+                    cx,
+                );
+            });
+        });
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert_eq!(r.resident_lo_for_test(), -1, "empty tail collapses lo");
+            assert_eq!(r.resident_hi_for_test(), -1, "empty tail collapses hi");
+        });
+    }
+
+    /// Codex F4: `known_committed` is monotonic; a Tail whose watermark is behind a
+    /// concurrently-advanced frontier must not regress it.
+    #[gpui::test]
+    async fn tail_watermark_does_not_regress_known_committed(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    tail_read(vec![(10, message_item("m10", None))], 100),
+                    cx,
+                );
+            });
+        });
+        assert_eq!(
+            cx.read(|cx| replica.read(cx).known_committed_for_test()),
+            100
+        );
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    tail_read(vec![(10, message_item("m10", None))], 90),
+                    cx,
+                );
+            });
+        });
+        assert_eq!(
+            cx.read(|cx| replica.read(cx).known_committed_for_test()),
+            100,
+            "known_committed must not regress from 100 to 90"
+        );
+    }
+
+    /// Codex F1 follow-up: a forward append that routes through a FULL reproject (no live section)
+    /// must not yank a genuinely scrolled-up viewport — the universal anchor re-pin holds it.
+    #[gpui::test]
+    async fn append_while_scrolled_up_preserves_anchor(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    tail_read(
+                        (0..20)
+                            .map(|o| (o, message_item(&format!("m{o}"), None)))
+                            .collect(),
+                        19,
+                    ),
+                    cx,
+                );
+                assert!(r.live_section_lo_for_test().is_none());
+                // Genuinely scrolled up: item_ix 5 of a 20-row list (count 20, not at bottom).
+                r.list_state.scroll_to(gpui::ListOffset {
+                    item_ix: 5,
+                    offset_in_item: gpui::px(0.),
+                });
+            });
+        });
+        let anchor_row = cx
+            .read(|cx| replica.read(cx).rows().order().get(5).cloned())
+            .expect("row at 5");
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Delta {
+                        after: 19,
+                        through: 20,
+                    },
+                    range_read(vec![(20, message_item("m20", None))], 20),
+                    cx,
+                );
+            });
+        });
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert!(
+                r.rows()
+                    .order()
+                    .contains(&RowId::Sibling(ItemId::new("m20")))
+            );
+            let top = r.list_state().logical_scroll_top().item_ix;
+            assert_eq!(
+                top, 5,
+                "append below the anchor must not shift a scrolled-up viewport"
+            );
+            assert_eq!(r.rows().order().get(top), Some(&anchor_row));
+        });
+    }
+
+    /// Codex F7: viewport anchored on the LoadOlder sentinel, a backward page reaching ordinal 0
+    /// removes the sentinel; the re-pin must fall back to the successor row, not reset to bottom.
+    #[gpui::test]
+    async fn backward_page_to_zero_repins_to_successor(cx: &mut gpui::TestAppContext) {
+        let (replica, rx) = new_replica(cx, ReconcileEpoch::default(), 1);
+        let _ = rx.try_recv().expect("baseline");
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Tail {
+                        byte_budget: TAIL_BUDGET_BYTES,
+                    },
+                    tail_read(
+                        (5..=9)
+                            .map(|o| (o, message_item(&format!("m{o}"), None)))
+                            .collect(),
+                        9,
+                    ),
+                    cx,
+                );
+                assert_eq!(r.rows().order().first(), Some(&RowId::LoadOlder));
+                r.list_state.scroll_to(gpui::ListOffset {
+                    item_ix: 0,
+                    offset_in_item: gpui::px(0.),
+                });
+            });
+        });
+        let successor = cx
+            .read(|cx| replica.read(cx).rows().order().get(1).cloned())
+            .expect("row below sentinel");
+        cx.update(|cx| {
+            replica.update(cx, |r, cx| {
+                r.apply_read(
+                    1,
+                    ReadRange::Backward {
+                        before: 5,
+                        byte_budget: PAGE_BUDGET_BYTES,
+                    },
+                    range_read(
+                        (0..=4)
+                            .map(|o| (o, message_item(&format!("m{o}"), None)))
+                            .collect(),
+                        9,
+                    ),
+                    cx,
+                );
+            });
+        });
+        cx.read(|cx| {
+            let r = replica.read(cx);
+            assert!(
+                !r.rows().order().contains(&RowId::LoadOlder),
+                "sentinel removed at ordinal 0"
+            );
+            let successor_ix = r
+                .rows()
+                .order()
+                .iter()
+                .position(|x| *x == successor)
+                .expect("successor survived");
+            assert_eq!(
+                r.list_state().logical_scroll_top().item_ix,
+                successor_ix,
+                "anchor re-pinned to the successor row, not reset to bottom"
             );
         });
     }

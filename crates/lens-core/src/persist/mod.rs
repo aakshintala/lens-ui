@@ -49,6 +49,18 @@ impl PersistError {
             _ => false,
         }
     }
+
+    pub fn is_busy(&self) -> bool {
+        self.is_transient()
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn synthetic_busy() -> Self {
+        PersistError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(5 /* SQLITE_BUSY */),
+            None,
+        ))
+    }
 }
 
 /// How a file was opened after the schema-version gate (§6.3).
@@ -154,8 +166,8 @@ pub enum ReconcileOutcome {
 /// Read/query-only transcript role — one read-only handle per replica (T-2 §3.3).
 pub trait TranscriptReader {
     fn mode(&self) -> StoreMode;
-    /// One transaction: the requested `(ordinal, Item)` rows + the snapshot's
-    /// non-provisional watermark.
+    /// One transaction: the requested `(ordinal, payload_len_bytes, Item)` rows +
+    /// the snapshot's non-provisional watermark.
     fn read_range(&self, range: ReadRange) -> Result<RangeRead>;
 }
 
@@ -168,12 +180,18 @@ pub enum ReadRange {
     Delta { after: i64, through: i64 },
     /// Single ordinal (`TranscriptRewritten` re-read).
     One { ordinal: i64 },
+    /// Newest rows up to `byte_budget`, ascending (last row may overshoot).
+    Tail { byte_budget: usize },
+    /// Rows with `ordinal < before` up to `byte_budget`, ascending.
+    Backward { before: i64, byte_budget: usize },
+    /// Inclusive `[from, through]` ascending; no budget.
+    Span { from: i64, through: i64 },
 }
 
 /// Outcome of `TranscriptReader::read_range` — rows, skips, and the snapshot watermark.
 #[derive(Clone, Debug)]
 pub struct RangeRead {
-    pub rows: Vec<(i64, Item)>,
+    pub rows: Vec<(i64, usize, Item)>,
     pub skipped: Vec<SkippedRow>,
     /// Newest non-provisional ordinal in the snapshot (`None` when the file is empty).
     pub watermark: Option<i64>,
@@ -219,5 +237,11 @@ mod tests {
         ));
         assert!(busy.is_transient());
         assert!(!PersistError::ReadOnly.is_transient());
+    }
+
+    #[test]
+    fn persist_error_is_busy_matches_transient() {
+        assert!(PersistError::synthetic_busy().is_busy());
+        assert!(!PersistError::ReadOnly.is_busy());
     }
 }

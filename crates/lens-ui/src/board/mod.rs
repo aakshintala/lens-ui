@@ -44,8 +44,13 @@ const _: () = assert!(
 
 /// Width of the left nav rail (unchanged placeholder).
 const NAV_RAIL_W: f32 = 48.0;
-/// Width of the focused-mode session rail (spec §5; `.boards` strip = 286px).
-const RAIL_W: f32 = 286.0;
+/// Horizontal + vertical breathing room around the masonry content, inside a pane (so cards
+/// and group boxes never sit flush against the pane/rail edges).
+const PAD: f32 = 16.0;
+/// Width of the focused-mode session rail. Sized to hold a 1-col group's box (a card plus its
+/// `2·GUTTER` ring overhang) with `PAD` breathing room each side, so the group tile fits
+/// without horizontal scroll (was a flat 286 that clipped the 294px group box).
+const RAIL_W: f32 = CARD_W + 2.0 * GUTTER + 2.0 * PAD;
 
 /// Shell layout mode derived from `FleetStore::focused`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -365,13 +370,18 @@ impl BoardView {
         });
     }
 
-    fn render_nav_rail(&self) -> impl IntoElement {
+    fn render_nav_rail(&self, cx: &App) -> impl IntoElement {
+        // Placeholder rail (real nav is unbuilt): a clean themed sidebar strip rather than
+        // bare "nav" text bleeding at the window edge.
+        let t = cx.lens_theme();
         div()
             .id("nav-rail")
             .w(px(NAV_RAIL_W))
             .h_full()
             .flex_shrink_0()
-            .child("nav")
+            .bg(t.base.sidebar)
+            .border_r_1()
+            .border_color(t.base.sidebar_border)
     }
 
     /// The masonry scroll container (spec §4). Builds the ephemeral tree, packs
@@ -382,6 +392,7 @@ impl BoardView {
         &mut self,
         avail_width: f32,
         viewport_h: f32,
+        max_cols: usize,
         scroll: ScrollHandle,
         cx: &mut Context<Self>,
     ) -> (AnyElement, Vec<SessionId>) {
@@ -430,17 +441,50 @@ impl BoardView {
             tile_groups.push(meta);
         }
 
-        let cols = pack::cols_for_width(avail_width);
+        // Cap the natural column count so a wide/ultrawide viewport packs into a bounded
+        // block (centered below) instead of fanning a handful of sessions edge-to-edge.
+        let cols = pack::cols_for_width(avail_width).min(max_cols);
         let packing = pack::pack(&items, cols);
 
-        // Last frame's painted offset (one-frame lag → overdraw covers it, §8).
-        let scroll_top = (-f32::from(scroll.offset().y)).max(0.0);
+        // Vertical mirror of `center_offset` (see the horizontal block below): when the whole
+        // board is shorter than the viewport, center it vertically; otherwise it overflows and
+        // this is 0. A short board's block drifts up and hard-snaps to top-aligned as sessions
+        // push `content_height` past the viewport (accepted trade-off).
+        let block_height = 2.0 * PAD + 2.0 * GUTTER + packing.content_height;
+        let fits_viewport = block_height <= viewport_h;
+        let v_center_offset = if fits_viewport {
+            (viewport_h - block_height) / 2.0
+        } else {
+            0.0
+        };
+
+        // Last frame's painted offset (one-frame lag → overdraw covers it, §8). When the block
+        // fits the viewport the board cannot scroll, so pin the cull band to the top: a stale
+        // negative offset (e.g. a tall scrolled board that just shrank below the viewport, not
+        // yet clamped by gpui) would otherwise ride `v_center_offset > 0` and cull the now-short
+        // block's tiles for a frame — vertical culling has no horizontal analog to lean on.
+        let scroll_top = if fits_viewport {
+            0.0
+        } else {
+            (-f32::from(scroll.offset().y)).max(0.0)
+        };
         let overdraw = CELL_H;
         let lo = scroll_top - overdraw;
         let hi = scroll_top + viewport_h + overdraw;
 
         let now_ms = self.fleet.read(cx).clock().now_millis();
         let mut group_chrome: Vec<GroupChromeSnapshot> = Vec::new();
+
+        // Center the packed block in the pane on wider screens. Cards are fixed-size, so the
+        // occupied width is `used_cols` (≤ cols — a capped board with few sessions leaves
+        // trailing columns empty) times CELL_W less the last column's absent trailing GAP,
+        // plus the PAD/GUTTER frame. `pane_width` is the scroll container's width (both modes:
+        // avail + the frame). The offset is purely horizontal and slides the absolutely-placed
+        // tiles as a block; vertical culling (`intersects_band` on `py`) is untouched.
+        let used_cols = packing.used_cols();
+        let content_extent = 2.0 * PAD + 2.0 * GUTTER + used_cols as f32 * CELL_W - GAP;
+        let pane_width = avail_width + 2.0 * PAD + 2.0 * GUTTER;
+        let center_offset = ((pane_width - content_extent) / 2.0).max(0.0);
 
         // Grid offset by GUTTER inside `padded` (below): group rings/tints — and loose
         // cards' expanding attention rings — overhang their tile by up to GUTTER on every
@@ -449,9 +493,9 @@ impl BoardView {
         // reach also clipped loose top-left cards). `content` stays a positioning context.
         let mut content = div()
             .absolute()
-            .left(px(GUTTER))
-            .top(px(GUTTER))
-            .w(px(cols as f32 * CELL_W))
+            .left(px(PAD + GUTTER + center_offset))
+            .top(px(PAD + GUTTER + v_center_offset))
+            .w(px(used_cols as f32 * CELL_W))
             .h(px(packing.content_height));
 
         let mut visible: Vec<SessionId> = Vec::new();
@@ -466,7 +510,7 @@ impl BoardView {
                     if let Some(tile) = self.absolute_card(
                         &sessions[0],
                         placed.cell_left(),
-                        placed.cell_top() + HEADER,
+                        placed.cell_top(), // pixel-masonry top; a loose card carries no header lane
                         cx,
                     ) {
                         content = content.child(tile);
@@ -499,25 +543,30 @@ impl BoardView {
         self.last_built = visible.clone();
         self.last_group_chrome = group_chrome;
 
-        // Reserve the GUTTER margin the offset grid needs (2×GUTTER total: the grid sits at
-        // +GUTTER, and rings overhang +GUTTER past the bottom-right tile).
+        // Content extent = PAD breathing room + GUTTER ring overhang on each side, around the
+        // occupied tile block (`used_cols·CELL_W − GAP`, the last column has no trailing gap)
+        // and the masonry height. When the pane is wider (centered), span the full pane so the
+        // block sits at `center_offset` without horizontal-scroll slack; when narrower, the
+        // extent governs and the vertical-only scroll clips the horizontal overflow as before.
+        // Height mirrors this: span the full viewport when the block fits (so `v_center_offset`
+        // has room to center it), else the block height governs and the board scrolls.
         let padded = div()
             .relative()
-            .w(px(cols as f32 * CELL_W + 2.0 * GUTTER))
-            .h(px(packing.content_height + 2.0 * GUTTER))
+            .w(px(content_extent.max(pane_width)))
+            .h(px(block_height.max(viewport_h)))
             .child(content);
         let el = div()
             .id("board-scroll")
             .size_full()
-            .overflow_scroll()
+            .overflow_y_scroll()
             .track_scroll(&scroll)
             .child(padded)
             .into_any_element();
         (el, visible)
     }
 
-    /// One loose card absolutely positioned at its body-zone (`top` already offset
-    /// by HEADER by the caller). Clickable (focus the session).
+    /// One loose card absolutely positioned at its pixel-masonry top-left (`top` is the tile
+    /// top — a loose card has no header lane). Clickable (focus the session).
     fn absolute_card(
         &self,
         session_id: &SessionId,
@@ -566,7 +615,12 @@ impl BoardView {
         let x = placed.cell_left();
         let y = placed.cell_top();
         let block_w = fc as f32 * CELL_W - GAP;
-        let block_h = fr as f32 * CELL_H - GAP;
+        // Tight box: header lane + fr member rows separated by GAP. The grid reserves fr full
+        // CELL_H rows (a per-row header lane for masonry alignment), but a group has ONE header
+        // — stacking members at CELL_H stride left a phantom HEADER-tall gap between every row
+        // (glaring in a 1×N reflow). Wrap members tightly; the reserved-cell slack falls BELOW
+        // the box, reading as clean separation before the next tile.
+        let block_h = HEADER + fr as f32 * CARD_H + (fr as f32 - 1.0) * GAP;
 
         let name = meta.map(|m| m.name.clone()).unwrap_or_default();
         let completed = meta.map(|m| m.completed_count).unwrap_or(0);
@@ -624,7 +678,7 @@ impl BoardView {
                 .rounded(px(12.0))
                 .border_1()
                 .border_color(accent)
-                .bg(accent.opacity(0.07)) // SSOT color-mix ~7% body wash
+                .bg(accent.opacity(0.12)) // SSOT color-mix ~12% body wash (cards are opaque; no bleed)
                 .into_any_element(),
         );
 
@@ -676,7 +730,9 @@ impl BoardView {
             let cc = i % fc;
             let rr = i / fc;
             let mx = INSET + cc as f32 * CELL_W;
-            let my = INSET + HEADER + rr as f32 * CELL_H;
+            // Tight vertical stride (CARD_H + GAP), not CELL_H — members share the group's one
+            // header, so no phantom header lane between stacked rows (matches the horizontal GAP).
+            let my = INSET + HEADER + rr as f32 * (CARD_H + GAP);
             if let Some(tile) = self.absolute_card(session, x - INSET + mx, y - INSET + my, cx) {
                 out.push(tile);
             }
@@ -787,7 +843,7 @@ impl BoardView {
             .rounded(px(12.0))
             .border_1()
             .border_color(accent)
-            .bg(accent.opacity(0.07));
+            .bg(accent.opacity(0.12)); // SSOT color-mix ~12% body wash (matches expanded box)
         let header = div()
             .absolute()
             .left(px(x))
@@ -964,21 +1020,39 @@ impl Render for BoardView {
 
         let (body, visible): (_, Vec<SessionId>) = match &mode {
             ShellMode::Board => {
-                let avail = (viewport_w - NAV_RAIL_W).max(CELL_W);
-                let (surface, visible) =
-                    self.pack_and_render(avail, viewport_h, self.board_scroll.clone(), cx);
+                // True pane width, NOT clamped to CELL_W: `pane_width` inside pack_and_render
+                // derives from this to center the block, so a floor here would lie about the
+                // pane on a narrow window and apply a spurious rightward offset (right ring
+                // then clips under the vertical-only scroll). `cols_for_width` already self-
+                // clamps to ≥1 col, so no floor is needed for packing. (codex P2, 2026-07-22)
+                let avail = viewport_w - NAV_RAIL_W - 2.0 * PAD - 2.0 * GUTTER;
+                let max_cols = pack::max_cols_for_width(viewport_w);
+                let (surface, visible) = self.pack_and_render(
+                    avail,
+                    viewport_h,
+                    max_cols,
+                    self.board_scroll.clone(),
+                    cx,
+                );
                 let el = div()
                     .id("shell-board")
                     .flex()
                     .flex_row()
                     .size_full()
-                    .child(self.render_nav_rail())
+                    .child(self.render_nav_rail(cx))
                     .child(div().flex_grow().h_full().child(surface));
                 (el.into_any_element(), visible)
             }
             ShellMode::Focused { .. } => {
-                let (rail, visible) =
-                    self.pack_and_render(RAIL_W, viewport_h, self.rail_scroll.clone(), cx);
+                let (rail, visible) = self.pack_and_render(
+                    RAIL_W - 2.0 * PAD - 2.0 * GUTTER,
+                    viewport_h,
+                    // The rail is a single fixed column; the cap is a no-op (never narrows
+                    // 1 col, never centers since content_extent == RAIL_W == pane_width).
+                    usize::MAX,
+                    self.rail_scroll.clone(),
+                    cx,
+                );
                 // Real focused-transcript tab (T-2). `pack_and_render` above already took
                 // `&mut self`, so build the chat slot after it to avoid a borrow overlap.
                 let chat_slot = if let Some(tab) = &self.chat_tab {
@@ -994,7 +1068,7 @@ impl Render for BoardView {
                     .flex()
                     .flex_row()
                     .size_full()
-                    .child(self.render_nav_rail())
+                    .child(self.render_nav_rail(cx))
                     .child(div().w(px(RAIL_W)).flex_shrink_0().h_full().child(rail))
                     .child(chat_slot)
                     .child(
@@ -1016,11 +1090,24 @@ impl Render for BoardView {
         self.apply_visibility_gate(visible.into_iter().collect(), cx);
         self.arm_collapsed_rollup_wake(cx); // refresh collapsed rollups on Ready/Scheduled expiry
         let banner = self.banner_text(cx);
-        let mut root = div().id("board-view").size_full().relative().child(body);
+        let bg = cx.lens_theme().base.background;
+        // In-app themed titlebar (drag region + traffic-light clearance handled by the
+        // component) over a dark-filled window, replacing the white system titlebar strip.
+        // min_h(0): without it this flex item's default `min-height:auto` = its content
+        // height, so the masonry's full height leaks out and the inner scroll container can
+        // never scroll (offset clamps to 0). min_h(0) lets flex_grow bound it to the window.
+        let mut shell = div().flex_grow().min_h(px(0.0)).relative().child(body);
         if let Some(text) = banner {
-            root = root.child(self.render_replica_banner(text, cx));
+            shell = shell.child(self.render_replica_banner(text, cx));
         }
-        root
+        div()
+            .id("board-view")
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(bg)
+            .child(gpui_component::TitleBar::new())
+            .child(shell)
     }
 }
 
@@ -1102,6 +1189,10 @@ mod tests {
 
     #[gpui::test]
     async fn banner_shows_for_load_failed(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::install_at_startup(cx); // render root now reads lens_theme (bg + nav rail)
+        });
         let fleet = cx.update(test_fleet);
         let replica = cx.update(|cx| {
             cx.new(|cx| BoardReplica::for_test_file(fleet.clone(), "/dev/null/nope.db".into(), cx))

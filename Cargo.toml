@@ -23,6 +23,7 @@ exclude = [
     "spikes/transcript-virtual",
     "spikes/terminal-render",
     "spikes/terminal-attach",
+    "spikes/board-drag",
 ]
 
 [workspace.package]

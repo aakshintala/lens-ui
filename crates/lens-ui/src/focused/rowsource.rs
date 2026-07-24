@@ -1,7 +1,7 @@
 //! Id-keyed retained row store — owned `RowPresentation` per projected block (T-2 §6).
 //! Two-level nesting: `Section` owns child rows; flattening is derived from the collapse flag.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 use gpui::{App, AppContext, Entity, EntityId, ListState};
@@ -15,34 +15,36 @@ use super::Marker;
 /// Stable row identity — keyed store, not list index.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum RowId {
-    /// Finalize-stable section key: `(response_id, run_index)`.
-    Section(ResponseId, u32),
+    /// Finalize-stable section key: `(response_id, run_anchor)`.
+    Section(ResponseId, ItemId),
     /// Work child inside a section (reasoning id, tool call item id, …).
     Work(ItemId),
     /// Top-level sibling (message, resource event, …).
     Sibling(ItemId),
     /// Live streaming tail keyed by accumulator id.
     StreamTail(AccId),
-    /// Section rail row paired with `Section` chip — same `(response_id, run_index)`.
-    SectionRail(ResponseId, u32),
+    /// Section rail row paired with `Section` chip — same `(response_id, run_anchor)`.
+    SectionRail(ResponseId, ItemId),
     /// Reconnect-break marker (Task 14).
     Marker(u64),
+    /// Top-of-list scroll-back sentinel (T-2b §5).
+    LoadOlder,
 }
 
-/// Section identity — finalize-stable `(response_id, run_index)`.
+/// Section identity — finalize-stable `(response_id, run_anchor)`.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct SectionKey {
     pub response_id: ResponseId,
-    pub run_index: u32,
+    pub run_anchor: ItemId,
 }
 
 impl SectionKey {
     pub fn chip_id(&self) -> RowId {
-        RowId::Section(self.response_id.clone(), self.run_index)
+        RowId::Section(self.response_id.clone(), self.run_anchor.clone())
     }
 
     pub fn rail_id(&self) -> RowId {
-        RowId::SectionRail(self.response_id.clone(), self.run_index)
+        RowId::SectionRail(self.response_id.clone(), self.run_anchor.clone())
     }
 }
 
@@ -69,6 +71,7 @@ pub enum RowKind {
     StreamingReasoning,
     StreamingMessage,
     ReconnectBreak,
+    LoadOlder,
 }
 
 /// Per-row retained state. Backends render a handle into this store.
@@ -91,6 +94,7 @@ pub(crate) enum StructureEntry {
     Sibling(RowId),
     #[allow(dead_code)] // constructed in Task 14 (ReconnectBreak markers)
     Marker(RowId),
+    LoadOlder,
 }
 
 /// Owned child list for a work section (Level 2).
@@ -264,6 +268,8 @@ impl RowStore {
         into: &mut RowStore,
         cx: &mut App,
     ) {
+        into.structure
+            .retain(|e| !matches!(e, StructureEntry::LoadOlder));
         into.structure.truncate(prefix_len);
         into.sections.retain(|key, _| {
             into.structure
@@ -281,14 +287,37 @@ impl RowStore {
         &mut self,
         acc_id: &AccId,
         pres: RowPresentation,
+        finalize_anchor: Option<ItemId>,
+        response_id: Option<ResponseId>,
         cx: &mut App,
     ) -> Option<EntityId> {
         let id = RowId::StreamTail(acc_id.clone());
         // Capture the tail's own section before any reproject can drop it.
-        if matches!(pres.kind, RowKind::StreamingReasoning)
-            && let Some(key) = self.section_containing_child(&id).cloned()
-        {
-            self.pending_tail_section.insert(acc_id.clone(), key);
+        if matches!(pres.kind, RowKind::StreamingReasoning) {
+            if let Some(existing) = self.section_containing_child(&id).cloned() {
+                if let (Some(anchor), Some(resp)) = (finalize_anchor.clone(), response_id.clone()) {
+                    let target = SectionKey {
+                        response_id: resp,
+                        run_anchor: anchor,
+                    };
+                    if existing.run_anchor.as_str() == acc_id.as_str() {
+                        self.rekey_section(&existing, &target, cx);
+                        self.pending_tail_section.insert(acc_id.clone(), target);
+                    } else {
+                        self.pending_tail_section.insert(acc_id.clone(), existing);
+                    }
+                } else {
+                    self.pending_tail_section.insert(acc_id.clone(), existing);
+                }
+            } else if let (Some(anchor), Some(resp)) = (finalize_anchor, response_id) {
+                self.pending_tail_section.insert(
+                    acc_id.clone(),
+                    SectionKey {
+                        response_id: resp,
+                        run_anchor: anchor,
+                    },
+                );
+            }
         }
         self.ensure_stream_tail_visible(acc_id, pres, cx);
         self.entity_id(&id, cx)
@@ -359,7 +388,7 @@ impl RowStore {
         }
         self.structure.retain(|e| match e {
             StructureEntry::Sibling(row) | StructureEntry::Marker(row) => row != &id,
-            StructureEntry::Section(_) => true,
+            StructureEntry::Section(_) | StructureEntry::LoadOlder => true,
         });
         self.entities.remove(&id);
         let prev_len = self.order.len();
@@ -489,8 +518,43 @@ impl RowStore {
                 StructureEntry::Sibling(id) | StructureEntry::Marker(id) => {
                     self.order.push(id.clone());
                 }
+                StructureEntry::LoadOlder => self.order.push(RowId::LoadOlder),
             }
         }
+    }
+
+    /// Drop `Entity` handles not referenced by the current projection (§6).
+    pub(crate) fn gc_entities(&mut self, live_stream_tails: &HashSet<AccId>) {
+        let mut retain = HashSet::new();
+        for id in &self.order {
+            retain.insert(id.clone());
+        }
+        for (key, node) in &self.sections {
+            retain.insert(key.chip_id());
+            retain.insert(key.rail_id());
+            for child in &node.children {
+                retain.insert(child.clone());
+            }
+        }
+        for key in self.pending_tail_section.values() {
+            retain.insert(key.chip_id());
+            retain.insert(key.rail_id());
+        }
+        for acc in live_stream_tails {
+            retain.insert(RowId::StreamTail(acc.clone()));
+        }
+        for entry in &self.structure {
+            match entry {
+                StructureEntry::Marker(id) => {
+                    retain.insert(id.clone());
+                }
+                StructureEntry::LoadOlder => {
+                    retain.insert(RowId::LoadOlder);
+                }
+                StructureEntry::Section(_) | StructureEntry::Sibling(_) => {}
+            }
+        }
+        self.entities.retain(|id, _| retain.contains(id));
     }
 
     pub(crate) fn section_containing_child(&self, child: &RowId) -> Option<&SectionKey> {
@@ -511,17 +575,82 @@ impl RowStore {
         }
     }
 
+    fn move_row_entity(&mut self, from: &RowId, to: &RowId, cx: &mut App) {
+        if from == to {
+            return;
+        }
+        if let Some(entity) = self.entities.remove(from) {
+            // Visible chrome lives on `from`; drop any placeholder at `to`.
+            self.entities.remove(to);
+            entity.update(cx, |state, _| {
+                state.id = to.clone();
+            });
+            self.entities.insert(to.clone(), entity);
+        }
+    }
+
+    fn rekey_section(&mut self, from: &SectionKey, to: &SectionKey, cx: &mut App) {
+        if from == to {
+            return;
+        }
+        if let Some(from_node) = self.sections.remove(from) {
+            use std::collections::hash_map::Entry;
+            match self.sections.entry(to.clone()) {
+                Entry::Occupied(mut e) => {
+                    for child in from_node.children {
+                        if !e.get().children.contains(&child) {
+                            e.get_mut().children.push(child);
+                        }
+                    }
+                }
+                Entry::Vacant(e) => {
+                    e.insert(from_node);
+                }
+            }
+        }
+        for entry in &mut self.structure {
+            if let StructureEntry::Section(key) = entry
+                && key == from
+            {
+                *key = to.clone();
+            }
+        }
+        let from_chip = from.chip_id();
+        let from_rail = from.rail_id();
+        let to_chip = to.chip_id();
+        let to_rail = to.rail_id();
+        self.move_row_entity(&from_chip, &to_chip, cx);
+        self.move_row_entity(&from_rail, &to_rail, cx);
+        for id in &mut self.order {
+            if *id == from_chip {
+                *id = to_chip.clone();
+            } else if *id == from_rail {
+                *id = to_rail.clone();
+            }
+        }
+        self.ensure_section_node(to, cx);
+        self.rebuild_flat_order();
+    }
+
     fn ensure_section_node(&mut self, key: &SectionKey, cx: &mut App) -> &mut SectionNode {
         if !self.sections.contains_key(key) {
             let chip = RowPresentation {
                 kind: RowKind::SectionChip,
-                text: format!("section {} run {}", key.response_id.as_str(), key.run_index),
+                text: format!(
+                    "section {} @{}",
+                    key.response_id.as_str(),
+                    key.run_anchor.as_str()
+                ),
                 collapsed: false,
                 height_hint: None,
             };
             let rail = RowPresentation {
                 kind: RowKind::SectionRail,
-                text: format!("rail {} run {}", key.response_id.as_str(), key.run_index),
+                text: format!(
+                    "rail {} @{}",
+                    key.response_id.as_str(),
+                    key.run_anchor.as_str()
+                ),
                 collapsed: false,
                 height_hint: None,
             };
@@ -543,6 +672,7 @@ fn child_ord(row_id: &RowId, item_ordinals: &HashMap<ItemId, i64>) -> i64 {
     match row_id {
         RowId::Work(id) | RowId::Sibling(id) => item_ordinals.get(id).copied().unwrap_or(i64::MAX),
         RowId::StreamTail(_) => i64::MAX,
+        RowId::LoadOlder => i64::MIN,
         _ => i64::MIN,
     }
 }
@@ -564,7 +694,7 @@ fn entry_repr(
             })
             .unwrap_or(i64::MIN),
         StructureEntry::Sibling(id) => child_ord(id, item_ordinals),
-        StructureEntry::Marker(_) => i64::MIN,
+        StructureEntry::Marker(_) | StructureEntry::LoadOlder => i64::MIN,
     }
 }
 
@@ -574,9 +704,9 @@ fn materialize_top_level(block: &ViewBlock<'_>, into: &mut RowStore, cx: &mut Ap
         ViewBlock::ToolSpan { call, output } => materialize_tool_span(call, *output, into, cx),
         ViewBlock::WorkSection {
             response_id,
-            run_index,
+            run_anchor,
             blocks,
-        } => materialize_work_section(response_id, *run_index, blocks, into, cx),
+        } => materialize_work_section(response_id, run_anchor.clone(), blocks, into, cx),
         ViewBlock::StreamingReasoning { acc, .. } => {
             materialize_streaming_reasoning(acc, into, cx);
         }
@@ -592,14 +722,14 @@ fn materialize_top_level(block: &ViewBlock<'_>, into: &mut RowStore, cx: &mut Ap
 
 fn materialize_work_section(
     response_id: &ResponseId,
-    run_index: u32,
+    run_anchor: ItemId,
     blocks: &[ViewBlock<'_>],
     into: &mut RowStore,
     cx: &mut App,
 ) {
     let key = SectionKey {
         response_id: response_id.clone(),
-        run_index,
+        run_anchor,
     };
     into.structure.push(StructureEntry::Section(key.clone()));
     into.ensure_section_node(&key, cx);
@@ -836,6 +966,64 @@ mod tests {
         }
     }
 
+    fn assistant_msg(id: &str, resp: Option<&str>, text: &str) -> Item {
+        item(
+            id,
+            resp,
+            ItemKind::Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock {
+                    kind: "text".into(),
+                    text: Some(text.into()),
+                    data: Value::Null,
+                }],
+            },
+        )
+    }
+
+    #[gpui::test]
+    fn run_anchor_stable_under_truncation(cx: &mut gpui::TestAppContext) {
+        let resp_a = ResponseId::new("resp_a");
+        let later_only = [reasoning("r2", Some("resp_a"))];
+        let later_refs: Vec<&Item> = later_only.iter().collect();
+        let scratch = lens_core::domain::item::StreamScratch::default();
+        let later_blocks = group_work_section(project(&later_refs, &scratch, None), None);
+
+        let mut store = RowStore::new();
+        cx.update(|cx| RowStore::materialize_full(&later_blocks, &mut store, cx));
+        let upper_key = SectionKey {
+            response_id: resp_a.clone(),
+            run_anchor: ItemId::new("r2"),
+        };
+        let entity_before = cx.read(|cx| {
+            store
+                .entity_id(&upper_key.rail_id(), cx)
+                .or_else(|| store.entity_id(&upper_key.chip_id(), cx))
+                .expect("section row")
+        });
+
+        let full = [
+            reasoning("r1", Some("resp_a")),
+            assistant_msg("a1", Some("resp_a"), "narration"),
+            reasoning("r2", Some("resp_a")),
+        ];
+        let full_refs: Vec<&Item> = full.iter().collect();
+        let full_blocks = group_work_section(project(&full_refs, &scratch, None), None);
+
+        cx.update(|cx| RowStore::materialize_full(&full_blocks, &mut store, cx));
+        let entity_after = cx.read(|cx| {
+            store
+                .entity_id(&upper_key.rail_id(), cx)
+                .or_else(|| store.entity_id(&upper_key.chip_id(), cx))
+                .expect("section row")
+        });
+
+        assert_eq!(
+            entity_before, entity_after,
+            "run_anchor-keyed section must not churn when older history is prepended"
+        );
+    }
+
     #[gpui::test]
     fn materialize_work_section_sibling_and_stream_tail(cx: &mut gpui::TestAppContext) {
         let resp_a = ResponseId::new("resp_a");
@@ -876,7 +1064,7 @@ mod tests {
             .order()
             .iter()
             .filter_map(|id| match id {
-                RowId::Section(resp, run_index) => Some((resp.as_str(), *run_index)),
+                RowId::Section(resp, anchor) => Some((resp.as_str(), anchor.as_str())),
                 _ => None,
             })
             .collect();
@@ -916,14 +1104,87 @@ mod tests {
         assert_eq!(store.len(), 2);
     }
 
+    #[gpui::test]
+    fn collapsed_child_entity_survives_gc_and_expand(cx: &mut gpui::TestAppContext) {
+        let resp_a = ResponseId::new("resp_a");
+        let items = [
+            reasoning("r1", Some("resp_a")),
+            call("c1", Some("resp_a"), "call_1"),
+        ];
+        let refs: Vec<&Item> = items.iter().collect();
+        let scratch = lens_core::domain::item::StreamScratch::default();
+        let projected = project(&refs, &scratch, Some(&resp_a));
+        let blocks = group_work_section(projected, Some(&resp_a));
+
+        let mut store = RowStore::new();
+        cx.update(|cx| RowStore::materialize_full(&blocks, &mut store, cx));
+
+        let child_id = RowId::Work(ItemId::new("c1"));
+        let child_entity_before = cx.read(|cx| store.entity_id(&child_id, cx).expect("child"));
+
+        store.set_response_expanded(&resp_a, false, None);
+        store.gc_entities(&HashSet::new());
+
+        let child_entity_collapsed =
+            cx.read(|cx| store.entity_id(&child_id, cx).expect("child after gc"));
+        assert_eq!(
+            child_entity_before, child_entity_collapsed,
+            "collapsed children must survive gc_entities"
+        );
+
+        store.set_response_expanded(&resp_a, true, None);
+        let child_entity_expanded =
+            cx.read(|cx| store.entity_id(&child_id, cx).expect("child after expand"));
+        assert_eq!(
+            child_entity_before, child_entity_expanded,
+            "expand must reuse the same EntityId after gc"
+        );
+    }
+
+    #[gpui::test]
+    fn pending_finalize_stream_tail_survives_gc(cx: &mut gpui::TestAppContext) {
+        let acc = AccId::new("acc_pending_gc");
+        let mut store = RowStore::new();
+        let entity_before = cx.update(|cx| {
+            store.stage_stream_finalize(
+                &acc,
+                RowPresentation {
+                    kind: RowKind::StreamingMessage,
+                    text: "staged".into(),
+                    collapsed: false,
+                    height_hint: None,
+                },
+                None,
+                None,
+                cx,
+            )
+        });
+        let live = HashSet::from([acc.clone()]);
+        store.gc_entities(&live);
+        let entity_after = cx.read(|cx| {
+            store
+                .entity_id(&RowId::StreamTail(acc), cx)
+                .expect("pending tail entity")
+        });
+        assert_eq!(
+            entity_before,
+            Some(entity_after),
+            "mid-finalize StreamTail must survive gc via live_stream_tails"
+        );
+    }
+
     /// Pre-fix rail keys used `RowId::Marker(0x8000… | hash)`; reconnect markers share that namespace.
-    fn legacy_section_rail_marker_seq(response_id: &ResponseId, run_index: u32) -> u64 {
+    fn legacy_section_rail_marker_seq(response_id: &ResponseId, run_anchor: &ItemId) -> u64 {
         let mut hash = 0xcbf29ce484222325u64;
         for byte in response_id.as_str().as_bytes() {
             hash ^= u64::from(*byte);
             hash = hash.wrapping_mul(0x100000001b3);
         }
-        0x8000_0000_0000_0000 | ((run_index as u64) << 32) ^ hash
+        for byte in run_anchor.as_str().as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        0x8000_0000_0000_0000 ^ hash
     }
 
     #[gpui::test]
@@ -938,9 +1199,9 @@ mod tests {
         let mut store = RowStore::new();
         cx.update(|cx| RowStore::materialize_full(&blocks, &mut store, cx));
 
-        let legacy_seq = legacy_section_rail_marker_seq(&resp_a, 0);
+        let legacy_seq = legacy_section_rail_marker_seq(&resp_a, &ItemId::new("r1"));
         let marker_id = RowId::Marker(legacy_seq);
-        let rail_id = RowId::SectionRail(resp_a.clone(), 0);
+        let rail_id = RowId::SectionRail(resp_a.clone(), ItemId::new("r1"));
         assert_ne!(
             rail_id, marker_id,
             "rail and legacy-marker seq must be distinct ids"
@@ -1046,6 +1307,8 @@ mod tests {
                     collapsed: false,
                     height_hint: None,
                 },
+                None,
+                None,
                 cx,
             )
         });

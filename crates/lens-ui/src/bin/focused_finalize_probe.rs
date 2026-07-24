@@ -80,6 +80,13 @@ async fn wait_frames(wcx: &mut AsyncWindowContext, n: usize) {
     }
 }
 
+fn row_with_len(
+    ord: i64,
+    item: lens_core::domain::item::Item,
+) -> (i64, usize, lens_core::domain::item::Item) {
+    (ord, 2, item)
+}
+
 fn assistant_item(id: &str, text: &str, resp: &str) -> lens_core::domain::item::Item {
     lens_core::domain::item::Item {
         id: ItemId::new(id),
@@ -188,7 +195,10 @@ async fn drive_legacy_finalize_probe(
                     through: 0,
                 },
                 RangeRead {
-                    rows: vec![(0, assistant_item("msg_local_0", "hi", "resp_a"))],
+                    rows: vec![row_with_len(
+                        0,
+                        assistant_item("msg_local_0", "hi", "resp_a"),
+                    )],
                     skipped: vec![],
                     watermark: Some(0),
                 },
@@ -291,7 +301,10 @@ async fn drive_canonical_finalize_probe(
                     through: 0,
                 },
                 RangeRead {
-                    rows: vec![(0, assistant_item("msg_canon_0", "hi", "resp_a"))],
+                    rows: vec![row_with_len(
+                        0,
+                        assistant_item("msg_canon_0", "hi", "resp_a"),
+                    )],
                     skipped: vec![],
                     watermark: Some(0),
                 },
