@@ -1165,32 +1165,40 @@ impl BoardView {
             }
         });
 
-        // Members at full size in body-zones (unchanged geometry from B-2).
+        let reserved_slot = |k: usize| -> AnyElement {
+            let cc = k % fc;
+            let rr = k / fc;
+            let mx = INSET + cc as f32 * CELL_W;
+            let my = INSET + HEADER + rr as f32 * (CARD_H + GAP);
+            div()
+                .absolute()
+                .left(px(x - INSET + mx))
+                .top(px(y - INSET + my))
+                .w(px(CARD_W))
+                .h(px(CARD_H))
+                .rounded(px(8.0))
+                .border_1()
+                .border_color(gpui::rgb(0x4a4a54))
+                .bg(gpui::rgb(0x1a1a22))
+                .into_any_element()
+        };
+
+        if let Some(k) = in_group_target {
+            out.push(reserved_slot(k));
+        }
+
+        // Members at full size in body-zones; shift right of the reserved slot.
         for (i, session) in sessions.iter().enumerate() {
             if hide_session == Some(session) {
                 continue;
             }
-            let cc = i % fc;
-            let rr = i / fc;
+            let render_index = in_group_target.map_or(i, |k| i + usize::from(i >= k));
+            let cc = render_index % fc;
+            let rr = render_index / fc;
             let mx = INSET + cc as f32 * CELL_W;
             let my = INSET + HEADER + rr as f32 * (CARD_H + GAP);
             let member_left = x - INSET + mx;
             let member_top = y - INSET + my;
-            if in_group_target == Some(i) {
-                out.push(
-                    div()
-                        .absolute()
-                        .left(px(member_left))
-                        .top(px(member_top))
-                        .w(px(CARD_W))
-                        .h(px(CARD_H))
-                        .rounded(px(8.0))
-                        .border_1()
-                        .border_color(gpui::rgb(0x4a4a54))
-                        .bg(gpui::rgb(0x1a1a22))
-                        .into_any_element(),
-                );
-            }
             let member_item_id = layout
                 .items
                 .iter()
@@ -1206,26 +1214,6 @@ impl BoardView {
             {
                 out.push(tile);
             }
-        }
-        if in_group_target == Some(sessions.len()) {
-            let i = sessions.len();
-            let cc = i % fc;
-            let rr = i / fc;
-            let mx = INSET + cc as f32 * CELL_W;
-            let my = INSET + HEADER + rr as f32 * (CARD_H + GAP);
-            out.push(
-                div()
-                    .absolute()
-                    .left(px(x - INSET + mx))
-                    .top(px(y - INSET + my))
-                    .w(px(CARD_W))
-                    .h(px(CARD_H))
-                    .rounded(px(8.0))
-                    .border_1()
-                    .border_color(gpui::rgb(0x4a4a54))
-                    .bg(gpui::rgb(0x1a1a22))
-                    .into_any_element(),
-            );
         }
 
         (out, snapshot)
