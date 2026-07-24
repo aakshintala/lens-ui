@@ -647,6 +647,15 @@ impl BoardView {
                 drag::DragPhase::Dragging | drag::DragPhase::Committing
             )
         });
+        // Committed footprints BEFORE the reflow preview grows an into-group target. The block's
+        // centering (below) derives from these so growing a group taller/wider does NOT re-center
+        // and move the whole block under the cursor mid-drag — the vertical/horizontal twin of the
+        // frozen-snapshot rule (§4.1): the geometry the cursor maps against must not shift.
+        let committed_items: Vec<Item> = if drag_preview.is_some() {
+            rows.iter().map(|r| r.item).collect()
+        } else {
+            Vec::new()
+        };
         if let Some(session) = drag_preview {
             let dragged_id = session.dragged_id.clone();
             let dragged_footprint = layout
@@ -707,11 +716,20 @@ impl BoardView {
         self.last_pack_cols = cols;
         let packing = pack::pack(&items, cols);
 
+        // Centering source: during a drag, the COMMITTED packing (pre-preview) so an into-group
+        // grow doesn't re-center the block; otherwise the live packing.
+        let (center_content_h, center_used_cols) = if committed_items.is_empty() {
+            (packing.content_height, packing.used_cols())
+        } else {
+            let cp = pack::pack(&committed_items, cols);
+            (cp.content_height, cp.used_cols())
+        };
+
         // Vertical mirror of `center_offset` (see the horizontal block below): when the whole
         // board is shorter than the viewport, center it vertically; otherwise it overflows and
         // this is 0. A short board's block drifts up and hard-snaps to top-aligned as sessions
         // push `content_height` past the viewport (accepted trade-off).
-        let block_height = 2.0 * PAD + 2.0 * GUTTER + packing.content_height;
+        let block_height = 2.0 * PAD + 2.0 * GUTTER + center_content_h;
         let fits_viewport = block_height <= viewport_h;
         let v_center_offset = if fits_viewport {
             (viewport_h - block_height) / 2.0
@@ -742,7 +760,9 @@ impl BoardView {
         // plus the PAD/GUTTER frame. `pane_width` is the scroll container's width (both modes:
         // avail + the frame). The offset is purely horizontal and slides the absolutely-placed
         // tiles as a block; vertical culling (`intersects_band` on `py`) is untouched.
-        let used_cols = packing.used_cols();
+        // Committed-based during a drag (see `center_content_h`) so the horizontal centering is
+        // stable too; equals `packing.used_cols()` when idle or under the downward-only grow.
+        let used_cols = center_used_cols;
         let content_extent = 2.0 * PAD + 2.0 * GUTTER + used_cols as f32 * CELL_W - GAP;
         let pane_width = avail_width + 2.0 * PAD + 2.0 * GUTTER;
         let center_offset = ((pane_width - content_extent) / 2.0).max(0.0);
