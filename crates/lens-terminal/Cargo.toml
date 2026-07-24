@@ -39,6 +39,11 @@ base64 = "0.22"
 criterion = { version = "0.5", default-features = false }
 gpui = { version = "0.2.2", features = ["test-support"] }
 lens-client = { path = "../lens-client", features = ["test-util"] }
+# `terminal_live` P9/P10 drive the server-side half of a `/clear` rotation over
+# REST (create sibling session, bind runner, transfer the terminal). Those two
+# routes are `include_in_schema=False` upstream, so lens-client does not model
+# them. Same crate + feature set lens-client already pulls in — no new build.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde_json = "1"
 url = "2"
 
