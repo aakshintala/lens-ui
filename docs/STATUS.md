@@ -333,9 +333,22 @@ _Last curated 2026-07-23 (**Transcript ▶ T-2b (disk-windowing) MERGED to `main
       trailing cell resolved before-last-member instead of append) → fixed + regression test. **Open design
       decisions surfaced for the brainstorm:** insertion convention (nearest-tile vs marker vs reflow-preview;
       lean = live reflow-preview), no natural end-of-list target (append when `cursor.y > content_height`),
-      group body-vs-header semantics, edge auto-scroll. **NEXT: B-4c brainstorm → plan → grill** (spike is the
-      input). Fold verdict into the B-4c design doc, then delete the spike. Carry the focused-rail group-reflow
-      minor (`pack.rs` unclamped `fc`) into B-4c since it touches this geometry.
+      group body-vs-header semantics, edge auto-scroll. **DESIGN LOCKED + GRILLED 2026-07-23**
+      (`docs/specs/2026-07-23-board-b4c-drag-drop-design.md`, `a78a640`; 4 decisions folded). **PLAN
+      WRITTEN + OPUS-REVIEWED 2026-07-23** (`docs/plans/2026-07-23-board-b4c-drag-drop.md`, 7 tasks;
+      grok-4.5 author + Opus source-verify). **EXECUTED + TASK-6 DEVICE-VERIFIED 2026-07-23** on branch
+      `board-b4c-drag` (`4708ffe`..`f84d340`; Composer-authored, Opus-reviewed; full `xtask gate` GREEN
+      incl. real-window stream_perf + no drift). Tasks 1–5,7 landed to plan (store `move_item` + §7 clamp
+      were already present as the plan review predicted). **Real-window verify caught 5 bugs the tests
+      structurally cannot** — all fixed + confirmed on device: (1) app-breaker — drag handlers must bind
+      to the VIEWPORT, not the tightly-sized content box, or drops outside the tiles strand the drag;
+      (2) drag image is the LIVE `SessionCardView` entity (not a ghost stub); (3) collapsed groups
+      draggable; (4) into-group insertion opens a real gap (member shift + downward-only grow);
+      (5) flicker = reflow feedback loop via the COORDINATE TRANSFORM — froze the block centering on the
+      committed layout during a drag, not just the resolver (§4.1). Accepted tradeoff: `INTO_GROUP_INSET`
+      = 24px makes end-of-group drops need precise aim (one-const tune). **NEXT: merge to `main`** (main
+      advanced 68 commits — T-3 + terminal slice-5 — reconcile is Cargo.toml only). Memory
+      [[board-b4c-drag-spike]].
     - **B-4d — context-menu grouping.** Still **gated** on the non-idempotent-retry commit-phase seam
       (design §8) that B-4a deferred — drag-to-*group* is B-4d, not B-4c. Adds `write()` op variants via
       B-4a's `run_op` seam.
