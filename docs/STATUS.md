@@ -13,6 +13,37 @@ _(prior curation, now on `main` — **▶▶▶ TERMINAL SLICE 5 (A+B+C+D) MERGE
 
 ## Next up
 
+- **⏳ DEFERRED (owned, not forgotten): terminal slice-5 `/clear` follow does blocking network
+  work on the foreground.** Deferred by user decision 2026-07-23 to a dedicated session right
+  after the riders, which are now done — **this is the next terminal task, before Slice 6.**
+
+  **The defect.** `AppSessionLoader::load` (`crates/lens-app/src/loader.rs`) correctly runs the
+  first `Client::new` + `sessions().get()` + `seed_disk` on the background executor — but then
+  does a **second `Client::new` on the foreground** (`loader.rs:59`), a multi-RTT blocking
+  handshake, and hands that client to `FleetStore::spawn_live_session`, which **also blocks on
+  the foreground** opening the SSE stream (`fleet/store.rs:407-410`
+  `client.sessions().stream(&session_id)`) plus `live::open_stores`. So every `/clear` supersede
+  stalls the UI thread for two handshakes and a stream open.
+
+  **Why the riders sharpened it.** The live order is `resource.deleted` *then*
+  `session.superseded` (memory `omnigent-clear-rotation-wire-contract`), so the delete parks the
+  tab in `ReplacementWaiting` — which arms `TerminalTab::REPLACEMENT_WAIT`, a **30s** timeout —
+  *before* the load of B begins. The foreground cost is therefore not merely a hitch: it spends a
+  **budget**. Overrun it and the tab detaches and the retained engine (and its scrollback) is
+  dropped, which is precisely what sub-slice A's retain-frozen-engine work exists to prevent.
+
+  **Why it was deferred rather than fixed inline.** (1) The fix reaches outside slice 5:
+  `spawn_live_session` is shared with the **app startup** path (`lens-app/src/main.rs:120`) and
+  `fleet_verify.rs:73`, so making its network work async is a cross-cutting signature change.
+  (2) **Nobody has measured it.** The rider was the first live observation of this path; the fix
+  should start from a number (handshake + stream-open latency against a real server), not a guess.
+
+  **Shape of the work.** Measure first; then either hoist the handshake+stream open into the
+  background half of `load` and pass ready-made handles to `spawn_live_session`, or give
+  `spawn_live_session` an async variant and migrate the startup path with it. Keep the
+  `ReentrantSessionLoader` poison fake green — the "never invoke `load` under an active
+  `FleetStore` update" gpui non-re-entrancy contract must survive the refactor.
+
 - **BOARD visual pass + masonry + max-col cap/centering — LANDED ON `main` 2026-07-22** (`board-visual-polish`→`main`, PUSHED; gate GREEN; codex cross-family reviewed). `1144f16` visual pass (card wash **bleed → opaque `muted` base** so the group wash sits behind cards; wash 0.07→0.12; **dark titlebar** via transparent native + in-app `gpui_component::TitleBar`, `min_h(0)` shell fixes a silent scroll-break; themed nav rail; title ellipsis via `min_w(0)`; context bar suppressed on dormant states; demo = 2-member group B + 2 loose). `014e140` **pixel-masonry** — `pack.rs` `Placed.gy`→`py`, `item_height()` SSOT, per-column shortest-col backfill, uniform `GAP` everywhere (killed the phantom-HEADER-lane 48px gaps + 72–120px group chasms; root cause: `HEADER==GAP==24`, header never fits an integer card-grid); `PAD=16` breathing room; `RAIL_W = CARD_W+2·GUTTER+2·PAD` so a 1-col group box fits (no h-scroll); 2×2 kept on wide, 1×N only when it can't fit. Verified live dark+light, wide board + focused 1×4 rail. `021491d` **max-col cap + centering** — `pack.rs` `max_cols_for_width(logical_w)` breakpoints (≥1400→4, ≥2000→5, ≥3400→6, ceiling 6; tuned for 1800/2056/3840 logical-pt screens, NOT physical — 14"/16" MBP "More Space" widths) + `Packing::used_cols()` (occupied-col count → few-tile boards center on occupied width, not the empty cap); board `cols = cols_for_width(avail).min(max_cols)`, block centered via `center_offset = max(0,(pane_width−content_extent)/2)` into `content` left, `padded` widened to `max(pane_width, content_extent)` (no clip); rail passes `usize::MAX` (no-op). **Dropped the `.max(CELL_W)` clamp on `avail`** (codex P2: fed a fictitious pane width into centering on narrow windows → spurious offset + right-ring clip; `cols_for_width` self-clamps). Demo window 1340→1440 (above the 4-col breakpoint). Codex (gpt-5.6) review = 1 P2 (fixed), no others. On-device verified: 3-col (capped from 4) + 4-col both center, no clip. Fixed cards ⇒ max-cols ≡ max-px-width; block identical across screens, only margins grow. Handoff `docs/handoffs/2026-07-22-board-masonry-centering.md` (mission complete).
   - **Vertical centering (2026-07-22, on `main`):** vertical mirror of `center_offset` in `board/mod.rs` — a board shorter than the viewport is now centered vertically (`v_center_offset = (viewport_h − block_height)/2` when `block_height ≤ viewport_h`, else 0; `padded.h = block_height.max(viewport_h)`). Hard-snaps to top-aligned as sessions push `content_height` past the viewport (accepted trade-off — no animation). Codex (gpt-5.6) review caught the one non-obvious edge: when the block fits, `scroll_top` is pinned to 0 for culling so a tall scrolled board that just shrank below the viewport can't ride a stale negative offset and blank its tiles for a frame (vertical culling has no horizontal analog to lean on). Gate: fmt + clippy clean, lens-ui 162/162. Overflowing boards are byte-identical to before.
 
