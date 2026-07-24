@@ -20,8 +20,8 @@ use lens_core::reduce::{RetireDisposition, StreamUpdate};
 use lens_ui::fleet::store::ReconcileEpoch;
 use lens_ui::focused::{FocusedTranscript, ReaderWorkerHandle, RowContent, RowId, RowKind};
 use lens_ui::md::{
-    init as md_init, markdown_probe_arm_selection, markdown_probe_selection_is_some,
-    markdown_state_entity_id, MarkdownView,
+    MarkdownView, init as md_init, markdown_probe_arm_selection, markdown_probe_selection_is_some,
+    markdown_state_entity_id,
 };
 
 /// Short initial stream chunk; a later delta appends [`STREAM_GROWTH`] so rendered height grows.
@@ -569,10 +569,7 @@ impl Render for HarnessView {
                     anchor.top_item_index, anchor.sub_offset
                 ));
             }
-            if !text.is_empty()
-                && text != "hi"
-                && !text.starts_with(STREAM_START)
-            {
+            if !text.is_empty() && text != "hi" && !text.starts_with(STREAM_START) {
                 p.failures.push(format!("unexpected content: {text:?}"));
             }
             if let Some(pres) = pres.as_ref()
@@ -582,14 +579,9 @@ impl Render for HarnessView {
                     content_key,
                 } = &pres.content
             {
-                let _ = MarkdownView::new(
-                    content_key.as_element_id(),
-                    source.clone(),
-                    window,
-                    cx,
-                )
-                .scrollable(false)
-                .selectable(true);
+                let _ = MarkdownView::new(content_key.as_element_id(), source.clone(), window, cx)
+                    .scrollable(false)
+                    .selectable(true);
                 if let Some(md_eid) =
                     markdown_state_entity_id(content_key.as_element_id().as_str(), window, cx)
                 {

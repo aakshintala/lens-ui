@@ -10,7 +10,7 @@ pub(crate) mod text_view;
 mod utils;
 
 use gpui::{App, Entity, EntityId, ListOffset, SharedString, Window};
-use mdstitch::{stitch, StitchOptions};
+use mdstitch::{StitchOptions, stitch};
 
 pub use style::*;
 pub use text_view::TextView;
@@ -56,17 +56,11 @@ impl MarkdownView {
     }
 }
 
-pub fn markdown_state_entity_id(
-    id: &str,
-    window: &mut Window,
-    cx: &mut App,
-) -> Option<EntityId> {
+pub fn markdown_state_entity_id(id: &str, window: &mut Window, cx: &mut App) -> Option<EntityId> {
     let key = SharedString::from(format!("{id}/state"));
-    let state = window.use_keyed_state::<text_view::TextViewState>(
-        key,
-        cx,
-        |_, cx| text_view::TextViewState::new(cx),
-    );
+    let state = window.use_keyed_state::<text_view::TextViewState>(key, cx, |_, cx| {
+        text_view::TextViewState::new(cx)
+    });
     Some(state.entity_id())
 }
 
@@ -103,7 +97,11 @@ fn markdown_probe_state(
 }
 
 #[cfg(feature = "probe")]
-pub fn markdown_probe_logical_scroll_top(id: &str, window: &mut Window, cx: &mut App) -> ListOffset {
+pub fn markdown_probe_logical_scroll_top(
+    id: &str,
+    window: &mut Window,
+    cx: &mut App,
+) -> ListOffset {
     markdown_probe_state(id, window, cx)
         .read(cx)
         .list_logical_scroll_top()
@@ -111,11 +109,18 @@ pub fn markdown_probe_logical_scroll_top(id: &str, window: &mut Window, cx: &mut
 
 #[cfg(feature = "probe")]
 pub fn markdown_probe_list_item_count(id: &str, window: &mut Window, cx: &mut App) -> usize {
-    markdown_probe_state(id, window, cx).read(cx).list_item_count()
+    markdown_probe_state(id, window, cx)
+        .read(cx)
+        .list_item_count()
 }
 
 #[cfg(feature = "probe")]
-pub fn markdown_probe_scroll_list_to(id: &str, offset: ListOffset, window: &mut Window, cx: &mut App) {
+pub fn markdown_probe_scroll_list_to(
+    id: &str,
+    offset: ListOffset,
+    window: &mut Window,
+    cx: &mut App,
+) {
     markdown_probe_state(id, window, cx).update(cx, |s, _| s.list_scroll_to(offset));
 }
 

@@ -3,12 +3,12 @@
 
 pub mod autolink;
 pub mod content_events;
-pub mod reader;
 mod content_key;
+pub mod reader;
 pub mod reasoning;
 mod rowsource;
-mod user_content;
 mod streaming;
+mod user_content;
 pub mod view;
 
 use crate::fleet::store::{ReaderFactory, ReconcileEpoch};
@@ -22,8 +22,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-pub use reader::{Priority, ReadTarget, ReaderWorkerHandle};
 pub use content_key::ContentKey;
+pub use reader::{Priority, ReadTarget, ReaderWorkerHandle};
 pub use rowsource::{
     RowContent, RowId, RowKind, RowPresentation, RowState, RowStore, SectionKey, UpsertEffect,
 };

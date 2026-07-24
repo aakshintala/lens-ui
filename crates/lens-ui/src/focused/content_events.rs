@@ -22,7 +22,10 @@ pub fn emit_navigate_to_file(path: String, line: Option<u32>, _cx: &mut gpui::Ap
     {
         SINK.with(|s| {
             s.borrow_mut()
-                .push(ContentUiEvent::NavigateToFile(NavigateToFile { path, line }));
+                .push(ContentUiEvent::NavigateToFile(NavigateToFile {
+                    path,
+                    line,
+                }));
         });
     }
     #[cfg(not(test))]

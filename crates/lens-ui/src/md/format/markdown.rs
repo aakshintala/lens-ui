@@ -1,3 +1,4 @@
+#![cfg_attr(rustfmt, rustfmt::skip)] // vendored gpui-component — kept byte-faithful to upstream (T-3 surgical patches only)
 use gpui::SharedString;
 use markdown::{
     mdast::{self, Node},

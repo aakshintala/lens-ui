@@ -15,16 +15,11 @@ pub fn scan_prose_autolinks(prose: &str) -> Vec<AutolinkHit> {
     for (idx, token) in prose.split_whitespace().enumerate() {
         let _ = idx;
         let lower = token.to_ascii_lowercase();
-        if lower.starts_with("http://")
-            || lower.starts_with("https://")
-            || token.contains("://")
-        {
+        if lower.starts_with("http://") || lower.starts_with("https://") || token.contains("://") {
             hits.push(AutolinkHit {
                 range: find_token_range(prose, token),
                 target: AutolinkTarget::Url(
-                    token
-                        .trim_end_matches(&['.', ',', ';'][..])
-                        .to_string(),
+                    token.trim_end_matches(&['.', ',', ';'][..]).to_string(),
                 ),
             });
         } else if looks_like_path_token(token) {

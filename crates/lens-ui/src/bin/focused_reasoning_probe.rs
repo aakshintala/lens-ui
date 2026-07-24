@@ -76,7 +76,10 @@ async fn wait_frames(wcx: &mut AsyncWindowContext, n: usize) {
 
 /// Read (scroll_top, item_count) via the render-captured handle. Returns None until the first
 /// render has captured the handle.
-fn read_scroll(weak: &WeakEntity<HarnessView>, wcx: &mut AsyncWindowContext) -> Option<(ListOffset, usize)> {
+fn read_scroll(
+    weak: &WeakEntity<HarnessView>,
+    wcx: &mut AsyncWindowContext,
+) -> Option<(ListOffset, usize)> {
     weak.update_in(wcx, |view, _window, cx| {
         let handle = view.handle.clone()?;
         let offset = markdown_probe_handle_scroll_top(&handle, cx);
@@ -144,7 +147,9 @@ async fn drive_reasoning_probe(
     });
     wait_frames(&mut wcx, SETTLE_FRAMES).await;
 
-    let top_ix_before = read_scroll(&weak, &mut wcx).map(|(o, _)| o.item_ix).unwrap_or(0);
+    let top_ix_before = read_scroll(&weak, &mut wcx)
+        .map(|(o, _)| o.item_ix)
+        .unwrap_or(0);
 
     let final_text = growth_text(GROWTH_STEPS + 1);
     let _ = weak.update_in(&mut wcx, |view, _, cx| {
@@ -154,7 +159,9 @@ async fn drive_reasoning_probe(
     wait_frames(&mut wcx, FRAMES_PER_GROWTH).await;
 
     let preserve_ok = match read_scroll(&weak, &mut wcx) {
-        Some((offset, count)) => offset.item_ix == top_ix_before && offset.item_ix < count.saturating_sub(1),
+        Some((offset, count)) => {
+            offset.item_ix == top_ix_before && offset.item_ix < count.saturating_sub(1)
+        }
         None => false,
     };
 
@@ -207,7 +214,9 @@ impl Render for HarnessView {
 
         let element = div().size_full().p_4().child(render_reasoning(
             &content,
-            ReasoningUiState::Collapsed { duration_secs: None },
+            ReasoningUiState::Collapsed {
+                duration_secs: None,
+            },
             None,
             window,
             cx,

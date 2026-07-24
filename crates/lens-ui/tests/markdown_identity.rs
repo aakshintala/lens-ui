@@ -1,9 +1,7 @@
 use gpui::{Context, EntityId, Render, TestAppContext, Window};
 use lens_core::domain::ids::{AccId, ItemId};
-use lens_ui::focused::{
-    ContentKey, RowContent, RowId, RowKind, RowPresentation, RowStore,
-};
-use lens_ui::md::{init as md_init, markdown_state_entity_id, MarkdownView};
+use lens_ui::focused::{ContentKey, RowContent, RowId, RowKind, RowPresentation, RowStore};
+use lens_ui::md::{MarkdownView, init as md_init, markdown_state_entity_id};
 
 struct IdentityHarness {
     store: RowStore,
@@ -36,11 +34,7 @@ impl Render for IdentityHarness {
             let _ = MarkdownView::new(self.key.as_element_id(), "hi", window, cx)
                 .scrollable(false)
                 .selectable(true);
-            self.before = markdown_state_entity_id(
-                self.key.as_element_id().as_str(),
-                window,
-                cx,
-            );
+            self.before = markdown_state_entity_id(self.key.as_element_id().as_str(), window, cx);
 
             self.store.commit_stream_finalize(
                 &self.acc,
@@ -73,11 +67,7 @@ impl Render for IdentityHarness {
             let _ = MarkdownView::new(final_key.as_element_id(), "hi there", window, cx)
                 .scrollable(false)
                 .selectable(true);
-            self.after = markdown_state_entity_id(
-                final_key.as_element_id().as_str(),
-                window,
-                cx,
-            );
+            self.after = markdown_state_entity_id(final_key.as_element_id().as_str(), window, cx);
             self.done = true;
         }
         gpui::Empty

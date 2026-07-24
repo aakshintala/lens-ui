@@ -54,10 +54,7 @@ pub fn validate_image_ref(url: &str) -> ImageVerdict {
         return ImageVerdict::Strip;
     }
     let lower = url.to_ascii_lowercase();
-    if lower.starts_with("data:")
-        || lower.starts_with("http://")
-        || lower.starts_with("https://")
-    {
+    if lower.starts_with("data:") || lower.starts_with("http://") || lower.starts_with("https://") {
         return ImageVerdict::RenderAsLink {
             url: url.to_string(),
         };
@@ -248,10 +245,7 @@ mod tests {
     #[test]
     fn strips_oversized_image_refs() {
         let artifact = format!("lens-artifact://{}", "a".repeat(MAX_URL_LEN));
-        assert!(matches!(
-            validate_image_ref(&artifact),
-            ImageVerdict::Strip
-        ));
+        assert!(matches!(validate_image_ref(&artifact), ImageVerdict::Strip));
         let data = format!("data:image/png;base64,{}", "a".repeat(MAX_URL_LEN));
         assert!(matches!(validate_image_ref(&data), ImageVerdict::Strip));
     }

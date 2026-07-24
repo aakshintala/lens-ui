@@ -1,7 +1,7 @@
 //! Threat-matrix fixtures for §6.3 security boundary (T3-2).
 
-use lens_ui::focused::autolink::{scan_prose_autolinks, AutolinkTarget};
-use lens_ui::security::{validate_image_ref, validate_link_url, ImageVerdict, LinkVerdict};
+use lens_ui::focused::autolink::{AutolinkTarget, scan_prose_autolinks};
+use lens_ui::security::{ImageVerdict, LinkVerdict, validate_image_ref, validate_link_url};
 
 #[test]
 fn javascript_link_stripped() {

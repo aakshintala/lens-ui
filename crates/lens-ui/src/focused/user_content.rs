@@ -1,10 +1,10 @@
-use gpui::{div, prelude::*, App, IntoElement, ParentElement, SharedString, Styled, Window};
+use gpui::{App, IntoElement, ParentElement, SharedString, Styled, Window, div, prelude::*};
 
-use crate::focused::autolink::{scan_prose_autolinks, AutolinkTarget};
+use crate::focused::autolink::{AutolinkTarget, scan_prose_autolinks};
 use crate::focused::content_events::emit_navigate_to_file;
 use crate::focused::{ContentKey, RowContent};
 use crate::md::MarkdownView;
-use crate::security::{validate_link_url, LinkVerdict};
+use crate::security::{LinkVerdict, validate_link_url};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UserSegment {
@@ -59,7 +59,11 @@ pub fn split_user_segments(text: &str) -> Vec<UserSegment> {
                 .unwrap_or(text.len());
             let code = text[i + 1..end].to_string();
             out.push(UserSegment::InlineCode(code));
-            i = if end < text.len() { end + 1 } else { text.len() };
+            i = if end < text.len() {
+                end + 1
+            } else {
+                text.len()
+            };
             continue;
         }
         let next = text[i..].find('`').map(|p| i + p).unwrap_or(text.len());
@@ -312,13 +316,7 @@ mod tests {
     fn markdown_fence_literal_not_full_user_markdown() {
         let segs = split_user_segments("```md\n[x](javascript:alert(1))\n```");
         assert_eq!(segs.len(), 1);
-        assert!(matches!(
-            segs[0],
-            UserSegment::Fenced {
-                lang: Some(_),
-                ..
-            }
-        ));
+        assert!(matches!(segs[0], UserSegment::Fenced { lang: Some(_), .. }));
         if let UserSegment::Fenced { body, .. } = &segs[0] {
             assert!(body.contains("javascript:"));
         }

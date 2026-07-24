@@ -10,8 +10,8 @@ use lens_core::domain::item::{Item, ItemKind, MessageAcc, ReasoningAcc};
 use lens_core::domain::scalars::Role;
 use lens_core::reduce::ViewBlock;
 
-use super::content_key::ContentKey;
 use super::Marker;
+use super::content_key::ContentKey;
 
 /// Stable row identity — keyed store, not list index.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -52,7 +52,9 @@ impl SectionKey {
 /// Typed row payload — markdown rendering consumes this in T3 Tasks 2–5.
 #[derive(Clone, Debug, PartialEq)]
 pub enum RowContent {
-    Stub { text: String },
+    Stub {
+        text: String,
+    },
     AssistantMarkdown {
         source: String,
         content_key: ContentKey,
@@ -368,9 +370,10 @@ impl RowStore {
         let mut changed = false;
         match pres.kind {
             RowKind::StreamingMessage => {
-                let absent = !self.structure.iter().any(|e| {
-                    matches!(e, StructureEntry::Sibling(row) if row == &id)
-                });
+                let absent = !self
+                    .structure
+                    .iter()
+                    .any(|e| matches!(e, StructureEntry::Sibling(row) if row == &id));
                 if absent {
                     self.structure.push(StructureEntry::Sibling(id));
                     changed = true;
@@ -1003,15 +1006,26 @@ pub(crate) fn presentation_for_work_item(item: &Item) -> RowPresentation {
 }
 
 /// D11: streaming→finalize keeps the stream `content_key`; never retarget to item id.
-fn preserve_content_key(stream_pres: &RowPresentation, mut pres: RowPresentation) -> RowPresentation {
+fn preserve_content_key(
+    stream_pres: &RowPresentation,
+    mut pres: RowPresentation,
+) -> RowPresentation {
     match (&stream_pres.content, &mut pres.content) {
         (
-            RowContent::AssistantMarkdown { content_key: src, .. },
-            RowContent::AssistantMarkdown { content_key: dst, .. },
+            RowContent::AssistantMarkdown {
+                content_key: src, ..
+            },
+            RowContent::AssistantMarkdown {
+                content_key: dst, ..
+            },
         ) => *dst = src.clone(),
         (
-            RowContent::Reasoning { content_key: src, .. },
-            RowContent::Reasoning { content_key: dst, .. },
+            RowContent::Reasoning {
+                content_key: src, ..
+            },
+            RowContent::Reasoning {
+                content_key: dst, ..
+            },
         ) => *dst = src.clone(),
         _ => {}
     }
@@ -1415,9 +1429,7 @@ mod tests {
                 row_id.clone(),
                 RowPresentation {
                     kind: RowKind::WorkChild,
-                    content: RowContent::Stub {
-                        text: "v1".into(),
-                    },
+                    content: RowContent::Stub { text: "v1".into() },
                     collapsed: false,
                     height_hint: None,
                 },
@@ -1432,9 +1444,7 @@ mod tests {
                 row_id.clone(),
                 RowPresentation {
                     kind: RowKind::WorkChild,
-                    content: RowContent::Stub {
-                        text: "v2".into(),
-                    },
+                    content: RowContent::Stub { text: "v2".into() },
                     collapsed: false,
                     height_hint: None,
                 },
@@ -1498,7 +1508,13 @@ mod tests {
         cx.read(|cx| {
             let id = RowId::Sibling(item_id);
             assert_eq!(
-                store.entity(&id).unwrap().read(cx).presentation.content.stub_text(),
+                store
+                    .entity(&id)
+                    .unwrap()
+                    .read(cx)
+                    .presentation
+                    .content
+                    .stub_text(),
                 "final"
             );
         });
@@ -1548,9 +1564,15 @@ mod tests {
             let id = RowId::Sibling(item_id);
             let final_pres = &store.entity(&id).unwrap().read(cx).presentation;
             match &final_pres.content {
-                RowContent::AssistantMarkdown { source, content_key } => {
+                RowContent::AssistantMarkdown {
+                    source,
+                    content_key,
+                } => {
                     assert_eq!(source, "hello world");
-                    assert_eq!(content_key, &key, "D11: content_key must stay the stream key");
+                    assert_eq!(
+                        content_key, &key,
+                        "D11: content_key must stay the stream key"
+                    );
                 }
                 other => panic!("unexpected {other:?}"),
             }
@@ -1614,7 +1636,10 @@ mod tests {
                     duration_secs,
                     ..
                 } => {
-                    assert_eq!(content_key, &key, "D11: reasoning content_key must stay the stream key");
+                    assert_eq!(
+                        content_key, &key,
+                        "D11: reasoning content_key must stay the stream key"
+                    );
                     assert!(!live);
                     assert_eq!(*duration_secs, Some(4));
                 }

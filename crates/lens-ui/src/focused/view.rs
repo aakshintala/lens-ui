@@ -1,6 +1,8 @@
 //! gpui `list()` render surface for the focused transcript (T-2 §7).
 
-use crate::focused::reasoning::{ReasoningExpand, ReasoningSetExpandFn, ReasoningUiState, render_reasoning};
+use crate::focused::reasoning::{
+    ReasoningExpand, ReasoningSetExpandFn, ReasoningUiState, render_reasoning,
+};
 use crate::focused::{ContentKey, FocusedTranscript, RowContent, RowKind, RowPresentation};
 use crate::md::MarkdownView;
 use gpui::{
@@ -243,7 +245,11 @@ pub(crate) fn render_assistant_markdown(
     window: &mut Window,
     cx: &mut App,
 ) -> gpui::AnyElement {
-    let RowContent::AssistantMarkdown { source, content_key } = content else {
+    let RowContent::AssistantMarkdown {
+        source,
+        content_key,
+    } = content
+    else {
         return div().into_any_element();
     };
     MarkdownView::new(content_key.as_element_id(), source.clone(), window, cx)
@@ -299,14 +305,7 @@ impl Render for FocusedTranscriptView {
                 return div().into_any_element();
             };
             let pres = entity.read(app).presentation.clone();
-            Self::render_row(
-                &reasoning_expanded,
-                &pres,
-                ix,
-                view_weak,
-                window,
-                app,
-            )
+            Self::render_row(&reasoning_expanded, &pres, ix, view_weak, window, app)
         })
         .size_full();
 

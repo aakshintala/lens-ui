@@ -1,8 +1,6 @@
-use gpui::{
-    div, prelude::*, px, App, IntoElement, ParentElement, SharedString, Styled, Window,
-};
 use crate::focused::RowContent;
 use crate::md::MarkdownView;
+use gpui::{App, IntoElement, ParentElement, SharedString, Styled, Window, div, prelude::*, px};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ReasoningExpand {
@@ -35,11 +33,7 @@ pub fn reasoning_collapsed_label(encrypted: bool, duration_secs: Option<u32>) ->
 }
 
 /// Body text for expanded reasoning rows — summary (or full if empty) vs full chain-of-thought.
-fn expanded_body<'a>(
-    state: ReasoningUiState,
-    summary: &'a str,
-    full: &'a str,
-) -> &'a str {
+fn expanded_body<'a>(state: ReasoningUiState, summary: &'a str, full: &'a str) -> &'a str {
     match state {
         ReasoningUiState::FullExpanded => full,
         ReasoningUiState::SummaryExpanded => {
@@ -215,11 +209,16 @@ mod tests {
         };
         let label = match &content {
             RowContent::Reasoning {
-                duration_secs, encrypted, ..
+                duration_secs,
+                encrypted,
+                ..
             } => reasoning_collapsed_label(*encrypted, *duration_secs),
             _ => panic!("expected reasoning"),
         };
-        assert!(label.contains("4s"), "label should contain durable duration_secs: {label}");
+        assert!(
+            label.contains("4s"),
+            "label should contain durable duration_secs: {label}"
+        );
     }
 
     #[test]
@@ -232,27 +231,15 @@ mod tests {
     #[test]
     fn full_expanded_renders_full_not_summary() {
         assert_eq!(
-            expanded_body(
-                ReasoningUiState::FullExpanded,
-                "short",
-                "LONG"
-            ),
+            expanded_body(ReasoningUiState::FullExpanded, "short", "LONG"),
             "LONG"
         );
         assert_eq!(
-            expanded_body(
-                ReasoningUiState::SummaryExpanded,
-                "short",
-                "LONG"
-            ),
+            expanded_body(ReasoningUiState::SummaryExpanded, "short", "LONG"),
             "short"
         );
         assert_eq!(
-            expanded_body(
-                ReasoningUiState::SummaryExpanded,
-                "",
-                "LONG"
-            ),
+            expanded_body(ReasoningUiState::SummaryExpanded, "", "LONG"),
             "LONG"
         );
     }
