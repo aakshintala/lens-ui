@@ -382,6 +382,139 @@ fn seed_demo_transcript(dir: &Path, conn: &ConnectionId, session: &SessionId, co
         }
     }
 
+    // A curated T-3 showcase seeded at the TAIL (highest ordinals = what cold focus
+    // shows first). Exercises the markdown message path (headings/bold/code/lists/link/
+    // table/blockquote), the user segment pipeline (```md fence + prose autolink), and
+    // the reasoning states (finalized summary→full with a duration, plus an encrypted
+    // row). The live "💭 thinking…" state needs a real stream — a static disk seed can't
+    // drive it; the `focused_reasoning_probe` covers that path.
+    fn text_message(id: &str, ordinal: i64, role: Role, response_id: &str, body: &str) -> Item {
+        Item {
+            id: ItemId::new(id.to_string()),
+            seq: Some(ordinal as u64),
+            ctx: BlockContext {
+                agent: Some("coder".into()),
+                depth: 0,
+                response_id: Some(ResponseId::new(response_id)),
+            },
+            created_at: 1_700_000_100_000 + ordinal,
+            kind: ItemKind::Message {
+                role,
+                content: vec![ContentBlock {
+                    kind: "text".into(),
+                    text: Some(body.to_string()),
+                    data: Default::default(),
+                }],
+            },
+        }
+    }
+
+    fn reasoning_item(
+        id: &str,
+        ordinal: i64,
+        response_id: &str,
+        summary: &str,
+        full: &str,
+        encrypted: bool,
+        duration_ms: i64,
+    ) -> Item {
+        Item {
+            id: ItemId::new(id.to_string()),
+            seq: Some(ordinal as u64),
+            ctx: BlockContext {
+                agent: Some("coder".into()),
+                depth: 0,
+                response_id: Some(ResponseId::new(response_id)),
+            },
+            created_at: 1_700_000_100_000 + ordinal,
+            kind: ItemKind::Reasoning {
+                full_text: full.to_string(),
+                summary_text: summary.to_string(),
+                encrypted,
+                duration_ms: Some(duration_ms),
+            },
+        }
+    }
+
+    const RESP: &str = "resp_showcase";
+
+    let user_ask = "Nice. Can you drop the summary into the ADR? Use this shape:\n\n\
+```md\n\
+### Result\n\
+- **cold focus:** 33 ms\n\
+- **resident:** 12.6 MB\n\
+```\n\n\
+Reference: https://example.com/adr/disk-windowing";
+
+    let assistant_answer = "## Disk-windowing: the resident window\n\n\
+The resident window is a **bounded** `BTreeMap` keyed by *ordinal*. The tail read \
+stops accumulating once it hits the byte budget, so cold focus is `O(window)` — not \
+`O(history)`.\n\n\
+### Read primitives\n\n\
+- `Tail` — newest rows up to the budget\n\
+- `Backward` — one page older, at `Priority::Page`\n\
+- `Span` — an explicit ordinal range\n\n\
+The flow on focus:\n\n\
+1. Focus triggers a `Tail` read.\n\
+2. Scrolling near the top enqueues a single `Backward` page.\n\
+3. Eviction trims the far end by follow direction.\n\n\
+```rust\n\
+fn tail_read(rows: &[Row], budget: usize) -> Window {\n\
+    let mut acc = 0;\n\
+    rows.iter().rev()\n\
+        .take_while(|r| { acc += r.bytes; acc <= budget })\n\
+        .collect()\n\
+}\n\
+```\n\n\
+> At 50k items: ~33 ms cold focus, ~12.6 MB resident — comfortably under the 24 MB cap.\n\n\
+| Metric      | Value    |\n\
+| ----------- | -------- |\n\
+| Cold focus  | 33 ms    |\n\
+| Resident    | 12.6 MB  |\n\
+| Cap         | 24 MB    |\n\n\
+See the [disk-windowing ADR](https://example.com/adr/disk-windowing) for the rationale.";
+
+    let assistant_followup = "Done — added the `### Result` block to the ADR and linked the \
+sweep numbers. The **D19 guard** asserts `run_catchup` never calls the full-reconcile path, \
+so we won't silently regress to `O(history)`.";
+
+    let reasoning_summary = "Confirm the byte-budget accounting and which end eviction drops.";
+    let reasoning_full = "The budget is measured in bytes, not rows, so the tail read \
+accumulates `r.bytes` and stops at the cap. Eviction follows the scroll direction: paused \
+near the top drops the newest resident rows, and the anchor is re-pinned by row identity so \
+nothing yanks. That keeps resident RAM flat while the user pages older history in.";
+
+    // ordinal order (ascending) = render order (tail last):
+    //   user ask → reasoning(7s) → assistant markdown → encrypted reasoning → follow-up
+    let base = count as i64;
+    let showcase: [Item; 5] = [
+        text_message("item_showcase_0", base, Role::User, RESP, user_ask),
+        reasoning_item(
+            "item_showcase_1",
+            base + 1,
+            RESP,
+            reasoning_summary,
+            reasoning_full,
+            false,
+            7_000,
+        ),
+        text_message(
+            "item_showcase_2",
+            base + 2,
+            Role::Assistant,
+            RESP,
+            assistant_answer,
+        ),
+        reasoning_item("item_showcase_3", base + 3, RESP, "", "", true, 3_000),
+        text_message(
+            "item_showcase_4",
+            base + 4,
+            Role::Assistant,
+            RESP,
+            assistant_followup,
+        ),
+    ];
+
     let db_path = dir.join(format!("{session}.db"));
     let store = SqliteTranscriptStore::open(&db_path, conn, session)
         .unwrap_or_else(|e| panic!("seed_demo_transcript open {}: {e}", db_path.display()));
@@ -391,6 +524,12 @@ fn seed_demo_transcript(dir: &Path, conn: &ConnectionId, session: &SessionId, co
         store
             .upsert_item(ordinal as i64, &item, false)
             .unwrap_or_else(|e| panic!("seed_demo_transcript upsert {ordinal}: {e}"));
+    }
+    for item in &showcase {
+        let ordinal = item.seq.expect("showcase seq") as i64;
+        store
+            .upsert_item(ordinal, item, false)
+            .unwrap_or_else(|e| panic!("seed_demo_transcript showcase upsert {ordinal}: {e}"));
     }
 }
 
