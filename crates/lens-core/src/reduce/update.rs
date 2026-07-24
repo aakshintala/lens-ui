@@ -1,7 +1,7 @@
 use crate::domain::controls::{
     Elicitation, ModelOption, PendingUserMessage, SandboxStatus, SkillSummary, Todo,
 };
-use crate::domain::ids::{AccId, AgentId, ItemId, ResponseId};
+use crate::domain::ids::{AccId, AgentId, ItemId, ResponseId, SessionId, TerminalId};
 use crate::domain::item::StreamScratch;
 use crate::domain::scalars::{ErrorInfo, SessionStatusValue};
 use crate::domain::session::SessionState;
@@ -57,6 +57,22 @@ pub enum StreamUpdate {
     ChildSessionChanged,
     PresenceChanged(Vec<PresenceViewer>),
     ResourcesChanged,
+    /// Session superseded (e.g. `/clear` rotation) — control-outcome path only.
+    Superseded {
+        target_conversation_id: String,
+        reason: String,
+    },
+    /// Terminal resource created — control-outcome path only.
+    TerminalResourceCreated {
+        terminal_id: TerminalId,
+        terminal_name: String,
+        session_key: String,
+        session_id: SessionId,
+    },
+    /// Terminal resource deleted — control-outcome path only.
+    TerminalResourceDeleted {
+        terminal_id: TerminalId,
+    },
     AgentChanged {
         agent_id: AgentId,
         agent_name: Option<String>,

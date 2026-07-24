@@ -1,4 +1,5 @@
 mod fleet_verify;
+mod loader;
 
 use gpui::{App, AppContext, Application, WindowOptions};
 use gpui_component::Root;
@@ -110,7 +111,12 @@ fn main() {
             };
             cx.open_window(window_options, move |window, cx| {
                 if let Some(prep) = live_prep {
+                    let conn = prep.conn.clone();
+                    let data_dir = prep.data_dir.clone();
                     fleet.update(cx, |fleet, cx| {
+                        fleet.set_session_loader(std::rc::Rc::new(
+                            crate::loader::AppSessionLoader::new(conn.clone(), data_dir.clone()),
+                        ));
                         for sid in prep.session_ids {
                             if let Err(e) = fleet.spawn_live_session(
                                 &prep.conn,

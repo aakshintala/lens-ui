@@ -1,6 +1,7 @@
 //! Session-field scalar folds + status/usage normalization (§4.1).
 
 use crate::clock::Clock;
+use crate::domain::ids::TerminalId;
 use crate::domain::{
     Elicitation, ElicitationId, ElicitationParams as DomainElicParams, ResponseId, SandboxStatus,
     SessionState, SessionStatusValue, Todo, TodoStatus,
@@ -132,8 +133,15 @@ pub(crate) fn fold_session_field(
         SessionEvent::TerminalActivity { .. }
         | SessionEvent::ChangedFilesInvalidated { .. }
         | SessionEvent::Interrupted { .. }
-        | SessionEvent::Superseded { .. }
         | SessionEvent::McpStartup { .. } => return Some(smallvec![]),
+        SessionEvent::Superseded {
+            target_conversation_id,
+            reason,
+            ..
+        } => smallvec![StreamUpdate::Superseded {
+            target_conversation_id: target_conversation_id.clone(),
+            reason: reason.clone(),
+        }],
         SessionEvent::InputConsumed {
             item_id,
             item_type: _,
@@ -157,8 +165,39 @@ pub(crate) fn fold_session_field(
         }
         // REVIEW#9: child spawn — D-P1-18 marker (no P1 field home; §9 owns child topology).
         SessionEvent::Created { .. } => smallvec![StreamUpdate::ChildSessionChanged],
-        SessionEvent::ResourceCreated | SessionEvent::ResourceDeleted { .. } => {
-            smallvec![StreamUpdate::ResourcesChanged] // D-P1-4
+        SessionEvent::ResourceCreated {
+            resource_id,
+            resource_type,
+            terminal_name,
+            session_key,
+        } => {
+            if resource_type == "terminal" {
+                if let (Some(terminal_name), Some(session_key)) = (terminal_name, session_key) {
+                    smallvec![StreamUpdate::TerminalResourceCreated {
+                        terminal_id: TerminalId::new(resource_id),
+                        terminal_name: terminal_name.clone(),
+                        session_key: session_key.clone(),
+                        session_id: state.id.clone(),
+                    }]
+                } else {
+                    smallvec![StreamUpdate::ResourcesChanged]
+                }
+            } else {
+                smallvec![StreamUpdate::ResourcesChanged]
+            }
+        }
+        SessionEvent::ResourceDeleted {
+            resource_id,
+            resource_type,
+            ..
+        } => {
+            if resource_type == "terminal" {
+                smallvec![StreamUpdate::TerminalResourceDeleted {
+                    terminal_id: TerminalId::new(resource_id),
+                }]
+            } else {
+                smallvec![StreamUpdate::ResourcesChanged]
+            }
         }
         SessionEvent::Heartbeat { .. } => return Some(smallvec![]),
         SessionEvent::Usage {
@@ -287,6 +326,7 @@ pub(crate) fn fold_response_marker(
 #[cfg(test)]
 mod tests {
     use crate::clock::ManualClock;
+    use crate::domain::ids::TerminalId;
     use crate::domain::{
         AgentId, ConnectionId, SessionId, SessionState, SessionStatusValue, TodoStatus,
     };
@@ -635,5 +675,97 @@ mod tests {
                 |update| matches!(update, StreamUpdate::PendingUserChanged(v) if v.is_empty())
             )
         );
+    }
+
+    #[test]
+    fn superseded_emits_stream_update() {
+        let mut s = st();
+        let u = reduce(
+            &mut s,
+            &ServerStreamEvent::Session(SessionEvent::Superseded {
+                conversation_id: "conv_a".into(),
+                target_conversation_id: "conv_b".into(),
+                reason: "clear".into(),
+            }),
+            &clock(),
+        );
+        assert_eq!(
+            &u[..],
+            &[StreamUpdate::Superseded {
+                target_conversation_id: "conv_b".into(),
+                reason: "clear".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn terminal_resource_created_emits_terminal_resource_update() {
+        let mut s = st();
+        let u = reduce(
+            &mut s,
+            &ServerStreamEvent::Session(SessionEvent::ResourceCreated {
+                resource_id: "terminal_tui_main".into(),
+                resource_type: "terminal".into(),
+                terminal_name: Some("tui".into()),
+                session_key: Some("main".into()),
+            }),
+            &clock(),
+        );
+        assert_eq!(
+            &u[..],
+            &[StreamUpdate::TerminalResourceCreated {
+                terminal_id: TerminalId::new("terminal_tui_main"),
+                terminal_name: "tui".into(),
+                session_key: "main".into(),
+                session_id: SessionId::new("conv"),
+            }]
+        );
+    }
+
+    #[test]
+    fn terminal_resource_deleted_emits_terminal_resource_update() {
+        let mut s = st();
+        let u = reduce(
+            &mut s,
+            &ServerStreamEvent::Session(SessionEvent::ResourceDeleted {
+                resource_id: "terminal_tui_main".into(),
+                resource_type: "terminal".into(),
+                session_id: "conv".into(),
+            }),
+            &clock(),
+        );
+        assert_eq!(
+            &u[..],
+            &[StreamUpdate::TerminalResourceDeleted {
+                terminal_id: TerminalId::new("terminal_tui_main"),
+            }]
+        );
+    }
+
+    #[test]
+    fn non_terminal_resource_events_keep_resources_changed_marker() {
+        let mut s = st();
+        let created = reduce(
+            &mut s,
+            &ServerStreamEvent::Session(SessionEvent::ResourceCreated {
+                resource_id: "file_abc".into(),
+                resource_type: "file".into(),
+                terminal_name: None,
+                session_key: None,
+            }),
+            &clock(),
+        );
+        assert_eq!(&created[..], &[StreamUpdate::ResourcesChanged]);
+
+        let deleted = reduce(
+            &mut s,
+            &ServerStreamEvent::Session(SessionEvent::ResourceDeleted {
+                resource_id: "file_abc".into(),
+                resource_type: "file".into(),
+                session_id: "conv".into(),
+            }),
+            &clock(),
+        );
+        assert_eq!(&deleted[..], &[StreamUpdate::ResourcesChanged]);
     }
 }

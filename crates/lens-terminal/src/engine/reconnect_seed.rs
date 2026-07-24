@@ -140,6 +140,10 @@ fn retained_reconnect_seed_viewport_matches_fresh_engine() {
     stop_engine(fresh);
 }
 
+// Cross-session (transfer) no-double-feed is NOT testable at the engine layer — `VtEngine`
+// has no session concept. That guarantee (server B replays clear+redraw, not full history)
+// is owned by the live riders (design Q6).
+
 #[test]
 fn retained_reconnect_seed_does_not_duplicate_scrollback() {
     let lines = load_capture_lines(RECONNECT_CAPTURE);

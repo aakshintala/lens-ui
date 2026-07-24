@@ -3,6 +3,7 @@ use crate::clock::UiClock;
 use crate::fleet::fake::{FEED_CAPACITY, FakeFleet};
 use crate::fleet::live::{self, StreamBridge, WallClock};
 use crate::fleet::poller::spawn_session_poller;
+use crate::fleet::terminal;
 use crate::focused::FocusedTranscript;
 use gpui::{App, AppContext, Context, Entity, Task};
 use lens_client::{Client, Connection};
@@ -75,6 +76,18 @@ pub struct FleetStore {
     stream_bridges: HashMap<SessionId, StreamBridge>,
     reader_factories: HashMap<SessionId, ReaderFactory>,
     reconcile_epochs: HashMap<SessionId, ReconcileEpoch>,
+    pub(crate) terminals:
+        HashMap<SessionId, HashMap<terminal::TerminalKeyId, terminal::TerminalMember>>,
+    pub(crate) session_loader: Option<std::rc::Rc<dyn crate::fleet::loader::SessionLoader>>,
+    /// Bumped per source session on every supersede that starts a load; the
+    /// async completion no-ops unless it still matches. Scoped per `from`
+    /// because a supersede of one session must never invalidate an in-flight
+    /// supersede of a different one (sub-slice A's `reconnect_epoch` is
+    /// per-tab for the same reason).
+    pub(crate) supersede_epochs: HashMap<SessionId, u64>,
+    /// Targets with a load in flight — prevents a duplicate/replayed
+    /// `Superseded` from double GET/seed/spawning the same session.
+    pub(crate) supersede_in_flight: std::collections::HashSet<SessionId>,
     focused_replica: Option<(SessionId, Entity<FocusedTranscript>)>,
     focus_generation: u64,
     #[cfg(test)]
@@ -95,6 +108,10 @@ impl FleetStore {
             stream_bridges: HashMap::new(),
             reader_factories: HashMap::new(),
             reconcile_epochs: HashMap::new(),
+            terminals: HashMap::new(),
+            session_loader: None,
+            supersede_epochs: HashMap::new(),
+            supersede_in_flight: std::collections::HashSet::new(),
             focused_replica: None,
             focus_generation: 0,
             #[cfg(test)]
@@ -115,11 +132,25 @@ impl FleetStore {
             stream_bridges: HashMap::new(),
             reader_factories: HashMap::new(),
             reconcile_epochs: HashMap::new(),
+            terminals: HashMap::new(),
+            session_loader: None,
+            supersede_epochs: HashMap::new(),
+            supersede_in_flight: std::collections::HashSet::new(),
             focused_replica: None,
             focus_generation: 0,
             #[cfg(test)]
             focused_detailed_fanout_count: Cell::new(0),
         })
+    }
+
+    /// Inject the session-load seam (design §10 step 1). `lens-app` wires the
+    /// real loader at startup; tests inject a fake. Without a loader the
+    /// supersede handler no-ops rather than stranding terminals.
+    pub fn set_session_loader(
+        &mut self,
+        loader: std::rc::Rc<dyn crate::fleet::loader::SessionLoader>,
+    ) {
+        self.session_loader = Some(loader);
     }
 
     pub fn store_notify_count(&self) -> u64 {

@@ -24,6 +24,7 @@ ropey = "=2.0.0-beta.1"
 smol = "2"
 tracing = "0.1"
 lens-core = { path = "../lens-core" }
+lens-terminal = { path = "../lens-terminal" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 smallvec = "1"
@@ -58,3 +59,4 @@ path = "src/bin/focused_sweep_probe.rs"
 [dev-dependencies]
 gpui = { version = "0.2.2", features = ["test-support"] }
 lens-core = { path = "../lens-core", features = ["test-util"] }
+lens-terminal = { path = "../lens-terminal", features = ["test-util"] }

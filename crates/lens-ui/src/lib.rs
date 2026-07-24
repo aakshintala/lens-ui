@@ -16,6 +16,7 @@ pub use clock::{ManualUiClock, UiClock, WallUiClock};
 pub use fleet::fake::{FEED_CAPACITY, FakeFleet, FakeSessionHandles};
 pub use fleet::poller::spawn_session_poller;
 pub use fleet::store::FleetStore;
+pub use fleet::terminal::{MemoryPressure, TERMINAL_IDLE_SLEEP_THRESHOLD_MS, TerminalMember};
 pub use slot::{ContentTab, PlaceholderTab, TabHandle, focused_transcript_tab, placeholder_tab};
 pub use theme::{ActiveLensTheme, LensTheme};
 

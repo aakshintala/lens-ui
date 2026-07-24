@@ -199,8 +199,8 @@ pub enum AccessMode {
     ReadOnly,
 }
 
-/// Open-time configuration. Holds **only** access intent, a scrollback limit,
-/// and initial user preferences.
+/// Open-time configuration. Holds **only** access intent, a scrollback byte
+/// budget, and initial user preferences.
 ///
 /// `#[non_exhaustive]` + [`Default`] + `with_*` setters so later slices can add
 /// preference fields **without** breaking a `lens-ui` struct literal (external
@@ -211,10 +211,11 @@ pub enum AccessMode {
 #[non_exhaustive]
 pub struct TerminalOpenOptions {
     pub access: AccessIntent,
-    /// Bounded scrollback cap in **lines** (`libghostty-vt` caps by line, not
-    /// byte — see the design's "Scrollback, memory, resize"). `None` = engine
-    /// default.
-    pub scrollback_lines: Option<usize>,
+    /// Scrollback retention as a **byte** budget for the engine (`max_scrollback`),
+    /// NOT a line count. `None` → the default `10_000_000` bytes (~12.5k rows @200 cols;
+    /// validated safe on the 64 MiB worker stack, memory
+    /// `terminal-max-scrollback-bytes-and-worker-stack`).
+    pub scrollback_bytes: Option<usize>,
     // Initial user preferences (mouse/paste/etc.) land with Slice 2.
 }
 
@@ -222,7 +223,7 @@ impl Default for TerminalOpenOptions {
     fn default() -> Self {
         Self {
             access: AccessIntent::Automatic,
-            scrollback_lines: None,
+            scrollback_bytes: None,
         }
     }
 }
@@ -235,10 +236,10 @@ impl TerminalOpenOptions {
         self
     }
 
-    /// Set the scrollback cap in lines (`None` = engine default).
+    /// Set the scrollback byte budget (`None` = default `10_000_000` bytes).
     #[must_use]
-    pub fn with_scrollback_lines(mut self, lines: Option<usize>) -> Self {
-        self.scrollback_lines = lines;
+    pub fn with_scrollback_bytes(mut self, bytes: Option<usize>) -> Self {
+        self.scrollback_bytes = bytes;
         self
     }
 }
@@ -385,6 +386,17 @@ pub enum TerminalHostEvent {
     /// detach that sets `reattach_available`). Reuses the retained engine when
     /// present; else a fresh attach.
     Reattach,
+    /// Host-driven close: the fleet is removing this terminal. Releases the
+    /// engine + transport (full teardown) and moves to [`Lifecycle::Ended`] so a
+    /// caller-held entity that outlives fleet membership cannot keep the runtime
+    /// alive. Terminal sink — no reattach, no wake.
+    End,
+    /// Host-driven cross-session supersede: the server has moved this live terminal
+    /// (same `terminal_id`) into `new_session`. Reuses the retained frozen engine via a
+    /// transport-only re-attach against B, retargeting `current_session` (design §10, Q3).
+    /// A `Transfer` whose `new_session` equals the current session is treated as an
+    /// agent-switch (adopt's same-session fresh-rediscover branch), not a reuse — intentional and leak-safe.
+    Transfer { new_session: SessionId },
     /// Host response to a typed permission request emitted on [`TerminalEvent`].
     HostRequestResponse {
         id: HostRequestId,
@@ -505,6 +517,8 @@ pub struct TerminalTab {
     pending_click_frames: VecDeque<(u64, Arc<Frame>)>,
     /// Monotonic source for the Left-down click token.
     next_click_seq: u64,
+    #[cfg(any(test, feature = "test-util"))]
+    host_events_seen: Vec<TerminalHostEvent>,
 }
 
 const PENDING_HOST_REQUESTS_CAP: usize = 64;
@@ -557,6 +571,8 @@ impl TerminalTab {
             mouse_time_base: std::time::Instant::now(),
             pending_click_frames: VecDeque::new(),
             next_click_seq: 0,
+            #[cfg(any(test, feature = "test-util"))]
+            host_events_seen: Vec::new(),
         }
     }
 
@@ -619,6 +635,8 @@ impl TerminalTab {
             mouse_time_base: std::time::Instant::now(),
             pending_click_frames: VecDeque::new(),
             next_click_seq: 0,
+            #[cfg(any(test, feature = "test-util"))]
+            host_events_seen: Vec::new(),
         }
     }
 
@@ -641,12 +659,36 @@ impl TerminalTab {
         self.presentation.clone()
     }
 
+    /// Ordinal retained-bytes estimate for fleet LRV (0 when no engine).
+    pub fn retained_bytes_estimate(&self) -> usize {
+        self.engine_handle()
+            .map(EngineHandle::retained_bytes_estimate)
+            .unwrap_or(0)
+    }
+
+    /// Every [`TerminalHostEvent`] delivered to this tab, in arrival order.
+    /// Test-only observability: sub-slice D asserts fleet-level forwarding
+    /// fidelity, which has no other observable effect on a tab that has not
+    /// yet bound a `terminal_id`.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn host_events_for_test(&self) -> &[TerminalHostEvent] {
+        &self.host_events_seen
+    }
+
     /// The single typed inbound seam.
     pub fn on_host_event(&mut self, event: TerminalHostEvent, cx: &mut Context<Self>) {
+        #[cfg(any(test, feature = "test-util"))]
+        self.host_events_seen.push(event.clone());
         match event {
             TerminalHostEvent::Sleep => self.on_sleep(cx),
             TerminalHostEvent::Wake => self.on_wake(cx),
             TerminalHostEvent::Reattach => self.on_reattach(cx),
+            TerminalHostEvent::End => self.on_host_end(cx),
+            TerminalHostEvent::Transfer { new_session } => {
+                if let Some(tid) = self.current_tid.clone() {
+                    self.adopt(new_session, tid, cx);
+                }
+            }
             TerminalHostEvent::ResourceCreated {
                 session_id,
                 terminal_id,
@@ -1667,6 +1709,28 @@ impl TerminalTab {
         self.input_enabled = false;
     }
 
+    /// Host-driven close (`TerminalHostEvent::End`). Fully releases the runtime
+    /// (engine + transport) and moves to the terminal [`Lifecycle::Ended`] sink so
+    /// a caller-held entity outliving fleet membership cannot keep resources alive.
+    /// Idempotent: safe from any state, including an already-torn-down tab.
+    fn on_host_end(&mut self, cx: &mut Context<Self>) {
+        if self.lifecycle == Lifecycle::Ended {
+            return;
+        }
+        self.reconnect_epoch = self.reconnect_epoch.wrapping_add(1);
+        self.adopt_in_flight = false;
+        self.clear_input_composition_state();
+        self.teardown_runtime_full(cx); // release engine + scrollback + transport
+        self.input_enabled = false;
+        self.presentation.output_gap = false;
+        self.presentation.reattach_available = false;
+        self.presentation.detached_detail = None;
+        self.lifecycle = Lifecycle::Ended;
+        self.presentation.lifecycle = Lifecycle::Ended;
+        cx.emit(TerminalEvent::PresentationChanged);
+        cx.notify();
+    }
+
     fn on_detach(&mut self, detail: DetachedDetail, cx: &mut Context<Self>) {
         self.reconnect_epoch = self.reconnect_epoch.wrapping_add(1);
         self.adopt_in_flight = false;
@@ -1888,7 +1952,7 @@ impl TerminalTab {
             Some(generation::GenerationVerdict::AdoptSuccessor {
                 session_id,
                 terminal_id,
-            }) => self.adopt_successor(session_id, terminal_id, cx),
+            }) => self.adopt(session_id, terminal_id, cx),
             Some(generation::GenerationVerdict::Detach(detail)) => self.on_detach(detail, cx),
             Some(generation::GenerationVerdict::Unchanged) | None => {}
         }
@@ -1897,7 +1961,9 @@ impl TerminalTab {
     fn enter_replacement_waiting(&mut self, cx: &mut Context<Self>) {
         self.reconnect_epoch = self.reconnect_epoch.wrapping_add(1);
         self.clear_input_composition_state();
-        self.teardown_runtime_full(cx);
+        // Transport-only teardown: retain the frozen engine for possible same-session
+        // (fresh re-attach) or cross-session (reconnect-shape reuse) adoption.
+        self.teardown_transport_off_foreground(cx);
         self.input_enabled = false;
         self.presentation.output_gap = false;
         self.lifecycle = Lifecycle::ReplacementWaiting;
@@ -1914,45 +1980,91 @@ impl TerminalTab {
     #[cfg_attr(test, allow(dead_code))]
     const REPLACEMENT_WAIT: Duration = Duration::from_secs(30);
 
-    fn adopt_successor(
-        &mut self,
-        session_id: SessionId,
-        terminal_id: TerminalId,
-        cx: &mut Context<Self>,
-    ) {
+    fn adopt(&mut self, session_id: SessionId, terminal_id: TerminalId, cx: &mut Context<Self>) {
         if self.adopt_in_flight {
             return;
         }
+        let same_session = self.current_session.as_ref() == Some(&session_id);
         self.adopt_in_flight = true;
         // Cancel the replacement timeout; a successor is in hand.
         self.reconnect_epoch = self.reconnect_epoch.wrapping_add(1);
         let epoch = self.reconnect_epoch;
-        let client = Arc::clone(&self.client);
-        let options = self.options.clone();
-        let target = TerminalTarget::Existing {
-            session_id,
-            terminal_id,
-        };
-        cx.spawn(async move |weak, cx| {
-            let outcome = cx
-                .background_executor()
-                .spawn(async move { discover_and_attach(client, target, options) })
-                .await;
-            let _ = weak.update(cx, |tab, cx| {
-                if tab.reconnect_epoch != epoch {
-                    tab.adopt_in_flight = false;
-                    if let Ok(parts) = outcome {
-                        tab.close_parts_off_foreground(parts, cx);
+        let read_only = matches!(self.presentation.access, AccessMode::ReadOnly);
+
+        if same_session {
+            // Agent-switch: the retained engine belongs to the OLD generation; drop it and
+            // discover+attach a FRESH engine against the exact key (today's behavior — no reuse).
+            self.teardown_runtime_full(cx); // explicit drop closes the leak change 3a introduces
+            let client = Arc::clone(&self.client);
+            let options = self.options.clone();
+            let target = TerminalTarget::Existing {
+                session_id,
+                terminal_id,
+            };
+            cx.spawn(async move |weak, cx| {
+                let outcome = cx
+                    .background_executor()
+                    .spawn(async move { discover_and_attach(client, target, options) })
+                    .await;
+                let _ = weak.update(cx, |tab, cx| {
+                    if tab.reconnect_epoch != epoch {
+                        tab.adopt_in_flight = false;
+                        if let Ok(parts) = outcome {
+                            tab.close_parts_off_foreground(parts, cx);
+                        }
+                        return;
                     }
-                    return;
-                }
-                match outcome {
-                    Ok(parts) => tab.on_attached(parts, cx),
-                    Err(detail) => tab.on_detach(detail, cx),
-                }
-            });
-        })
-        .detach();
+                    tab.adopt_in_flight = false;
+                    match outcome {
+                        Ok(parts) => tab.on_attached(parts, cx),
+                        Err(detail) => tab.on_detach(detail, cx),
+                    }
+                });
+            })
+            .detach();
+        } else {
+            // Cross-session transfer: REUSE the retained frozen engine — transport-only
+            // re-attach against the new session (reconnect shape), retargeting current_session.
+            let client = Arc::clone(&self.client);
+            cx.spawn(async move |weak, cx| {
+                let attempt = cx
+                    .background_executor()
+                    .spawn({
+                        let client = Arc::clone(&client);
+                        let session = session_id.clone();
+                        let tid = terminal_id.clone();
+                        async move {
+                            let resource = preflight_reconnect(client.as_ref(), &session, &tid)?;
+                            let attach = attach(
+                                client.as_ref(),
+                                &session,
+                                &tid,
+                                AttachOptions { read_only },
+                            )
+                            .map_err(|_| DetachedDetail::DiscoveryFailed)?;
+                            Ok::<_, DetachedDetail>((resource, attach))
+                        }
+                    })
+                    .await;
+                let _ = weak.update(cx, |tab, cx| {
+                    if tab.reconnect_epoch != epoch {
+                        tab.adopt_in_flight = false;
+                        if let Ok((_r, attach)) = attempt {
+                            tab.close_attach_off_foreground(attach, cx);
+                        }
+                        return;
+                    }
+                    tab.adopt_in_flight = false;
+                    match attempt {
+                        // on_reconnect_success installs transport on the RETAINED engine and
+                        // retargets current_session = resource.session_id (= the new session B).
+                        Ok((resource, attach)) => tab.on_reconnect_success(resource, attach, cx),
+                        Err(detail) => tab.on_detach(detail, cx),
+                    }
+                });
+            })
+            .detach();
+        }
     }
 
     fn arm_replacement_timeout(&mut self, cx: &mut Context<Self>) {
@@ -2007,6 +2119,7 @@ impl TerminalTab {
             }
             return;
         }
+        self.adopt_in_flight = false;
         match outcome {
             Ok(parts) => self.on_attached(parts, cx),
             Err(detail) => self.on_detach(detail, cx),
@@ -2192,10 +2305,17 @@ impl TerminalTab {
                     matches!(detail, DetachedDetail::ClientDetached),
                     "policy reattach_available must match ClientDetached detail"
                 );
-                // on_detach derives reattach_available from the detail (ClientDetached⇔true),
-                // which matches policy.rs (only TerminalDetached sets it), and now bumps the epoch
-                // + clears adopt_in_flight so an in-flight adopt/wake/reconnect cannot resurrect.
-                self.on_detach(detail, cx);
+                // 4404-first (Slice 5-A): a TerminalGone on a discover-or-create target may
+                // have an exact-key successor coming — wait for it (retaining the frozen
+                // engine, Task 3) instead of hard-detaching. Existing targets never adopt a
+                // different resource, so they stay a hard detach.
+                if matches!(detail, DetachedDetail::TerminalGone)
+                    && matches!(self.target, TerminalTarget::OpenOrCreate { .. })
+                {
+                    self.enter_replacement_waiting(cx);
+                } else {
+                    self.on_detach(detail, cx);
+                }
             }
             PolicyAction::DowngradeReadOnly => {
                 let was_write = matches!(self.presentation.access, AccessMode::Write);
@@ -2628,15 +2748,29 @@ pub fn open(
 ) -> Entity<TerminalTab> {
     let entity = cx
         .new(|cx| TerminalTab::starting(target.clone(), Arc::clone(&client), options.clone(), cx));
+    let epoch = entity.read(cx).reconnect_epoch;
     let weak = entity.downgrade();
     cx.spawn(async move |cx| {
         let outcome = cx
             .background_executor()
             .spawn(async move { discover_and_attach(client, target, options) })
             .await;
-        let _ = weak.update(cx, |tab, cx| match outcome {
-            Ok(parts) => tab.on_attached(parts, cx),
-            Err(detail) => tab.on_detach(detail, cx),
+        let _ = weak.update(cx, |tab, cx| {
+            // Re-check at APPLY time, like the wake/reconnect/adopt/replacement
+            // spawns: a `TerminalHostEvent::End` (or any transition) while the initial
+            // attach was in flight bumps `reconnect_epoch` and leaves the tab no longer
+            // `Starting`. Applying then would resurrect an Ended tab with a live
+            // engine/transport outside fleet accounting (codex/Opus review finding 3).
+            if tab.reconnect_epoch != epoch || tab.lifecycle != Lifecycle::Starting {
+                if let Ok(parts) = outcome {
+                    tab.close_parts_off_foreground(parts, cx);
+                }
+                return;
+            }
+            match outcome {
+                Ok(parts) => tab.on_attached(parts, cx),
+                Err(detail) => tab.on_detach(detail, cx),
+            }
         });
     })
     .detach();
@@ -2808,6 +2942,37 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn host_event_recorder_records_in_order(cx: &mut gpui::TestAppContext) {
+        let engine = std::sync::Arc::new(EngineHandle::spawn(test_cfg()).expect("engine"));
+        let tab = cx.update(|cx| TerminalTab::open_with_engine_for_test(engine, cx));
+        cx.update(|cx| {
+            tab.update(cx, |tab, cx| {
+                tab.on_host_event(
+                    TerminalHostEvent::ResourceDeleted {
+                        terminal_id: TerminalId::new("term_1"),
+                    },
+                    cx,
+                );
+                tab.on_host_event(TerminalHostEvent::Sleep, cx);
+            });
+        });
+        cx.update(|cx| {
+            let recorded = tab.read(cx).host_events_for_test().to_vec();
+            assert_eq!(recorded.len(), 2, "both host events recorded");
+            assert!(
+                matches!(recorded[0], TerminalHostEvent::ResourceDeleted { .. }),
+                "first recorded event is ResourceDeleted, got {:?}",
+                recorded[0]
+            );
+            assert!(
+                matches!(recorded[1], TerminalHostEvent::Sleep),
+                "second recorded event is Sleep, got {:?}",
+                recorded[1]
+            );
+        });
+    }
+
+    #[gpui::test]
     fn sleep_releases_engine_and_freezes(cx: &mut gpui::TestAppContext) {
         let (engine, tab) = live_tab_for_test(cx, true, "t1", "main", "k");
         let weak_engine = Arc::downgrade(&engine);
@@ -2897,6 +3062,46 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn openorcreate_4404_while_live_enters_replacement_waiting(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (_engine, tab) = live_tab_for_test(cx, true, "t1", "main", "k");
+        tab.update(cx, |tab, cx| {
+            assert_eq!(tab.lifecycle, Lifecycle::Live);
+            tab.apply_bridge_event(
+                BridgeEvent::Closed(lens_client::CloseCause::TerminalNotFound),
+                cx,
+            );
+            assert_eq!(
+                tab.lifecycle,
+                Lifecycle::ReplacementWaiting,
+                "OpenOrCreate 4404 must wait for a successor, not hard-detach"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn existing_4404_while_live_hard_detaches(cx: &mut gpui::TestAppContext) {
+        let (_engine, tab) = live_tab_for_test(cx, false, "t1", "main", "k"); // Existing target
+        tab.update(cx, |tab, cx| {
+            assert_eq!(tab.lifecycle, Lifecycle::Live);
+            tab.apply_bridge_event(
+                BridgeEvent::Closed(lens_client::CloseCause::TerminalNotFound),
+                cx,
+            );
+            assert_eq!(
+                tab.lifecycle,
+                Lifecycle::Detached,
+                "Existing 4404 has no successor semantics — stays hard-detach"
+            );
+            assert_eq!(
+                tab.presentation.detached_detail,
+                Some(DetachedDetail::TerminalGone)
+            );
+        });
+    }
+
+    #[gpui::test]
     fn late_bridge_close_does_not_wake_sleeping(cx: &mut gpui::TestAppContext) {
         use lens_client::CloseCause;
 
@@ -2942,6 +3147,54 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn end_during_initial_attach_does_not_resurrect(cx: &mut gpui::TestAppContext) {
+        let target = TerminalTarget::OpenOrCreate {
+            session_id: SessionId::new("s1"),
+            key: TerminalKey {
+                terminal_name: "main".into(),
+                session_key: "k1".into(),
+            },
+        };
+        let tab = cx.update(|cx| {
+            open(
+                target,
+                Arc::new(Client::stub_for_test()),
+                TerminalOpenOptions::default(),
+                cx,
+            )
+        });
+        assert_eq!(
+            tab.read_with(cx, |t, _| t.lifecycle),
+            Lifecycle::Starting,
+            "open returns Starting with discover_and_attach in flight"
+        );
+
+        // Host closes the tab while the initial attach is still in flight.
+        tab.update(cx, |tab, cx| {
+            tab.on_host_event(TerminalHostEvent::End, cx);
+        });
+        assert_eq!(tab.read_with(cx, |t, _| t.lifecycle), Lifecycle::Ended);
+
+        // Drive the in-flight initial attach to completion. It must NOT resurrect
+        // the Ended tab (reinstalling a live engine/transport outside fleet
+        // accounting) — the exact leak finding 3 targets. The other attach spawns
+        // (wake/reconnect/adopt/replacement) already re-check the epoch at apply;
+        // the initial `open` spawn must too.
+        cx.run_until_parked();
+        assert_eq!(
+            tab.read_with(cx, |t, _| t.lifecycle),
+            Lifecycle::Ended,
+            "a late initial attach must not resurrect an Ended tab"
+        );
+        tab.read_with(cx, |t, _| {
+            assert!(
+                t.runtime.is_none(),
+                "Ended tab must not hold a runtime after a late attach resolves"
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn open_or_create_delete_enters_replacement_waiting(cx: &mut gpui::TestAppContext) {
         let (engine, tab) = live_tab_for_test(cx, true, "t1", "main", "k");
         tab.update(cx, |tab, cx| {
@@ -2953,11 +3206,177 @@ mod tests {
             );
             assert_eq!(tab.lifecycle, Lifecycle::ReplacementWaiting);
             assert!(
-                tab.runtime.is_none(),
-                "dead engine must be released on reset"
+                tab.runtime.is_some(),
+                "reset must RETAIN the frozen engine (transport-only teardown) for possible reuse"
+            );
+            assert!(
+                tab.runtime.as_ref().and_then(|r| r.engine_ref()).is_some(),
+                "frozen engine must survive enter_replacement_waiting"
             );
         });
         let _ = engine;
+    }
+
+    #[gpui::test]
+    async fn transfer_reuses_retained_engine_and_retargets_session(cx: &mut gpui::TestAppContext) {
+        let (_engine, tab) = live_tab_for_test(cx, true, "t1", "main", "k");
+        // Reset -> ReplacementWaiting retains the frozen engine (Task 3).
+        tab.update(cx, |tab, cx| {
+            tab.on_host_event(
+                TerminalHostEvent::ResourceDeleted {
+                    terminal_id: TerminalId::new("t1"),
+                },
+                cx,
+            );
+            assert!(tab.runtime.is_some(), "engine retained pending transfer");
+        });
+        let engine_ptr_before = tab.read_with(cx, |tab, _| {
+            tab.runtime
+                .as_ref()
+                .and_then(|r| r.engine_ref())
+                .map(|e| e as *const _ as usize)
+        });
+        // Host drives a cross-session transfer to session B, then assert the reuse branch
+        // was taken SYNCHRONOUSLY (engine NOT dropped/rebuilt) — BEFORE the offline attach resolves.
+        tab.update(cx, |tab, cx| {
+            tab.on_host_event(
+                TerminalHostEvent::Transfer {
+                    new_session: SessionId::new("session_B"),
+                },
+                cx,
+            );
+            let engine_ptr_sync = tab
+                .runtime
+                .as_ref()
+                .and_then(|r| r.engine_ref())
+                .map(|e| e as *const _ as usize);
+            assert!(
+                tab.runtime.is_some(),
+                "Transfer must take the REUSE branch: retained engine kept, NOT dropped (contrast same-session adopt which drops synchronously)"
+            );
+            assert_eq!(
+                engine_ptr_before, engine_ptr_sync,
+                "Transfer must REUSE the exact retained engine instance, not build a fresh one"
+            );
+        });
+        // After park the OFFLINE attach against session_B cannot succeed (no AttachHandle builder
+        // offline) -> honest reachable end-state.
+        cx.run_until_parked();
+        tab.read_with(cx, |tab, _| {
+            assert_eq!(tab.lifecycle, Lifecycle::Detached);
+            assert_eq!(
+                tab.presentation.detached_detail,
+                Some(DetachedDetail::DiscoveryFailed)
+            );
+            assert!(
+                tab.runtime.is_none(),
+                "offline attach against session_B fails -> on_detach(DiscoveryFailed) tears down engine"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn same_session_adopt_drops_retained_engine_and_reattaches_fresh(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (_engine, tab) = live_tab_for_test(cx, true, "t1", "main", "k");
+        // Reset -> ReplacementWaiting retains the frozen engine.
+        tab.update(cx, |tab, cx| {
+            tab.on_host_event(
+                TerminalHostEvent::ResourceDeleted {
+                    terminal_id: TerminalId::new("t1"),
+                },
+                cx,
+            );
+            assert_eq!(tab.lifecycle, Lifecycle::ReplacementWaiting);
+            assert!(
+                tab.runtime.is_some(),
+                "engine retained in ReplacementWaiting"
+            );
+        });
+        // Same-session successor (agent-switch) -> adopt() takes the FRESH branch.
+        tab.update(cx, |tab, cx| {
+            let same = tab.current_session.clone().unwrap();
+            tab.adopt(same, TerminalId::new("t1"), cx);
+            assert!(
+                tab.runtime.is_none(),
+                "same-session adopt must synchronously DROP the retained engine (fresh path), not reuse it"
+            );
+        });
+        cx.run_until_parked();
+        tab.read_with(cx, |tab, _| {
+            assert!(
+                !tab.adopt_in_flight,
+                "adopt must resolve (fresh path) — not leave adopt_in_flight set"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn replacement_timeout_drops_retained_engine_no_leak(cx: &mut gpui::TestAppContext) {
+        let (_engine, tab) = live_tab_for_test(cx, true, "t1", "main", "k");
+        tab.update(cx, |tab, cx| {
+            tab.on_host_event(
+                TerminalHostEvent::ResourceDeleted {
+                    terminal_id: TerminalId::new("t1"),
+                },
+                cx,
+            );
+            assert!(tab.runtime.is_some(), "engine retained pending successor");
+            tab.fire_replacement_timeout_now(cx); // deterministic timeout
+        });
+        cx.run_until_parked();
+        tab.read_with(cx, |tab, _| {
+            assert_eq!(tab.lifecycle, Lifecycle::Detached);
+            assert_eq!(
+                tab.presentation.detached_detail,
+                Some(DetachedDetail::ReplacementTimedOut)
+            );
+            assert!(
+                tab.runtime.is_none(),
+                "timeout must fully tear down the retained engine (no leak)"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn fourohfour_first_then_delete_create_adopts(cx: &mut gpui::TestAppContext) {
+        use lens_client::CloseCause;
+
+        let (_engine, tab) = live_tab_for_test(cx, true, "t1", "main", "k");
+        tab.update(cx, |tab, cx| {
+            tab.apply_bridge_event(BridgeEvent::Closed(CloseCause::TerminalNotFound), cx);
+            assert_eq!(tab.lifecycle, Lifecycle::ReplacementWaiting);
+        });
+        tab.update(cx, |tab, cx| {
+            tab.on_host_event(
+                TerminalHostEvent::ResourceDeleted {
+                    terminal_id: TerminalId::new("t1"),
+                },
+                cx,
+            );
+            tab.on_host_event(
+                TerminalHostEvent::ResourceCreated {
+                    session_id: SessionId::new("test_sess"),
+                    terminal_id: TerminalId::new("t1"),
+                    terminal_name: "main".into(),
+                    session_key: "k".into(),
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        tab.read_with(cx, |tab, _| {
+            assert!(
+                !tab.adopt_in_flight,
+                "4404-first delete+create must drive adopt() to completion"
+            );
+            assert_eq!(
+                tab.lifecycle,
+                Lifecycle::Detached,
+                "4404-first entry must drive through delete+create -> adopt -> (offline stub) Detached, not strand in ReplacementWaiting"
+            );
+        });
     }
 
     fn attached_parts_for_test(
@@ -3061,7 +3480,10 @@ mod tests {
             assert_ne!(tab.lifecycle, Lifecycle::Live);
             assert_eq!(tab.lifecycle, Lifecycle::ReplacementWaiting);
             assert!(!tab.adopt_in_flight);
-            assert!(tab.runtime.is_none());
+            assert!(
+                tab.runtime.is_some(),
+                "stale adopt must not drop the retained frozen engine"
+            );
         });
     }
 
@@ -3139,13 +3561,23 @@ mod tests {
                 cx,
             );
             assert_eq!(tab.lifecycle, Lifecycle::ReplacementWaiting);
-            assert!(tab.runtime.is_none());
+            assert!(
+                tab.runtime.is_some(),
+                "ReplacementWaiting retains the frozen engine"
+            );
+            assert!(
+                tab.runtime.as_ref().and_then(|r| r.engine_ref()).is_some(),
+                "frozen engine must survive enter_replacement_waiting"
+            );
             assert_ne!(tab.reconnect_epoch, stale_epoch);
         });
         tab.update(cx, |tab, cx| {
             tab.on_reconnect_exit_fatal(stale_epoch, DetachedDetail::TerminalGone, cx);
             assert_eq!(tab.lifecycle, Lifecycle::ReplacementWaiting);
-            assert!(tab.runtime.is_none());
+            assert!(
+                tab.runtime.is_some(),
+                "stale reconnect exit must not drop the retained engine"
+            );
         });
     }
 
@@ -3161,13 +3593,23 @@ mod tests {
                 cx,
             );
             assert_eq!(tab.lifecycle, Lifecycle::ReplacementWaiting);
-            assert!(tab.runtime.is_none());
+            assert!(
+                tab.runtime.is_some(),
+                "ReplacementWaiting retains the frozen engine"
+            );
+            assert!(
+                tab.runtime.as_ref().and_then(|r| r.engine_ref()).is_some(),
+                "frozen engine must survive enter_replacement_waiting"
+            );
             assert_ne!(tab.reconnect_epoch, stale_epoch);
         });
         tab.update(cx, |tab, cx| {
             tab.on_reconnect_exit_exhausted(stale_epoch, cx);
             assert_eq!(tab.lifecycle, Lifecycle::ReplacementWaiting);
-            assert!(tab.runtime.is_none());
+            assert!(
+                tab.runtime.is_some(),
+                "stale reconnect exit must not drop the retained engine"
+            );
         });
     }
 
@@ -3519,10 +3961,26 @@ mod tests {
     }
 
     #[test]
+    fn scrollback_bytes_default_is_ten_million_not_seven_rows() {
+        // With no override, the engine byte budget must be a real default, not 1000 bytes.
+        let opts = TerminalOpenOptions::default();
+        assert_eq!(opts.scrollback_bytes, None);
+        let cfg = super::policy::engine_config_for_test(&opts);
+        assert_eq!(cfg.max_scrollback, 10_000_000);
+    }
+
+    #[test]
+    fn with_scrollback_bytes_overrides_the_default() {
+        let opts = TerminalOpenOptions::default().with_scrollback_bytes(Some(2_048));
+        let cfg = super::policy::engine_config_for_test(&opts);
+        assert_eq!(cfg.max_scrollback, 2_048);
+    }
+
+    #[test]
     fn open_options_default_is_automatic_engine_scrollback() {
         let o = TerminalOpenOptions::default();
         assert_eq!(o.access, AccessIntent::Automatic);
-        assert_eq!(o.scrollback_lines, None);
+        assert_eq!(o.scrollback_bytes, None);
     }
 
     #[test]

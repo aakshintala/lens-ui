@@ -248,6 +248,10 @@ impl SessionCard {
             | StreamUpdate::PresenceChanged(_)
             | StreamUpdate::CollaborationModeChanged(_)
             | StreamUpdate::ModelOptionsChanged(_)
+            // Terminal-5 control-path updates: routed via ActorOutcome, no card-view delta.
+            | StreamUpdate::Superseded { .. }
+            | StreamUpdate::TerminalResourceCreated { .. }
+            | StreamUpdate::TerminalResourceDeleted { .. }
             | StreamUpdate::Retired { .. } => {}
             // Liveness delta is consumed by the T-2 transcript replica, not the summary card.
             StreamUpdate::ActiveResponseChanged(_) => {}
