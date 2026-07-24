@@ -379,9 +379,11 @@ _(prior curation, now on `main` — **▶▶▶ TERMINAL SLICE 5 (A+B+C+D) MERGE
       draggable; (4) into-group insertion opens a real gap (member shift + downward-only grow);
       (5) flicker = reflow feedback loop via the COORDINATE TRANSFORM — froze the block centering on the
       committed layout during a drag, not just the resolver (§4.1). Accepted tradeoff: `INTO_GROUP_INSET`
-      = 24px makes end-of-group drops need precise aim (one-const tune). **NEXT: merge to `main`** (main
-      advanced 68 commits — T-3 + terminal slice-5 — reconcile is Cargo.toml only). Memory
-      [[board-b4c-drag-spike]].
+      = 24px makes end-of-group drops need precise aim (one-const tune). **MERGED to `main` `92d5001`
+      2026-07-23** (clean ff after `main`→branch reconcile — Cargo.toml auto-merged, toolchain bumped
+      to 1.95.0 with main; full `xtask gate` GREEN on the merged tree under 1.95; UNPUSHED). Memory
+      [[board-b4c-drag-spike]]. **NEXT: B-4d** (context-menu grouping, gated on the §8 non-idempotent
+      seam) or the deferred foreground-handshake terminal task.
     - **B-4d — context-menu grouping.** Still **gated** on the non-idempotent-retry commit-phase seam
       (design §8) that B-4a deferred — drag-to-*group* is B-4d, not B-4c. Adds `write()` op variants via
       B-4a's `run_op` seam.
