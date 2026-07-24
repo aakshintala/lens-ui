@@ -28,9 +28,12 @@ pub(crate) fn accumulate_reasoning(
     kind: ReasoningKind,
     delta: &str,
     new_acc_id: Option<AccId>,
+    clock: &dyn crate::clock::Clock,
 ) -> Updates {
+    let now = clock.now_millis();
     let acc = scratch.open_reasoning.get_or_insert_with(|| ReasoningAcc {
         acc_id: new_acc_id.expect("pre-minted acc_id required when opening reasoning acc"),
+        started_at_ms: Some(now),
         ..Default::default()
     });
     match kind {

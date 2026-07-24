@@ -65,10 +65,18 @@ pub enum SessionEvent {
         sequence_number: Option<i64>,
         server_time: Option<String>,
     },
-    ResourceCreated,
+    ResourceCreated {
+        resource_id: String,
+        resource_type: String,
+        /// Present only when `resource_type == "terminal"` (from resource metadata).
+        terminal_name: Option<String>,
+        /// Present only when `resource_type == "terminal"` (from resource metadata).
+        session_key: Option<String>,
+    },
     ResourceDeleted {
         resource_id: String,
         resource_type: String,
+        session_id: String,
     },
     InputConsumed {
         item_id: String,
@@ -328,11 +336,29 @@ struct RawHeartbeat {
     server_time: Option<String>,
 }
 #[derive(Deserialize)]
+struct RawResourceCreated {
+    resource: RawResourceObject,
+}
+#[derive(Deserialize)]
+struct RawResourceObject {
+    id: String,
+    #[serde(rename = "type")]
+    resource_type: String,
+    #[serde(default)]
+    metadata: Option<RawResourceMetadata>,
+}
+#[derive(Deserialize)]
+struct RawResourceMetadata {
+    #[serde(default)]
+    terminal_name: Option<String>,
+    #[serde(default)]
+    session_key: Option<String>,
+}
+#[derive(Deserialize)]
 struct RawResourceDeleted {
     resource_id: String,
     resource_type: String,
-    #[serde(rename = "session_id")]
-    _session_id: String,
+    session_id: String,
 }
 #[derive(Deserialize)]
 struct RawChangedFiles {
@@ -823,12 +849,30 @@ impl SessionEvent {
                     server_time: r.server_time,
                 }
             }
-            "session.resource.created" => SessionEvent::ResourceCreated,
+            "session.resource.created" => {
+                let r: RawResourceCreated = serde_json::from_str(d).ok()?;
+                let (terminal_name, session_key) = if r.resource.resource_type == "terminal" {
+                    let meta = r.resource.metadata.as_ref();
+                    (
+                        meta.and_then(|m| m.terminal_name.clone()),
+                        meta.and_then(|m| m.session_key.clone()),
+                    )
+                } else {
+                    (None, None)
+                };
+                SessionEvent::ResourceCreated {
+                    resource_id: r.resource.id,
+                    resource_type: r.resource.resource_type,
+                    terminal_name,
+                    session_key,
+                }
+            }
             "session.resource.deleted" => {
                 let r: RawResourceDeleted = serde_json::from_str(d).ok()?;
                 SessionEvent::ResourceDeleted {
                     resource_id: r.resource_id,
                     resource_type: r.resource_type,
+                    session_id: r.session_id,
                 }
             }
             "session.input.consumed" => {
@@ -2200,6 +2244,41 @@ mod tests {
     }
 
     #[test]
+    fn bytes_session_resource_created_terminal() {
+        // Byte-verified: docs/spikes/captures/2026-07-21-t0-verify/turn2.stream.sse
+        let ev = parse_event(&frame(
+            "session.resource.created",
+            r#"{"sequence_number": null, "type": "session.resource.created", "resource": {"id": "terminal_tui_main", "object": "session.resource", "type": "terminal", "session_id": "conv_599b6d156fd44a8886c200d9d55c7758", "name": "tui:main", "metadata": {"terminal_name": "tui", "session_key": "main", "running": true, "tmux_socket": "/var/folders/dq/_c83wftd34g281_1002c_gl00000gn/T/omnigent-terminal-dozedgdx/tmux.sock", "tmux_target": "main", "terminal_transport": "control"}, "environment": "env_terminal_tui_main"}}"#,
+        ));
+        assert_eq!(
+            ev,
+            ServerStreamEvent::Session(SessionEvent::ResourceCreated {
+                resource_id: "terminal_tui_main".into(),
+                resource_type: "terminal".into(),
+                terminal_name: Some("tui".into()),
+                session_key: Some("main".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn bytes_session_resource_created_non_terminal_omits_terminal_fields() {
+        let ev = parse_event(&frame(
+            "session.resource.created",
+            r#"{"type": "session.resource.created", "resource": {"id": "file_abc", "object": "session.resource", "type": "file", "session_id": "conv_1", "name": "upload.txt", "metadata": {}}}"#,
+        ));
+        assert_eq!(
+            ev,
+            ServerStreamEvent::Session(SessionEvent::ResourceCreated {
+                resource_id: "file_abc".into(),
+                resource_type: "file".into(),
+                terminal_name: None,
+                session_key: None,
+            })
+        );
+    }
+
+    #[test]
     fn bytes_session_resource_deleted() {
         // Byte-verified: docs/spikes/captures/2026-06-26-live-recapture/agent-switched.sse
         let ev = parse_event(&frame(
@@ -2211,6 +2290,7 @@ mod tests {
             ServerStreamEvent::Session(SessionEvent::ResourceDeleted {
                 resource_id: "terminal_tui_main".into(),
                 resource_type: "terminal".into(),
+                session_id: "conv_2a9".into(),
             })
         );
     }

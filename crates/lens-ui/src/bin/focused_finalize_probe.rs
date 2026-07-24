@@ -1,4 +1,5 @@
-//! Real-window staged-finalize probe — must run on the main thread (`cargo run -p lens-ui --bin focused_finalize_probe`).
+//! Real-window staged-finalize probe — must run on the main thread
+//! (`cargo run -p lens-ui --features probe --bin focused_finalize_probe`).
 //! `Application::new().run()`; not invokable from `#[gpui::test]` worker threads.
 
 use std::cell::RefCell;
@@ -17,7 +18,19 @@ use lens_core::domain::scalars::Role;
 use lens_core::persist::{RangeRead, ReadRange};
 use lens_core::reduce::{RetireDisposition, StreamUpdate};
 use lens_ui::fleet::store::ReconcileEpoch;
-use lens_ui::focused::{FocusedTranscript, ReaderWorkerHandle, RowId};
+use lens_ui::focused::{FocusedTranscript, ReaderWorkerHandle, RowContent, RowId, RowKind};
+use lens_ui::md::{
+    MarkdownView, init as md_init, markdown_probe_arm_selection, markdown_probe_selection_is_some,
+    markdown_state_entity_id,
+};
+
+/// Short initial stream chunk; a later delta appends [`STREAM_GROWTH`] so rendered height grows.
+const STREAM_START: &str = "Start";
+const STREAM_GROWTH: &str = "\n\n- alpha\n- beta\n- gamma\n\nA taller paragraph that forces additional layout height in MarkdownView.";
+
+fn stream_full_text() -> String {
+    format!("{STREAM_START}{STREAM_GROWTH}")
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct AnchorSnapshot {
@@ -39,6 +52,12 @@ struct ProbeState {
     samples: usize,
     failures: Vec<String>,
     target_entity: Option<EntityId>,
+    target_markdown_entity: Option<EntityId>,
+    markdown_selection_armed: bool,
+    armed_element_id: Option<String>,
+    armed_source_len: usize,
+    max_source_len: usize,
+    markdown_source_grew: bool,
     min_row_count: usize,
 }
 
@@ -148,7 +167,7 @@ async fn drive_legacy_finalize_probe(
                     open_message: Some(lens_core::domain::item::MessageAcc {
                         acc_id: acc_id.clone(),
                         message_id: None,
-                        text: "streaming text".into(),
+                        text: STREAM_START.into(),
                         block_index: 0,
                     }),
                     ..Default::default()
@@ -161,6 +180,31 @@ async fn drive_legacy_finalize_probe(
         cx.notify();
     });
     wait_frames(wcx, 3).await;
+
+    let _ = weak.update_in(wcx, |view, _, cx| {
+        view.replica.update(cx, |r, cx| {
+            r.fold_detailed(
+                StreamUpdate::ScratchChanged(std::sync::Arc::new(StreamScratch {
+                    open_message: Some(lens_core::domain::item::MessageAcc {
+                        acc_id: acc_id.clone(),
+                        message_id: None,
+                        text: stream_full_text(),
+                        block_index: 0,
+                    }),
+                    ..Default::default()
+                })),
+                cx,
+            );
+        });
+        let count = view.replica.read(cx).rows().len();
+        view.list_state
+            .splice(0..view.list_state.item_count(), count);
+        cx.notify();
+    });
+    // Wait past the 100ms markdown reparse throttle so the taller parsed_result actually
+    // applies and drives a real update_bounds height change (P2 carve-out is only exercised
+    // by a REAL rendered-height change, not the source string growing).
+    wait_frames(wcx, 12).await;
 
     let _ = weak.update_in(wcx, |view, _, cx| {
         view.replica.update(cx, |r, cx| {
@@ -235,7 +279,7 @@ async fn drive_canonical_finalize_probe(
                     open_message: Some(lens_core::domain::item::MessageAcc {
                         acc_id: acc_id.clone(),
                         message_id: None,
-                        text: "streaming text".into(),
+                        text: STREAM_START.into(),
                         block_index: 0,
                     }),
                     ..Default::default()
@@ -247,6 +291,27 @@ async fn drive_canonical_finalize_probe(
         cx.notify();
     });
     wait_frames(wcx, 3).await;
+
+    let _ = weak.update_in(wcx, |view, _, cx| {
+        view.replica.update(cx, |r, cx| {
+            r.fold_detailed(
+                StreamUpdate::ScratchChanged(std::sync::Arc::new(StreamScratch {
+                    open_message: Some(lens_core::domain::item::MessageAcc {
+                        acc_id: acc_id.clone(),
+                        message_id: None,
+                        text: stream_full_text(),
+                        block_index: 0,
+                    }),
+                    ..Default::default()
+                })),
+                cx,
+            );
+        });
+        cx.notify();
+    });
+    // Wait past the 100ms markdown reparse throttle so the taller parsed_result applies and
+    // drives a real update_bounds height change (see legacy-phase note).
+    wait_frames(wcx, 12).await;
 
     let _ = weak.update_in(wcx, |view, _, cx| {
         view.replica.update(cx, |r, cx| {
@@ -367,6 +432,8 @@ async fn drive_finalize_probe(
             p.failures.is_empty()
                 && p.samples >= 4
                 && p.target_entity.is_some()
+                && p.target_markdown_entity.is_some()
+                && p.markdown_source_grew
                 && p.min_row_count > 0
         })
         .unwrap_or(false);
@@ -381,6 +448,8 @@ async fn drive_finalize_probe(
         process::exit(1);
     }
     eprintln!("FINALIZE PROBE (legacy): staged finalize flash-free (real paint)");
+    eprintln!("D11 MARKDOWN IDENTITY (legacy): PASS");
+    eprintln!("P2 SELECTION CARVE-OUT (legacy): PASS");
 
     // Phase 2: canonical end-of-turn ordering on a fresh replica, replica-synced list.
     let acc_canon = AccId::new("acc_canon");
@@ -404,6 +473,8 @@ async fn drive_finalize_probe(
             p.failures.is_empty()
                 && p.samples >= 4
                 && p.target_entity.is_some()
+                && p.target_markdown_entity.is_some()
+                && p.markdown_source_grew
                 && p.min_row_count > 0
         })
         .unwrap_or(false);
@@ -416,6 +487,8 @@ async fn drive_finalize_probe(
         });
     } else {
         eprintln!("FINALIZE PROBE (canonical): end-of-turn active-none-before-disk renders");
+        eprintln!("D11 MARKDOWN IDENTITY (canonical): PASS");
+        eprintln!("P2 SELECTION CARVE-OUT (canonical): PASS");
     }
     *exit_ok.borrow_mut() = ok;
     process::exit(if ok { 0 } else { 1 });
@@ -452,13 +525,16 @@ impl Render for HarnessView {
         };
 
         let entity_id = self.replica.read(cx).rows().entity_id_at(row_ix, cx);
-        let text = self
+        let pres = self
             .replica
             .read(cx)
             .rows()
             .id_at(row_ix)
             .and_then(|id| self.replica.read(cx).rows().entity(id))
-            .map(|e| e.read(cx).presentation.text.clone())
+            .map(|e| e.read(cx).presentation.clone());
+        let text = pres
+            .as_ref()
+            .map(|p| p.content.stub_text().to_owned())
             .unwrap_or_default();
         let list_state = match self.list_binding {
             ListBinding::HarnessManual => self.list_state.clone(),
@@ -493,15 +569,74 @@ impl Render for HarnessView {
                     anchor.top_item_index, anchor.sub_offset
                 ));
             }
-            if !text.is_empty() && text != "streaming text" && text != "hi" {
+            if !text.is_empty() && text != "hi" && !text.starts_with(STREAM_START) {
                 p.failures.push(format!("unexpected content: {text:?}"));
+            }
+            if let Some(pres) = pres.as_ref()
+                && matches!(pres.kind, RowKind::Message | RowKind::StreamingMessage)
+                && let RowContent::AssistantMarkdown {
+                    source,
+                    content_key,
+                } = &pres.content
+            {
+                let _ = MarkdownView::new(content_key.as_element_id(), source.clone(), window, cx)
+                    .scrollable(false)
+                    .selectable(true);
+                if let Some(md_eid) =
+                    markdown_state_entity_id(content_key.as_element_id().as_str(), window, cx)
+                {
+                    if let Some(target) = p.target_markdown_entity {
+                        if md_eid != target {
+                            p.failures.push(format!(
+                                "markdown entity id changed {target:?} -> {md_eid:?}"
+                            ));
+                        }
+                        // Arm selection only AFTER the target's initial 0x0->real layout has
+                        // settled on a prior frame's paint. Arming on the first sighting (bounds
+                        // still 0x0) would let the first real layout count as a size change and
+                        // clear the pre-layout selection — a probe artifact, not a P2 failure.
+                        if !p.markdown_selection_armed {
+                            markdown_probe_arm_selection(
+                                content_key.as_element_id().as_str(),
+                                window,
+                                cx,
+                            );
+                            p.markdown_selection_armed = true;
+                            p.armed_element_id =
+                                Some(content_key.as_element_id().as_str().to_string());
+                            p.armed_source_len = source.len();
+                            p.max_source_len = source.len();
+                        }
+                    } else {
+                        p.target_markdown_entity = Some(md_eid);
+                        p.max_source_len = source.len();
+                    }
+                    if p.markdown_selection_armed {
+                        p.max_source_len = p.max_source_len.max(source.len());
+                        if source.len() > p.armed_source_len.saturating_add(10) {
+                            p.markdown_source_grew = true;
+                        }
+                    }
+                }
+            }
+            if self.finalized && p.samples >= 4 && p.markdown_selection_armed {
+                if !p.markdown_source_grew {
+                    p.failures
+                        .push("markdown stream source never grew in height".into());
+                }
+                if let Some(ref id) = p.armed_element_id
+                    && !markdown_probe_selection_is_some(id, window, cx)
+                {
+                    p.failures
+                        .push("markdown selection lost across streamed height growth".into());
+                }
             }
             p.samples += 1;
         }
 
         let replica = self.replica.clone();
         div().size_full().child(
-            list(list_state, move |ix, _window, cx| {
+            list(list_state, move |ix, window, cx| {
                 let replica = replica.clone();
                 let Some(id) = replica.read(cx).rows().id_at(ix) else {
                     return div().into_any_element();
@@ -509,7 +644,25 @@ impl Render for HarnessView {
                 let Some(entity) = replica.read(cx).rows().entity(id) else {
                     return div().into_any_element();
                 };
-                let text = entity.read(cx).presentation.text.clone();
+                let pres = entity.read(cx).presentation.clone();
+                if matches!(pres.kind, RowKind::Message | RowKind::StreamingMessage)
+                    && let RowContent::AssistantMarkdown {
+                        source,
+                        content_key,
+                    } = &pres.content
+                {
+                    return MarkdownView::new(
+                        content_key.as_element_id(),
+                        source.clone(),
+                        window,
+                        cx,
+                    )
+                    .scrollable(false)
+                    .selectable(true)
+                    .into_inner()
+                    .into_any_element();
+                }
+                let text = pres.content.stub_text().to_owned();
                 div().id(ix).child(text).into_any_element()
             })
             .size_full(),
@@ -527,6 +680,7 @@ fn main() {
 
     Application::new().run(move |cx: &mut App| {
         gpui_component::init(cx);
+        md_init(cx);
         lens_ui::theme::install_at_startup(cx);
 
         let replica = spawn_replica(cx);

@@ -3455,6 +3455,7 @@ dependencies = [
  "gpui",
  "lens-client",
  "libghostty-vt",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.19",
@@ -3484,10 +3485,16 @@ dependencies = [
  "gpui-component",
  "lens-client",
  "lens-core",
+ "lens-terminal",
+ "markdown",
+ "mdstitch",
+ "ropey",
  "serde",
  "serde_json",
  "smallvec",
+ "smol",
  "tempfile",
+ "tracing",
 ]
 
 [[package]]
@@ -3765,6 +3772,12 @@ dependencies = [
  "cfg-if",
  "digest 0.10.7",
 ]
+
+[[package]]
+name = "mdstitch"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c85a8c4350811e8f4b00621aa211b1eb9b5035591826f885faf0bc1c6f1f7bc"
 
 [[package]]
 name = "memchr"

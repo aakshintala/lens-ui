@@ -1,6 +1,6 @@
 # Pinned for reproducibility — matches the ground-truth/pinning discipline used
 # for the omnigent contract. Bump deliberately, not incidentally.
 [toolchain]
-channel = "1.91.1"
+channel = "1.95.0"
 components = ["rustfmt", "clippy", "rust-analyzer"]
 profile = "minimal"

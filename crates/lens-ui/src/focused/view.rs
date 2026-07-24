@@ -1,10 +1,15 @@
 //! gpui `list()` render surface for the focused transcript (T-2 §7).
 
-use crate::focused::{FocusedTranscript, RowKind, RowPresentation};
+use crate::focused::reasoning::{
+    ReasoningExpand, ReasoningSetExpandFn, ReasoningUiState, render_reasoning,
+};
+use crate::focused::{ContentKey, FocusedTranscript, RowContent, RowKind, RowPresentation};
+use crate::md::MarkdownView;
 use gpui::{
     App, ClickEvent, Context, Entity, FocusHandle, IntoElement, ListOffset, ListScrollEvent,
-    ParentElement, Render, Styled, Window, div, list, prelude::*, px,
+    ParentElement, Render, Styled, WeakEntity, Window, div, list, prelude::*, px,
 };
+use std::collections::HashMap;
 
 /// Auto-follow ↔ paused (§16 contract 1).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -21,6 +26,8 @@ pub struct FocusedTranscriptView {
     rows_at_pause: usize,
     last_row_count: usize,
     focus_handle: FocusHandle,
+    /// Per-reasoning-row expand target (default collapsed when finalized).
+    reasoning_expanded: HashMap<ContentKey, ReasoningExpand>,
 }
 
 impl FocusedTranscriptView {
@@ -42,6 +49,7 @@ impl FocusedTranscriptView {
             rows_at_pause: row_count,
             last_row_count: row_count,
             focus_handle,
+            reasoning_expanded: HashMap::new(),
         }
     }
 
@@ -140,9 +148,75 @@ impl FocusedTranscriptView {
                     .text_color(gpui::rgb(0x888888))
                     .child(kind_tag(pres.kind)),
             )
-            .child(pres.text.clone())
+            .child(pres.content.stub_text().to_owned())
             .when_some(pres.height_hint, |el, h| el.h(px(h)))
             .into_any_element()
+    }
+
+    fn render_row(
+        reasoning_expanded: &HashMap<ContentKey, ReasoningExpand>,
+        pres: &RowPresentation,
+        ix: usize,
+        view_weak: WeakEntity<Self>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> gpui::AnyElement {
+        match &pres.content {
+            RowContent::AssistantMarkdown { .. } => {
+                render_assistant_markdown(&pres.content, window, cx)
+            }
+            RowContent::UserVerbatim { .. } => {
+                crate::focused::user_content::render_user_content(&pres.content, window, cx)
+            }
+            RowContent::Reasoning {
+                live,
+                encrypted,
+                duration_secs,
+                content_key,
+                ..
+            } => {
+                let ui = if *encrypted {
+                    ReasoningUiState::Encrypted {
+                        duration_secs: *duration_secs,
+                    }
+                } else if *live {
+                    ReasoningUiState::Collapsed {
+                        duration_secs: *duration_secs,
+                    }
+                } else {
+                    match reasoning_expanded
+                        .get(content_key)
+                        .copied()
+                        .unwrap_or_default()
+                    {
+                        ReasoningExpand::Collapsed => ReasoningUiState::Collapsed {
+                            duration_secs: *duration_secs,
+                        },
+                        ReasoningExpand::Summary => ReasoningUiState::SummaryExpanded,
+                        ReasoningExpand::Full => ReasoningUiState::FullExpanded,
+                    }
+                };
+                let on_set_expand = if *encrypted || *live {
+                    None
+                } else {
+                    let content_key = content_key.clone();
+                    Some(Box::new(move |target: ReasoningExpand, cx: &mut App| {
+                        view_weak
+                            .update(cx, |view, cx| {
+                                if target == ReasoningExpand::Collapsed {
+                                    view.reasoning_expanded.remove(&content_key);
+                                } else {
+                                    view.reasoning_expanded.insert(content_key.clone(), target);
+                                }
+                                cx.notify();
+                            })
+                            .ok();
+                    }) as ReasoningSetExpandFn)
+                };
+                render_reasoning(&pres.content, ui, on_set_expand, window, cx)
+            }
+            RowContent::Stub { .. } => Self::render_stub_row(pres, ix),
+        }
     }
 
     #[doc(hidden)]
@@ -164,6 +238,25 @@ impl FocusedTranscriptView {
     pub fn jump_to_latest_for_test(&mut self, cx: &mut Context<Self>) {
         self.jump_to_latest(cx);
     }
+}
+
+pub(crate) fn render_assistant_markdown(
+    content: &RowContent,
+    window: &mut Window,
+    cx: &mut App,
+) -> gpui::AnyElement {
+    let RowContent::AssistantMarkdown {
+        source,
+        content_key,
+    } = content
+    else {
+        return div().into_any_element();
+    };
+    MarkdownView::new(content_key.as_element_id(), source.clone(), window, cx)
+        .scrollable(false)
+        .selectable(true)
+        .into_inner()
+        .into_any_element()
 }
 
 fn kind_tag(kind: RowKind) -> &'static str {
@@ -190,14 +283,21 @@ impl Render for FocusedTranscriptView {
         let weak = cx.weak_entity();
         // Scroll events fire from input, outside the render/update pass, so a direct weak.update
         // is not re-entrant (the re-entrancy panic was the replica observer, fixed in `new`).
-        list_state.set_scroll_handler(move |event: &ListScrollEvent, _, app| {
-            weak.update(app, |view, cx| view.on_scroll_event(event, cx))
-                .ok();
+        list_state.set_scroll_handler({
+            let weak = weak.clone();
+            move |event: &ListScrollEvent, _, app| {
+                weak.update(app, |view, cx| view.on_scroll_event(event, cx))
+                    .ok();
+            }
         });
 
         let replica = self.replica.clone();
-        let list_el = list(list_state, move |ix, _window, app| {
+        let view_weak = weak.clone();
+        let reasoning_expanded = self.reasoning_expanded.clone();
+        let list_el = list(list_state, move |ix, window, app| {
             let replica = replica.clone();
+            let view_weak = view_weak.clone();
+            let reasoning_expanded = reasoning_expanded.clone();
             let Some(id) = replica.read(app).rows().id_at(ix) else {
                 return div().into_any_element();
             };
@@ -205,7 +305,7 @@ impl Render for FocusedTranscriptView {
                 return div().into_any_element();
             };
             let pres = entity.read(app).presentation.clone();
-            FocusedTranscriptView::render_stub_row(&pres, ix)
+            Self::render_row(&reasoning_expanded, &pres, ix, view_weak, window, app)
         })
         .size_full();
 
@@ -281,7 +381,8 @@ mod tests {
     use super::*;
     use crate::fleet::store::ReconcileEpoch;
     use crate::focused::{
-        FocusedTranscript, ReaderWorkerHandle, RowId, RowKind, RowPresentation, RowStore,
+        FocusedTranscript, ReaderWorkerHandle, RowContent, RowId, RowKind, RowPresentation,
+        RowStore,
     };
     use gpui::{ListAlignment, ListState};
     use lens_core::domain::ids::{AccId, CallId, ItemId, ResponseId};
@@ -344,6 +445,7 @@ mod tests {
                 full_text: "think".into(),
                 summary_text: String::new(),
                 encrypted: false,
+                duration_ms: None,
             },
         }
     }
@@ -433,6 +535,7 @@ mod tests {
                 full_text: "streaming reasoning".into(),
                 summary_text: String::new(),
                 encrypted: false,
+                started_at_ms: None,
             }),
             open_message: Some(MessageAcc {
                 acc_id: AccId::new("acc_m"),
@@ -453,7 +556,9 @@ mod tests {
                 marker_id.clone(),
                 RowPresentation {
                     kind: RowKind::ReconnectBreak,
-                    text: "reconnect".into(),
+                    content: RowContent::Stub {
+                        text: "reconnect".into(),
+                    },
                     collapsed: false,
                     height_hint: None,
                 },
@@ -507,7 +612,9 @@ mod tests {
                         id.clone(),
                         RowPresentation {
                             kind: RowKind::Message,
-                            text: format!("row {i}"),
+                            content: RowContent::Stub {
+                                text: format!("row {i}"),
+                            },
                             collapsed: false,
                             height_hint: None,
                         },
@@ -590,7 +697,9 @@ mod tests {
                         id.clone(),
                         RowPresentation {
                             kind: RowKind::Message,
-                            text: format!("row {i}"),
+                            content: RowContent::Stub {
+                                text: format!("row {i}"),
+                            },
                             collapsed: false,
                             height_hint: None,
                         },
@@ -721,7 +830,9 @@ mod tests {
             let _ = FocusedTranscriptView::render_stub_row(
                 &RowPresentation {
                     kind,
-                    text: "stub".into(),
+                    content: RowContent::Stub {
+                        text: "stub".into(),
+                    },
                     collapsed: false,
                     height_hint: None,
                 },
@@ -756,7 +867,9 @@ mod tests {
                         id.clone(),
                         RowPresentation {
                             kind: RowKind::Message,
-                            text: format!("row {i}"),
+                            content: RowContent::Stub {
+                                text: format!("row {i}"),
+                            },
                             collapsed: false,
                             height_hint: None,
                         },
@@ -811,7 +924,9 @@ mod tests {
                         id.clone(),
                         RowPresentation {
                             kind: RowKind::Message,
-                            text: format!("row {i}"),
+                            content: RowContent::Stub {
+                                text: format!("row {i}"),
+                            },
                             collapsed: false,
                             height_hint: None,
                         },

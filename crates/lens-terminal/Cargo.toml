@@ -23,9 +23,15 @@ url = "2"
 
 [features]
 bench = []
-# Exposes `render_test_api` for the real-window harness. Integration tests link
-# the crate's normal build (not cfg(test)), so the harness runs with this on.
-test-util = []
+# Exposes `render_test_api` + the engine-backed test constructors
+# (`open_with_engine_for_test`, `PolicyState::with_retry_window`) that sibling
+# crates' dev-dependencies need. Deliberately does NOT gate the real-window
+# `[[test]]` binaries — those require `real-window` (below), so Cargo feature
+# unification (e.g. lens-ui's dev-dep) can't drag them into the ordinary gate.
+test-util = ["lens-client/test-util"]
+# Real-window harness activation. A superset of `test-util`; only ever enabled
+# explicitly (xtask `--features real-window`), never via cross-crate unification.
+real-window = ["test-util"]
 live-tests = ["lens-client/live-tests"]
 
 [dev-dependencies]
@@ -33,6 +39,11 @@ base64 = "0.22"
 criterion = { version = "0.5", default-features = false }
 gpui = { version = "0.2.2", features = ["test-support"] }
 lens-client = { path = "../lens-client", features = ["test-util"] }
+# `terminal_live` P9/P10 drive the server-side half of a `/clear` rotation over
+# REST (create sibling session, bind runner, transfer the terminal). Those two
+# routes are `include_in_schema=False` upstream, so lens-client does not model
+# them. Same crate + feature set lens-client already pulls in — no new build.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde_json = "1"
 url = "2"
 
@@ -49,36 +60,37 @@ required-features = ["bench"]
 # Real-window render harness (Slice 1c C1/C5). `harness = false` → a plain
 # `fn main()` that opens a real GPUI window and drives Menlo/paint/perf
 # assertions from a canvas paint callback (gpui's NoopTextSystem is useless for
-# these). `required-features` keeps `cargo test --workspace` from building it;
-# xtask executes it on macOS with `--features test-util`.
+# these). `required-features = ["real-window"]` keeps every ordinary
+# `cargo test` (incl. cross-crate feature unification via lens-ui's dev-dep)
+# from building these; xtask executes them on macOS with `--features real-window`.
 [[test]]
 name = "render_realwindow"
 path = "tests/render_realwindow.rs"
 harness = false
-required-features = ["test-util"]
+required-features = ["real-window"]
 
 [[test]]
 name = "stream_perf_realwindow"
 harness = false
-required-features = ["test-util"]
+required-features = ["real-window"]
 
 [[test]]
 name = "input_realwindow"
 path = "tests/input_realwindow.rs"
 harness = false
-required-features = ["test-util"]
+required-features = ["real-window"]
 
 [[test]]
 name = "presentation_realwindow"
 path = "tests/presentation_realwindow.rs"
 harness = false
-required-features = ["test-util"]
+required-features = ["real-window"]
 
 [[test]]
 name = "mouse_realwindow"
 path = "tests/mouse_realwindow.rs"
 harness = false
-required-features = ["test-util"]
+required-features = ["real-window"]
 
 # Live open()+paint+reconnect rider (Slice 1d). `harness = false` → real GPUI
 # window; env-gated skip vs fail; not part of default `cargo test --workspace`.
@@ -86,4 +98,4 @@ required-features = ["test-util"]
 name = "terminal_live"
 path = "tests/terminal_live.rs"
 harness = false
-required-features = ["live-tests", "test-util"]
+required-features = ["live-tests", "real-window"]

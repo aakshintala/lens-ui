@@ -19,7 +19,7 @@ use lens_client::stream::EventStream;
 use lens_client::{Auth, Client, Connection};
 use lens_core::actor::{
     ActorFeed, ActorOutcome, ActorStores, ActorTransport, ClientSessionApi, CommandOutcome,
-    FleetScheduler, FleetSchedulerError, ParkReason, SessionCommand,
+    FleetScheduler, FleetSchedulerError, ParkReason, SessionCommand, TerminalResourceSignal,
 };
 use lens_core::clock::Clock;
 use lens_core::domain::ids::AgentId;
@@ -740,6 +740,34 @@ fn actor_outcome_json(outcome: &ActorOutcome) -> Value {
             "lens_pending_id": lens_pending_id,
             "content": content,
         }),
+        ActorOutcome::Superseded {
+            target_conversation_id,
+            reason,
+        } => json!({
+            "variant": "Superseded",
+            "target_conversation_id": target_conversation_id,
+            "reason": reason,
+        }),
+        ActorOutcome::TerminalResource(signal) => match signal {
+            TerminalResourceSignal::Created {
+                terminal_id,
+                terminal_name,
+                session_key,
+                session_id,
+            } => json!({
+                "variant": "TerminalResource",
+                "signal": "Created",
+                "terminal_id": terminal_id,
+                "terminal_name": terminal_name,
+                "session_key": session_key,
+                "session_id": session_id,
+            }),
+            TerminalResourceSignal::Deleted { terminal_id } => json!({
+                "variant": "TerminalResource",
+                "signal": "Deleted",
+                "terminal_id": terminal_id,
+            }),
+        },
     }
 }
 

@@ -70,6 +70,7 @@ pub enum ItemKind {
         full_text: String,
         summary_text: String,
         encrypted: bool,
+        duration_ms: Option<i64>,
     },
     /// web_search_call, mcp_call, …
     NativeTool {
@@ -141,6 +142,7 @@ pub struct ReasoningAcc {
     pub full_text: String,
     pub summary_text: String,
     pub encrypted: bool,
+    pub started_at_ms: Option<i64>,
 }
 
 #[cfg(test)]
@@ -214,6 +216,7 @@ mod tests {
                 full_text: "think".into(),
                 summary_text: "t".into(),
                 encrypted: false,
+                duration_ms: None,
             },
             ItemKind::NativeTool {
                 tool_type: "web_search_call".into(),

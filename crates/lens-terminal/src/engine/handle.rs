@@ -324,6 +324,11 @@ impl EngineHandle {
         self.inspect.snapshot()
     }
 
+    /// Ordinal retained-bytes estimate without a full inspect snapshot (two atomics).
+    pub fn retained_bytes_estimate(&self) -> usize {
+        self.inspect.retained_bytes_estimate()
+    }
+
     pub fn presentation_rx(&self) -> &Receiver<EnginePresentationEvent> {
         &self.presentation_rx
     }

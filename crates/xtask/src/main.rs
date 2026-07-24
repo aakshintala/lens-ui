@@ -512,7 +512,7 @@ fn gate() -> Result<()> {
     // Real-window render harness (Slice 1c C1/C5): EXECUTE on macOS — the
     // Menlo/paint/perf assertions need a real GPUI text system (gpui's
     // NoopTextSystem fakes them). Fail-closed paint p95 budgets live here, so
-    // this runs (not `--no-run`), gated by `test-util`.
+    // this runs (not `--no-run`), gated by `real-window`.
     //
     // `--release` is load-bearing: the p95 budgets are 120fps *product* targets
     // and must be measured in the shipping profile. Debug is ~5.4× slower on the
@@ -527,7 +527,7 @@ fn gate() -> Result<()> {
             "--test",
             "render_realwindow",
             "--features",
-            "test-util",
+            "real-window",
         ])?;
         // Job-A sustained multi-tab streaming perf gate (Slice 3). Short burst
         // by default (fits the gate); LENS_STREAM_SOAK=1 for a longer soak.
@@ -539,7 +539,7 @@ fn gate() -> Result<()> {
             "--test",
             "stream_perf_realwindow",
             "--features",
-            "test-util",
+            "real-window",
         ])?;
     } else {
         println!("gate: skip render_realwindow (macOS-only real GPUI text system)");

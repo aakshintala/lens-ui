@@ -215,6 +215,16 @@ impl InspectShared {
         self.total_rows.store(total_rows as u64, Ordering::Relaxed);
     }
 
+    /// Lightweight ordinal retained-bytes estimate (`total_rows × cols ×
+    /// `PER_CELL_BYTES`) from two atomics — no ring lock, no full snapshot.
+    pub fn retained_bytes_estimate(&self) -> usize {
+        let cols = self.cols.load(Ordering::Relaxed) as usize;
+        let total_rows = self.total_rows.load(Ordering::Relaxed) as usize;
+        total_rows
+            .saturating_mul(cols)
+            .saturating_mul(PER_CELL_BYTES)
+    }
+
     pub fn record_egress(&self, len: usize) {
         self.egress_emitted.fetch_add(1, Ordering::Relaxed);
         self.record_event(InspectEvent {
@@ -428,9 +438,7 @@ impl InspectShared {
 
         let cols = self.cols.load(Ordering::Relaxed);
         let total_rows = self.total_rows.load(Ordering::Relaxed) as usize;
-        let retained_bytes_estimate = total_rows
-            .saturating_mul(cols as usize)
-            .saturating_mul(PER_CELL_BYTES);
+        let retained_bytes_estimate = self.retained_bytes_estimate();
 
         EngineInspect {
             cols,
@@ -513,6 +521,16 @@ mod tests {
     }
 
     #[test]
+    fn retained_bytes_estimate_fast_path_matches_snapshot() {
+        let shared = super::InspectShared::new(200, 50, 100_000);
+        shared.record_retained_rows(10_000);
+        assert_eq!(
+            shared.retained_bytes_estimate(),
+            shared.snapshot().retained_bytes_estimate
+        );
+    }
+
+    #[test]
     fn inspect_mouse_copy_counters_default_zero() {
         let h = EngineHandle::spawn(test_config()).expect("spawn engine for test");
         let snap = h.inspect();
@@ -558,6 +576,11 @@ mod tests {
         assert_eq!(
             snap.retained_bytes_estimate,
             snap.total_rows * snap.cols as usize * crate::PER_CELL_BYTES
+        );
+        assert_eq!(
+            h.retained_bytes_estimate(),
+            snap.retained_bytes_estimate,
+            "fast-path estimate must match inspect snapshot"
         );
         h.stop();
     }

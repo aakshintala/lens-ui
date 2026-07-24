@@ -1,8 +1,14 @@
 //! Store-owned focused transcript replica (T-2 §5). State machine + fold rules;
 //! two-level retained rows, staged finalize, and collapse timing (Task 12).
 
+pub mod autolink;
+pub mod content_events;
+mod content_key;
 pub mod reader;
+pub mod reasoning;
 mod rowsource;
+mod streaming;
+mod user_content;
 pub mod view;
 
 use crate::fleet::store::{ReaderFactory, ReconcileEpoch};
@@ -16,10 +22,12 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+pub use content_key::ContentKey;
 pub use reader::{Priority, ReadTarget, ReaderWorkerHandle};
 pub use rowsource::{
-    RowId, RowKind, RowPresentation, RowState, RowStore, SectionKey, UpsertEffect,
+    RowContent, RowId, RowKind, RowPresentation, RowState, RowStore, SectionKey, UpsertEffect,
 };
+pub use streaming::StreamCoalescer;
 
 const LIST_OVERDRAW: Pixels = gpui::px(200.);
 const SYNC_DEBOUNCE_MS: u64 = 150;
@@ -84,6 +92,8 @@ pub struct FocusedTranscript {
     section_anchor: HashMap<ItemId, ItemId>,
     /// Single-in-flight guard for scroll-near-top `Backward` pages (§5).
     page_in_flight: bool,
+    /// Per-stream message coalescer — frame-budget mdstitch emits (D1).
+    message_coalescers: HashMap<AccId, StreamCoalescer>,
 }
 
 impl FocusedTranscript {
@@ -138,6 +148,7 @@ impl FocusedTranscript {
             settled_structure_len: 0,
             section_anchor: HashMap::new(),
             page_in_flight: false,
+            message_coalescers: HashMap::new(),
         };
         replica.enqueue_read(
             ReadRange::Tail {
@@ -190,6 +201,7 @@ impl FocusedTranscript {
             settled_structure_len: 0,
             section_anchor: HashMap::new(),
             page_in_flight: false,
+            message_coalescers: HashMap::new(),
         };
         cx.notify();
         replica
@@ -381,6 +393,11 @@ impl FocusedTranscript {
                 dirty = true;
             }
             StreamUpdate::ScratchChanged(scratch) => {
+                // Coalescer sub-budget (`None`) does not yet skip `reproject`; reproject is
+                // live-tail bounded. Frame-budget gating + pending-flush on finalize deferred
+                // (T-3 review roll-up).
+                let old = Arc::clone(&self.scratch);
+                self.coalesce_message_scratch_delta(&old, &scratch, cx);
                 self.scratch = scratch;
                 self.reproject(false, cx);
                 dirty = true;
@@ -414,7 +431,11 @@ impl FocusedTranscript {
             | StreamUpdate::ContextWindowChanged(_)
             | StreamUpdate::Reconnecting { .. }
             | StreamUpdate::Disconnected(_)
-            | StreamUpdate::SnapshotRestored(_) => {}
+            | StreamUpdate::SnapshotRestored(_)
+            // Terminal-5 control-path updates: routed via ActorOutcome, no replica delta.
+            | StreamUpdate::Superseded { .. }
+            | StreamUpdate::TerminalResourceCreated { .. }
+            | StreamUpdate::TerminalResourceDeleted { .. } => {}
             StreamUpdate::Reconnected { gap } => {
                 if gap != Some(0) {
                     let seq = self.next_marker_seq();
@@ -669,12 +690,53 @@ impl FocusedTranscript {
             .map(|(ord, _)| *ord);
     }
 
+    fn coalesce_message_scratch_delta(
+        &mut self,
+        old: &StreamScratch,
+        new: &StreamScratch,
+        cx: &mut Context<Self>,
+    ) {
+        // Sub-budget `None` from `StreamCoalescer::push_delta` still reprojects above; only
+        // live-tail bounded today — skip-on-sub-budget + finalize flush deferred (T-3 roll-up).
+        let Some(msg) = &new.open_message else {
+            self.message_coalescers.clear();
+            return;
+        };
+        let delta = match old.open_message.as_ref() {
+            Some(prev) if prev.acc_id == msg.acc_id && msg.text.starts_with(&prev.text) => {
+                msg.text[prev.text.len()..].to_string()
+            }
+            _ => {
+                self.message_coalescers.remove(&msg.acc_id);
+                msg.text.clone()
+            }
+        };
+        let coalescer = self
+            .message_coalescers
+            .entry(msg.acc_id.clone())
+            .or_default();
+        if let Some(source) = coalescer.push_delta(&delta) {
+            let id = RowId::StreamTail(msg.acc_id.clone());
+            let pres = RowPresentation {
+                kind: RowKind::StreamingMessage,
+                content: RowContent::AssistantMarkdown {
+                    source,
+                    content_key: ContentKey::from_acc(&msg.acc_id),
+                },
+                collapsed: false,
+                height_hint: None,
+            };
+            self.rows.upsert(id, pres, cx);
+        }
+    }
+
     fn handle_retired(
         &mut self,
         acc_id: AccId,
         disposition: RetireDisposition,
         cx: &mut Context<Self>,
     ) {
+        self.message_coalescers.remove(&acc_id);
         let prev_len = self.rows.len();
         match disposition {
             RetireDisposition::Finalizing { item_id } => {
@@ -684,7 +746,9 @@ impl FocusedTranscript {
                     self.stream_presentation(&acc_id, cx)
                         .unwrap_or_else(|| RowPresentation {
                             kind: RowKind::StreamingMessage,
-                            text: String::new(),
+                            content: RowContent::Stub {
+                                text: String::new(),
+                            },
                             collapsed: false,
                             height_hint: None,
                         });
@@ -940,7 +1004,9 @@ impl FocusedTranscript {
         if self.resident_lo > 0 {
             let pres = RowPresentation {
                 kind: RowKind::LoadOlder,
-                text: "Load older".into(),
+                content: RowContent::Stub {
+                    text: "Load older".into(),
+                },
                 collapsed: false,
                 height_hint: None,
             };
@@ -1341,6 +1407,7 @@ mod tests {
                 full_text: "think".into(),
                 summary_text: String::new(),
                 encrypted: false,
+                duration_ms: None,
             },
         }
     }
@@ -1494,6 +1561,7 @@ mod tests {
                             full_text: "streaming chrome".into(),
                             summary_text: String::new(),
                             encrypted: false,
+                            started_at_ms: None,
                         }),
                         ..Default::default()
                     })),
@@ -2367,6 +2435,7 @@ mod tests {
                             full_text: "streaming think".into(),
                             summary_text: String::new(),
                             encrypted: false,
+                            started_at_ms: None,
                         }),
                         ..Default::default()
                     })),
@@ -2554,6 +2623,7 @@ mod tests {
                             full_text: "streaming under resp_a".into(),
                             summary_text: String::new(),
                             encrypted: false,
+                            started_at_ms: None,
                         }),
                         ..Default::default()
                     })),
@@ -2690,6 +2760,7 @@ mod tests {
                             full_text: "streaming tail".into(),
                             summary_text: String::new(),
                             encrypted: false,
+                            started_at_ms: None,
                         }),
                         ..Default::default()
                     })),
@@ -2801,6 +2872,7 @@ mod tests {
                             full_text: "streaming tail".into(),
                             summary_text: String::new(),
                             encrypted: false,
+                            started_at_ms: None,
                         }),
                         ..Default::default()
                     })),
@@ -2924,6 +2996,7 @@ mod tests {
                             full_text: "reasoning-only section".into(),
                             summary_text: String::new(),
                             encrypted: false,
+                            started_at_ms: None,
                         }),
                         ..Default::default()
                     })),
@@ -3192,7 +3265,8 @@ mod tests {
                     .unwrap()
                     .read(cx)
                     .presentation
-                    .text,
+                    .content
+                    .stub_text(),
                 "hi"
             );
         });
@@ -3281,7 +3355,8 @@ mod tests {
                     .unwrap()
                     .read(cx)
                     .presentation
-                    .text,
+                    .content
+                    .stub_text(),
                 "hi",
                 "finalized message must render its disk text"
             );
@@ -4362,6 +4437,7 @@ mod tests {
                                 full_text: format!("stream {i}"),
                                 summary_text: String::new(),
                                 encrypted: false,
+                                started_at_ms: None,
                             }),
                             ..Default::default()
                         })),
@@ -4414,6 +4490,7 @@ mod tests {
                             full_text: "staged".into(),
                             summary_text: String::new(),
                             encrypted: false,
+                            started_at_ms: None,
                         }),
                         ..Default::default()
                     })),
@@ -4579,7 +4656,7 @@ mod tests {
             let found = r.rows().order().iter().any(|id| {
                 r.rows()
                     .entity(id)
-                    .is_some_and(|e| e.read(cx).presentation.text == "ok")
+                    .is_some_and(|e| e.read(cx).presentation.content.stub_text() == "ok")
             });
             assert!(found, "orphan output must render without panic");
         });
@@ -4653,6 +4730,7 @@ mod tests {
                             full_text: "streaming".into(),
                             summary_text: String::new(),
                             encrypted: false,
+                            started_at_ms: None,
                         }),
                         ..Default::default()
                     })),
