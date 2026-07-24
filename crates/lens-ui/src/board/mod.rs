@@ -504,35 +504,50 @@ impl BoardView {
         ));
     }
 
-    fn card_ghost(&self, session_id: &SessionId, id: BoardItemId, cx: &App) -> drag::DragGhost {
-        let fleet = self.fleet.read(cx);
-        let theme = cx.lens_theme();
-        let now_ms = fleet.clock().now_millis();
-        let (title, status_color) = fleet
-            .cards
-            .get(session_id)
-            .map(|entity| {
-                let card = entity.read(cx);
-                let title = card.title.clone().unwrap_or_else(|| "—".into());
-                let wave = derive_wave(card, now_ms, false);
-                (title, wave.status_color(theme))
-            })
-            .unwrap_or_else(|| ("—".into(), gpui::rgb(0x6b7280).into()));
-        drag::DragGhost::card(id, title, status_color)
-    }
-
     fn group_ghost(&self, id: BoardItemId, cx: &App) -> drag::DragGhost {
         let layout = self.replica.read(cx).layout();
-        let (name, accent) = layout
-            .item(&id)
+        let fleet = self.fleet.read(cx);
+        let now_ms = fleet.clock().now_millis();
+        let item = layout.item(&id);
+        let (name, accent, spend_age) = item
             .and_then(|it| match &it.kind {
                 BoardItemKind::Group {
                     name, color_token, ..
-                } => Some((name.clone(), group_accent(color_token.as_deref()))),
+                } => {
+                    let accent = group_accent(color_token.as_deref());
+                    let sessions: Vec<SessionId> = layout
+                        .items
+                        .iter()
+                        .filter_map(|child| match &child.kind {
+                            BoardItemKind::Card { session, .. }
+                                if child.parent_item_id.as_ref() == Some(&it.id) =>
+                            {
+                                Some(session.clone())
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    let members: Vec<rollup::MemberCost> = sessions
+                        .iter()
+                        .filter_map(|s| {
+                            fleet
+                                .cards
+                                .get(s)
+                                .map(|e| rollup::MemberCost::from_card(e.read(cx)))
+                        })
+                        .collect();
+                    let rollup = rollup::group_rollup(&members, 0);
+                    let spend_age = format!(
+                        "{} · {}",
+                        rollup::format_group_spend(rollup.spend_usd),
+                        rollup::format_age(rollup.oldest_created_at, now_ms),
+                    );
+                    Some((name.clone(), accent, spend_age))
+                }
                 _ => None,
             })
-            .unwrap_or_else(|| (String::new(), group_accent(None)));
-        drag::DragGhost::group(id, name, accent)
+            .unwrap_or_else(|| (String::new(), group_accent(None), String::new()));
+        drag::DragGhost::group(id, name, accent, spend_age)
     }
 
     fn gap_placeholder_element(placed: &pack::Placed) -> AnyElement {
@@ -911,11 +926,11 @@ impl BoardView {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let cached = self.cached_tiles.get(session_id)?.clone();
-        let entity_id = self.card_views.get(session_id)?.entity_id();
+        let card_entity = self.card_views.get(session_id)?.clone();
+        let entity_id = card_entity.entity_id();
         let sid = session_id.clone();
         let drag_id = item_id.clone();
         let weak = cx.weak_entity();
-        let sid_for_ghost = sid.clone();
         Some(
             div()
                 .absolute()
@@ -931,26 +946,16 @@ impl BoardView {
                 .on_drag(drag_id.clone(), {
                     let card_left = left;
                     let card_top = top;
+                    let card_entity = card_entity.clone();
                     move |id, offset, _window, cx: &mut App| {
                         let cursor = (
                             card_left + f32::from(offset.x),
                             card_top + f32::from(offset.y),
                         );
-                        let ghost = weak
-                            .update(cx, |board, cx| {
-                                board.begin_item_drag(id.clone(), DraggedKind::Card, cursor, cx);
-                                board.card_ghost(&sid_for_ghost, id.clone(), cx)
-                            })
-                            .ok();
-                        cx.new(|_| {
-                            ghost.unwrap_or_else(|| {
-                                drag::DragGhost::card(
-                                    id.clone(),
-                                    "—".into(),
-                                    gpui::rgb(0x6b7280).into(),
-                                )
-                            })
-                        })
+                        let _ = weak.update(cx, |board, cx| {
+                            board.begin_item_drag(id.clone(), DraggedKind::Card, cursor, cx);
+                        });
+                        card_entity.clone()
                     }
                 })
                 .child(cached)
@@ -1096,6 +1101,7 @@ impl BoardView {
                                     id.clone(),
                                     String::new(),
                                     group_accent(None),
+                                    String::new(),
                                 )
                             })
                         })
@@ -1373,6 +1379,7 @@ impl BoardView {
                                     id.clone(),
                                     String::new(),
                                     group_accent(None),
+                                    String::new(),
                                 )
                             })
                         })
