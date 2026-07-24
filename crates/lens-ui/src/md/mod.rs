@@ -119,6 +119,40 @@ pub fn markdown_probe_scroll_list_to(id: &str, offset: ListOffset, window: &mut 
     markdown_probe_state(id, window, cx).update(cx, |s, _| s.list_scroll_to(offset));
 }
 
+/// Opaque handle to a markdown row's keyed `TextViewState`, captured DURING render/paint
+/// (where `use_keyed_state` is legal) so a probe driver can read scroll state BETWEEN frames
+/// via the entity — entity reads/updates do not require paint context (unlike `use_keyed_state`,
+/// which panics outside request_layout/prepaint/paint).
+#[cfg(feature = "probe")]
+#[derive(Clone)]
+pub struct MarkdownProbeHandle(Entity<text_view::TextViewState>);
+
+/// MUST be called during render/paint (uses `use_keyed_state`).
+#[cfg(feature = "probe")]
+pub fn markdown_probe_handle(id: &str, window: &mut Window, cx: &mut App) -> MarkdownProbeHandle {
+    MarkdownProbeHandle(markdown_probe_state(id, window, cx))
+}
+
+/// Callable between frames (no paint context needed).
+#[cfg(feature = "probe")]
+pub fn markdown_probe_handle_scroll_top(handle: &MarkdownProbeHandle, cx: &mut App) -> ListOffset {
+    handle.0.read(cx).list_logical_scroll_top()
+}
+
+#[cfg(feature = "probe")]
+pub fn markdown_probe_handle_item_count(handle: &MarkdownProbeHandle, cx: &mut App) -> usize {
+    handle.0.read(cx).list_item_count()
+}
+
+#[cfg(feature = "probe")]
+pub fn markdown_probe_handle_scroll_to(
+    handle: &MarkdownProbeHandle,
+    offset: ListOffset,
+    cx: &mut App,
+) {
+    handle.0.update(cx, |s, _| s.list_scroll_to(offset));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,6 +1,10 @@
 //! Real-window live-reasoning stick-to-bottom probe — must run on the main thread
 //! (`cargo run -p lens-ui --features probe --bin focused_reasoning_probe`).
 //! `Application::new().run()`; not invokable from `#[gpui::test]` worker threads.
+//!
+//! The scroll state is read via a `MarkdownProbeHandle` captured DURING render (where
+//! `use_keyed_state` is legal) and then queried BETWEEN frames through the entity — calling
+//! `use_keyed_state` outside paint panics ("only during request_layout/prepaint/paint").
 
 use std::cell::RefCell;
 use std::process;
@@ -15,8 +19,8 @@ use gpui::{
 use lens_ui::focused::reasoning::{ReasoningUiState, render_reasoning};
 use lens_ui::focused::{ContentKey, RowContent};
 use lens_ui::md::{
-    init as md_init, markdown_probe_list_item_count, markdown_probe_logical_scroll_top,
-    markdown_probe_scroll_list_to,
+    MarkdownProbeHandle, init as md_init, markdown_probe_handle, markdown_probe_handle_item_count,
+    markdown_probe_handle_scroll_to, markdown_probe_handle_scroll_top,
 };
 
 const GROWTH_STEPS: usize = 6;
@@ -49,6 +53,7 @@ struct HarnessView {
     probe: Rc<RefCell<ProbeState>>,
     spawned: bool,
     exit_ok: Rc<RefCell<bool>>,
+    handle: Option<MarkdownProbeHandle>,
 }
 
 async fn wait_frames(wcx: &mut AsyncWindowContext, n: usize) {
@@ -69,10 +74,22 @@ async fn wait_frames(wcx: &mut AsyncWindowContext, n: usize) {
     }
 }
 
+/// Read (scroll_top, item_count) via the render-captured handle. Returns None until the first
+/// render has captured the handle.
+fn read_scroll(weak: &WeakEntity<HarnessView>, wcx: &mut AsyncWindowContext) -> Option<(ListOffset, usize)> {
+    weak.update_in(wcx, |view, _window, cx| {
+        let handle = view.handle.clone()?;
+        let offset = markdown_probe_handle_scroll_top(&handle, cx);
+        let count = markdown_probe_handle_item_count(&handle, cx);
+        Some((offset, count))
+    })
+    .ok()
+    .flatten()
+}
+
 async fn drive_reasoning_probe(
     weak: WeakEntity<HarnessView>,
     mut wcx: AsyncWindowContext,
-    md_id: String,
     probe: Rc<RefCell<ProbeState>>,
     exit_ok: Rc<RefCell<bool>>,
 ) {
@@ -86,44 +103,48 @@ async fn drive_reasoning_probe(
             view.full_text = text;
             cx.notify();
         });
+        // Wait past the 100ms markdown reparse throttle so the taller parsed_result applies and
+        // the list actually grows (T3-1 lesson: the source string growing is not enough).
         wait_frames(&mut wcx, FRAMES_PER_GROWTH).await;
 
-        let (at_bottom, item_ix, count) = weak
-            .update_in(&mut wcx, |_, window, cx| {
-                let offset = markdown_probe_logical_scroll_top(&md_id, window, cx);
-                let count = markdown_probe_list_item_count(&md_id, window, cx);
-                let at_bottom = md_at_bottom(offset, count);
-                (at_bottom, offset.item_ix, count)
-            })
-            .unwrap_or((false, 0, 0));
-
-        if !at_bottom {
-            stick_ok = false;
-            probe.borrow_mut().failures.push(format!(
-                "stick-to-bottom failed at step {step}: item_ix={item_ix} count={count}"
-            ));
+        match read_scroll(&weak, &mut wcx) {
+            Some((offset, count)) => {
+                if !md_at_bottom(offset, count) {
+                    stick_ok = false;
+                    probe.borrow_mut().failures.push(format!(
+                        "stick-to-bottom failed at step {step}: item_ix={} count={count}",
+                        offset.item_ix
+                    ));
+                }
+            }
+            None => {
+                stick_ok = false;
+                probe
+                    .borrow_mut()
+                    .failures
+                    .push(format!("no handle/scroll state at step {step}"));
+            }
         }
     }
 
-    let _ = weak.update_in(&mut wcx, |_, window, cx| {
-        markdown_probe_scroll_list_to(
-            &md_id,
-            ListOffset {
-                item_ix: 0,
-                offset_in_item: px(0.),
-            },
-            window,
-            cx,
-        );
+    // Scroll to the top, then grow once more: an at-bottom implementation must NOT yank us back
+    // to the bottom (P3 preserve for the scrolled-up case).
+    let _ = weak.update_in(&mut wcx, |view, _, cx| {
+        if let Some(handle) = view.handle.clone() {
+            markdown_probe_handle_scroll_to(
+                &handle,
+                ListOffset {
+                    item_ix: 0,
+                    offset_in_item: px(0.),
+                },
+                cx,
+            );
+        }
         cx.notify();
     });
     wait_frames(&mut wcx, SETTLE_FRAMES).await;
 
-    let top_ix_before = weak
-        .update_in(&mut wcx, |_, window, cx| {
-            markdown_probe_logical_scroll_top(&md_id, window, cx).item_ix
-        })
-        .unwrap_or(0);
+    let top_ix_before = read_scroll(&weak, &mut wcx).map(|(o, _)| o.item_ix).unwrap_or(0);
 
     let final_text = growth_text(GROWTH_STEPS + 1);
     let _ = weak.update_in(&mut wcx, |view, _, cx| {
@@ -132,17 +153,14 @@ async fn drive_reasoning_probe(
     });
     wait_frames(&mut wcx, FRAMES_PER_GROWTH).await;
 
-    let preserve_ok = weak
-        .update_in(&mut wcx, |_, window, cx| {
-            let offset = markdown_probe_logical_scroll_top(&md_id, window, cx);
-            let count = markdown_probe_list_item_count(&md_id, window, cx);
-            offset.item_ix == top_ix_before && offset.item_ix < count.saturating_sub(1)
-        })
-        .unwrap_or(false);
+    let preserve_ok = match read_scroll(&weak, &mut wcx) {
+        Some((offset, count)) => offset.item_ix == top_ix_before && offset.item_ix < count.saturating_sub(1),
+        None => false,
+    };
 
     if !preserve_ok {
         probe.borrow_mut().failures.push(format!(
-            "scroll-preserve failed: expected near top (ix={top_ix_before}) after growth"
+            "scroll-preserve failed: expected to stay near top (ix={top_ix_before}) after growth"
         ));
     }
 
@@ -169,11 +187,10 @@ impl Render for HarnessView {
             self.spawned = true;
             let exit_ok = Rc::clone(&self.exit_ok);
             let probe = Rc::clone(&self.probe);
-            let md_id = self.content_key.as_element_id().as_str().to_string();
             cx.spawn_in(window, move |weak, wcx: &mut AsyncWindowContext| {
                 let wcx = wcx.clone();
                 async move {
-                    drive_reasoning_probe(weak, wcx, md_id, probe, exit_ok).await;
+                    drive_reasoning_probe(weak, wcx, probe, exit_ok).await;
                 }
             })
             .detach();
@@ -188,16 +205,21 @@ impl Render for HarnessView {
             live: true,
         };
 
-        div()
-            .size_full()
-            .p_4()
-            .child(render_reasoning(
-                &content,
-                ReasoningUiState::Collapsed { duration_secs: None },
-                None,
-                window,
-                cx,
-            ))
+        let element = div().size_full().p_4().child(render_reasoning(
+            &content,
+            ReasoningUiState::Collapsed { duration_secs: None },
+            None,
+            window,
+            cx,
+        ));
+
+        // Capture the keyed TextViewState entity DURING render (paint) so the driver can read
+        // scroll state between frames. The live reasoning MarkdownView keys on
+        // `content_key.as_element_id()`; use the same id.
+        let id = self.content_key.as_element_id();
+        self.handle = Some(markdown_probe_handle(id.as_str(), window, cx));
+
+        element
     }
 }
 
@@ -219,6 +241,7 @@ fn main() {
                 probe: Rc::clone(&probe),
                 spawned: false,
                 exit_ok: Rc::clone(&exit_for_run),
+                handle: None,
             })
         })
         .expect("open window");
