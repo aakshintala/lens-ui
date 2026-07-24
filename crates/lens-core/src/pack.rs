@@ -10,6 +10,9 @@ pub const CARD_W: f32 = 280.0;
 pub const CARD_H: f32 = 160.0;
 pub const HEADER: f32 = 24.0;
 pub const GAP: f32 = 24.0;
+/// Shrink the into-group body hit-test on left/right/bottom so preview-grown
+/// groups do not flip the target at the body edge (B-4c drag hysteresis).
+pub const INTO_GROUP_INSET: f32 = GAP;
 pub const INSET: f32 = 5.0;
 
 pub const CELL_W: f32 = CARD_W + GAP; // 296
@@ -278,7 +281,10 @@ pub fn resolve_drop(snapshot: &[DropTile], cursor: (f32, f32), dragged: DraggedK
             let block_w = fc as f32 * CELL_W - GAP;
             let block_h = HEADER + fr as f32 * CARD_H + (fr as f32 - 1.0) * GAP;
             let body_top = y0 + HEADER;
-            let in_body = cx >= x0 && cx <= x0 + block_w && cy >= body_top && cy <= y0 + block_h;
+            let in_body = cx >= x0 + INTO_GROUP_INSET
+                && cx <= x0 + block_w - INTO_GROUP_INSET
+                && cy >= body_top
+                && cy <= y0 + block_h - INTO_GROUP_INSET;
             if !in_body {
                 continue;
             }
@@ -445,7 +451,12 @@ mod tests {
     fn drop_into_expanded_group_body_targets_member_slot() {
         let items = [Item::group(4)];
         let s = snap(&items, &["g"], &[false], 3);
-        let t = resolve_drop(&s, (4.0, HEADER + CARD_H / 2.0), DraggedKind::Card);
+        // Past the left inset (INTO_GROUP_INSET = GAP) so into-group still qualifies.
+        let t = resolve_drop(
+            &s,
+            (INTO_GROUP_INSET + 8.0, HEADER + CARD_H / 2.0),
+            DraggedKind::Card,
+        );
         assert_eq!(
             t,
             DropTarget {
@@ -453,7 +464,7 @@ mod tests {
                 ordinal: 0
             }
         );
-        let x_m1 = CELL_W + CARD_W - 4.0;
+        let x_m1 = CELL_W + CARD_W / 2.0 + 16.0;
         let t2 = resolve_drop(&s, (x_m1, HEADER + CARD_H / 2.0), DraggedKind::Card);
         assert_eq!(
             t2,
@@ -461,6 +472,37 @@ mod tests {
                 parent: Some(bid("g")),
                 ordinal: 2
             }
+        );
+    }
+
+    #[test]
+    fn into_group_body_edge_inset_resolves_top_level() {
+        let items = [Item::group(4)];
+        let s = snap(&items, &["g"], &[false], 3);
+        // Within the left inset margin — must not flip into-group.
+        let t = resolve_drop(&s, (4.0, HEADER + CARD_H / 2.0), DraggedKind::Card);
+        assert_eq!(
+            t.parent, None,
+            "cursor in the inset margin should resolve top-level"
+        );
+    }
+
+    #[test]
+    fn into_group_body_center_still_targets_member() {
+        let items = [Item::group(4)];
+        let s = snap(&items, &["g"], &[false], 3);
+        let t = resolve_drop(
+            &s,
+            (CELL_W + CARD_W / 2.0, HEADER + CARD_H / 2.0),
+            DraggedKind::Card,
+        );
+        assert_eq!(
+            t,
+            DropTarget {
+                parent: Some(bid("g")),
+                ordinal: 1
+            },
+            "well inside the body still resolves into-group"
         );
     }
 
